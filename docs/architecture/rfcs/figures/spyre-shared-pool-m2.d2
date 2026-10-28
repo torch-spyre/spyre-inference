@@ -1,38 +1,40 @@
 direction: down
-
-instA: Spyre instance A {
-  style.fill: "#eef5ff"
-  style.stroke: "#3b6fb3"
-  OA: "OffloadingConnector + SpyreSharedOffloadingSpec\n(subclasses M1's SpyreOffloadingSpec)"
-  HA: "SpyreOffloadingWorker -> SpyreKvDmaCopier"
-  OA -> HA
+classes: {
+  control: {style: {fill: "#37474f"; stroke: "#263238"; font-color: "#ffffff"}}
+  plugin: {style: {fill: "#2e7d32"; stroke: "#1b5e20"; font-color: "#ffffff"; bold: true}}
+  device: {style: {fill: "#1565c0"; stroke: "#0d47a1"; font-color: "#ffffff"}}
+  container: {style: {fill: "#e0e0e0"; stroke: "#9e9e9e"; font-color: "#212121"}}
 }
 
-instB: Spyre instance B {
-  style.fill: "#eef5ff"
-  style.stroke: "#3b6fb3"
-  OB: "OffloadingConnector + SpyreSharedOffloadingSpec"
-  HB: "SpyreOffloadingWorker -> SpyreKvDmaCopier"
-  OB -> HB
+control: "Control plane — target persistent lifecycle" {
+  class: container
+  delegator: "Node-local delegator\nCreatePool / OpenPool / DestroyPool" {class: control}
 }
 
-RAW: "torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)\nbyte-exact raw DMA — device page <-> pool slot\n(no host pointers / device addresses cross into Python)" {
-  style.fill: "#ffe4e1"
-  style.stroke: "#a83232"
+clients: "Data plane — compatible serving instances" {
+  class: container
+  a: "Instance A\nShared manager + page worker" {class: plugin}
+  b: "Instance B\nShared manager + page worker" {class: plugin}
 }
 
-pool: shared host KV pool (hardware runtime, one per node) {
-  style.fill: "#fff4e6"
-  style.stroke: "#c1620a"
-  META: "SharedHostMetadata - shared directory\nblock-hash -> slot_id; lookup / claim / publish / evict;\npublish gate -> a stale slot degrades to a miss, never torn bytes"
-  SLOTS: "SharedHostPool - fixed-size slots\nDMA-able shared memory, addressed by slot_id" {
-    shape: cylinder
-  }
-  META -- SLOTS
+pair: "Named pair per selected cache group — retained at startup" {
+  class: container
+  lifecycle: "Generation-checked attachment\nAttachPool / DetachPool only for serving\nPublished entries survive last detach" {class: control}
+  directory: "Host-resident shared metadata\nComponent key → slot + generation\nClaim / publish / pin / evict" {class: control}
+  data: "SharedPool data slots\nHost memory OR secondary memory\nNo automatic tiering" {class: device; shape: cylinder}
+  lifecycle -> directory: "protect pair identity"
+  directory -> data: "all components valid + pinned before a hit"
 }
 
-instA.HA -> RAW: "store (offload) / load (reload)"
-instB.HB -> RAW: "store (offload) / load (reload)"
-RAW <-> pool.SLOTS: "raw DMA into slot"
-instA.HA -> pool.META: "claim / publish / lookup" { style.stroke-dash: 3 }
-instB.HB -> pool.META: "lookup (peer hit)" { style.stroke-dash: 3 }
+control.delegator -> pair.lifecycle: "provision / resolve / explicit destroy"
+clients.a -> pair.lifecycle: "attach / detach"
+clients.b -> pair.lifecycle: "attach / detach"
+clients.a -> pair.directory: "claim → copy → publish pages" {style.stroke-dash: 3}
+clients.b -> pair.directory: "lookup → pin → recheck → copy" {style.stroke-dash: 3}
+clients.a <-> pair.data: "byte-exact page DMA"
+clients.b <-> pair.data: "byte-exact page DMA"
+
+scope: "Target architecture: M2 demonstrates host sharing; M3 separately demonstrates\nsecondary-memory transport. Combining them and persistent lifecycle remain work." {
+  class: container
+}
+pair -> scope: "implementation status" {style.stroke-dash: 3}

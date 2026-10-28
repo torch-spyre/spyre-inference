@@ -5,1129 +5,714 @@
 | Status | Draft |
 | Authors | Chen Wang ([@wangchen615](https://github.com/wangchen615)), Yue Zhu ([@yuezhu1](https://github.com/yuezhu1)), Pravein Govindan Kannan ([@praveingk](https://github.com/praveingk)), Hubertus Franke ([@frankeh](https://github.com/frankeh)) |
 | Created | 2026-06-05 |
+| Updated | 2026-10-28 |
 | Tracking | First design doc for [#76 — \[Epic\] Develop KVCacheConnector for Spyre](https://github.com/torch-spyre/spyre-inference/issues/76) |
-| Related | vLLM `OffloadingConnector`, vLLM `TieringOffloadingSpec` (PR #40020), vLLM `tiering/fs` (PR #41735), vLLM `tiering/obj` (PR #41968), prior internal Spyre PD-disaggregation prototype |
+| Related | vLLM `OffloadingConnector`; device-runtime shared-pool and persistent-lifecycle designs; M1/M2/M3 offload prototypes |
 
 ## 1. Motivation
 
-The upstream vLLM `OffloadingConnector` framework gives every CUDA platform three things for free:
+vLLM's `OffloadingConnector` separates scheduler-side cache policy from worker-side transfers.
+Spyre can reuse this framework without upstream patches, but needs its own dense-cache ingestion
+and byte-exact transfer path. The stock CPU-offload worker is implemented for CUDA-alike/XPU devices.
 
-1. A pluggable scheduler-side `OffloadingManager` that tracks where each block lives (G/H/F tiers).
-2. A worker-side `OffloadingWorker` that performs the actual transfer, with direction explicit via `submit_store` / `submit_load`.
-3. An `OffloadingSpec` factory that lets out-of-tree platforms drop in their own manager + worker without touching upstream code.
+This RFC describes three incremental capabilities:
 
-As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** that lets a single connector cascade across host RAM, filesystem, and object stores. This RFC does **not** build on that framework as a milestone (§3.5 keeps it as background): the fast second tier we want is a future **DMA-able, faster-than-DRAM memory pool** (a CXL-class secondary memory tier the Spyre runtime layer sketches — expansion memory the device reaches *by DMA*, exactly like host DRAM, **not** a byte-addressable mmap'd region) reached through the same shared-pool DMA path as M2 — not a filesystem/object `SecondaryTierManager`, so a tiering milestone would be a detour.
+1. **M1 — instance-local host-memory offload:** reuse an offloaded prefix across requests in one engine.
+2. **M2 — shared host-memory offload:** another compatible instance on the same node can find and load
+   that prefix through a shared allocator and directory.
+3. **M3 — secondary-memory offload:** use a secondary-memory data pool behind the same shared-pool
+   contract, retaining CPU-resident metadata.
 
-The existing `spyre-inference` plugin has **none** of this wired up. `TorchSpyreWorker` extends `CPUWorker` and never calls `register_kv_caches`. Both the single-tier `CPUOffloadingSpec` and the `TieringOffloadingSpec` that subclasses it error out on non-CUDA platforms via the `current_platform.is_cuda_alike() or .is_xpu()` check inside `CPUOffloadingSpec.get_worker` (`vllm/v1/kv_offload/cpu/spec.py`). So the entire upstream offload + tiering stack is unreachable from Spyre today, and the only KV-tier story we have is "the whole cache is on-device, full-stop."
+Working development branches exist for these three stages (§9). They establish the implementation
+path, not availability in the main-branch dependency pins or completion of the persistent-lifecycle
+contract. This remains an agreed starting design, with implementation and production hardening in
+follow-up PRs.
 
-Meanwhile, an earlier internal Spyre PD-disaggregation prototype has already demonstrated end-to-end KV transfer between two Spyre instances over NIXL, using a Spyre-specific device↔host copy primitive. That prototype is not packaged for vLLM's connector contract — it sits in standalone scripts that drive the model directly via `fms` — so it cannot ride the upstream connector ecosystem (LMCache, llm-d shared-storage backend, prefix caching, PD disaggregation) without an adaptor.
-
-This RFC proposes how to combine the two: take the prototype's data-copy primitive, wrap it as an upstream-conformant `OffloadingWorker`, and register a `SpyreOffloadingSpec` so that the upstream `OffloadingConnector` works on Spyre (M1). It then makes the host tier a **cross-instance shared pool** (M2) so co-located instances reuse each other's offloaded blocks with one raw DMA and no serialization — which is also the path a future faster tier (a DMA-able, faster-than-DRAM CXL-class secondary memory pool) will take. The Spyre-specific code stops at the device↔host primary tier plus one KV-cache-layout adapter (§6.6); the manager, factory, and scheduler-side connector above it are platform-agnostic upstream code, reused unchanged.
-
-**Both extension points this needs are already public** — `spec_module_path` for the spec and `kv_connector_module_path` for the connector — so **no upstream vLLM change is required** (§3.4). That is a deliberate constraint: Spyre-specific support is slow to land upstream, so the design depends only on general-purpose seams that already exist at the pinned version.
+Host DRAM and secondary memory are **alternative, co-equal pool backends**. This RFC does not define
+an automatic hierarchy, spill to DRAM, promotion/demotion, or lookup across unrelated pools. It makes
+no relative performance claim about the memory kinds.
 
 ## 2. Goals and non-goals
 
-### Goals (M1)
+### M1 — instance-local host memory
 
-- A user runs vLLM on Spyre with `--kv-transfer-config '{"kv_connector":"SpyreOffloadingConnector", "kv_connector_module_path":"spyre_inference.v1.kv_offload.connector", "kv_connector_extra_config":{"spec_name":"SpyreOffloadingSpec","spec_module_path":"spyre_inference.v1.kv_offload.spec","cpu_bytes_to_use":"8000000000"}}'` and gets host-RAM offload that survives across requests. Both module paths are public upstream config keys, so this needs no vLLM patch (§3.4); the connector half is what carries the Spyre paged-KV adapter (§6.6).
-- The Spyre device↔host copy goes through one named, testable primitive (`SpyreKvDmaCopier`). For KV data the copy must be **byte-exact**: the default converting `copy_tensor` path re-encodes fp16 through the device representation and drifts ~1 ULP on about half of values (§4/§6.1), which is a correctness defect for a KV tier — so M1's copier uses the byte-exact raw copy path (`torch_spyre._C.copy_tensor_raw`), not the converting `copy_tensor`. That raw primitive is a pending torch-spyre dependency (not present in the current pinned build), so M1 is gated on it landing the same way M2 is (§6.7, §10 Q1). No earlier low-level prototype path is reused; no internal DMA-queue primitives.
-- `pytest tests/v1/kv_offload/` runs the same matrix as upstream for the CPU spec, plus a Spyre-specific test that round-trips a known-pattern block device→host→device.
+- Select `SpyreOffloadingConnector` and `SpyreOffloadingSpec` through existing vLLM configuration.
+- Reuse upstream `CPUOffloadingManager` for local admission, eviction and block bookkeeping.
+- Offload and restore the device representation byte-for-byte, without converting through host floats.
+- Support dense head-major and token-major model-dtype caches; validate each layout's physical page
+  mapping separately. FP8 acceptance is a separate gate (§6.1, §12), not implied by FP16 success.
+- Preserve the no-connector serving path and avoid an upstream vLLM patch.
 
-### Goals (M2 — cross-instance shared host-memory KV pool)
+### M2 — shared host memory
 
-M1 gives each instance its **own** host-RAM primary tier — a block offloaded by one instance is
-invisible to every other. M2 makes the host tier a single **shared host KV pool** provided by the
-hardware runtime and shared by every co-located Spyre instance, so a KV block offloaded by one
-instance is reloaded by another with **one raw DMA and no serialization** — at memory speed and
-without a disk round-trip. It is the same shared-pool DMA path a future DMA-able, faster-than-DRAM
-memory pool (a CXL-class secondary memory tier, §6.4) will use.
+- Let compatible instances attach the same named data/metadata pair and discover published prefixes.
+- Use a shared allocator and generation-checked directory, not independent local allocators pointing
+  at the same backing.
+- Never consume a reserved, stale, incompatible or partially written entry as a cache hit.
+- Separate pool administration from serving: a node-local control-plane service (the **delegator**)
+  manages pool creation/discovery/destruction; serving processes attach/detach only.
+- Keep the pool and published entries across a zero-attachment interval, normal shutdown or a serving
+  process restart. Host shared memory is not durable across node reboot.
 
-- A user runs two `vllm serve` instances on the same host, each with `spec_name:
-  "SpyreSharedOffloadingSpec"` and a shared pool config, and the second instance gets a prefix-cache
-  hit on a block the first offloaded — served by a device←host DMA out of the shared pool, no
-  recompute, no file I/O.
-- The shared pool is a valid Spyre DMA endpoint regardless of how the runtime backs the pool, via the
-  hardware runtime's raw-copy primitive exposed through torch-spyre as `copy_tensor_raw` over a
-  `SharedHostPool` / `SharedHostMetadata` surface (the torch-spyre KV-offload Python-surface design).
-- Torn reads under concurrent overwrite are **impossible to consume silently** — the shared directory's
-  publish gate plus a generation/concurrency check means a stale or mid-write slot degrades to a cache
-  miss, never to corruption.
+### M3 — secondary memory
 
-M2 depends on lower-layer work that does not exist yet (the hardware runtime's raw-copy primitive and
-its torch-spyre `copy_tensor_raw` / `SharedHostPool` / `SharedHostMetadata` bindings); §6.7 and §11
-track that dependency chain. M2 is specified here so the milestone ladder is coherent, but it is gated
-on those upstream pieces landing.
+- Replace the data-pool backend without replacing vLLM's scheduling contract or the shared directory.
+- Keep transport, backing acquisition and device-visible addresses below the Python boundary.
+- Apply the same compatibility, completion, publication and persistent-lifecycle rules as M2.
 
-Items explicitly out of scope (PD disaggregation, replacing the device addressing scheme, etc.) are listed in §11 alongside their owners and follow-up plans.
+Cross-host PD disaggregation, filesystem/object-store integration, cross-topology raw-page reuse,
+and automatic multi-tier placement are separate work (§11).
 
-## 3. Background: what the upstream `OffloadingConnector` actually requires
+## 3. Background: the pinned upstream contracts
 
-Three abstraction points matter on the worker side.
+**Version basis.** Source references below were checked against spyre-inference main
+`94f4f6950f7e979a7cac5808bf85f283f09ea530`. Its `pyproject.toml` specifies
+`vllm[grpc]>=0.32.0,<0.33`; `uv.lock` resolves tag `v0.32.0` to
+`5df63a7203cdb9328d824a27b682e77c7b9928be`. The torch-spyre pin is
+`64870622fc39cda7e344a271decb901e7088c6c6`. These are source checks, not hardware qualification
+of that dependency combination.
 
-**Version basis.** All upstream claims in this RFC are verified against the **exact rev this plugin
-pins**: `pyproject.toml` declares `vllm>=0.26.0,<0.27` and `uv.lock` resolves it to `v0.26.0` =
-`568afb3a13806beb53bb2e6bd518269357b237c0`. Where post-`0.26` upstream `main` has already moved on in
-ways that will affect our next bump, this is called out in §3.6 rather than mixed into the design.
+### 3.1 Dense KV caches and the ingestion point
 
-### 3.1 `OffloadingConnector` and the KV-cache ingestion point
+`SpyrePagedKVCache` is a named tuple with **two dense tensors**, `key` and `value`, per layer.
+It is not two Python lists of separately allocated pages. Each tensor's leading dimension is
+`num_blocks`, and its remaining dimensions come from the selected attention backend:
 
-`OffloadingConnector` (`vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`) is
-constructed once per role (`SCHEDULER`/`WORKER`) and delegates to `OffloadingConnectorScheduler` or
-`OffloadingConnectorWorker` (the latter in `.../v1/offloading/worker.py` at this pin — note the
-package layout, see §3.6). The worker side calls `connector_worker.register_kv_caches(kv_caches)`
-with the caches the runner has already allocated. **This is the only ingestion point for the on-device
-KV cache** — everything downstream operates on what is handed in here.
+| Backend | Shape of each K or V tensor | Selection |
+|---|---|---|
+| `SpyreHeadMajorAttentionBackend` | `[num_blocks, num_kv_heads, block_size, head_size]` | Default |
+| `SpyreAttentionBackend` | `[num_blocks, block_size, num_kv_heads, head_size]` | `SPYRE_ATTN_KV_LAYOUT=token_major` |
 
-The parameter is typed `dict[str, torch.Tensor | list[torch.Tensor]]`, so a list-valued entry is
-*type-legal* at the boundary. But inside, the `AttentionSpec` branch canonicalizes each layer to one
-contiguous storage:
+`allocate_spyre_kv_caches` in `spyre_inference/v1/worker/kv_cache_setup.py` delegates to each
+attention implementation's `allocate_pages`. It uses `kv_cache_config.num_blocks` directly and
+preserves aliases for shared layers. There is **no rounding of the block count to a multiple of 64**
+in this allocator. Physical tensor padding and head-dimension constraints are separate issues.
 
-```python
-assert isinstance(layer_kv_cache, torch.Tensor)
-raw = torch.empty(0, dtype=torch.int8, device=layer_kv_cache.device).set_(
-    layer_kv_cache.untyped_storage())
-tensors_per_block[layer_name] = (
-    torch.as_strided(raw, (num_blocks, page), (block_stride_bytes, 1), byte_offset),)
-```
+At vLLM 0.32, `OffloadingConnector` delegates worker calls to `OffloadingConnectorWorker` in
+`vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py`. Its `register_kv_caches`:
 
-Both steps are fatal for Spyre: `SpyrePagedKVCache` is two Python lists of per-block tensors (so the
-`isinstance` assert fails), and storage reinterpretation via `.set_()` is unsupported on Spyre tensors
-regardless. `register_kv_caches` ends by calling `self._init_worker(canonical_kv_caches)`, so
-**canonicalization runs strictly before any spec method** — which is why no spec-level hook can fix
-it. This is the single highest-risk dependency in M1; §6.6 gives the design and §6.5 the registration
-that makes it reachable without patching vLLM.
+1. Selects offloaded groups and derives canonical mappings.
+2. Calls `group_kernel_blocks` for each layer's tensor.
+3. Builds an `int8` storage view using `set_(ref.untyped_storage(), byte_offset, size, stride)`.
+4. Deduplicates aliased regions and calls `_init_worker(canonical_kv_caches)`.
 
-### 3.2 `OffloadingSpec` (`vllm/v1/kv_offload/base.py`, verified at the pinned `v0.26.0`)
+The former `isinstance(layer_kv_cache, torch.Tensor)` assertion is **not** the current failure
+premise. The dense K and V fields are tensors; the outer pair still needs adapting to upstream's
+single-tensor-per-layer contract. More importantly, a logical byte-strided storage view is not a
+validated description of a padded/tiled device page. Canonicalization precedes `spec.get_worker`,
+so changing the spec alone cannot fix ingestion. §6.6 retains a small dense-cache adapter for this
+reason, not a paged-list adapter.
 
-The contract a platform implements is exactly two abstract methods:
+### 3.2 `OffloadingSpec`, `OffloadingWorker` and canonical caches
 
-- `get_manager() -> OffloadingManager` — scheduler-side bookkeeping (which blocks are where, admission,
-  eviction policy).
-- `get_worker(kv_caches: CanonicalKVCaches) -> OffloadingWorker` — worker-side transfer engine.
+`vllm/v1/kv_offload/base.py` defines:
 
-`OffloadingWorker` is a four-method ABC (plus a non-abstract `shutdown()`), with **direction explicit
-in the method name** rather than routed by `(src_medium, dst_medium)` type pairs:
+- `OffloadingSpec(config: OffloadingConfig)`, with `get_manager()` and `get_worker(kv_caches)`.
+- `OffloadingWorker`, with `submit_store`, `submit_load`, `get_finished`, `wait`, and optional
+  `shutdown`. `TransferResult` records job completion and success.
+- `GPULoadStoreSpec`, containing device block IDs, group sizes and logical block indices. Its name
+  does not require CUDA. Group/chunk mapping must be respected; blindly zipping host and device
+  block-ID lists is insufficient when `blocks_per_chunk > 1`.
+- `CanonicalKVCacheTensor(tensor, page_size_bytes)` and per-group `CanonicalKVCacheRef` entries,
+  including optional `mapping: CanonicalPageMapping | None`.
 
-- `submit_store(job_id, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec) -> bool` — device → offloaded medium
-- `submit_load(job_id, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool` — offloaded medium → device
-- `get_finished() -> list[TransferResult]`
-- `wait(job_ids: set[int]) -> None`
+The tensor contract permits a leading block dimension `(num_blocks, ...)`; the stock worker turns
+it into a byte view. Our worker consumes the original typed dense tensors instead. Reusing these
+containers does not certify that raw pages are portable across TP layouts: leave `mapping=None`
+unless that mapping has actually been established, and reject unsupported canonical/replicated
+layout modes.
 
-`CanonicalKVCaches` is the canonicalized block view: `tensors: list[CanonicalKVCacheTensor]` (each
-`(num_blocks, page_size_bytes)`, `int8`) plus `group_data_refs` mapping each KV-cache group's layers
-onto those tensors.
+`OffloadKey` includes the KV-cache group index as well as the block hash. Shared lookup must retain
+that group identity and the request context required by the current manager API.
 
-> **Supersedes an earlier draft of this RFC.** Prior revisions described a `get_handlers()` API
-> yielding `(src_type, dst_type, OffloadingHandler)` triples, with handlers exposing
-> `transfer_async(job_id, transfer_spec)`. That was the `v0.24`-era shape. At the pinned `v0.26.0`,
-> `get_handlers`, `OffloadingHandler`, and `CpuGpuOffloadingHandlers` **do not exist** (zero real
-> occurrences repo-wide). Any design written against them is not merely dated — it would fail to
-> instantiate, since Python rejects a subclass that leaves `get_worker` unimplemented.
+### 3.3 CPU reference implementation
 
-### 3.3 `CPUOffloadingSpec` / `CPUOffloadingWorker` (`vllm/v1/kv_offload/cpu/{spec,gpu_worker}.py`)
+`CPUOffloadingSpec.get_worker` in `vllm/v1/kv_offload/cpu/spec.py` rejects platforms other than
+CUDA-alike/XPU before calling `create_worker`. `CPUOffloadingWorker` in `cpu/gpu_worker.py` uses
+byte views and accelerator streams/events. Neither is a ready-made Spyre transfer implementation.
 
-The reference CUDA implementation. Three verified facts shape our design:
+We subclass `OffloadingSpec` directly rather than inheriting and replacing CPU-specific behavior.
+This is a factoring choice, not a claim that Python subclasses cannot override `get_worker`.
+`CPUOffloadingManager` itself is platform-independent and reusable for **M1**. It takes
+`num_chunks`, cache-policy options, event settings and admission thresholds. The Spyre spec must
+also declare the metric definitions its manager emits through `build_metric_definitions`.
 
-- **The platform gate is inside `CPUOffloadingSpec.get_worker`**, which raises "CPU Offloading is
-  currently only supported on CUDA-alike and XPU GPUs" unless
-  `current_platform.is_cuda_alike() or current_platform.is_xpu()`. Since `is_cuda_alike()` is
-  `self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)` and `TorchSpyrePlatform._enum` is
-  `PlatformEnum.OOT`, Spyre fails it. Critically, the raise happens **before** the overridable
-  `create_worker()` hook is reached, so **the gate cannot be removed by subclassing
-  `CPUOffloadingSpec`** — the only way past it is to not inherit it (§3.4).
-- **`CPUOffloadingWorker` is not reusable on Spyre.** Its constructor does
-  `kv_cache_tensor.tensor.view(torch.int8).view((-1, gpu_page_size_bytes))` — storage reinterpretation,
-  unsupported on Spyre tensors — and its transfers are CUDA-stream driven.
-- **But its internal structure is worth mirroring.** `CPUOffloadingWorker` composes **two
-  `SingleDirectionOffloadingHandler` instances** (one per direction) and exposes them through
-  `submit_store`/`submit_load`. So the handler-pair idea from earlier drafts of this RFC is still the
-  right *internal* factoring — it simply sits one level down, as a private detail behind the worker,
-  instead of being the upstream-facing contract.
+M2 cannot inherit that manager unchanged: a per-instance dictionary/allocator neither discovers
+peer entries nor reserves shared slots safely (§6.8).
 
-`OffloadingManager` and `CPUOffloadingManager`, by contrast, **are** reusable verbatim:
-`vllm/v1/kv_offload/cpu/manager.py` contains no `current_platform`, `is_cuda_alike`, or `torch.cuda`
-reference, so the upstream cache policy (admission, LRU eviction, block-hash bookkeeping, hit/miss)
-is platform-agnostic. This is what lets both milestones inherit policy and override only mechanism
-(§5.2).
+### 3.4 Public configuration seams
 
-### 3.4 Dynamic loading — two public seams, no upstream patch required
+- `kv_connector_module_path` lets `KVConnectorFactory` load the Spyre connector.
+- `spec_name` and `spec_module_path` in `kv_connector_extra_config` let `OffloadingSpecFactory`
+  load the Spyre spec. Registry calls are optional conveniences, not prerequisites.
+- A secondary tier's `module_path` is a different setting; it does not select an offloading spec.
 
-This RFC's central feasibility claim: **every extension point M1 and M2 need is already public and
-documented at the pinned rev.** No Spyre-specific change to vLLM is required. That matters because
-landing Spyre support upstream is slow and uncertain; the plan below deliberately depends on
-general-purpose seams that already exist rather than on new ones we would have to negotiate.
+No upstream patch is required for these seams. They do not eliminate the plugin's responsibility
+to wire cache registration, transfer hooks, worker output and shutdown into its model runner.
 
-**(a) Spec loading — `OffloadingSpecFactory` (`vllm/v1/kv_offload/factory.py`).** Two paths: an
-in-tree `_registry` populated by `register_spec(name, module_path, class_name)`, and — for anything
-out-of-tree — a config-driven import:
+### 3.5 Filesystem/object tiering is background, not a free integration
 
-```python
-spec_name = extra_config.get("spec_name", "CPUOffloadingSpec")
-if spec_name in cls._registry:
-    spec_cls = cls._registry[spec_name]()
-else:
-    spec_module_path = extra_config.get("spec_module_path")
-    if spec_module_path is None:
-        raise ValueError(f"Unsupported spec type: {spec_name}")
-    spec_module = importlib.import_module(spec_module_path)
-    spec_cls = getattr(spec_module, spec_name)
-assert issubclass(spec_cls, OffloadingSpec)
-```
+Upstream `TieringOffloadingSpec` subclasses `CPUOffloadingSpec`. Its primary tier exposes a host
+`memoryview` to filesystem/object secondary tiers. Selecting it does not compose our Spyre spec
+underneath it, and a pool addressed only by slots is not that host-memory interface.
 
-So `spec_name` + `spec_module_path` in `kv_connector_extra_config` loads an out-of-tree spec whose only
-requirement is subclassing `OffloadingSpec` and accepting one `OffloadingConfig`. Both `register_spec`
-and this path import lazily, so a CUDA-only deployment that happens to install `spyre-inference` pays
-nothing for our spec.
+Consequently, adding `tiering/fs` or `tiering/obj` is **not a config-only extension of M1**. It needs
+separate primary-tier/worker integration. Likewise, an unrelated LMCache or NIXL connector does not
+automatically gain Spyre support merely because this connector exists.
 
-Because the platform gate lives inside `CPUOffloadingSpec.get_worker` (§3.3) and **not** in the
-framework, a spec that subclasses `OffloadingSpec` **directly** is never subject to it. That is the
-design consequence: we do not "drop" or "patch out" the gate — we simply do not inherit it.
+### 3.6 What changed since the earlier version basis
 
-**(b) Connector loading — `KVConnectorFactory` (`vllm/distributed/kv_transfer/kv_connector/factory.py`).**
-The same pattern one layer up, via the documented `KVTransferConfig` field:
-
-```python
-kv_connector_module_path: str | None = None
-"""The Python module path to dynamically load the KV connector from.
-Only supported in V1."""
-```
-
-This is what makes the §3.1 canonicalization blocker solvable in-tree: we can ship our own
-`KVConnector` and therefore our own `register_kv_caches`, without an upstream PR (§6.6).
-
-**(c) Secondary tiers** use the same idiom via `SecondaryTierFactory.register_tier(...)`
-(`vllm/v1/kv_offload/tiering/factory.py`), and upstream has since added an explicit `module_path` key
-for out-of-tree tier managers. Not used by this RFC — noted only so the three seams are not confused
-with one another: `module_path` (tiers) is a different, narrower key than `spec_module_path` (specs).
-
-### 3.5 The v0.22 multi-tier layer
-
-vLLM v0.22 added a multi-tier framework on top of the four pieces above:
-
-- **`TieringOffloadingSpec`** (`vllm/v1/kv_offload/tiering/spec.py`, PR #40020) — a concrete `OffloadingSpec` that builds a `TieringOffloadingManager` over a CPU primary tier and one or more secondary tiers.
-- **`SecondaryTierManager`** abstract base class (`vllm/v1/kv_offload/tiering/base.py`, PR #40020) — the contract any new tier must implement (`submit_store`, `submit_load`, `get_finished_jobs`, etc.). Cannot be instantiated directly; concrete tiers subclass it.
-- **`SecondaryTierFactory`** (`vllm/v1/kv_offload/tiering/factory.py`, PR #40020) — the registry where tiers are plugged in by name (mirrors `OffloadingSpecFactory`).
-- **In-tree concrete tiers:** `tiering/fs` (filesystem, PR #41735) and `tiering/obj` (object store, PR #41968), both subclassing `SecondaryTierManager`.
-
-A deployment selects `spec_name: "TieringOffloadingSpec"` (a single spec) and lists secondary tiers in `extra_config`. The `TieringOffloadingManager` orchestrates a coherent hierarchy — primary CPU tier mmap'd via `SharedOffloadRegion`, plus one or more `SecondaryTierManager`s that read/write through a `primary_kv_view: memoryview`. Stores can cascade primary→secondary; loads can promote secondary→primary; the manager owns the bookkeeping.
-
-This framework is **background only** for this RFC — it is not a milestone.
-A deployment may still select an fs/obj `SecondaryTierManager` on top of M1's `SpyreOffloadingSpec`
-via upstream config if it wants a disk/object tier, but this RFC ships no Spyre-specific tiering spec:
-the fast second tier we care about (a future DMA-able, faster-than-DRAM CXL-class secondary memory pool, §6.4) is
-served by M2's shared-pool path, not an fs/obj secondary tier.
-
-**Historical note on the prior llm-d shape.** llm-d v0.8 deployments use a different shape that pre-dates the v0.22 multi-tier framework: `MultiConnector` stacking two independent top-level `OffloadingSpec`s — typically one Spyre/CUDA `OffloadingSpec` for device↔host plus `SharedStorageOffloadingSpec` from the in-tree `llmd_fs_backend` module in [`llm-d/llm-d-kv-cache`](https://github.com/llm-d/llm-d-kv-cache) for host↔shared-storage. The two children operate in parallel without coordination — saves fan out to both, loads return from whichever child reports a hit first. The standalone PyPI package `llmd-fs-connector` was already EOL at `==0.22`; the maintainers of `llmd_fs_backend` (its in-tree successor in `llm-d/llm-d-kv-cache`) have signaled they are retiring it in favor of the upstream `TieringOffloadingSpec` + `tiering/fs` shape. **This RFC does not target the `MultiConnector + llmd_fs_backend` shape**: it points at a moving target on the way out. The upstream-canonical replacement (`TieringOffloadingSpec` + `tiering/fs`) remains available to deployments as upstream config, but is not a milestone here — cross-instance sharing is delivered by M2's shared pool instead.
-
-### 3.6 Post-`0.26` upstream drift (what our next vLLM bump will bring)
-
-The KV-offload area is under heavy active development — well over a hundred merged "KV Offload" PRs,
-many landing after `v0.26.0`. The following are already on upstream `main` and will arrive with our
-next bump. None invalidates this design; each is listed with the concrete action it implies, so the
-bump is a known quantity rather than a surprise.
-
-| Upstream change | Effect on this design |
+| Earlier assumption | Verified v0.32 contract / design consequence |
 |---|---|
-| Canonicalization moved back into `offloading_connector.py` under an `OffloadingConnectorWorker` class (at our pin it lives in the `offloading/worker.py` package) | **§6.6 import path changes; logic does not.** The subclass target keeps its name, so the override survives a path update. |
-| `OffloadingConnectorWorker.__init__` gained `vllm_config` as a 2nd positional arg | Our subclass must forward `*args`/`**kwargs` rather than pin a fixed signature. Cheap insurance — adopt from day one. |
-| `CanonicalKVCacheRef` gained an optional `mapping: CanonicalPageMapping \| None = None` field | Backward-compatible (defaulted). We construct refs positionally by `tensor_idx`/`page_size_bytes`; no change needed. |
-| `SharedOffloadRegion` became the default CPU-offload backing, gated on `_uses_shared_region()` | A **second** platform gate returning `is_cuda_alike()`. Another reason to subclass `OffloadingSpec` directly rather than `CPUOffloadingSpec` (§3.3, §3.4). |
-| `SUPPORTS_REPLICATED_LAYOUT` flag replaced by an overridable `_uses_shared_region()` method | Only relevant if we ever subclass `CPUOffloadingSpec`; recorded for completeness. |
-| `OffloadingConfig` replaced `VllmConfig` in the spec constructor | **Helps us** — a narrow, stable config surface for an out-of-tree spec. Already assumed by §3.4. |
-| Out-of-tree `SecondaryTierManager` via a `module_path` key | Not used here (§3.4c); noted to keep it distinct from `spec_module_path`. |
+| Connector worker will move into `offloading_connector.py` | At this exact tag it is imported from `offloading/worker.py`; use the pinned source, not a predicted move. |
+| Constructor shape is uncertain | `OffloadingConnectorWorker(spec, vllm_config, kv_cache_config)`; test this integration on each bump. |
+| A connector `_worker_cls` attribute selects the subclass | Upstream directly constructs `OffloadingConnectorWorker`; no such factory hook exists at this pin. |
+| Canonical caches require a paged-list bridge | Dense K/V tensors need a small typed adapter and physical page-copy contract. |
+| Storage reinterpretation is wholly unsupported | The pin registers `set_.source_Storage_storage_offset`; that is not proof of valid raw device-page addressing (§4). |
+| Shared CPU backing and mappings are future drift | `_uses_shared_region()`, `CanonicalPageMapping`, and `OffloadingConfig` already exist; do not advertise unimplemented Spyre replicated/canonical layouts. |
 
-The `OffloadingSpec` / `OffloadingWorker` / `OffloadingManager` ABCs themselves are **unchanged**
-between our pin and current `main` — same abstract methods, same signatures. So the contracts this
-design targets are the stable part; the churn is in the CPU reference implementation and in where
-canonicalization physically lives. §7 keeps our code in one package so a bump touches few files.
+## 4. Device-copy contract and current torch-spyre
 
-## 4. Background: device↔host copy in current torch-spyre
+The pinned torch-spyre exposes converting `copy_tensor`. A converting device→host→device transfer
+is not a contract for preserving the device representation, even if ordinary floating-point tests
+pass. KV offload must snapshot and restore **raw bytes**, with no quantization, dequantization or
+layout conversion in the transport.
 
-torch-spyre exposes a public, stream-backed copy entrypoint that handles both directions and is already in the dev-image-pinned commit (`4dcfee15c3a93446`):
+A source check of the pin found no `copy_tensor_raw` or shared-pool bindings. The working prototypes
+use local dependency builds with additional APIs (§9). They must not be described as available
+merely by installing the main-branch lockfile.
+
+**Storage recheck.** `torch_spyre/csrc/spyre_mem.cpp` registers
+`set_.source_Storage_storage_offset`; `spyre_set_storage` delegates to `at::cpu::set_`.
+Spyre-aware view implementations in `spyre_views.cpp` explicitly carry tensor layout and DMA
+size/stride metadata. The old blanket statement that `.set_()` is unsupported is therefore removed.
+However, a generic `int8` storage reinterpretation does not establish the correct physical page
+layout or preserve all that tensor metadata. No device round-trip through upstream canonicalization
+was run for this docs-only revision; the adapter remains until that complete path is qualified.
+
+### 4.1 Runtime/binding boundary
+
+The proposed shared-pool interface is:
 
 ```python
-import torch
-import torch_spyre._C as _C   # registered as a private extension; no extra deps
-
-cpu_t   = torch.empty_like(spyre_t, device="cpu")
-_C.copy_tensor(spyre_t, cpu_t, non_blocking=False)   # device → host
-
-cpu_in  = torch.zeros(..., dtype=...)
-spyre_in = torch.empty(..., device="spyre")
-_C.copy_tensor(cpu_in, spyre_in, non_blocking=False) # host → device
+copy_tensor_raw(dev_tensor, pool, slot_id, to_device, non_blocking=False)
 ```
 
-`copy_tensor(src, dst, non_blocking=False)` is bound in [`torch_spyre/csrc/module.cpp:272`](https://github.com/torch-spyre/torch-spyre/blob/4dcfee15c3a9344652f067149ec65c4bf2941890/torch_spyre/csrc/module.cpp#L272) → `spyre::spyre_copy_from` ([`torch_spyre/csrc/spyre_mem.cpp:581`](https://github.com/torch-spyre/torch-spyre/blob/4dcfee15c3a9344652f067149ec65c4bf2941890/torch_spyre/csrc/spyre_mem.cpp#L581)) → `SpyreStream::copyAsync` ([`torch_spyre/csrc/spyre_stream.cpp:142`](https://github.com/torch-spyre/torch-spyre/blob/4dcfee15c3a9344652f067149ec65c4bf2941890/torch_spyre/csrc/spyre_stream.cpp#L142)) → `copyAsyncImpl`, which invokes the hardware runtime's DMA. Direction is auto-detected from `src.is_cpu()` / `src.is_privateuseone()`; no separate H2D/D2H entrypoints. With `non_blocking=False`, `spyre_copy_from` calls `stream.synchronize()` after the DMA, so callers can treat it as synchronous; `non_blocking=True` returns immediately and the caller is responsible for syncing.
+`to_device=False` stores into a slot; `True` restores from it. The tensor and pool/slot are the Python
+boundary. The device runtime owns address resolution support, physical byte movement, bounds checks
+and backing retention; torch-spyre provides the tensor-aware bindings. Python receives no raw host
+pointer, device address or host-buffer-registration API.
 
-**`copy_tensor` is not byte-exact for KV data, so it is not what M1 or M2 use.** The default `copy_tensor` path is a *converting* copy: a plain fp16 device↔host round-trip re-encodes into the device representation and drifts ~1 ULP on about half of the values. For a KV tier — where the whole point is to reload a block and reuse it as if it were never evicted — that drift is a correctness defect, not a rounding nicety. **Both M1 and M2 therefore require the byte-exact raw copy path** (`torch_spyre._C.copy_tensor_raw`, §6.7), a raw DMA that reproduces the device page's bytes exactly with no dtype/layout conversion. The converting `copy_tensor` merely exists today; the byte-exact raw primitive M1 and M2 both need is still pending (§10 Q1), so both milestones are gated on it landing.
+`SharedPool` provides immutable slot geometry and checked copy dispatch. Concrete host-memory and
+secondary-memory pools own their local mappings or provider resources. The host backend manages
+shared-memory mapping and pinning per device function; the secondary-memory backend retains its
+provider range. Backing must stay valid until DMA completes, regardless of Python handle lifetime.
 
-M1's device↔host copy is a single raw-DMA primitive over the torch-spyre copy surface: the connector handler operates on plain `torch.Tensor` arguments and never touches low-level DMA-queue primitives or compile-time descriptor artifacts.
+**Dense-page prerequisite.** The baseline pooled call copies a complete allocation. A slice such as
+`cache.key[block_id]` is a view into a larger allocation, not necessarily an independently transferable
+page. The production binding must support a validated page/range transfer, or another explicitly
+byte-exact page operation, before it can offload dense caches. It must not silently snapshot the
+whole layer into a page-sized slot. The prototypes' page-copy implementation is evidence for this
+extension, not evidence that the baseline whole-allocation signature already handles views.
 
-**Single-chunk vs multi-chunk (why the plugin need not care).** On some Spyre generations a KV page is a single contiguous device allocation, and the byte-exact invariant — two tensors of the same `(shape, dtype)` share a byte-identical on-card layout, so a raw snapshot restores into any same-shaped page — holds directly. On others a KV tensor may span multiple device domains (multi-chunk); there, the Spyre runtime packs the chunks contiguously into the slot on offload and rebuilds the device-side address from a chunk descriptor it stores in `SharedHostMetadata` on reload. That pack/rebuild is **entirely the runtime's** — single-chunk is just the degenerate one-chunk case, and it is **not** a plugin- or torch-spyre-enforced restriction. So the connector worker is oblivious to chunking on every generation: it passes a tensor and a `slot_id` and lets the Spyre runtime own the layout.
-
-### 4.1 Data paths in scope
-
-| Path | Milestone | Compose how | Notes |
-|---|---|---|---|
-| Spyre device ↔ host RAM (single tier) | **M1** | `OffloadingConnector` + `SpyreOffloadingSpec` | Single-tier offload; survives across requests. |
-| Spyre device ↔ **shared** host-RAM pool (cross-instance, on-node) | **M2** | `OffloadingConnector` + `SpyreSharedOffloadingSpec` | Multiple co-located instances attach one shared host KV pool (`SharedHostPool`) with a shared directory (`SharedHostMetadata`); a block offloaded by one instance is reloaded by another with one raw DMA — no serialization, no disk. Device↔pool transfer is `copy_tensor_raw(dev_tensor, pool, slot_id, ...)`; the seam between the plugin and torch-spyre is an integer `slot_id` (§6.6). Reuses M1's device↔host copier unchanged. See §6.7–6.8. |
-| Direct Spyre device ↔ filesystem / object store | Out of scope | n/a | Would require a Spyre-side analogue of NVIDIA GDS so a secondary tier can DMA without a host bounce. Not provided by torch-spyre today, and the upstream `SecondaryTierManager` contract assumes the `primary_kv_view` is over CPU memory; supporting this would change both. Filed as a future-work item in §11. |
-
-M1 and M2 reuse the same device↔host copy path (§4/§6.1, §6.7); both offload into a `SharedHostPool`
-slot named by integer `slot_id`, and M2 only changes the pool from M1's single-process one to a named
-cross-instance pool with a `SharedHostMetadata` directory. A deployment that additionally wants a disk/object tier can still stack an upstream fs/obj
-`SecondaryTierManager` on top of M1's `SpyreOffloadingSpec` via config, but this RFC ships no
-Spyre-specific tiering spec (§2, §3.5).
+Single-chunk raw transfers are the baseline. Multi-chunk packing/restoration is a runtime extension,
+with ordered chunk sizes/domain identities and no persisted process-local addresses. Unsupported
+chunking or layouts must fail explicitly; same logical shape/dtype alone does not prove compatibility.
 
 ## 5. Proposed architecture
 
-<!-- Source: figures/spyre-offloading-arch.{mmd,d2}. Regenerate with:
-       npx -y -p @mermaid-js/mermaid-cli@10 mmdc \
-         -i docs/architecture/rfcs/figures/spyre-offloading-arch.mmd \
-         -o docs/architecture/rfcs/figures/spyre-offloading-arch.svg -b transparent
-       d2 docs/architecture/rfcs/figures/spyre-offloading-arch.d2 docs/architecture/rfcs/figures/spyre-offloading-arch.d2.svg
--->
-
 ![Spyre KV offloading architecture](figures/spyre-offloading-arch.svg)
 
-<details>
-<summary>Diagram sources (Mermaid at <code>figures/spyre-offloading-arch.mmd</code>; D2 at <code>figures/spyre-offloading-arch.d2</code>, rendered to <code>spyre-offloading-arch.d2.svg</code>)</summary>
+Diagram sources: [D2](figures/spyre-offloading-arch.d2),
+[Mermaid](figures/spyre-offloading-arch.mmd).
 
-```mermaid
-%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
-flowchart TB
+The plugin owns vLLM integration, selection/admission policy, compatible cache identity and transfer
+sequencing. torch-spyre and the device runtime own byte-copy and shared-memory mechanisms. The
+control plane owns persistent pool lifecycle, not the serving worker.
 
-    subgraph vllm["<b>vllm</b> (upstream — unchanged)"]
-        direction TB
-        Factory["OffloadingSpecFactory<br/>.create_spec(spec_name=&quot;SpyreOffloadingSpec&quot;,<br/>spec_module_path=&quot;spyre_inference.kv_offload.spec&quot;)"]
-        KVFactory["KVConnectorFactory<br/>(kv_connector_module_path)"]
-        Mgr["CPUOffloadingManager<br/><i>reused verbatim — cache policy,<br/>admission, LRU eviction, hit/miss</i>"]
-        Sched["OffloadingConnectorScheduler"]
-    end
+### 5.1 Worker factoring
 
-    subgraph spyre["<b>spyre-inference</b> (new code — this RFC)"]
-        direction TB
-        Conn["<b>SpyreOffloadingConnector</b><br/>subclasses OffloadingConnector"]
-        CWorker["<b>SpyreOffloadingConnectorWorker</b><br/>overrides register_kv_caches ONLY:<br/>SpyrePagedKVCache → CanonicalKVCaches<br/>(no untyped_storage / .set_)<br/>then inherited _init_worker()"]
-        Spec["<b>SpyreOffloadingSpec</b><br/>subclasses OffloadingSpec <i>directly</i><br/>(so no is_cuda_alike / is_xpu gate)"]
-        Worker["<b>SpyreOffloadingWorker(OffloadingWorker)</b><br/>submit_store / submit_load / get_finished / wait"]
-        D2H["_SpyreDirectionHandler (store)<br/>device page → host slot"]
-        H2D["_SpyreDirectionHandler (load)<br/>host slot → device page"]
-        Copier["<b>SpyreKvDmaCopier</b><br/>byte-exact; addresses a pool slot by integer slot_id"]
-        Backend["<b>torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)</b><br/>→ hardware-runtime raw DMA<br/>(no dtype/layout conversion)"]
+`SpyreOffloadingWorker` implements the current upstream worker ABC. A copier isolates device-specific
+operations from scheduler bookkeeping and enables mock tests. Per-direction helper objects are
+optional implementation details, not upstream extension points or a requirement to duplicate state.
 
-        Conn --> CWorker
-        Spec -- "get_worker(CanonicalKVCaches)" --> Worker
-        Worker --> D2H
-        Worker --> H2D
-        D2H --> Copier
-        H2D --> Copier
-        Copier --> Backend
-    end
+The initial correctness path waits for copies before exposing completion. Batching submissions and
+waiting once per job is compatible with this contract. Neither a `non_blocking` flag nor queue
+submission alone means that bytes are safe to consume or publish.
 
-    KVFactory -. "resolves to" .-> Conn
-    Factory -. "resolves to" .-> Spec
-    CWorker -- "_init_worker → spec.get_worker" --> Spec
-    Spec -- "get_manager()" --> Mgr
-    Sched --> Mgr
+### 5.2 Manager factoring
 
-    classDef upstream fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
-    classDef plugin fill:#fff4e6,stroke:#c1620a,color:#3a2300
-    classDef hot fill:#ffe4e1,stroke:#a83232,color:#3a0000
+M1 reuses `CPUOffloadingManager`. M2/M3 provide a shared manager implementing `OffloadingManager`
+over the runtime directory/allocator. They can reuse admission/eviction policy choices, but **not**
+an independent instance-local ownership map as the authority for shared slots.
 
-    class Factory,KVFactory,Mgr,Sched upstream
-    class Conn,CWorker,Spec,Worker,D2H,H2D plugin
-    class Copier,Backend hot
-```
-
-</details>
-
-Key shape: **the new Spyre code is one connector-worker override, one spec, one worker, and the
-copier.** Cache policy (`CPUOffloadingManager`), the scheduler-side connector, eviction policies, and
-llm-d composition are unchanged upstream code. Both new registrations go through public config keys
-(§3.4), so **no upstream vLLM patch is required**.
-
-### 5.1 Why we implement `OffloadingWorker` instead of subclassing the CPU one
-
-Two independent reasons, both verified at the pin:
-
-- **The platform gate is unreachable by subclassing.** `CPUOffloadingSpec.get_worker` raises for any
-  non-CUDA/XPU platform *before* it reaches the overridable `create_worker()` hook, so a subclass
-  cannot "drop the gate" — it can only inherit the raise. Subclassing `OffloadingSpec` directly avoids
-  it entirely (§3.3). Post-`0.26` upstream adds a second such gate via `_uses_shared_region()` (§3.6),
-  reinforcing the same choice.
-- **`CPUOffloadingWorker` is CUDA-shaped end to end.** Its constructor reinterprets storage
-  (`tensor.view(torch.int8).view((-1, page))` — unsupported on Spyre tensors), and its transfers are
-  driven by `torch.cuda.Stream`/`Event` with `event.query()` / `synchronize()` / `elapsed_time()`.
-  There is no "swap CUDA for Spyre" override point.
-
-We do, however, **mirror its internal factoring**: upstream's `CPUOffloadingWorker` composes two
-`SingleDirectionOffloadingHandler`s and dispatches `submit_store`/`submit_load` to them. Our
-`SpyreOffloadingWorker` does the same with two `_SpyreDirectionHandler`s. The per-direction split from
-earlier revisions of this RFC therefore survives — as a private implementation detail, not as the
-upstream-facing contract (§3.2).
-
-### 5.2 Why we reuse `CPUOffloadingManager` verbatim
-
-The manager is pure bookkeeping: keyed by `LoadStoreSpec` types rather than tensor backends, with
-eviction delegated to the upstream pluggable cache-policy registry (`lru`, `arc`). Verified
-platform-agnostic — `vllm/v1/kv_offload/cpu/manager.py` contains no `current_platform`,
-`is_cuda_alike`, or `torch.cuda` reference. So **both milestones own only the transfer mechanism and
-inherit the cache policy** (see also §6.8, which states this explicitly for M2).
+The shared manager handles lookup, reservation, load protection, publication, completion and local
+request cleanup. Changing only pool construction in the M1 spec is not enough to implement sharing.
 
 ## 6. Component design
 
-### 6.1 `SpyreKvDmaCopier`
+### 6.1 `SpyreKvDmaCopier`: layout and physical capacity
 
-```python
-# spyre_inference/v1/kv_offload/copier.py
-import torch
-import torch_spyre._C as _spyre_c
+The copier takes dense K/V tensors plus page identities and validated pool destinations. It must
+preserve the selected backend layout; head-major and token-major pages are not interchangeable even
+when their logical byte counts match. No per-transfer host transpose or float conversion is allowed.
 
+Capacity is based on **physical transfer extents**, not blindly on
+`numel() * element_size()`, and not on the size of the entire dense layer divided by block count
+without a validated layout mapping. Use the runtime's size/alignment information for the actual
+page/range operation. The aligned slot stride must accommodate every physical fragment assigned to
+it; all range/stride/slot arithmetic is bounds- and overflow-checked.
 
-class SpyreKvDmaCopier:
-    """Single-purpose owner of every device↔pool KV byte transfer.
+A vLLM offloaded chunk may cover multiple device blocks and all K/V tensors in a cache group. In
+the M2 prototype, **each component page has its own directory entry and slot**, keyed by the full
+`OffloadKey` plus component identity. A stable manifest fixes layer order, K/V order, page order and
+rank-local ownership. Slots need not be adjacent. Publication is per page, not an atomic transaction
+over the whole chunk: a logical hit requires every component to be valid and successfully pinned.
+Capacity negotiation between scheduler and workers must agree on complete chunks, not confuse a
+K-only page slot with one vLLM chunk. Heterogeneous layers need validated per-tensor extents, not one
+guessed page size. The initial PoCs require `blocks_per_chunk == 1` and one KV group; supporting
+larger chunks or multiple groups is an explicit extension, not demonstrated behavior.
 
-    Thin wrapper around torch_spyre._C.copy_tensor_raw, the byte-exact raw
-    DMA bound to SpyreStream.copyAsync → the hardware runtime's raw-copy
-    primitive. KV data must round-trip byte-for-byte: the converting
-    copy_tensor path re-encodes fp16 through the device representation and
-    drifts ~1 ULP on about half of values (§4), which is a correctness
-    defect for a KV tier, so the copier uses the raw path exclusively.
-    We expose two named methods purely for handler readability.
+**Layout/dtype coverage:**
 
-    The host destination is always a SharedHostPool slot named by integer
-    slot_id — there is no host-tensor form of copy_tensor_raw (raw host
-    pointers never cross into Python). M1 uses a single-process pool; M2
-    uses the same pool shape plus a cross-instance directory (§6.7). This
-    is why the copier is byte-for-byte identical across both milestones.
-    """
+| Cache layout and encoding | Current attention support | Offload requirement |
+|---|---|---|
+| Head-major, model dtype | Default; normally FP16 | Qualify dense page addressing, padding and raw round-trip. |
+| Token-major, model dtype | Explicit opt-in | Qualify its distinct page mapping; do not use head-major offsets. |
+| Head-major, `fp8` / `fp8_e4m3` | Allocated as `torch.float8_e4m3fn`; requires `head_size % 128 == 0` | Separate raw-copy/slot-sizing and end-to-end acceptance gate. |
+| Token-major, FP8 | Rejected by current attention implementation | Reject during configuration; do not imply M1 enables it. |
 
-    def copy_d2h(self, dev: torch.Tensor, pool, slot_id: int) -> None:
-        # offload: byte-exact raw DMA device → pool slot; no dtype/layout conversion
-        _spyre_c.copy_tensor_raw(dev, pool, slot_id, to_device=False, non_blocking=False)
+For FP8, the vLLM cache spec can report `uint8` while actual device pages hold E4M3 values. Store the
+existing encoded bytes, not an FP16 expansion or a new quantization. Physical padding/alignment
+still applies: a logical one-byte dtype does not guarantee a pool slot is exactly half its FP16
+size. Compatibility includes the encoding, layout, quantization scheme and resolved per-layer K/V
+scales. Current attention uses per-layer scales rather than putting scales into each cache page;
+shared reuse must establish identical scales or explicitly carry/restore them as part of a future
+format. Raw bytes copied under different scales are not reusable KV.
 
-    def copy_h2d(self, dev: torch.Tensor, pool, slot_id: int) -> None:
-        # reload: byte-exact raw DMA pool slot → device
-        _spyre_c.copy_tensor_raw(dev, pool, slot_id, to_device=True, non_blocking=False)
-```
+Until the production page-copy API supports and passes a layout/dtype combination, reject that
+combination explicitly. Attention support by itself is not offload qualification.
 
-Constraints:
+### 6.2 Transfer ordering and worker completion
 
-- Both methods are synchronous (`non_blocking=False` causes `spyre_copy_from` to call `stream.synchronize()` after the DMA). M1 does not pursue async overlap; an async path is a follow-up tracked in §11 ("Async DMA on Spyre").
-- Neither method allocates. The handler caller owns allocation.
-- A single instance is shared across both directions; the class holds no state beyond the bound `_C.copy_tensor_raw` reference, so it is effectively a namespace.
+For each store job:
 
-Why a class at all instead of inlining `_C.copy_tensor_raw` into the worker? Two reasons. First, the `OffloadingWorker` shouldn't import `torch_spyre._C` directly — keeping the device-side primitive behind one wrapper means tests can monkey-patch `SpyreKvDmaCopier` without touching the C extension. Second, if torch-spyre later adds an async or batched copy entrypoint, swapping `SpyreKvDmaCopier`'s implementation is a one-file change; everything above it stays unchanged.
+1. Retain the source pages and destination reservation.
+2. Fence all relevant pending compute/KV writes before raw DMA reads the pages. Synchronizing only
+   after copying cannot repair a snapshot taken before the producer finished.
+3. Transfer all K/V pages for the selected groups/chunks and wait for completion.
+4. Publish each newly stored shared page only after its DMA completes. Report job success after its
+   required transfers finish; complete pinned lookup across components/ranks establishes logical
+   availability. The runtime does not supply an atomic multi-worker publication barrier.
 
-### 6.2 `SpyreOffloadingWorker`
-
-Implements the upstream `OffloadingWorker` ABC (§3.2) — the worker-side transfer engine that
-`SpyreOffloadingSpec.get_worker()` returns. Internally it mirrors upstream's own factoring: a pair of
-single-direction handlers behind explicit `submit_store` / `submit_load` entry points.
-
-```python
-# spyre_inference/v1/kv_offload/worker.py
-from vllm.v1.kv_offload.base import (
-    CanonicalKVCaches, GPULoadStoreSpec, LoadStoreSpec, OffloadingWorker, TransferResult,
-)
-
-
-class SpyreOffloadingWorker(OffloadingWorker):
-    def __init__(self,
-                 kv_caches: CanonicalKVCaches,
-                 blocks_per_chunk: int,
-                 num_host_blocks: int,
-                 copier: SpyreKvDmaCopier,
-                 pool,                        # SharedHostPool: single-process (M1) or shared (M2)
-                 directory=None):             # SharedHostMetadata; M2 passes it, M1 leaves None
-        self._store = _SpyreDirectionHandler(..., to_device=False)
-        self._load = _SpyreDirectionHandler(..., to_device=True)
-
-    def submit_store(self, job_id: int,
-                     src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec) -> bool:
-        return self._store.transfer(job_id, src_spec, dst_spec)      # device → host slot
-
-    def submit_load(self, job_id: int,
-                    src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool:
-        return self._load.transfer(job_id, src_spec, dst_spec)       # host slot → device
-
-    def get_finished(self) -> list[TransferResult]:
-        return self._store.get_finished() + self._load.get_finished()
-
-    def wait(self, job_ids: set[int]) -> None:
-        self._store.wait(job_ids); self._load.wait(job_ids)
-
-    def shutdown(self) -> None:                                       # non-abstract upstream
-        self._store.shutdown(); self._load.shutdown()
-```
-
-Each `_SpyreDirectionHandler` is private to us — it implements no upstream interface (there is no
-`OffloadingHandler` type at the pinned version, §3.2). Per transfer it:
-
-1. Walks the block-id pairs in the two specs, resolving each to a pool `slot_id` (M1: directly from the
-   block index; M2: via the `SharedHostMetadata` directory).
-2. Calls `copier.copy_{d2h,h2d}(dev, pool, slot_id)` for each block.
-3. Records a `TransferResult(job_id, success=...)`; synchronous today, so every submitted job is
-   already complete when `get_finished()` is next called.
-
-Note the direction is fixed by which method the framework calls, not inferred from a
-`(src_type, dst_type)` registration — one of the simplifications the `0.26` API brought.
-
-The host destination is a `SharedHostPool` slot in **both** milestones — the canonical
-`copy_tensor_raw(dev_tensor, pool, slot_id, ...)` has no host-tensor form (raw host pointers never
-cross into Python, §6.7), so there is no `torch.empty` host-page path. M1 supplies a **single-process**
-pool: a `SharedHostPool` sized from `cpu_bytes_to_use`, with **no** `SharedHostMetadata` directory
-(one instance, no cross-instance lookup — the handler assigns `slot_id` directly from the block index).
-M2 supplies the **same pool shape plus a shared directory** so co-located instances name each other's
-slots by content hash (§6.7–6.8). Either way the copier's raw DMA targets the slot via
-`copy_tensor_raw(dev_tensor, pool, slot_id, ...)`. This is why the M2 device↔host copy path is the M1
-path **unchanged** — M2 adds only the cross-instance directory, not a different transfer. Pinning is
-**internal to the pool**: there is no Python-level host-buffer registration and no raw host pointer or
-device address crosses into Python (a hard runtime requirement). There is no `cudaHostRegister` on
-Spyre — there is no equivalent, and none is needed because the runtime owns pinning inside
-`SharedHostPool`.
+For a load, retain the source slot protection through the final DMA completion and make restored
+pages visible before attention runs. Block reuse, preemption, cancellation, `wait` and `shutdown`
+must respect in-flight transfers. Failed stores must not publish; failed loads must not be consumed
+as restored KV. After a scheduled hit fails, return the upstream failure/recompute path rather than
+silently treating partially loaded device pages as usable.
 
 ### 6.3 `SpyreOffloadingSpec`
 
-Subclass `OffloadingSpec` **directly** and implement its two abstract methods: `get_manager()`
-(delegating to the upstream `CPUOffloadingManager`, reused verbatim) and `get_worker()` (returning our
-`SpyreOffloadingWorker`).
+Subclass `OffloadingSpec` directly. `get_manager` creates the M1 `CPUOffloadingManager` with validated
+chunk capacity and the current cache-policy/event options. `get_worker` builds the Spyre transfer
+worker from canonical dense tensors. Declare matching metric definitions instead of inheriting the
+base class's empty definition set while emitting CPU-manager statistics.
 
-**Why not subclass `CPUOffloadingSpec`?** Because its platform gate is unreachable from a subclass:
-`get_worker` raises for non-CUDA/XPU platforms *before* reaching the overridable `create_worker()`
-hook (§3.3). Subclassing it would inherit the raise with no way to remove it; subclassing
-`OffloadingSpec` never acquires it. Post-`0.26` upstream adds a second gate via
-`_uses_shared_region()` returning `is_cuda_alike()` (§3.6), which we likewise never inherit. The cost
-of going one level up is re-implementing the `num_blocks`-from-`cpu_bytes_to_use` arithmetic — a few
-lines, and it keeps our `slot_bytes` derived from the device page's **physical** size rather than
-CUDA's `numel × itemsize` assumption.
+Pool/DMA construction belongs on the worker side after cache geometry is known; constructing a spec
+in the scheduler must not initialize an accelerator stream. Keep imports lazy so installations
+without the optional lower-layer APIs can still use spyre-inference with no offload connector.
 
-```python
-# spyre_inference/v1/kv_offload/spec.py
-import os
-import torch_spyre._C as _spyre_c
-from torch_spyre._C import SharedHostPool
-from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager, OffloadingSpec, OffloadingWorker
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+The shared spec replaces both the local manager and pool-resolution behavior. Reuse the byte mover
+and validated page mapping where possible, not a promise of identical worker/spec source in every
+milestone.
 
+### 6.4 Secondary-memory backend
 
-class SpyreOffloadingSpec(OffloadingSpec):
-    def __init__(self, config):                          # OffloadingConfig (§3.6)
-        super().__init__(config)
-        self.num_blocks = ...                            # from extra_config["cpu_bytes_to_use"]
-        self.slot_bytes = ...                            # device page PHYSICAL size, not numel*itemsize
-        self._copier = SpyreKvDmaCopier()
-        self._manager: OffloadingManager | None = None
-        self._worker: OffloadingWorker | None = None
-        # M1's host tier is a single-process SharedHostPool (no shared directory).
-        # M2's SpyreSharedOffloadingSpec overrides this to attach a *named* pool +
-        # SharedHostMetadata directory instead (§6.8). The name is process-unique
-        # here so nothing else attaches it.
-        self._pool = SharedHostPool.create_or_attach(
-            _spyre_c.get_dma_stream(), name=f"/kv.m1.{os.getpid()}",
-            num_slots=self.num_blocks, slot_bytes=self.slot_bytes,
-        )
+M3 uses the same slot-copy and directory contracts with a secondary-memory data pool. Metadata
+remains host-resident and CPU-accessible. The runtime owns acquisition, attachment and retention of
+the provider backing; the plugin does not construct provider handles or device-visible addresses.
 
-    def get_manager(self) -> OffloadingManager:
-        # Upstream cache policy, reused verbatim: admission, LRU eviction,
-        # block-hash bookkeeping, hit/miss. Verified platform-agnostic (§5.2).
-        if self._manager is None:
-            self._manager = CPUOffloadingManager(
-                num_blocks=self.num_blocks,
-                cache_policy=self.extra_config.get("eviction_policy", "lru"),
-                enable_events=self.kv_events_config.enable_kv_cache_events,
-            )
-        return self._manager
+A pool is a DMA endpoint, not necessarily a host-mappable byte array. Multiple named pools can
+coexist; a cache group attaches its selected pair at startup. This does not imply one global pool,
+a host-wide directory spanning all pools, per-hit pool resolution, or fallback into another backend.
+Unsupported backends fail clearly instead of silently switching to host memory.
 
-    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
-        # No platform gate: we never inherited one.
-        if self._worker is None:
-            self._worker = self._create_worker(kv_caches)
-        return self._worker
+### 6.5 Registration and serving configuration
 
-    def _create_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
-        # M2 overrides ONLY this, to pass a shared pool + directory (§6.8).
-        return SpyreOffloadingWorker(
-            kv_caches=kv_caches,
-            blocks_per_chunk=self.blocks_per_chunk,
-            num_host_blocks=self.num_blocks,
-            copier=self._copier,
-            pool=self._pool,                             # M1: single-process; directory stays None
-        )
-```
-
-`GPULoadStoreSpec` (used in the worker's signatures, §6.2) is the upstream "device-side" type — a tag,
-not CUDA-specific despite the name — so we use it for Spyre unchanged.
-
-We keep our own `_create_worker` seam so M2's `SpyreSharedOffloadingSpec` subclasses **this M1 spec**
-and overrides only pool construction (§6.8), leaving the worker, the copier, and both `get_*` methods
-byte-for-byte identical across milestones.
-
-### 6.4 Filesystem/object tiering — not a milestone
-
-This RFC ships no Spyre-specific tiering spec. The fast second tier we want is a future DMA-able,
-faster-than-DRAM memory pool — a **CXL-class secondary memory tier** the Spyre runtime layer sketches:
-CXL-class expansion memory the device reaches *by DMA*,
-exactly like host DRAM. The runtime is explicit that the contract with this tier is **a DMA endpoint,
-not a byte-addressable, mmap'd region** — so it is served by M2's shared-pool DMA path (hot blocks in
-secondary memory, spilling to DRAM on eviction), not an fs/obj `SecondaryTierManager` (which assumes a
-`primary_kv_view` memoryview read/written by CPU-side store/load, not a DMA endpoint). Crucially, the
-runtime's building blocks are **tier-agnostic**: a secondary memory tier changes *which DMA-able buffer the bytes
-live in and the promotion/eviction policy* (a spyre-inference concern), not the runtime's `copyRaw` /
-`SharedHostPool` / `SharedHostMetadata` contract — so nothing in M2 needs to change to add it later. A
-deployment that instead wants a disk/object tier can still select upstream `TieringOffloadingSpec` +
-`tiering/{fs,obj}` on top of M1's `SpyreOffloadingSpec` via config — no Spyre-specific spec is needed
-for that, and none is shipped here.
-
-### 6.5 Registration
-
-In `spyre_inference/__init__.py`, after the existing platform plugin registration:
-
-```python
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
-
-OffloadingSpecFactory.register_spec(
-    "SpyreOffloadingSpec",
-    "spyre_inference.v1.kv_offload.spec",
-    "SpyreOffloadingSpec",
-)
-
-# Added in M2:
-OffloadingSpecFactory.register_spec(
-    "SpyreSharedOffloadingSpec",
-    "spyre_inference.v1.kv_offload.shared_spec",
-    "SpyreSharedOffloadingSpec",
-)
-```
-
-This mirrors how the upstream CPU spec is registered. No changes to `TorchSpyrePlatform` and no changes
-to `TorchSpyreWorker` — both the connector and the spec are selected by `kv-transfer-config` at engine
-init.
-
-Registration is by **public config key**, so nothing here needs an upstream vLLM patch (§3.4). A
-deployment selects both halves — our connector (for §6.6's KV-cache ingestion) and our spec (for the
-transfer engine):
+M1 uses the existing configuration seams:
 
 ```bash
-vllm serve $MODEL --kv-transfer-config '{
+vllm serve "$MODEL" --kv-transfer-config '{
   "kv_connector": "SpyreOffloadingConnector",
   "kv_connector_module_path": "spyre_inference.v1.kv_offload.connector",
   "kv_role": "kv_both",
   "kv_connector_extra_config": {
     "spec_name": "SpyreOffloadingSpec",
     "spec_module_path": "spyre_inference.v1.kv_offload.spec",
-    "cpu_bytes_to_use": 17179869184
+    "cpu_bytes_to_use": 8000000000
   }
 }'
 ```
 
-`spec_module_path` makes the `register_spec` calls above strictly optional (a convenience so
-`spec_name` alone resolves); `kv_connector_module_path` is a documented `KVTransferConfig` field.
+This is an implementation target; the main-branch dependency pin does not supply the raw-pool APIs.
+A PoC build must use its matching dependencies and configuration, not the lockfile alone.
 
-### 6.6 `SpyreOffloadingConnector` — getting a paged KV cache past canonicalization
+For persistent shared pools, the **proposed** public selection is
+`kv_connector_extra_config.pool_name`, with `SPYRE_KV_POOL_NAME` as fallback. Resolve it once before
+worker processes start:
 
-**This is M1's highest-risk component, and the one place the "zero plugin change" premise fails.**
+1. An explicitly present `pool_name` wins. Empty/invalid values are errors, not a fallback request.
+2. Otherwise use the environment value, if present and valid.
+3. Otherwise generate an instance-specific name to prevent accidental sharing.
 
-`register_kv_caches` is the sole ingestion point for the on-device KV cache (§3.1), and at the pinned
-rev its `AttentionSpec` branch requires one contiguous storage per layer:
+Use logical names matching `[A-Za-z0-9][A-Za-z0-9._-]*`; validate length including derived suffixes
+and never truncate. Log the effective name and source, then propagate the resolved configuration.
+Workers and bindings must not independently reread the environment.
 
-```python
-assert isinstance(layer_kv_cache, torch.Tensor)          # (a)
-raw = torch.empty(0, dtype=torch.int8, device=...).set_(
-    layer_kv_cache.untyped_storage())                    # (b)
-```
+Derive deterministic rank/shard/cache-group suffixes, for example `_r0_c0`, from agreed topology.
+Explicit shared names must not acquire a process-local engine ID; generated defaults must retain
+instance identity. Derive matching data, metadata and lifecycle names from the same scope. Naming
+alone does not implement sharing: the shared allocator and compatibility checks remain mandatory.
 
-Spyre fails **both**: `SpyrePagedKVCache` is two Python lists of per-block tensors, so (a) raises; and
-storage reinterpretation via `.set_()` is unsupported on Spyre tensors, so (b) would fail even for a
-single tensor. Because `register_kv_caches` ends by calling `self._init_worker(canonical_kv_caches)`,
-this runs **strictly before** `spec.get_worker()` — so no spec-level hook, and no amount of
-`spec_module_path` cleverness, can intervene.
+The delegator resolves the name to a descriptor whose backend, slot geometry, compatibility and
+pool generation were fixed at creation. Neither `cpu_bytes_to_use` nor worker-local defaults may
+resize an existing shared pool. Exact Python lifecycle binding/config field names remain subject to
+the lower-layer implementation; do not document prototype-only backend selectors as a stable API.
 
-**The fix, entirely in-tree.** Ship our own connector via `kv_connector_module_path` (§3.4b) and
-override exactly one method:
+### 6.6 `SpyreOffloadingConnector`: dense-cache ingestion
 
-```python
-# spyre_inference/v1/kv_offload/connector.py
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import OffloadingConnector
-# NB: at the pinned rev the worker lives in .../v1/offloading/worker.py; on post-0.26 main it
-# moved into offloading_connector.py. Import defensively (§3.6) — the class name is stable.
+The adapter should retain each original typed dense K and V tensor, create one
+`CanonicalKVCacheTensor` per unique field, and build ordered per-group references. Preserve known
+shared-layer aliases without manufacturing a device byte view. Validate the selected groups,
+per-layer specs, block counts, layout and supported dtype before initializing the transfer worker.
+Physical transfer sizes come from the page-copy contract (§6.1), not storage reinterpretation.
 
+This is a **dense adapter**, conventionally `spyre_dense_to_canonical`, replacing the earlier
+`spyre_paged_to_canonical` sketch. There is no concatenation of per-block Python lists and no reason
+to allocate a second canonical device cache.
 
-class SpyreOffloadingConnectorWorker(OffloadingConnectorWorker):
-    def register_kv_caches(self, kv_caches):
-        # Build CanonicalKVCaches from the Spyre paged-list layout directly:
-        # one CanonicalKVCacheTensor per layer group, page_size_bytes from the
-        # device page's PHYSICAL size, and group_data_refs mapping each layer to
-        # its tensor index. No untyped_storage(), no .set_(), no as_strided.
-        canonical = spyre_paged_to_canonical(kv_caches, self._kv_cache_config)
-        self._init_worker(canonical)          # inherited, unchanged
+At the pin, upstream's connector constructor directly instantiates its worker; assigning a
+`_worker_cls` attribute has no effect. The plugin connector must explicitly install its
+`SpyreOffloadingConnectorWorker` on the worker role, preserving the upstream scheduler role and
+configuration. Its registration override then calls inherited `_init_worker` with our canonical
+containers. Test that the intended worker is actually constructed, not merely that the subclass
+exists.
 
+The model runner also needs connector lifecycle integration: register caches after
+`allocate_spyre_kv_caches`, run load/save and preemption hooks around execution, propagate connector
+output, and drain/shut down transfers. The PoC includes this wiring. The old acceptance criterion
+that **no worker/model-runner file may change** is withdrawn. The allocator's backend-owned layout
+need not change, but connector wiring cannot be omitted.
 
-class SpyreOffloadingConnector(OffloadingConnector):
-    # Same scheduler side; worker side swapped for the paged-aware one.
-    _worker_cls = SpyreOffloadingConnectorWorker
-```
+### 6.7 Shared-pool lifecycle: control plane versus data plane
 
-Everything downstream of `_init_worker` — job scheduling, `get_finished`, preemption handling, the
-scheduler-side connector, the manager — is inherited unchanged.
+The persistent-lifecycle contract supersedes prototype `create_or_attach` and last-detacher-unlink
+behavior for named shared pools.
 
-**Two consequences to state plainly:**
+| Owner | Responsibilities |
+|---|---|
+| Node-local delegator | `CreatePool`, `OpenPool`, `DestroyPool`; provisioning, discovery, recovery and explicit retirement policy. Not in the KV-copy path. |
+| Serving processes | Resolve through the delegator; `AttachPool` / `DetachPool`; perform ordinary cache lookup, reservation, copy and eviction. Never create or destroy a persistent pool. |
+| torch-spyre | Thin tensor-aware bindings and local handle lifetime; no separate pool policy. |
+| Device runtime | Geometry validation, backing attachment, DMA retention, metadata synchronization and generation-checked lifecycle mechanism. |
 
-1. **This is not a "no plugin change" design.** Earlier revisions of this RFC claimed
-   `register_kv_caches` would work as long as the tensors were real `torch.Tensor`s on
-   `device("spyre")`. That is false: the cache is not a tensor per layer, and the canonicalization
-   would reject it. Any issue or plan asserting "no changes to the Spyre worker or platform, verified
-   by diff" as an acceptance criterion needs correcting — a paged-list adapter is mandatory.
-2. **It couples us to an upstream internal.** `register_kv_caches` is a public method, but our override
-   reimplements logic whose *shape* upstream may change (it already relocated between our pin and
-   `main`, and gained a `vllm_config` constructor arg — §3.6). Mitigation: keep the adapter in one
-   function (`spyre_paged_to_canonical`), forward `*args/**kwargs` in the constructor, and pin a test
-   that fails loudly on signature drift. The §11 follow-up is to upstream a paged-layout hook so the
-   subclass can be deleted; until then this is a known, bounded maintenance cost — and it is the price
-   of needing **zero** upstream changes today.
+`PoolConfig` identifies logical name, memory backend, immutable slot geometry and versioned KV
+compatibility. A descriptor includes the opaque **pool generation**, state and effective config.
+Attach requires `READY`, matching generation/config and the original data/metadata backing. Missing,
+replaced or incompatible backing is unavailable; do not create a replacement during lookup/attach.
 
-Note the runner-side allocation itself is unchanged (`spyre_model_runner.py`, `device="spyre"`); what
-changes is only how we *present* those allocations to the connector.
+Attachments hold a shared lifecycle `flock` until dependent metadata/data mappings and DMA resources
+are released. Destruction requires exclusive access and the expected pool generation; busy pools
+return `PoolBusy` without leaving `READY`. There is no force-destroy by a serving worker and no
+authoritative process-count field whose decrement destroys the pool.
 
-### 6.7 M2 — the shared host pool surface (`SharedHostPool` / `SharedHostMetadata` / `copy_tensor_raw`)
+The runtime serializes management with a persistent per-name guard, publishes a fully initialized
+root atomically, and can recover interrupted `INITIALIZING`/`DESTROYING` transitions. Recovery must
+not remove a `READY` pool. Same-name recreation gets a new generation, invalidating old descriptors.
 
-M1's `SpyreKvDmaCopier` already does a byte-exact raw DMA between a device page and a `SharedHostPool`
-slot (§6.1). M2 keeps that copy path unchanged and only swaps M1's single-process pool for a shared,
-named host KV pool provided by the hardware runtime, adding a directory so co-located instances name
-each other's slots. torch-spyre exposes that pool to Python as two objects (the torch-spyre KV-offload
-Python-surface design):
+Last detach, `shutdown` and `reset_cache()` release local work/pins/bookkeeping, **not published
+shared entries**. Normal cache eviction remains permitted under the slot protocol. Existing
+attachments can keep serving if the delegator is unavailable; new resolution retries or fails,
+never silently creates a local replacement. Persistence across zero attached processes is not
+persistence across host reboot.
 
-```python
-# torch_spyre._C (M2 dependency — not in the current pinned build).
-# These are thin pybind passthroughs over the Spyre runtime objects;
-# torch-spyre adds no SHM creation, locking, or directory logic of its own.
+### 6.8 Shared manager, identity and concurrency
 
-class SharedHostPool:
-    """A DMA-able shared-memory pool of fixed-size slots. Pinning is internal."""
-    @staticmethod
-    def create_or_attach(stream, name: str, num_slots: int, slot_bytes: int) -> "SharedHostPool": ...
-    def slot_count(self) -> int: ...
-    def slot_bytes(self) -> int: ...
-    # slot_ptr is intentionally NOT exposed to Python; copy_tensor_raw uses it in C++.
+![Shared pools and persistent lifecycle](figures/spyre-shared-pool-m2.svg)
 
-class SharedHostMetadata:
-    """A shared block-hash → slot directory with a per-slot concurrency protocol."""
-    @staticmethod
-    def create_or_attach(name: str, num_slots: int, max_chunks: int) -> "SharedHostMetadata": ...
-    # lookup / claim / publish / evict + a generation-checked per-slot pin are the
-    # Spyre runtime's directory protocol, NOT a committed torch-spyre object
-    # API; the exact method set tracks the runtime header once it lands.
+Diagram sources: [D2](figures/spyre-shared-pool-m2.d2),
+[Mermaid](figures/spyre-shared-pool-m2.mmd).
 
-# The device↔pool byte transfer — byte-exact raw DMA, the runtime owns the copy size.
-def copy_tensor_raw(dev_tensor: torch.Tensor, pool: SharedHostPool, slot_id: int,
-                    to_device: bool, non_blocking: bool = False) -> None: ...
-```
+Each selected cache group has a matching named data-pool/metadata pair, retained for the session.
+The metadata is pageable host shared memory for either backend. Its directory maps each compatible
+component-page key to a slot and **slot generation**; the serving-side manager composes and validates
+the complete chunk manifest. Pool generation protects backing incarnation; slot generation protects
+reuse within a live pool. Neither replaces the other.
 
-`copy_tensor_raw` is a **byte-exact raw DMA** between a `device("spyre")` KV page tensor and a pool
-slot named by integer `slot_id` — no dtype/layout conversion. **The Spyre runtime owns the copy size** (the
-padded/tiled physical `total_size()`, not `numel * itemsize`), the chunking, and the
-byte-identical-layout invariant; torch-spyre forwards the tensor's device-side address and the slot and
-computes no byte count. The **seam** between the plugin and torch-spyre is that integer `slot_id` (plus
-a tensor): **raw host pointers and device addresses never cross into Python** — a hard runtime requirement
-(the data pool is index-addressed and the metadata directory keys pinning/eviction on the slot) — and
-there is deliberately **no** Python-level host-buffer registration, because pinning is internal to the
-pool (the runtime pins the whole pool once per IOMMU Function inside `create_or_attach`). The M2
-`SpyreKvDmaCopier` reuses its M1 `copy_d2h` / `copy_h2d` methods against `copy_tensor_raw`
-**verbatim** — the copier already takes `(dev, pool, slot_id)` in M1; M2 changes only *which* pool it
-is handed (a named cross-instance one) and adds the directory that picks the `slot_id`.
+**Compatibility.** A shared prefix requires matching model/revision and relevant adapters, hash
+algorithm/seed and request identity inputs, cache-group/layer order, block/chunk geometry, attention
+layout, dtype/encoding and scales, TP rank/shard topology, and versioned physical format. Equal
+names, hashes or byte counts alone are insufficient. Reject incompatible attachments before DMA;
+do not claim cross-TP raw-page portability.
 
-**Which layer calls the directory.** The Spyre runtime owns the *mechanism* (the pool, the `copyRaw` DMA, the
-directory lock, the DMA-completion publish gate, and the `generation` reuse check). This RFC's
-`SpyreSharedOffloadingSpec` owns the *cache policy* — which block to offload, when to evict, which to
-drop — and drives the `lookup`/`claim`/`publish`/`evict` protocol steps (§6.8). That split is the runtime's
-ownership contract.
+**Store.** Claim missing component pages under the shared allocator/directory lock, with duplicate
+recheck and first-writer-wins semantics; already valid pages can be reused. Entries transition
+`EMPTY → RESERVED → VALID`; a reservation is neither readable nor evictable. Release the directory
+lock before DMA. Complete all new page copies before publishing them individually. Logical readiness
+comes from complete pinned lookup, not an assumed multi-entry atomic publish. After failure, quiesce
+DMA before aborting reservations or removing only attempt-owned publications, rechecking tenancy.
+A future multi-worker extension must not report a logical hit while any required rank is missing.
 
-### 6.8 M2 — `SpyreSharedOffloadingSpec`: the shared host pool design
+**Load.** Obtain a safe lookup snapshot, acquire the process-shared per-slot read protection, and
+recheck generation plus `VALID` **before** copying. A stale snapshot is a miss with no DMA. Hold
+protection through completion. For a chunk spanning slots, protect the entire required manifest
+before consuming it; an incomplete manifest is not a partial hit.
 
-M2 makes the host tier a **single shared host KV pool shared by every co-located instance**, instead
-of M1's per-instance single-process pool. There is **one design**: the pool is a `SharedHostPool`
-of fixed-size slots with a `SharedHostMetadata` directory, both provided by the hardware runtime
-through torch-spyre (§6.7), and the plugin names each offloadable slot by an integer `slot_id`.
+**Eviction.** Obtain exclusive slot protection, then the directory lock; recheck tenancy, remove the
+mapping and advance the slot generation before reuse. Never wait for a slot lock or DMA while
+holding the directory lock. Refuse generation exhaustion rather than wrap.
 
-**`SpyreSharedOffloadingSpec` subclasses M1's `SpyreOffloadingSpec`.** It reuses M1's
-`SpyreOffloadingWorker` / `SpyreKvDmaCopier` device↔host path **unchanged** — the only difference
-is the pool is a *named, cross-instance* `SharedHostPool` with a `SharedHostMetadata` directory rather
-than M1's single-process pool with no directory. Its manager names each
-offloadable block by content hash (exactly as vLLM's prefix cache already computes it), maps that hash
-to a pool `slot_id` via `SharedHostMetadata` (`claim` on store, `lookup` on load), and honors
-`publish` / `evict` and the directory's concurrency guarantees:
+The baseline slot protocol uses process-shared pthread read/write locks. Unlock on the same OS
+thread that acquired the lock; do not rely on arbitrary Python finalization or a completion callback
+on another thread. Bindings release the GIL during blocking attachment/locking/copy/wait operations.
+The GIL is not cross-process synchronization, and no directory lock spans the whole
+claim→copy→publish sequence.
 
-```python
-# spyre_inference/v1/kv_offload/shared_spec.py
-import torch_spyre._C as _spyre_c
-from torch_spyre._C import SharedHostPool, SharedHostMetadata
-from spyre_inference.v1.kv_offload.spec import SpyreOffloadingSpec
+**Crash boundary.** Lifecycle `flock` cleanup on process exit does not make pthread slot locks robust
+or prove device DMA has stopped. A timeout, dead PID or recovered directory mutex alone does not
+justify resetting locks or recycling active storage. If quiescence cannot be established, mark the
+affected pool unavailable pending coordinated recovery. The design must not promise that every
+mid-copy failure can be downgraded to an ordinary miss after bytes were already consumed.
 
-class SpyreSharedOffloadingSpec(SpyreOffloadingSpec):
-    """Cross-instance shared host KV pool on Spyre.
+## 7. Implementation plan
 
-    Subclasses M1's SpyreOffloadingSpec and reuses its worker + copier
-    unchanged. The ONLY difference from M1 is the pool: a *named*, runtime-owned
-    SharedHostPool plus a shared SharedHostMetadata directory (block-hash ->
-    slot_id), instead of M1's single-process pool with no directory. Two
-    instances attaching the same named pool + directory see the same slots.
-    """
-    def __init__(self, config):                      # OffloadingConfig
-        super().__init__(config)                     # M1 built a single-process self._pool
-        cfg = self.shared_pool                       # {name, num_slots, slot_bytes, max_chunks}
-        stream = _spyre_c.get_dma_stream()           # pooled DMA stream (torch-spyre §3.4)
-        # Replace M1's single-process pool with the *named* cross-instance one,
-        # and add the shared directory M1 doesn't have.
-        self._pool = SharedHostPool.create_or_attach(
-            stream, name=cfg.name,
-            num_slots=cfg.num_slots, slot_bytes=cfg.slot_bytes,
-        )
-        self._directory = SharedHostMetadata.create_or_attach(  # same named directory
-            name=cfg.name, num_slots=cfg.num_slots, max_chunks=cfg.max_chunks,
-        )
+Keep the plugin-specific code in `spyre_inference/v1/kv_offload/`; the prototype may factor modules
+differently as the interfaces settle. Avoid estimated line counts as an architectural constraint.
 
-    def _create_worker(self, kv_caches):             # M1's seam (§6.3); adds the directory
-        return SpyreOffloadingWorker(
-            kv_caches=kv_caches, blocks_per_chunk=self.blocks_per_chunk,
-            num_host_blocks=self._pool.slot_count(), copier=self._copier,
-            pool=self._pool, directory=self._directory,   # cross-instance lookup/claim/publish
-        )
-    # get_manager / get_worker: inherited from SpyreOffloadingSpec (§6.3) unchanged.
-    # Cache policy stays the upstream CPUOffloadingManager's (§5.2) — M2 changes
-    # only where a decided hit resolves to storage, never admission or eviction.
-```
-
-**Why not upstream's `SharedOffloadRegion`?** Upstream now ships a shared-memory CPU-offload region
-(`vllm/v1/kv_offload/cpu/shared_offload_region.py`), and post-`0.26` it is the *default* backing for
-CPU offload. It is a genuinely similar mechanism — a `/dev/shm` file mmap'd `MAP_SHARED`, with an
-O_EXCL creator/joiner rendezvous — so it is worth stating precisely why M2 does not build on it. Four
-verified reasons, each independent:
-
-1. **Its DMA-ability is CUDA-only.** The region's bytes become DMA-able via `pin_mmap_region()`, which
-   is `cudaHostRegister` and returns early on any non-CUDA platform ("Skipping mmap host registration
-   on %s; cudaHostRegister is only available on CUDA/ROCm"). On Spyre we would get an unregistered
-   mapping. Upstream treats unpinned as *slower*, not broken, because CUDA can stage through its own
-   buffers — Spyre has no such fallback path in-tree, and pinning is exactly what the runtime-owned pool
-   provides internally (§6.7).
-2. **It is instance-scoped, not host-scoped.** The path is
-   `/dev/shm/vllm_offload_{engine_id}.mmap`, and `engine_id` is per-DP-replica (suffixed `_dp{rank}`).
-   Its own docstring says "shared across all workers for **a vLLM instance**." Two `vllm serve`
-   instances get different files by construction — which is precisely the sharing M2 exists to provide.
-3. **Its geometry is rank-sliced and fixed at creation.** The creator `ftruncate`s to
-   `num_blocks × kv_bytes_per_block`, and each worker takes a private slice within every block row via
-   `_worker_offset = rank * cpu_page_size`. There is no slot for a *different instance's* ranks, and
-   every joiner must agree on the exact geometry.
-4. **Its lifetime is creator-owned and it has no publish protocol.** `cleanup()` `shm_unlink`s the file
-   if this process was the O_EXCL creator — so a co-located instance still mapping it loses the backing
-   name. And nothing maps content hash → block, so there is no way for instance B to *find* what A
-   wrote, and no publish gate to make a mid-write slot degrade to a miss rather than a torn read.
-
-Items 2–4 hold **even on CUDA**, so this is not merely a Spyre gap: upstream's region is a
-within-instance worker-sharing mechanism, not a cross-instance cache. M2's `SharedHostPool` +
-`SharedHostMetadata` supply exactly what items 1–4 lack — runtime-owned pinning, host-scoped naming,
-allocator-managed slots, and a generation-checked publish/pin protocol (§6.7).
-We reuse upstream's *idea* (one shared mapping addressed by index) without inheriting its scoping.
-
-**Store / load.** On store, the manager `claim`s a `slot_id` for the block's content hash, the copier
-D2H-DMAs the device page into that slot via `copy_tensor_raw(dev_tensor, pool, slot_id, to_device=False)`,
-and — only after the DMA has synchronized — the directory `publish`es the hash→slot mapping. On load,
-the manager `lookup`s the content hash; a hit yields a `slot_id`, which the copier H2D-DMAs back into a
-device page via `copy_tensor_raw(dev_tensor, pool, slot_id, to_device=True)`. The runtime owns the copy
-size and the byte-identical-layout invariant, so a stored slot restores byte-for-byte.
-
-**Cross-instance sharing.** Two instances that attach the same named pool + directory see the same
-slots. A block instance A stores and publishes is discoverable by instance B's `lookup` on the same
-content hash, and loaded via the same raw copy — no recompute, no serialization, no disk. The
-instances must agree on the hash seed (as vLLM prefix caching already requires).
-
-**Torn reads.** A stale or mid-write slot degrades to a cache **miss, never torn bytes**: the
-directory's publish gate plus a generation/concurrency check means a reader only ever observes a slot
-whose write has been published, and a slot reused mid-copy fails the check and is treated as a miss.
-This correctness property is now **owned by the runtime directory** — the plugin holds no host
-pointers, no device addresses, and no lock of its own; it names slots by integer and passes tensors.
-
-**Sequencing and the GIL (per Takeshi review).** The connector composes each transfer as a *sequence*
-of directory operations issued one call at a time through the torch-spyre bindings, under the Python
-GIL — `claim` → D2H `copy_tensor_raw` → `publish` on store, `lookup` → H2D `copy_tensor_raw` on load
-(the generation-checked pin is held inside the runtime for the duration of the copy). The connector
-deliberately holds **no lock across this sequence**, and there is no single combined
-`claim_dma_publish` call: correctness across the span is carried entirely by the runtime's
-`RESERVED` + `generation` + publish gate (the "Torn reads" guarantee above), not by the caller. This
-is what makes the multi-call sequence safe from Python — and it depends on two properties of the layer
-below, called out here so the end-to-end contract is explicit: (1) the runtime never holds its
-directory lock across a DMA, so a peer's wait is short and bounded; and (2) the
-torch-spyre bindings **release the GIL** while blocked in the runtime (`lookup`/`claim`/`publish`/
-`evict` and blocking `copy_tensor_raw`), so one instance stalled on a peer's lock never freezes this
-process's Python threads — the vLLM scheduler and other connectors keep running. The connector relies
-on those guarantees; it does not implement them.
-
-**Dependency gating.** M2 is gated on the runtime + torch-spyre surface — `copy_tensor_raw`,
-`SharedHostPool`, and `SharedHostMetadata` — landing. These are **external prerequisites, not present
-in the current pinned build**; §7 and §11 track them. M2 is specified here so the milestone ladder is
-coherent, but it cannot ship until they land.
-
-The shared-pool topology — two co-located instances attaching one node-local `SharedHostPool` +
-`SharedHostMetadata` via `SpyreSharedOffloadingSpec` (subclassing M1's `SpyreOffloadingSpec`), each
-DMA-ing into a slot with `copy_tensor_raw(dev_tensor, pool, slot_id, ...)`:
-
-<!-- Source: figures/spyre-shared-pool-m2.{mmd,d2}. Regenerate with:
-       npx -y -p @mermaid-js/mermaid-cli@10 mmdc -i docs/architecture/rfcs/figures/spyre-shared-pool-m2.mmd \
-         -o docs/architecture/rfcs/figures/spyre-shared-pool-m2.svg -b transparent
-       d2 docs/architecture/rfcs/figures/spyre-shared-pool-m2.d2 docs/architecture/rfcs/figures/spyre-shared-pool-m2.d2.svg -->
-
-![M2: two Spyre instances attach one node-local SharedHostPool with a SharedHostMetadata directory via SpyreSharedOffloadingSpec (subclassing M1's SpyreOffloadingSpec) + SpyreOffloadingWorker; each offloads/reloads a slot with copy_tensor_raw(dev_tensor, pool, slot_id, ...). The directory maps block-hash to slot_id and gates publish/lookup so a stale slot degrades to a miss](figures/spyre-shared-pool-m2.svg)
-
-<!-- NOTE: the SVG below is stale and must be regenerated from the updated .mmd/.d2 sources (labels changed to SharedHostPool / SharedHostMetadata / slot_id / copy_tensor_raw). -->
-
-<details>
-<summary>Diagram sources (Mermaid at <code>figures/spyre-shared-pool-m2.mmd</code>; D2 at <code>figures/spyre-shared-pool-m2.d2</code>, rendered to <code>spyre-shared-pool-m2.d2.svg</code>)</summary>
-
-```mermaid
-%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
-flowchart TB
-    subgraph instA["<b>Spyre instance A</b>"]
-        direction TB
-        OA["OffloadingConnector + SpyreSharedOffloadingSpec"]
-        HA["SpyreOffloadingWorker → SpyreKvDmaCopier"]
-        OA --> HA
-    end
-    subgraph instB["<b>Spyre instance B</b>"]
-        direction TB
-        OB["OffloadingConnector + SpyreSharedOffloadingSpec"]
-        HB["SpyreOffloadingWorker → SpyreKvDmaCopier"]
-        OB --> HB
-    end
-    RAW["<b>torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, ...)</b><br/>byte-exact raw DMA; pinning internal to the pool"]
-    subgraph pool["<b>SharedHostPool</b> (runtime-provided, one per node)"]
-        direction TB
-        HM["<b>SharedHostMetadata</b> directory: block-hash → slot_id,<br/>publish gate + generation/concurrency check (stale ⇒ miss)"]
-        SLOTS[("fixed-size slots: raw KV page images<br/>host DRAM, DMA-able")]
-        HM --- SLOTS
-    end
-    HA -->|"D2H offload / H2D reload (by slot_id)"| RAW
-    HB -->|"D2H offload / H2D reload (by slot_id)"| RAW
-    RAW <-->|"raw DMA into slot"| SLOTS
-    HA -. "lookup / claim / publish" .-> HM
-    HB -. "lookup (peer hit)" .-> HM
-```
-
-</details>
-
-## 7. File-by-file plan
-
-### M1 files
-
-New files in `spyre_inference/v1/kv_offload/`:
-
-| File | Purpose | Approx LOC |
+| Stage | Plugin work | Lower-layer prerequisites |
 |---|---|---|
-| `__init__.py` | empty | 0 |
-| `copier.py` | `SpyreKvDmaCopier` (thin wrapper around the byte-exact `torch_spyre._C.copy_tensor_raw`) | ~30 |
-| `worker.py` | `SpyreOffloadingWorker(OffloadingWorker)` + two private `_SpyreDirectionHandler`s | ~180 |
-| `spec.py` | `SpyreOffloadingSpec(OffloadingSpec)` — `get_manager` / `get_worker` + `num_blocks` math | ~100 |
-| `connector.py` | `SpyreOffloadingConnector` + `SpyreOffloadingConnectorWorker` (paged-list `register_kv_caches` override) and the `spyre_paged_to_canonical` adapter (§6.6) | ~120 |
+| M1 | Dense canonicalization, connector/runner lifecycle, local spec/manager, byte copier, transfer completion and metrics | Raw dense-page/range copy, physical extent validation, compute-to-DMA ordering, host pool |
+| M2 | Shared manager and transfer specs, compatible keys, reservations/publication/pins, shared configuration | Matching named host data/metadata pair, shared allocator and concurrency mechanism |
+| M3 | Backend selection using the same shared contracts; secondary-memory integration tests | Secondary-memory pool implementation, provider attachment and validated page transport |
+| Persistent shared-pool hardening | Delegator resolution, attach/detach-only serving, local reset semantics, restart/recovery tests | Generation-checked lifecycle, whole-pool attachment protection, recoverable creation/destruction |
 
-Modified files:
+Persistent lifecycle applies to **both** M2 and M3; it is not an optional implementation detail of
+one memory backend. Existing instance-local M1 scratch pools may remain ephemeral, provided they
+cannot accidentally attach or destroy a persistent shared pool.
 
-| File | Change |
-|---|---|
-| `spyre_inference/__init__.py` | Add `OffloadingSpecFactory.register_spec(...)` call for `SpyreOffloadingSpec` (optional convenience — `spec_module_path` also resolves it). |
-| `pyproject.toml` | Bump the torch-spyre pin to one that exposes the byte-exact `torch_spyre._C.copy_tensor_raw` (the converting `copy_tensor` in the current pin is not byte-exact for KV data — §4/§6.1). |
+Change the dependency pin only in implementation PRs that have matching runtime builds and hardware
+qualification. This RFC adds no runtime code or dependency override.
 
-No changes to `TorchSpyrePlatform`, and no changes to `TorchSpyreWorker` or the model runner's KV
-allocation: the paged→canonical adaptation lives entirely in our connector (§6.6), not in the runner.
+## 8. Compatibility with other connectors
 
-New tests in `tests/v1/kv_offload/`:
+M1 supplies a device↔host offload path through **our** connector. M2/M3 add on-node shared reuse.
+Neither registration makes stock `OffloadingConnector` understand a Spyre K/V pair, nor does it add
+our raw-copy path to all other connectors.
 
-| File | Coverage |
-|---|---|
-| `test_copier_round_trip.py` | Allocate a Spyre tensor with a known fp16 pattern, copy d2h, mutate host copy, copy h2d, assert content. Skipped if `device("spyre")` not available (CI gating already exists for other Spyre tests). |
-| `test_spec_registration.py` | Import `spyre_inference`, then `OffloadingSpecFactory.create_spec(...)` resolves; also assert `SpyreOffloadingSpec` instantiates on a non-CUDA platform (i.e. no `is_cuda_alike()` gate was inherited). Pure-CPU test — no Spyre device required. |
-| `test_worker_dispatch.py` | Exercise `SpyreOffloadingWorker.submit_store` / `submit_load` against block-id specs; assert the correct content lands and `get_finished()` reports success. |
-| `test_canonicalize_paged.py` | Pure-CPU test of `spyre_paged_to_canonical`: a fake paged-list KV cache produces a `CanonicalKVCaches` with the expected `tensors` / `group_data_refs` and per-layer physical `page_size_bytes` — and does so without calling `untyped_storage()` or `.set_()`. Also asserts our connector-worker constructor tolerates extra positional args, so an upstream signature change (§3.6) fails here rather than at serve time. |
+Filesystem/object tiers need explicit integration with a suitable primary tier (§3.5). LMCache and
+NIXL integrations require their own storage/transfer/lifecycle checks. PD disaggregation additionally
+requires transport, routing, request handoff and failure semantics. These are follow-ups, not
+features automatically unlocked by a config change.
 
-### M2 files (cross-instance shared pool — gated on §6.7 external deps)
+## 9. Alignment with the working prototypes
 
-M2 depends on the runtime + torch-spyre surface `copy_tensor_raw` / `SharedHostPool` /
-`SharedHostMetadata` (the torch-spyre KV-offload Python-surface design), which does not exist in the
-current pinned build. The M2 files are a thin spec + registration over the reused M1 device↔host path:
+The fork's three branches demonstrate separate capabilities; they are **not a cumulatively integrated
+M1→M2→M3 product**. In particular, M3 selects a secondary-memory backend for the M1-style worker and
+does not contain M2's shared manager/spec/worker. Combining sharing with secondary memory remains
+integration work.
 
-| File | Purpose | Approx LOC |
+| Branch / inspected tip | Implemented shape | Boundary still to close |
 |---|---|---|
-| `spyre_inference/v1/kv_offload/shared_spec.py` | `SpyreSharedOffloadingSpec(SpyreOffloadingSpec)` — attach a `SharedHostPool` + `SharedHostMetadata`, map block-hash → `slot_id` (`claim` on store, `lookup` on load, `publish`/`evict`), and override only `_create_worker` to point the reused M1 worker at the shared pool. Reuses M1's copier/worker device↔host path unchanged; inherits the upstream cache policy (§5.2, §6.8). | ~90 |
-| `spyre_inference/__init__.py` | Add a third `OffloadingSpecFactory.register_spec(...)` for `SpyreSharedOffloadingSpec`. | +5 |
-| `pyproject.toml` | Bump the torch-spyre pin to one that exposes `copy_tensor_raw` + `SharedHostPool` / `SharedHostMetadata`. | +1 |
-| `tests/v1/kv_offload/test_shared_pool_round_trip.py` | Spyre-gated shared-pool round-trip: store a known-pattern device page into a pool slot (`claim` + D2H `copy_tensor_raw`, `publish`), then `lookup` + H2D `copy_tensor_raw` into a fresh page and assert byte-exact content; also assert a mid-write slot degrades to a miss via the directory gate (torn-read safety). | ~120 |
-| `tests/v1/kv_offload/test_cross_instance.py` | Two-process cross-instance test: process A stores+publishes a block into the shared pool; process B, attaching the same named pool + directory, `lookup`s the same content hash and reloads it — asserts a cross-instance hit and byte-identical reload. | ~140 |
+| `kvc-offload-m1` / `582390cc1472328b41330d6c21f01b66c08a1a08` | Dense host-page offload, upstream local manager, connector/runner wiring; per-cache pools with K slot `2*h` and V slot `2*h+1` | Physical capacity negotiation; full failure-path quiescence; production dependency/API integration |
+| `kvc-offload-m2` / `28bf1a2768e9758071ebfa1c06a11041551a4042` | One shared host data pool across components, directory, shared manager/worker, fragmented page slots and complete pinned lookup | TP1, one group, one block per chunk, FP16, single-chunk allocations and `uni` executor only; persistent lifecycle remains separate |
+| `kvc-offload-m3` / `7921f92110133631c37e022a40719e6e6b908f89` | Selectable host or secondary-memory transport behind the M1-style page offloader; disjoint per-rank/per-cache backing windows | No M2 directory integration or global backing allocator; independent engines still need non-overlapping assigned regions |
 
-## 8. Compatibility with existing connectors and tiers
+**Concrete transfer seam.** `SpyreKvPageOffloader` in
+`spyre_inference/v1/worker/spyre_kv_offload.py` calls
+`copy_kv_page_raw(tensor, block_id, pool, slot_id, to_device, non_blocking)`. It passes the original
+rank-four allocation plus the block ID, letting the native binding identify the physical page range;
+it does not copy the whole layer just because the argument is the full tensor. The page starts at
+byte zero of its destination slot. Its size helper divides physical allocation size by block count
+with a divisibility check; production support must validate that mapping for every admitted layout.
 
-The seam that matters:
+The PoC helper is still named `spyre_paged_to_canonical` in `kv_offload/connector.py`, but it handles
+dense tensors: flattened K/V views serve bookkeeping, while `SpyrePhysicalCaches` retains the
+original allocations for DMA. §6.6's dense name describes the intended factoring, not a claim that
+the branch already renamed it. There is no dtype-changing canonical copy.
 
-1. **Device↔host hop** — `OffloadingSpec.get_worker`. M1 makes this work on Spyre by registering `SpyreOffloadingSpec`, which returns a `SpyreOffloadingWorker`; M2 keeps the same worker and swaps the host buffer for a shared, DMA-registered pool.
-2. **KV-cache ingestion** — `register_kv_caches`. M1 supplies its own connector so the Spyre paged-list layout survives canonicalization (§6.6); every connector below inherits that fix, since they all reach the device↔host hop through it.
+**Shared mechanism.** M2's `shared_spec.py`, `shared_manager.py`, `shared_worker.py` and
+`shared_types.py` implement the shared spec, manager, worker and component manifest. Slot stride is
+the aligned largest component-page size; logical capacity is
+`floor(budget / (component_count * slot_stride))`. All components must be found and pinned for a hit;
+partial publication alone cannot create one. Local upstream admission policy is reused, while shared
+claims/pins determine actual slot ownership. Peer-owned pages are readable, but this is not a global
+victim policy or orphan-page scavenger.
 
-After M1 ships (and M2 for the shared pool), the following work on Spyre **without further Spyre-specific plugin code**:
+M2 currently registers one data pool with its directory and carries versioned pool/slot references.
+The target runtime design instead attaches a matching named pair at startup (§6.4, §6.8); a global
+registry or per-hit pool resolution is not a requirement carried forward from that prototype.
+Its configured model/revision digest also must not be mistaken for verification of actual weights or
+all semantic settings. The full compatibility contract in §6.8 remains the requirement.
 
-- **Single-tier host-RAM offload** (M1) — via `SpyreOffloadingSpec`. Same prefix-cache semantics as the upstream CPU spec on CUDA.
-- **Cross-instance shared host-RAM pool** (M2) — via `SpyreSharedOffloadingSpec`; on-node, memory-speed, no serialization.
-- **`tiering/fs` / `tiering/obj` secondary tiers as a deployment choice** — a user can stack upstream `TieringOffloadingSpec` + `tiering/{fs,obj}` on top of M1's `SpyreOffloadingSpec` via config if they want a disk/object tier. This RFC ships no Spyre-specific tiering spec for it (§2, §3.5): the intended fast tier is a future DMA-able, faster-than-DRAM CXL-class secondary memory pool (§6.4), served by M2's DMA path, not an fs/obj `SecondaryTierManager`. With matching `PYTHONHASHSEED`, two instances on a shared `root_dir` still cross-share via the upstream content-hashed `FileMapper`.
-- **LMCache connectors that route through the `OffloadingWorker` device↔host seam** — M1 alone is enough. LMCache ships several connector flavors, not all of which use this seam (some implement their own CUDA copy path); M1 supports the ones that do, and the others would need an LMCache-side change to swap their device↔host hop for `SpyreKvDmaCopier` (§11).
+**Ordering.** All three inspected tips fence the device on job entry, enqueue page copies with
+`non_blocking=True`, then synchronize once before reporting success. Job submission remains
+synchronous; this is not serving/transfer overlap or a native batched-descriptor API. M2 additionally
+quiesces and rolls back attempt-owned pages on failure; the other branches do not establish the same
+transactional failure recovery.
 
-Two caveats. Anything requiring async copy semantics (e.g. CUDA-graph-capturable transfers) does **not** drop in — the M1/M2 workers are synchronous today (§11 "Async DMA on Spyre"). And any connector that is *not* ours does not get the §6.6 canonicalization fix: a deployment selecting upstream `OffloadingConnector` directly (rather than `SpyreOffloadingConnector`) will fail in `register_kv_caches` on the paged layout. Composite connectors therefore need our connector as the device↔host leg.
+**Evidence and remaining gates.** `tests/kv_offload/` contains both-layout FP16 page/worker tests,
+M2 shared-manager and shared-worker tests, and an opt-in two-server cross-instance test. M3's secondary
+backend tests require explicit hardware setup and otherwise skip. The M2 branch's recorded manual
+run in `docs/superpowers/results/2026-09-30-spyre-shared-kv-manual-demo.md` reports a compiled one-pool
+A→A→B reuse demonstration; it is evidence from an earlier development state, not a rerun of these tips.
+No hardware tests were rerun for this RFC revision, and the offload suites do not establish FP8 reuse.
 
-## 9. Migration: from the prior PD prototype to upstream
+Prototype creation/last-handle cleanup and operator demo cleanup are **not** persistent control-plane
+management. Their local dependency pins and backend-specific selectors are not a stable public API.
+Persistent attach/detach-only serving, zero-attachment reuse, crash recovery and M2+M3 integration
+require the newer lifecycle and shared-backend work. §12 keeps those gates separate.
 
-For users currently running the prior standalone NIXL demo, the migration shape is:
+## 10. Open questions and resolved review points
 
-| Today (prior prototype) | After this RFC |
-|---|---|
-| Standalone `demo.py --role prefill/decode` | `vllm serve --kv-transfer-config '{"kv_connector":"OffloadingConnector",...}'` on each side |
-| Prototype's accessor driven directly from script | `SpyreKvDmaCopier` driven by the handler |
-| Custom NIXL connector module | Upstream `NixlConnector` does the cross-host hop after the device→host hop is in place |
-| Cross-instance sharing via custom router copies | Built-in via M2's shared host-RAM pool (on-node, memory-speed, no serialization). A shared-volume disk tier remains available as an upstream `tiering/fs` deployment choice if wanted. |
-| device addresses resolved from a compile-time descriptor | Same — until torch-spyre exposes a stable descriptor (filed separately) |
+1. **Dense page-copy API and physical accounting.** Settle the production tensor/page or range
+   interface, supported layouts, authoritative byte extents and scheduler/worker capacity agreement.
+   The whole-allocation pool call cannot simply be applied to a dense-page view.
+2. **Canonicalization — corrected premise.** Dense K/V fields replace the old paged-list assumption.
+   Retain the small adapter until upstream ingestion and its storage view are fully qualified on
+   Spyre. The exact pin implements a storage-offset `set_` overload; do not describe all `set_` as
+   unsupported.
+3. **Parallelism.** Current Spyre supports TP beyond the old TP=2-only statement; DP>1 and PP>1 are
+   rejected. Offload still needs per-rank slice, identity, capacity and all-worker publication tests.
+   Do not infer those guarantees from ordinary model TP support.
+4. **Block-count alignment — resolved/removed.** `allocate_spyre_kv_caches` uses the configured block
+   count unchanged. There is no hidden multiple-of-64 block-count slack to expose on the host tier.
+   Physical padding and offload chunk factors still need validation.
+5. **FP8.** Qualify raw E4M3 page copies, physical slot geometry and scale compatibility. Reject
+   unsupported combinations rather than assuming success from model-dtype tests.
+6. **Persistent lifecycle and crash recovery.** Finalize delegator/binding integration and safe recovery
+   from abandoned reservations or non-robust slot locks without recycling live DMA storage.
+7. **Upstream maintenance.** Keep constructor/registration/metrics tests at the pinned vLLM tag. An
+   eventual upstream canonicalization hook could reduce the connector subclass, but it is not needed
+   to begin implementation.
 
-The PD-disaggregation half of the prior prototype (custom NIXL connector and `CpuBufferManager`) is out of scope for this RFC — see §11 for the follow-up plan.
+## 11. Out of scope and follow-ups
 
-## 10. Open questions
-
-1. **Device↔host primitive — the byte-exact raw copy is still pending.** A *converting* copy entrypoint (`torch_spyre._C.copy_tensor`) is bound in the current pinned torch-spyre commit and routes through `SpyreStream::copyAsync`. But for KV data it is **not** the primitive M1 needs: the converting path re-encodes fp16 through the device representation and drifts ~1 ULP on about half of the values (§4/§6.1), which is a correctness defect for a KV tier. M1 (and M2) require the **byte-exact raw copy** `copy_tensor_raw`, which reproduces the device page's bytes exactly with no dtype/layout conversion and lets the runtime own the copy size. That raw primitive is **not in the current pinned build** — it is the external prerequisite both milestones are gated on. The open item is landing the byte-exact raw copy, not the converting copy that merely exists.
-2. ~~**`OffloadingConnectorWorker` device assertions.**~~ **Resolved — and worse than an `.is_cuda` assert.** The worker path does not merely assert device type; it canonicalizes each layer to a single contiguous storage (`assert isinstance(layer_kv_cache, torch.Tensor)` then `.set_(untyped_storage())`), which the Spyre paged-list layout fails outright. The fix is **not** a one-liner upstream: we ship our own connector via the public `kv_connector_module_path` and override `register_kv_caches` (§3.1, §6.6). No upstream change required.
-3. **TP > 1.** `SpyreCommunicator` currently only supports TP=2. The connector handler operates per-rank, so TP>1 should be transparent, but we should verify the `kv_caches` dict the worker hands us at TP=2 contains exactly the local-rank slice. (It does on CUDA; we expect the same on Spyre because both go through the same upstream allocator.)
-4. **Block alignment.** Spyre's `_allocate_kv_cache_tensors` rounds `num_blocks` up to a multiple of 64 (`spyre_model_runner.py:336`). The upstream `block_size_factor` machinery assumes the GPU/device block count and the offloaded block count are integer-related, which holds, but the alignment slack means a few blocks at the end are unusable. We should document this in the spec and not try to "use" the alignment slack on the host side.
-5. ~~**`SpyreOffloadingSpec` parent class.**~~ **Resolved: subclass `OffloadingSpec` directly.** Subclassing `CPUOffloadingSpec` is not viable — its `get_worker` raises for non-CUDA/XPU platforms *before* reaching the overridable `create_worker()` hook, so a subclass inherits the gate with no way to remove it (§3.3, §5.1). Post-`0.26` upstream adds a second gate via `_uses_shared_region()` (§3.6). The cost is re-implementing the `num_blocks`-from-`cpu_bytes_to_use` math (~30 lines), which we want anyway so `slot_bytes` derives from the device page's physical size rather than `numel × itemsize`. M2's `SpyreSharedOffloadingSpec` subclasses the M1 spec, so this cascades.
-6. **Host pool for M1 vs M2.** Both milestones offload into a `SharedHostPool` slot — the canonical `copy_tensor_raw(dev, pool, slot_id, ...)` has no host-tensor form (§6.7), so there is no `torch.empty` host-page path on either. M1 attaches a **single-process** pool with no directory (the direction handler assigns `slot_id` from the block index); M2 attaches a **named cross-instance** pool plus a `SharedHostMetadata` directory that maps content hash → `slot_id` (§6.7–6.8). The worker's `pool` / `directory` parameters (§6.2) are the seam; M1 leaves `directory=None`. The plugin holds no host pointers or device addresses — pinning is internal to the pool.
-
-7. **Upstream drift on the `register_kv_caches` override (§6.6).** Our connector-worker subclass reimplements a method whose internals upstream is actively changing — it relocated between our pin and `main`, and its constructor gained a `vllm_config` positional arg (§3.6). Open: how much of the canonicalization we can share vs. reimplement, and whether upstream would accept a paged-layout hook (a `_canonicalize()` seam, or accepting `list[torch.Tensor]` in the `AttentionSpec` branch) so the subclass can be deleted. Mitigation until then: the adapter lives in one function, the constructor forwards `*args/**kwargs`, and `test_canonicalize_paged.py` fails loudly on signature drift (§7).
-
-## 11. Out of scope (filed as follow-ups)
-
-- **Upstream a paged-KV-layout hook so `SpyreOffloadingConnector` can be deleted.** The §6.6 override exists only because upstream canonicalization assumes one contiguous storage per layer. A small upstream seam — a `_canonicalize()` override point, or honoring the already-declared `list[torch.Tensor]` in the type signature — would let us drop the connector subclass and use upstream `OffloadingConnector` with just our spec. Worth proposing once M1 is working and we can point at a concrete, tested consumer.
-- **Public Spyre device↔host primitive for third-party connectors.** Promote `spyre_inference.v1.kv_offload.copier.SpyreKvDmaCopier` to a stable, documented import surface so out-of-tree connectors that today target CUDA's `swap_blocks_batch` / `cudaMemcpy` can swap their device↔host hop for Spyre by importing one symbol. M1 builds the primitive; a later commit stabilizes its API and documents it. (Raised by [@yuezhu1](https://github.com/yuezhu1). Note: cross-instance *sharing* of the host pool is now a first-class milestone — see M2 in §2 / §6.7–6.8 — which is distinct from this connector-reuse item; the raw-copy primitive M2 adds is the natural thing to stabilize here.)
-- **Direct device ↔ filesystem / object store.** Would need a Spyre-side analogue of NVIDIA GDS so a secondary tier can read/write device memory without a host bounce. Requires both a torch-spyre primitive and a contract change to upstream's `SecondaryTierManager` (which today takes a `primary_kv_view: memoryview` over CPU memory). Tracked separately. (Raised by [@yuezhu1](https://github.com/yuezhu1).)
-- **PD disaggregation on Spyre.** Standalone RFC, builds on M1. Every component PD needs *except* the cross-host transport is delivered by M1 — the follow-up is purely about wiring a NIXL agent into the upstream PD producer/consumer connectors. The prior prototype's NIXL connector and `CpuBufferManager` get two *hosts* exchanging CPU tensors over the network; M1 makes the device→host hop stand on its own, so that NIXL adapter can be lifted into a PD-specific RFC without re-doing the device-side work.
-- **Async DMA on Spyre.** Depends on torch-spyre exposing a stream/event API. Until then, the synchronous handler is fine for offload/prefetch but precludes overlap with compute.
-- **Stable on-device KV descriptor.** Depends on torch-spyre. The M1/M2 raw copy operates on `at::Tensor` allocations directly (no explicit device-address addressing in Python). Filed separately for the future case where a Spyre-side direct-storage path needs a descriptor independent of an allocated tensor.
-- **Authoring a new secondary tier.** Anything that does not slot into an existing `SecondaryTierManager` (e.g. a Spyre-to-Spyre direct fabric tier) is a separate design, not a milestone of this RFC.
+- Upstream a general cache-ingestion hook once the dense adapter has a tested consumer.
+- Stabilize a public copier API for third-party connectors after the raw-page contract is qualified.
+- Integrate filesystem/object tiers with a suitable primary-memory interface.
+- Design cross-host PD disaggregation and any direct device-to-storage path separately.
+- Qualify compute/copy overlap and batched/asynchronous execution without weakening completion,
+  page lifetime or slot-lock ownership.
+- Add multi-chunk raw-page support and cross-topology canonical formats only with explicit layout
+  descriptors and validation; never persist process-local device addresses.
+- Define multi-pool placement or migration policy separately. Selecting secondary memory does not
+  imply automatic tiering.
 
 ## 12. Acceptance criteria
 
-Each milestone's acceptance is a literal `vllm serve` invocation a deployment engineer can run, plus the observable behavior that confirms it works.
+These are implementation gates, **not test results for this docs-only PR**. Hardware tests must run
+sequentially on a contested accelerator; independent serving processes can be exercised in sequence
+for restart/reuse tests. Concurrent device tests require separately assigned hardware.
 
 ### M1 acceptance
 
-**A1.1 — single-tier host-RAM offload runs end-to-end.**
-
-```bash
-vllm serve <model> --kv-transfer-config '{
-  "kv_connector": "SpyreOffloadingConnector",
-  "kv_connector_module_path": "spyre_inference.v1.kv_offload.connector",
-  "kv_role": "kv_both",
-  "kv_connector_extra_config": {
-    "spec_name": "SpyreOffloadingSpec",
-    "spec_module_path": "spyre_inference.v1.kv_offload.spec",
-    "cpu_bytes_to_use": 8000000000,
-    "lazy_offload": true
-  }
-}'
-```
-
-- [ ] Server boots. `register_kv_caches` is reached on the Spyre worker and completes **without raising** — i.e. our paged-list adapter (§6.6) produced a valid `CanonicalKVCaches` from `SpyrePagedKVCache`. Selecting upstream `OffloadingConnector` here instead is expected to fail; that negative case is asserted in A1.3.
-- [ ] `SpyreOffloadingSpec` instantiates on the OOT Spyre platform — confirming no `is_cuda_alike()`/`is_xpu()` gate was inherited (§3.3).
-- [ ] A two-prompt sweep where the second prompt extends the first by ≥256 tokens reports a host-tier hit on the second prompt. Concretely: the worker log emits `OffloadingConnectorWorker: loading N blocks from host` (or the same `kv_offload_blocks_loaded` counter exposed by `OffloadingConnectorScheduler.get_metrics()` in v0.22, depending on which interface the deployment scrapes) with `N > 0`. Either source is sufficient — pick one in the test harness.
-- [ ] With `temperature=0`, generated tokens for both prompts are byte-identical to a baseline run with the same model and `--kv-transfer-config` omitted. (No tolerance — `temperature=0` is deterministic.)
-
-**A1.2 — plugin-side test suite green.**
-
-- [ ] `pytest spyre_inference/tests/v1/kv_offload/test_copier_round_trip.py` passes on a Spyre runner.
-- [ ] `pytest spyre_inference/tests/v1/kv_offload/test_spec_registration.py`, `test_worker_dispatch.py`, and `test_canonicalize_paged.py` pass on CPU-only runners.
-
-**A1.3 — no plugin-platform-side regressions.**
-
-- [ ] **No upstream vLLM patch required.** M1 lands using only the public `spec_module_path` and `kv_connector_module_path` seams (§3.4). Verified by the M1 PR touching no vendored/patched vLLM source.
-- [ ] No source changes required to `TorchSpyreWorker` or `TorchSpyrePlatform`, and none to the model runner's KV allocation. Verified by inspecting the M1 PR diff: `spyre_inference/v1/worker/` and `spyre_inference/platform.py` are unchanged. **Note:** this is *not* a claim that no plugin code is needed — M1 necessarily adds a connector subclass that overrides `register_kv_caches` (§6.6), because upstream canonicalization rejects the Spyre paged-list layout. The criterion is that the *platform and worker* stay untouched, not that the plugin adds nothing.
-- [ ] **Negative control:** the same serve command with `"kv_connector": "OffloadingConnector"` (upstream, no `kv_connector_module_path`) fails in `register_kv_caches`. This documents *why* our connector exists; if it unexpectedly succeeds, upstream has relaxed the layout assumption and §6.6 can likely be deleted (§11).
-- [ ] The existing Spyre platform/worker test suite (`pytest spyre_inference/tests/ -k 'not kv_offload'`) passes both with `SpyreOffloadingSpec` registered (M1 default after `spyre_inference` is imported) and with the connector unselected (no `--kv-transfer-config`). Same suite, two configs, both green — confirms registration alone has no effect when the connector isn't selected.
-- [ ] `bash format.sh` clean. (`format.sh` at the repo root is this repo's lint wrapper around `uvx prek`; runs `--all-files` if no arg is given.)
+- [ ] The §6.5 serve configuration boots with matching dependency builds. The Spyre connector worker
+  is actually selected, caches are registered, and transfer hooks/output/shutdown are reached.
+- [ ] Mock-safe tests cover spec loading, constructor/API drift, manager metrics, dense K/V identity,
+  shared-layer aliases, selected groups, per-layer geometry and chunk-factor dispatch. The adapter
+  does not call `untyped_storage().set_()` or copy the device cache to a new buffer.
+- [ ] A known-pattern raw page is stored and restored into another page byte-for-byte. Cover both
+  head-major and token-major model-dtype layouts, first/middle/last pages, nonzero view offsets,
+  padding, multiple K/V heads and adjacent-page canaries. Unsupported extents fail before DMA.
+- [ ] Store ordering is tested with pending KV writes; load ordering is tested before attention reads.
+  Failure/cancellation, preemption, waits and shutdown do not publish or reuse unfinished transfers.
+- [ ] Force device-cache eviction or otherwise rule out a device-only prefix hit. A subsequent request
+  records completed offload/load jobs with nonzero blocks and reuses the host prefix. Do not rely on
+  a guessed log string or an obsolete metric name as evidence.
+- [ ] With the same model, precision, topology, execution mode and deterministic settings, greedy
+  tokens match a no-offload baseline. Raw-byte tests remain the transport correctness test; greedy
+  equality alone is not enough.
+- [ ] No-connector serving remains unchanged; no upstream vLLM source patch is needed. Runner wiring
+  changes are allowed and tested. Stock-connector behavior is a diagnostic, not a mandated failure
+  if future upstream support improves.
 
 ### M2 acceptance
 
-M2 is gated on the §6.7 external dependencies (the hardware runtime's raw-copy primitive and its
-torch-spyre bindings — `copy_tensor_raw`, `SharedHostPool`, `SharedHostMetadata`), which are **not
-present in the current pinned build**. Acceptance below assumes those have landed on the pinned dev
-image.
+- [ ] Two compatible instances resolve the same named pair, use a shared allocator, and validate the
+  full compatibility descriptor. A peer's first request finds a previously published chunk; no
+  peer-side prefix recomputation, file/object-store hop or private-cache warmup is mistaken for reuse.
+- [ ] Each page becomes valid only after its copy completes; logical hits require the complete pinned
+  component set, including every required rank. Duplicate writers, capacity exhaustion, eviction and
+  stale generations cannot turn a partially published set into a logical hit.
+- [ ] A reader holds generation-checked protection through DMA; an evictor cannot recycle its slot.
+  Stale/reserved entries are rejected before DMA. Incompatible layout/dtype/scale/rank attachments
+  fail instead of reusing equal-sized bytes.
+- [ ] Bindings release the GIL when blocking; slot-lock release occurs on the acquiring thread;
+  backing survives dropped Python references while a copy is pending.
+- [ ] M1 still works, and importing the plugin without selecting offload does not require optional
+  shared-pool APIs.
 
-**A2.1 — cross-instance shared-pool hit runs end-to-end.**
+### M3 acceptance
 
-```bash
-# Two instances on the same host, same shared pool (name/num_slots/slot_bytes/max_chunks).
-vllm serve <model> --kv-transfer-config '{
-  "kv_connector": "SpyreOffloadingConnector",
-  "kv_connector_module_path": "spyre_inference.v1.kv_offload.connector",
-  "kv_role": "kv_both",
-  "kv_connector_extra_config": {
-    "spec_name": "SpyreSharedOffloadingSpec",
-    "cpu_bytes_to_use": 8000000000,
-    "shared_pool": {"name": "/kv.<model-id>", "num_slots": 4096, "slot_bytes": 262144, "max_chunks": 1}
-  }
-}'
-```
+- [ ] Repeat raw round-trip and end-to-end offload/reload tests using a secondary-memory data pool and
+  the same host-resident metadata protocol. Verify the selected backend was actually used; no silent
+  host-memory fallback.
+- [ ] Invalid provider/backing identity, insufficient slot capacity and unsupported physical ranges
+  fail safely. Backing ownership lasts through DMA completion.
+- [ ] M1 and M2 remain functional; adding the backend does not introduce automatic spill or migration.
 
-- [ ] Both instances boot; each attaches the same `shared_pool` (`SharedHostPool.create_or_attach`) and
-      the same `SharedHostMetadata` directory. Pinning is internal to the pool — the plugin passes no
-      host pointer and does no per-transfer registration.
-- [ ] Instance A serves a prompt (offloads its prefix into the shared pool: `claim` a `slot_id`, D2H
-      `copy_tensor_raw`, `publish`). Instance B, started with the same `shared_pool`, serves a prompt
-      sharing the first ≥256 tokens and reports a host-tier hit **on its first request** (no warmup on
-      B) — B `lookup`s the same content hash, gets the `slot_id`, and reloads via H2D `copy_tensor_raw`,
-      not recompute and not disk.
-- [ ] With `temperature=0`, B's tokens are byte-identical to a no-cache baseline.
+### FP8 acceptance, for each enabled offload backend
 
-**A2.2 — copy correctness and torn-read safety.**
+- [ ] Head-major E4M3 pages round-trip byte-exactly with physical extent/alignment-derived slot sizes,
+  adjacent-slot canaries, nonzero page offsets and representative head/block geometries.
+- [ ] FP8-aware offload tokens match an **FP8 no-offload baseline**, not an FP16 model baseline.
+  Shared instances establish identical resolved K/V scales and encoding.
+- [ ] Token-major FP8 and any unqualified copy/backend combination are rejected explicitly.
 
-- [ ] Byte-exact round-trip: a device KV page snapshotted D2H into a pool slot and restored H2D into a
-      different same-`(shape,dtype)` page reproduces the pattern **byte-for-byte** (`copy_tensor_raw` is
-      byte-exact; the converting `copy_tensor` would drift ~1 ULP and is not used). The runtime owns the
-      copy size (the padded/tiled physical size, not `numel*itemsize`).
-- [ ] Torn-read safety: while a reader copies a slot, the owner evicts and re-DMAs it; assert no torn
-      read is consumed — the `SharedHostMetadata` publish gate plus its generation/concurrency check
-      means a stale or mid-write slot degrades to a **cache miss, never torn bytes**, under concurrent
-      multi-instance load. This is owned by the runtime directory, not the plugin.
-- [ ] Sequencing under the GIL: the connector composes `claim`→D2H→`publish` / `lookup`→H2D across
-      separate binding calls and holds **no** lock across the sequence (no combined `claim_dma_publish`);
-      a directory op or blocking `copy_tensor_raw` that stalls on a peer's lock does **not** block this
-      process's other Python threads — the torch-spyre bindings release the GIL while blocked in the
-      runtime (verified against the torch-spyre surface).
+### Persistent lifecycle acceptance, for both shared memory kinds
 
-**A2.3 — no regression, dependency honesty.**
-
-- [ ] The M1 (`SpyreOffloadingSpec`) path is unaffected; `pytest spyre_inference/tests/v1/kv_offload/` green.
-- [ ] `SpyreSharedOffloadingSpec` registration is inert when not selected (importing `spyre_inference`
-      on a build without the M2 torch-spyre surface must not error — the spec import is lazy via the
-      factory, as in §3.4).
-- [ ] `SpyreSharedOffloadingSpec` reuses M1's `SpyreOffloadingWorker` / `SpyreKvDmaCopier`
-      device↔host path unchanged — the only difference from M1 is the pool is a named cross-instance
-      `SharedHostPool` with a `SharedHostMetadata` directory, not M1's single-process pool. Both
-      offload into a slot named by integer `slot_id`; the plugin holds no host pointers or device
-      addresses.
+- [ ] Provision through the delegator; serving processes only attach/detach. Configuration/env/default
+  naming precedence is resolved once and propagated, with invalid/empty names rejected.
+- [ ] A publishes a prefix, all serving attachments exit, then B attaches and reuses it. `reset_cache`,
+  normal shutdown and rolling restart do not delete published shared entries.
+- [ ] Old descriptors fail after explicit destroy/recreate. A destroy while attached or while dependent
+  DMA is retained returns busy without destroying the live pool.
+- [ ] Delegator restart and interrupted create/destroy recover correctly. Existing attachments survive
+  delegator unavailability; a new client cannot create a replacement on its own.
+- [ ] Crash recovery does not reset non-robust slot locks or reuse storage based only on a timeout/PID
+  check. Unprovable quiescence fails unavailable pending coordinated recovery.
 
 ## 13. References
 
-- Upstream `OffloadingConnector`: `vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`
-- Upstream `OffloadingSpec`: `vllm/v1/kv_offload/base.py:319`
-- Upstream CPU spec (CUDA-only today): `vllm/v1/kv_offload/cpu/spec.py`
-- Upstream factory: `vllm/v1/kv_offload/factory.py:21`
-- Upstream tiering framework (PR #40020, merged 2026-05-13): `vllm/v1/kv_offload/tiering/{base,manager,spec,factory}.py`
-- Upstream FS secondary tier (PR #41735, merged 2026-05-24): `vllm/v1/kv_offload/tiering/fs/manager.py`
-- Upstream object-store secondary tier (PR #41968, merged 2026-06-05): `vllm/v1/kv_offload/tiering/obj/`
-- Upstream `SharedOffloadRegion`: `vllm/v1/kv_offload/cpu/shared_offload_region.py`
-- Upstream `FileMapper` (content-hashed paths): `vllm/v1/kv_offload/file_mapper.py`
-- Upstream `OffloadingConnector` user-facing usage guide (single- and multi-tier): [vllm-project/vllm#44415](https://github.com/vllm-project/vllm/pull/44415) — adds `docs/features/kv_offloading_usage.md`, the canonical end-user reference for the M1 offload shape (and for the optional upstream fs/obj tiering a deployment may still stack on top).
-- Prior llm-d shape (historical context, see §3.5): [`llm-d/llm-d-kv-cache`](https://github.com/llm-d/llm-d-kv-cache) — `llmd_fs_backend` / `SharedStorageOffloadingSpec`. Not targeted by this RFC; included for readers migrating from existing llm-d v0.8 deployments.
-- Spyre KV allocation today: `spyre_inference/v1/worker/spyre_model_runner.py:322–368`
-- **M2 lower layers (external prerequisites, not yet in the pinned build):**
-    - Spyre runtime shared host KV pool design — the layer that actually owns the mechanism: the `copyRaw` byte-exact raw DMA, `SharedHostPool` (DMA-able slot pool, pinned once per IOMMU Function), and `SharedHostMetadata` (the block-hash→slot directory + per-slot rwlock/`generation` concurrency protocol). The raw-copy *body* lives here, in the Spyre runtime — not in torch-spyre.
-    - torch-spyre KV-offload Python-surface design (`torch-spyre:docs/source/architecture/raw_copy_kv_offload.md`) — the thin `torch_spyre._C` bindings over the Spyre runtime objects: `copy_tensor_raw(dev_tensor, pool, slot_id, to_device, ...)`, `get_composite_address` (the one tensor-aware step), `get_dma_stream`, and pybind passthroughs of `SharedHostPool` / `SharedHostMetadata`. The binding seam is the integer `slot_id`; raw host pointers never cross into Python, and there is deliberately **no** host-buffer-registration binding (pinning is internal to the pool). This supersedes the earlier torch-spyre-only raw-copy design (torch-spyre PR #2796 / issue #2744), which put the raw-copy body and an explicit `register_dmable_host_buffer` in torch-spyre; the copy body is now the Spyre runtime's `copyRaw` and torch-spyre keeps only the accessors + bindings.
+**Main-branch source at the version basis in §3:**
+
+- `spyre_inference/v1/attention/backends/spyre_attn.py`: `SpyrePagedKVCache`, model-dtype allocation,
+  FP8 eligibility checks.
+- `spyre_inference/v1/attention/backends/spyre_head_major_attn.py`: default cache shape, E4M3 allocation
+  and per-layer scale usage.
+- `spyre_inference/v1/worker/kv_cache_setup.py`: `allocate_spyre_kv_caches`.
+- `spyre_inference/envs.py`: head-major default and token-major override.
+
+**vLLM [v0.32.0](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be):**
+
+- `vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`: connector construction.
+- `vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py`: registration/canonicalization.
+- `vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py`: offloading configuration.
+- `vllm/v1/kv_offload/{base,config,factory}.py`: worker/spec/manager and dynamic-loading contracts.
+- `vllm/v1/kv_offload/cpu/{spec,manager,gpu_worker,shared_offload_region}.py`: CPU reference path.
+- `vllm/v1/kv_offload/tiering/spec.py`: CPU-primary-tier dependency.
+
+**torch-spyre [pinned source](https://github.com/torch-spyre/torch-spyre/tree/64870622fc39cda7e344a271decb901e7088c6c6):**
+
+- `torch_spyre/csrc/spyre_mem.cpp`: `spyre_set_storage`, converting copies and allocation metadata.
+- `torch_spyre/csrc/spyre_views.cpp`: Spyre-aware view metadata propagation.
+- `torch_spyre/csrc/module.cpp`: exported Python bindings.
+
+**Development evidence and design dependencies:**
+
+- Fork branches `kvc-offload-m1`, `kvc-offload-m2`, `kvc-offload-m3`: instance-local host offload,
+  cross-instance host sharing, and the secondary-memory end-to-end prototype, respectively.
+- Device-runtime shared-pool and raw-copy contracts: slot-addressed host/secondary-memory pools,
+  matching per-pool metadata, physical copy geometry and slot concurrency.
+- Persistent shared-pool lifecycle contract: delegator-managed provisioning/destruction and
+  attach/detach-only serving. This supersedes creator/last-detacher destruction in earlier sketches.

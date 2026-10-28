@@ -1,44 +1,39 @@
-%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
 flowchart TB
-
-    subgraph vllm["<b>vllm</b> (upstream — unchanged)"]
-        direction TB
-        Factory["OffloadingSpecFactory<br/>.create_spec(spec_name=&quot;SpyreOffloadingSpec&quot;,<br/>spec_module_path=&quot;spyre_inference.kv_offload.spec&quot;)"]
-        KVFactory["KVConnectorFactory<br/>(kv_connector_module_path)"]
-        Mgr["CPUOffloadingManager<br/><i>reused verbatim — cache policy,<br/>admission, LRU eviction, hit/miss</i>"]
-        Sched["OffloadingConnectorScheduler"]
+    subgraph upstream["vLLM 0.32 — reused contracts"]
+        factories["KVConnectorFactory / OffloadingSpecFactory<br/>Public module-path configuration"]
+        scheduler["OffloadingConnectorScheduler"]
     end
-
-    subgraph spyre["<b>spyre-inference</b> (new code — this RFC)"]
-        direction TB
-        Conn["<b>SpyreOffloadingConnector</b><br/>subclasses OffloadingConnector"]
-        CWorker["<b>SpyreOffloadingConnectorWorker</b><br/>overrides register_kv_caches ONLY:<br/>SpyrePagedKVCache → CanonicalKVCaches<br/>(no untyped_storage / .set_)<br/>then inherited _init_worker()"]
-        Spec["<b>SpyreOffloadingSpec</b><br/>subclasses OffloadingSpec <i>directly</i><br/>(so no is_cuda_alike / is_xpu gate)"]
-        Worker["<b>SpyreOffloadingWorker(OffloadingWorker)</b><br/>submit_store / submit_load / get_finished / wait"]
-        D2H["_SpyreDirectionHandler (store)<br/>device page → host slot"]
-        H2D["_SpyreDirectionHandler (load)<br/>host slot → device page"]
-        Copier["<b>SpyreKvDmaCopier</b><br/>byte-exact; addresses a pool slot by integer slot_id"]
-        Backend["<b>torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)</b><br/>→ hardware-runtime raw DMA<br/>(no dtype/layout conversion)"]
-
-        Conn --> CWorker
-        Spec -- "get_worker(CanonicalKVCaches)" --> Worker
-        Worker --> D2H
-        Worker --> H2D
-        D2H --> Copier
-        H2D --> Copier
-        Copier --> Backend
+    subgraph plugin["spyre-inference — connector integration"]
+        connector["SpyreOffloadingConnector<br/>Explicitly installs Spyre connector worker"]
+        runner["Model runner<br/>Register dense K/V; transfer hooks and output"]
+        adapter["Dense-cache adapter<br/>Typed K/V refs; original allocations retained"]
+        worker["Spyre transfer worker<br/>Store / load / completion / shutdown"]
+        runner -->|register caches| adapter
+        connector -->|worker-side ingestion| adapter
+        adapter -->|spec.get_worker| worker
     end
+    subgraph policy["Scheduler-side policy"]
+        local["M1: CPUOffloadingManager<br/>Instance-local ownership"]
+        shared["M2/M3 target: shared manager<br/>Shared claims; complete pinned lookup"]
+    end
+    subgraph runtime["torch-spyre + device runtime"]
+        copy["Validated raw page copy<br/>Fence producers → copy pages → wait"]
+        pools["Slot-addressed data pool<br/>Host memory OR secondary memory"]
+        copy -->|byte-exact; no format conversion| pools
+    end
+    factories -->|connector selection| connector
+    scheduler -->|local spec| local
+    scheduler -->|shared spec| shared
+    worker -->|tensor + page identity + pool/slot| copy
+    shared -.->|shared-directory locations| pools
 
-    KVFactory -. "resolves to" .-> Conn
-    Factory -. "resolves to" .-> Spec
-    CWorker -- "_init_worker → spec.get_worker" --> Spec
-    Spec -- "get_manager()" --> Mgr
-    Sched --> Mgr
-
-    classDef upstream fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
-    classDef plugin fill:#fff4e6,stroke:#c1620a,color:#3a2300
-    classDef hot fill:#ffe4e1,stroke:#a83232,color:#3a0000
-
-    class Factory,KVFactory,Mgr,Sched upstream
-    class Conn,CWorker,Spec,Worker,D2H,H2D plugin
-    class Copier,Backend hot
+    classDef base fill:#37474f,stroke:#263238,color:#ffffff
+    classDef spyre fill:#2e7d32,stroke:#1b5e20,color:#ffffff
+    classDef device fill:#1565c0,stroke:#0d47a1,color:#ffffff
+    class factories,scheduler,local base
+    class connector,runner,adapter,worker,shared spyre
+    class copy,pools device
+    style upstream fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style plugin fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style policy fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style runtime fill:#e0e0e0,stroke:#9e9e9e,color:#212121

@@ -1,42 +1,43 @@
 direction: down
-
-vllm: vllm (upstream - unchanged) {
-  style.fill: "#eef5ff"
-  style.stroke: "#3b6fb3"
-  Factory: "OffloadingSpecFactory\n.create_spec(spec_name=\"SpyreOffloadingSpec\",\nspec_module_path=\"spyre_inference.kv_offload.spec\")"
-  KVFactory: "KVConnectorFactory\n(kv_connector_module_path)"
-  Mgr: "CPUOffloadingManager\nreused verbatim - cache policy, admission, LRU eviction, hit/miss"
-  Sched: OffloadingConnectorScheduler
-  Sched -> Mgr
+classes: {
+  upstream: {style: {fill: "#37474f"; stroke: "#263238"; font-color: "#ffffff"}}
+  plugin: {style: {fill: "#2e7d32"; stroke: "#1b5e20"; font-color: "#ffffff"; bold: true}}
+  device: {style: {fill: "#1565c0"; stroke: "#0d47a1"; font-color: "#ffffff"}}
+  container: {style: {fill: "#e0e0e0"; stroke: "#9e9e9e"; font-color: "#212121"}}
 }
 
-spyre: spyre-inference (new code - this RFC) {
-  style.fill: "#fff4e6"
-  style.stroke: "#c1620a"
-  Conn: "SpyreOffloadingConnector\nsubclasses OffloadingConnector"
-  CWorker: "SpyreOffloadingConnectorWorker\noverrides register_kv_caches ONLY:\nSpyrePagedKVCache -> CanonicalKVCaches\n(no untyped_storage / .set_)\nthen inherited _init_worker()"
-  Spec: "SpyreOffloadingSpec\nsubclasses OffloadingSpec directly\n(so no is_cuda_alike / is_xpu gate)"
-  Worker: "SpyreOffloadingWorker(OffloadingWorker)\nsubmit_store / submit_load / get_finished / wait"
-  D2H: "_SpyreDirectionHandler (store: device page -> host slot)"
-  H2D: "_SpyreDirectionHandler (load: host slot -> device page)"
-  Copier: "SpyreKvDmaCopier\nbyte-exact; addresses a pool slot by integer slot_id" {
-    style.fill: "#ffe4e1"
-    style.stroke: "#a83232"
-  }
-  Backend: "torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)\nhardware-runtime raw DMA (no dtype/layout conversion)" {
-    style.fill: "#ffe4e1"
-    style.stroke: "#a83232"
-  }
-  Conn -> CWorker
-  Spec -> Worker: "get_worker(CanonicalKVCaches)"
-  Worker -> D2H
-  Worker -> H2D
-  D2H -> Copier
-  H2D -> Copier
-  Copier -> Backend
+upstream: "vLLM 0.32 — reused contracts" {
+  class: container
+  factories: "KVConnectorFactory / OffloadingSpecFactory\nPublic module-path configuration" {class: upstream}
+  scheduler: "OffloadingConnectorScheduler" {class: upstream}
 }
 
-vllm.KVFactory -> spyre.Conn: "resolves to" { style.stroke-dash: 3 }
-vllm.Factory -> spyre.Spec: "resolves to" { style.stroke-dash: 3 }
-spyre.CWorker -> spyre.Spec: "_init_worker -> spec.get_worker"
-spyre.Spec -> vllm.Mgr: "get_manager()"
+plugin: "spyre-inference — connector integration" {
+  class: container
+  connector: "SpyreOffloadingConnector\nExplicitly installs Spyre connector worker" {class: plugin}
+  runner: "Model runner\nRegister dense K/V; transfer hooks and output" {class: plugin}
+  adapter: "Dense-cache adapter\nTyped K/V refs; original allocations retained" {class: plugin}
+  worker: "Spyre transfer worker\nStore / load / completion / shutdown" {class: plugin}
+  runner -> adapter: "register caches"
+  connector -> adapter: "worker-side ingestion"
+  adapter -> worker: "spec.get_worker"
+}
+
+policy: "Scheduler-side policy" {
+  class: container
+  local: "M1: CPUOffloadingManager\nInstance-local ownership" {class: upstream}
+  shared: "M2/M3 target: shared manager\nShared claims; complete pinned lookup" {class: plugin}
+}
+
+runtime: "torch-spyre + device runtime" {
+  class: container
+  copy: "Validated raw page copy\nFence producers → copy pages → wait" {class: device}
+  pools: "Slot-addressed data pool\nHost memory OR secondary memory" {class: device}
+  copy -> pools: "byte-exact; no format conversion"
+}
+
+upstream.factories -> plugin.connector: "connector selection"
+upstream.scheduler -> policy.local: "local spec"
+upstream.scheduler -> policy.shared: "shared spec"
+plugin.worker -> runtime.copy: "tensor + page identity + pool/slot"
+policy.shared -> runtime.pools: "shared-directory locations" {style.stroke-dash: 3}

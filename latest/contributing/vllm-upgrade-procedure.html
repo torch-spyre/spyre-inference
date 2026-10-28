@@ -2399,12 +2399,22 @@ are missing.</p>
 <td>Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors.</td>
 </tr>
 <tr>
+<td><code>spyre_inference/v1/spec_decode/{xpress_head,checkpoint}.py</code></td>
+<td><code>vllm/model_executor/models/{qwen3_xpress,qwen3_dflash}.py</code></td>
+<td>Temporary compatibility for vllm#54448 (<code>ce9467b757</code>), which postdates 0.32.0. Replace with upstream XPress model/head subclasses when available, retaining the Spyre overrides.</td>
+</tr>
+<tr>
 <td>The sampler patch in <code>TorchSpyreModelRunner.__init__</code></td>
 <td><code>Sampler</code> (<code>vllm/v1/sample/sampler.py</code>), its construction and <code>RejectionSampler(self.sampler)</code> (<code>vllm/v1/worker/gpu_model_runner.py</code>)</td>
 <td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>
 </tr>
 </tbody>
 </table>
+<p><code>tests/spec_decode/test_xpress_vendored.py</code> deliberately fails if the new vLLM
+ships the XPress module or registers either XPress architecture. Follow
+<a href="https://github.com/torch-spyre/spyre-inference/issues/1417">the cleanup issue</a>
+to migrate the temporary head, loader/config bridge and registrations before
+removing the canary. Keep the Spyre execution overrides and requalify the serving path.</p>
 <p>Diff the upstream side between the current pin and the target:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>&lt;vllm<span class="w"> </span>checkout&gt;<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>fetch<span class="w"> </span>--tags
 </span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>git<span class="w"> </span>diff<span class="w"> </span>v&lt;current&gt;<span class="w"> </span>v<span class="o">{</span>VERSION<span class="o">}</span><span class="w"> </span>--stat<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>

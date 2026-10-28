@@ -195,9 +195,6 @@ def _spyre_loader_supported(vllm_config) -> bool:
     """
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
-    tp_size = getattr(parallel_config, "tensor_parallel_size", 1) if parallel_config else 1
-    if tp_size != 1:
-        return False
     if model_config is None:
         return False
     if getattr(model_config, "quantization", None) is not None:

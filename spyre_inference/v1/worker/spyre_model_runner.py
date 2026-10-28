@@ -21,13 +21,14 @@ Data flow in the current WIP version:
 - self.device = CPU. Buffers and scatter ops stay on CPU.
 - _SpyreModelWrapper converts input_ids/positions to Spyre int64 at the
   model call boundary.
-- Generative: D2H hidden_states for logits/sampling. Pooling: keep on Spyre;
+- Generative: hidden_states stay on Spyre; the sampled rows are gathered and
+  projected there and only the logits D2H for sampling. Pooling: keep on Spyre;
   pooler D2Hs only the final pooled vectors in ``_pool``.
 - Embedding: Spyre int64 input → Spyre compute → float16 output on Spyre.
 - Hidden states flow on Spyre between decoder layers; attention, RoPE and the
   embedding gather run on-device too.
 - What stays on CPU is host-side bookkeeping: slot mapping, attention metadata
-  (index tables, mask tiles) built by the metadata builder, logits indexing and
+  (index tables, mask tiles) built by the metadata builder, the logits index and
   sampling, plus the few model-specific workarounds that route one op through the
   host (see ``spyre_inference.multimodal`` and ``spyre_inference.models``).
 """
@@ -115,6 +116,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     expand_packed_token_types,
     group_width_caps,
     logits_row_buckets,
+    next_bucket,
 )
 
 if TYPE_CHECKING:
@@ -324,12 +326,9 @@ class _SpyreModelWrapper:
         self.device=CPU in the runner and buffer scatter ops run on CPU.
         Convert them to int64 and provide them to the model.
 
-    Output conversion (Spyre → CPU):
-        The model's final hidden_states come out on Spyre. Downstream
-        operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead: ``compute_logits``
-        below does the H2D of the sampled rows, SpyreLogitsProcessor the D2H of the
-        logits.
+    Output conversion:
+        Generative hidden_states stay on Spyre, so the sampled rows are gathered and
+        projected on-device and only the logits D2H.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -346,12 +345,15 @@ class _SpyreModelWrapper:
         *,
         model_dtype: torch.dtype,
         inputs_embeds_buffer: torch.Tensor | None = None,
+        sample_rows_on_device: bool = False,
         keep_aux_hidden_states_on_device: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_sample_rows_on_device", sample_rows_on_device)
+        object.__setattr__(self, "_sampled_rows", None)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
@@ -389,12 +391,16 @@ class _SpyreModelWrapper:
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
-        # Pooling: keep on Spyre. Generative: D2H for sampling.
+        # Device poolers keep their outputs; only generation opts into sampled-row gathering.
         if not self._keep_outputs_on_device:
             if self._keep_aux_hidden_states_on_device:
                 hidden_states, aux_hidden_states = result
                 result = (convert_tensor_tree(hidden_states, device="cpu"), aux_hidden_states)
-            else:
+            elif not (
+                self._sample_rows_on_device
+                and isinstance(result, torch.Tensor)
+                and result.device.type == "spyre"
+            ):
                 result = convert_tensor_tree(result, device="cpu")
 
         input_ids = kwargs_converted.get("input_ids")
@@ -409,29 +415,39 @@ class _SpyreModelWrapper:
     def _to_cpu(self, t):
         return convert(t, device="cpu") if isinstance(t, torch.Tensor) else t
 
+    def pad_sampled_rows(self, logits_indices: torch.Tensor) -> torch.Tensor:
+        """Pad the sampled-row index onto a warmed row bucket; ``compute_logits`` trims."""
+        num_rows = logits_indices.numel()
+        padded_rows = next_bucket(num_rows, self._logits_row_buckets)
+        object.__setattr__(self, "_sampled_rows", num_rows)
+        if not num_rows or padded_rows == num_rows:
+            return logits_indices
+        return torch.cat([logits_indices, logits_indices[-1:].expand(padded_rows - num_rows)])
+
     def compute_logits(self, hidden_states, *args, **kwargs):
-        """Move hidden_states onto Spyre for the lm_head custom op.
+        """Run the lm_head on Spyre over the sampled rows, padded to a warmed row bucket.
 
-        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (``__call__`` D2Hs the body output), so the tensor handed
-        to compute_logits is on CPU;
-        move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: the head's ``SpyreUnquantizedLMHeadMethod.apply`` keeps them
-        on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice
-        and scale -- in ``_apply_head`` at TP=1, right after the all_gather in
-        ``_gather_logits`` at TP>1 -- so downstream sampling gets CPU logits.
-
-        The sampled-row count is not body-bucket padded, so padding it onto the warmed
-        row buckets keeps the projection on shapes warmup compiled.
+        Logits come back on CPU: SpyreLogitsProcessor converts them after the head, in
+        ``_apply_head`` at TP=1 and right after the all_gather in ``_gather_logits`` at TP>1.
         """
         num_rows = hidden_states.shape[0]
         buckets = self._logits_row_buckets
         idx = bisect.bisect_left(buckets, num_rows)
         padded_rows = buckets[idx] if idx < len(buckets) else num_rows
-        if padded_rows != num_rows:
-            hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
+        sampled_rows = self._sampled_rows
+        object.__setattr__(self, "_sampled_rows", None)
+        if sampled_rows is not None:
+            # The gather of ``pad_sampled_rows``' index, already on a warmed row bucket.
+            num_rows = sampled_rows
+        else:
+            if hidden_states.device.type == "spyre":
+                # A view of the body output (prompt logprobs) changes the head's work
+                # division, and with it the fp16 accumulation order.
+                hidden_states = convert(hidden_states, device="cpu")
+            if padded_rows != num_rows:
+                hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
+            hidden_states = convert(hidden_states, device=self._spyre_device)
 
-        hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -715,7 +731,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
 
-        # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
+        # CPU-fallback pooling must not opt into the generative output contract.
         bucketer = self.spyre_shape_bucketer
         self.model = _SpyreModelWrapper(
             self.model,
@@ -731,6 +747,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
+            # Without a bucketer (enforce_eager) the body is unpadded, so every prompt
+            # length would compile a fresh gather.
+            # kv_sharing_fast_prefill reads the logits index, which this pads.
+            sample_rows_on_device=(
+                self.model_config.runner_type == "generate"
+                and bucketer is not None
+                and envs.SPYRE_SAMPLE_ROWS_ON_DEVICE
+                and not self.cache_config.kv_sharing_fast_prefill
+                # Aux hidden states D2H the body output, so the gather would run on CPU.
+                and not self.use_aux_hidden_state_outputs
+            ),
             keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
         )
 
@@ -928,6 +955,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 hidden_states, last_hidden_states = self._dummy_run(size)
+                self._warm_sample_row_gathers(hidden_states, row_widths)
                 self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     # Verification projects every draft position plus the bonus row;
@@ -1282,7 +1310,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
-        """Force D2H during dummy forward (upstream logits index is CPU).
+        """Force D2H during a pooling model's dummy forward (upstream logits index is CPU).
 
         Pooling must pass ``force_attention=True``. Upstream skips attention
         metadata unless that flag or a FULL cudagraph is set; encoder impl
@@ -1317,6 +1345,39 @@ class TorchSpyreModelRunner(GPUModelRunner):
             hidden_states = convert(hidden_states, self._spyre_device)
         return hidden_states, last_hidden_states
 
+    @torch.inference_mode()
+    def _warm_sample_row_gathers(self, hidden_states: torch.Tensor, row_widths: list[int]) -> None:
+        """Compile the sampled-row gather and the lm_head on its output, per row bucket.
+
+        A multi-row gather returns a padded device layout that ``_dummy_sampler_run``'s
+        rows lack, and the lm_head graph guards on layout.
+        """
+        model = getattr(self, "model", None)
+        if not (isinstance(model, _SpyreModelWrapper) and model._sample_rows_on_device):
+            return
+        for rows in row_widths:
+            if rows <= hidden_states.shape[0]:
+                indices = torch.arange(rows, dtype=torch.int64)
+                model.compute_logits(hidden_states[model.pad_sampled_rows(indices)])
+                if rows == hidden_states.shape[0]:
+                    # Decode projects the padded body itself, not a gather of it.
+                    model.pad_sampled_rows(indices)
+                    model.compute_logits(hidden_states)
+
+    def _prepare_inputs(self, scheduler_output, *args, **kwargs):
+        logits_indices, *rest = super()._prepare_inputs(scheduler_output, *args, **kwargs)
+        if isinstance(self.model, _SpyreModelWrapper) and self.model._sample_rows_on_device:
+            num_tokens = scheduler_output.total_num_scheduled_tokens
+            padded = self.model.pad_sampled_rows(logits_indices)
+            # Decode samples every token; on its own row bucket the padded body is the gather.
+            if num_tokens == logits_indices.numel() and self.spyre_shape_bucketer.warmed_bucket(
+                num_tokens
+            ) == len(padded):
+                padded = slice(None)
+            logits_indices = padded
+        return logits_indices, *rest
+
+    @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:
         if not self._pooling_on_spyre:
             return

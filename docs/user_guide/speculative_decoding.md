@@ -67,14 +67,21 @@ SPYRE_XPRESS_TEST_TOPC=128 uv run --no-sync pytest \
   tests/e2e/test_speculative_decoding.py -m model_quality -s
 ```
 
-CPU recurrence and lifecycle tests pass. Device qualification remains open:
-the strict target-token comparison exposes a shape-dependent target score tie
-between ordinary decoding and block verification. The equality assertion remains
-in the test. Repeat device validation with C512 when qualifying that configuration.
+CPU recurrence, sampling and lifecycle tests pass. At C128, device validation
+passes seven reference cases and 63 strict greedy token comparisons across
+scripted rejection, full acceptance, DFlash and XPress. Stopping, cancellation
+and cache reuse checks also pass, including exact controlled-cache comparisons.
+
+A known numerical limitation remains: nearly tied FP16 target scores can select
+different greedy tokens between ordinary decoding and block verification. The
+counting prompt avoids the previously observed Spain/Germany tie; the underlying
+numerical difference is not fixed. Repeat device validation with C512 when
+qualifying that configuration.
 
 Seeded chunked prefill preserves CPU RNG state when discarding intermediate
-samples. Ordinary seeded decoding, including long prefill, passes exact replay
-checks; qualification of the complete stochastic DFlash/XPress matrix is ongoing.
+samples. At C128, stochastic device validation passes 24 generations across
+ordinary decoding, DFlash and XPress: temperature, top-k, top-p, and combined
+filtering near the context limit, each repeated with exact token and cache replay.
 
 The 503-token case starts too close to the context limit to draft. A separate
 495-token case verifies that a previously nonempty draft is cleared at the limit

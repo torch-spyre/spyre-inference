@@ -30,23 +30,40 @@ the block graph calls. The body is vLLM's reference math (``causal_conv1d_ref``,
 Two compiled kernels do the work, each reading and writing the state slots in-graph
 (eager indexing has no Spyre kernel): one per decode batch, padded to a power of two,
 and one per prefill chunk of ``chunk_size`` tokens, so prefill compiles once.
+
+Upstream shards only a ``tp`` that divides ``n_groups`` (or ``n_groups == 1``), which caps
+Nemotron-3 (8 groups) at TP8. A ``tp`` that is a multiple of ``n_groups`` is accepted too:
+each rank then holds one group, shared by ``tp // n_groups`` consecutive ranks, and its
+own slice of that group's heads (``_replicate_groups``).
 """
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2, Mixer2RMSNormGated
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
+from spyre_inference.custom_ops.linear import (
+    SpyrePaddedRowsLinearMethod,
+    SpyreUnquantizedLinearMethod,
+)
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker import compile_guard
 
@@ -191,6 +208,46 @@ def decode_buckets(max_num_seqs: int) -> list[int]:
     return sorted(sizes)
 
 
+def replicates_groups(n_groups: int, tp_size: int) -> bool:
+    """Whether ``tp_size`` shards past ``n_groups``: a multiple of it that upstream refuses.
+
+    Every split upstream accepts (``n_groups % tp_size == 0``, or one group) is left to it.
+    """
+    return n_groups > 1 and n_groups % tp_size != 0 and tp_size % n_groups == 0
+
+
+def group_replicated_loader(
+    segments: list[tuple[int, int]], tp_size: int, tp_rank: int
+) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    """Dim-0 loader for ``in_proj`` / ``conv1d`` when groups are replicated over ranks.
+
+    Each ``(width, shards)`` segment of the checkpoint tensor is cut into ``shards`` equal
+    pieces, and the rank takes piece ``tp_rank * shards // tp_size``: ``shards`` is
+    ``tp_size`` for the per-head segments and ``n_groups`` for B and C. Upstream's
+    single-group duplication is the ``n_groups == 1`` case.
+    """
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        boundary = loaded_boundary = 0
+        for width, shards in segments:
+            take = width // shards
+            start = loaded_boundary + tp_rank * shards // tp_size * take
+            target = param.data[boundary : boundary + take]
+            target.copy_(loaded_weight[start : start + take].view_as(target))
+            boundary += take
+            loaded_boundary += width
+        assert boundary == param.shape[0], (boundary, tuple(param.shape))
+
+    return loader
+
+
+def _set_weight_loader(param: torch.Tensor, loader: Callable) -> None:
+    # Upstream sets the attribute it builds for the single-group case; replace it.
+    if hasattr(param, "weight_loader"):
+        delattr(param, "weight_loader")
+    set_weight_attrs(param, {"weight_loader": loader})
+
+
 @Mixer2RMSNormGated.register_oot(name="Mixer2RMSNormGated")
 class SpyreMixer2RMSNormGated(Mixer2RMSNormGated):
     """Upstream's norm with both operands materialised in fp32 before the gate product.
@@ -201,16 +258,47 @@ class SpyreMixer2RMSNormGated(Mixer2RMSNormGated):
     column slice of ``in_proj``'s output, whose width need not be a multiple of the
     64-element stick (Nemotron-H-4B: 16496); upcasting such a slice directly returns
     wrong values, so it is copied out first.
+
+    When groups are replicated over ranks, a group spans ``tp_size // n_groups`` ranks.
+    Upstream all-gathers the whole intermediate for that case; here each rank all-reduces
+    only its partial sum of squares, placed in its group's column.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._group_column: torch.Tensor | None = None
+        if self.use_rms_norm and replicates_groups(self.n_groups, self.tp_size):
+            # Padded to whole fp16 sticks, so the reduced tensor keeps a plain layout.
+            column = torch.zeros(1, -(-self.n_groups // 64) * 64, dtype=torch.float32)
+            column[0, self.tp_rank * self.n_groups // self.tp_size] = 1.0
+            del self._group_column
+            self.register_buffer("_group_column", column, persistent=False)
+
     def forward_native(self, x: torch.Tensor, gate: torch.Tensor):
-        return super().forward_native(x.to(torch.float32), gate.clone()).to(x.dtype)
+        if self._group_column is None:
+            return super().forward_native(x.to(torch.float32), gate.clone()).to(x.dtype)
+        y = x.to(torch.float32) * F.silu(gate.clone().to(torch.float32))
+        partial = y.pow(2).sum(-1, keepdim=True) * self._group_column
+        sums = tensor_model_parallel_all_reduce(partial)
+        variance = (sums * self._group_column).sum(-1, keepdim=True) / self.group_size
+        y = y * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * y).to(x.dtype)
 
 
 @MambaMixer2.register_oot(name="MambaMixer2")
 class SpyreMambaMixer2(MambaMixer2):
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        bound = inspect.signature(MambaMixer2.__init__).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        n_groups = bound.arguments["n_groups"]
+        replicate = replicates_groups(n_groups, get_tensor_model_parallel_world_size())
+        if replicate:
+            # Upstream builds the shapes and the state spec of one group per rank only
+            # for a single group; its loaders and norm are re-pointed at the real groups.
+            bound.arguments["n_groups"] = 1
+        super().__init__(*bound.args[1:], **bound.kwargs)
+        if replicate:
+            self._replicate_groups(n_groups, bound.arguments)
         if self.use_replayssm or self.num_spec > 0:
             raise NotImplementedError(
                 "Spyre MambaMixer2 supports neither ReplaySSM nor speculative decoding."
@@ -230,6 +318,39 @@ class SpyreMambaMixer2(MambaMixer2):
         self._spyre_consts: dict[str, torch.Tensor] | None = None
         self._spyre_staging: dict[str, torch.Tensor] | None = None
         self._spyre_out: torch.Tensor | None = None
+
+    def _replicate_groups(self, n_groups: int, args: dict[str, Any]) -> None:
+        """Re-point the single-group layer upstream built at the ``n_groups`` real groups.
+
+        Upstream already sized every buffer and state for one group per rank; only which
+        group a rank loads, and the norm's group width, depend on ``n_groups``.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        heads = (self.intermediate_size, self.tp_size)
+        groups = (n_groups * self.ssm_state_size, n_groups)
+        conv_loader = group_replicated_loader([heads, groups, groups], self.tp_size, tp_rank)
+        _set_weight_loader(self.conv1d.weight, conv_loader)
+        if self.conv1d.bias is not None:
+            _set_weight_loader(self.conv1d.bias, conv_loader)
+        proj_loader = group_replicated_loader(
+            [heads, heads, groups, groups, (self.num_heads, self.tp_size)], self.tp_size, tp_rank
+        )
+        for name in ("weight", "weight_scale", "input_scale"):
+            param = getattr(self.in_proj, name, None)
+            if param is not None:
+                _set_weight_loader(param, proj_loader)
+        # Upstream's merged in_proj, used whenever tp divides n_groups, takes this method.
+        if type(self.in_proj.quant_method) is SpyreUnquantizedLinearMethod:
+            self.in_proj.quant_method = SpyrePaddedRowsLinearMethod()
+        self.norm = Mixer2RMSNormGated(
+            self.intermediate_size, n_groups, args["use_rms_norm"], eps=args["rms_norm_eps"]
+        )
+        logger.info_once(
+            "Spyre MambaMixer2: %d groups over TP%d, each group on %d ranks.",
+            n_groups,
+            self.tp_size,
+            self.tp_size // n_groups,
+        )
 
     def bind_kv_cache(self, kv_cache: Any) -> None:
         # Spyre allocates each state as its own tensor (kv_cache_setup), not as a raw

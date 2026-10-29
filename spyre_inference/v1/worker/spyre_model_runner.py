@@ -199,6 +199,8 @@ class _SlotMappingKernelShim:
         TOTAL_CP_WORLD_SIZE: int = 1,
         TOTAL_CP_RANK: int = 0,
         CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
+        *args,
+        **kwargs,
     ) -> None:
         _compute_slot_mapping_impl(
             num_tokens,
@@ -214,15 +216,20 @@ class _SlotMappingKernelShim:
             CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
         )
 
+    def __getitem__(self, grid):
+        """Support older vLLM releases that used grid launch syntax kernel[(grid,)](...)."""
+        return _compute_slot_mapping_impl
+
     def register_warmup(self, *args, **kwargs) -> None:
         pass
 
 
 _compute_slot_mapping_kernel = _SlotMappingKernelShim()
 
-# The module attribute in vllm.v1.worker.block_table that both launches the
-# slot-mapping kernel and receives its warmup registration.
+# The module attributes in vllm.v1.worker.block_table that both launch the
+# slot-mapping kernel and receive its warmup registration across vLLM versions.
 _SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
+_LEGACY_SLOT_MAPPING_KERNEL_ATTR = "_compute_slot_mapping_kernel"
 
 
 def _patch_compute_slot_mapping() -> None:
@@ -234,16 +241,19 @@ def _patch_compute_slot_mapping() -> None:
     """
     from vllm.v1.worker import block_table
 
-    if not hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+    if hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+        setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
+    elif hasattr(block_table, _LEGACY_SLOT_MAPPING_KERNEL_ATTR):
+        setattr(block_table, _LEGACY_SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
+    else:
         raise RuntimeError(
-            f"Cannot find vLLM's slot-mapping kernel to patch: "
-            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} does not exist. vLLM has moved it; "
+            f"Cannot find vLLM's slot-mapping kernel to patch: neither "
+            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} nor "
+            f"block_table.{_LEGACY_SLOT_MAPPING_KERNEL_ATTR} exists. vLLM has moved it; "
             f"update _SlotMappingKernelShim and _patch_compute_slot_mapping for the "
             f"new launch site. Leaving the patch unapplied would defer the failure to "
             f"the first decode step."
         )
-
-    setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):

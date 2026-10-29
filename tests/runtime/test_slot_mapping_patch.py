@@ -31,10 +31,19 @@ import pytest
 import torch
 
 from spyre_inference.v1.worker.spyre_model_runner import (
+    _LEGACY_SLOT_MAPPING_KERNEL_ATTR,
     _SLOT_MAPPING_KERNEL_ATTR,
     _compute_slot_mapping_kernel,
     _patch_compute_slot_mapping,
 )
+
+
+def _active_kernel_attr() -> str:
+    from vllm.v1.worker import block_table
+
+    if hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+        return _SLOT_MAPPING_KERNEL_ATTR
+    return _LEGACY_SLOT_MAPPING_KERNEL_ATTR
 
 
 def test_patched_attribute_is_the_one_vllm_launches():
@@ -43,16 +52,18 @@ def test_patched_attribute_is_the_one_vllm_launches():
     kernel twice, so assert the launch site still reads the name we patch."""
     from vllm.v1.worker import block_table
 
+    attr = _active_kernel_attr()
     launch_src = inspect.getsource(block_table.BlockTable.compute_slot_mapping)
-    assert _SLOT_MAPPING_KERNEL_ATTR in launch_src, (
+    assert attr in launch_src, (
         f"block_table.BlockTable.compute_slot_mapping no longer launches "
-        f"{_SLOT_MAPPING_KERNEL_ATTR}; update _patch_compute_slot_mapping"
+        f"{attr}; update _patch_compute_slot_mapping"
     )
 
-    register_src = inspect.getsource(block_table.BlockTable.__init__)
-    assert f"{_SLOT_MAPPING_KERNEL_ATTR}.register_warmup" in register_src, (
-        "warmup registration moved off the patched attribute; it would try to compile"
-    )
+    if attr == _SLOT_MAPPING_KERNEL_ATTR:
+        register_src = inspect.getsource(block_table.BlockTable.__init__)
+        assert f"{attr}.register_warmup" in register_src, (
+            "warmup registration moved off the patched attribute; it would try to compile"
+        )
 
 
 def test_patch_installs_the_shim():
@@ -60,14 +71,18 @@ def test_patch_installs_the_shim():
 
     _patch_compute_slot_mapping()
 
-    assert getattr(block_table, _SLOT_MAPPING_KERNEL_ATTR) is _compute_slot_mapping_kernel
+    attr = _active_kernel_attr()
+    assert getattr(block_table, attr) is _compute_slot_mapping_kernel
 
 
 def test_patch_raises_when_the_kernel_moves(monkeypatch):
     """Silently skipping the patch defers the failure to the first decode step."""
     from vllm.v1.worker import block_table
 
-    monkeypatch.delattr(block_table, _SLOT_MAPPING_KERNEL_ATTR)
+    if hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+        monkeypatch.delattr(block_table, _SLOT_MAPPING_KERNEL_ATTR)
+    if hasattr(block_table, _LEGACY_SLOT_MAPPING_KERNEL_ATTR):
+        monkeypatch.delattr(block_table, _LEGACY_SLOT_MAPPING_KERNEL_ATTR)
 
     with pytest.raises(RuntimeError, match="Cannot find vLLM's slot-mapping kernel"):
         _patch_compute_slot_mapping()

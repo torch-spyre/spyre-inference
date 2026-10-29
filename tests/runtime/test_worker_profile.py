@@ -27,6 +27,11 @@ from vllm.profiler import wrapper
 
 from spyre_inference.v1.worker import spyre_worker
 
+pytestmark = pytest.mark.skipif(
+    not hasattr(wrapper, "_SUPPORTED_TORCH_PROFILER_ACTIVITIES"),
+    reason="Installed vLLM version does not have profiler wrapper._SUPPORTED_TORCH_PROFILER_ACTIVITIES",
+)
+
 
 @pytest.fixture
 def cpu_device_type(monkeypatch):

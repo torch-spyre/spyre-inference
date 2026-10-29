@@ -124,8 +124,11 @@ def allow_private_use1_profiler_activity() -> None:
     """
     from vllm.profiler import wrapper
 
+    if not hasattr(wrapper, "_SUPPORTED_TORCH_PROFILER_ACTIVITIES"):
+        return
+
     supported = wrapper._SUPPORTED_TORCH_PROFILER_ACTIVITIES
-    if "PrivateUse1" not in supported["cpu"]:
+    if "cpu" in supported and "PrivateUse1" not in supported["cpu"]:
         supported["cpu"] = supported["cpu"] | {"PrivateUse1"}
         logger.debug("Allowed PrivateUse1 in vLLM's torch profiler activities for cpu")
 

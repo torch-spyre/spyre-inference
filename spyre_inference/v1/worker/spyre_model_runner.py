@@ -1313,18 +1313,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return CUDAGraphMode.NONE, pad, False, None, None
         self._encoder_buffer_rows = num_tokens
 
-        return super()._determine_batch_execution_and_padding(
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
-            allow_microbatching=allow_microbatching,
-            force_eager=force_eager,
-            force_uniform_decode=force_uniform_decode,
-            force_has_lora=force_has_lora,
-            force_num_active_loras=force_num_active_loras,
-            num_encoder_reqs=num_encoder_reqs,
-        )
+        kwargs: dict[str, Any] = {
+            "num_tokens": num_tokens,
+            "num_reqs": num_reqs,
+            "num_scheduled_tokens_np": num_scheduled_tokens_np,
+            "max_num_scheduled_tokens": max_num_scheduled_tokens,
+            "allow_microbatching": allow_microbatching,
+            "force_eager": force_eager,
+            "force_uniform_decode": force_uniform_decode,
+            "force_has_lora": force_has_lora,
+            "force_num_active_loras": force_num_active_loras,
+            "num_encoder_reqs": num_encoder_reqs,
+        }
+        import inspect
+
+        sig = inspect.signature(super()._determine_batch_execution_and_padding)
+        if "use_cascade_attn" in sig.parameters:
+            kwargs["use_cascade_attn"] = use_cascade_attn
+        return super()._determine_batch_execution_and_padding(**kwargs)
 
     def _spyre_bucket_batch_descriptor(
         self,

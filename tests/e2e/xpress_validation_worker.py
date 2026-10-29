@@ -14,7 +14,9 @@
 
 """Worker instrumentation for serial, real-model speculative decoding tests."""
 
+import time
 import warnings
+from functools import wraps
 
 import torch
 
@@ -40,6 +42,76 @@ class ValidationWorker(TorchSpyreWorker):
         self.model_runner.propose_draft_token_ids = self._propose
         self._native_bookkeeping = self.model_runner._bookkeeping_sync
         self.model_runner._bookkeeping_sync = self._bookkeeping
+        self._stats: dict[str, dict[str, float | int]] = {
+            "drafter": dict.fromkeys(
+                (
+                    "proposal_calls",
+                    "proposal_seconds",
+                    "context_tokens",
+                    "context_seconds",
+                    "draft_forward_seconds",
+                ),
+                0,
+            ),
+            "model": dict.fromkeys(
+                (
+                    "selection_calls",
+                    "device_to_host_seconds",
+                    "host_argmax_seconds",
+                    "candidate_gather_seconds",
+                    "refiner_seconds",
+                    "logits_seconds",
+                    "logits_transfer_bytes",
+                ),
+                0,
+            ),
+        }
+        drafter = self.model_runner.drafter
+        self._time_call(
+            drafter, "propose_spyre", "drafter", "proposal_seconds", count="proposal_calls"
+        )
+        model = drafter.model
+        for name in ("combine_hidden_states", "precompute_and_store_context_kv"):
+            self._time_call(model, name, "drafter", "context_seconds")
+        self._time_call(model, "forward", "drafter", "draft_forward_seconds")
+        self._time_call(model, "compute_device_logits", "model", "logits_seconds")
+        self._time_call(
+            model,
+            "_copy_logits_to_cpu",
+            "model",
+            "device_to_host_seconds",
+            transferred="logits_transfer_bytes",
+        )
+        self._time_call(
+            model, "_argmax_on_cpu", "model", "host_argmax_seconds", count="selection_calls"
+        )
+        for name, metric in (
+            ("_hidden_cache", "refiner_seconds"),
+            ("_refine", "refiner_seconds"),
+            ("_refine_candidates", "refiner_seconds"),
+            ("_gather_readout", "candidate_gather_seconds"),
+        ):
+            if hasattr(model, name):
+                self._time_call(model, name, "model", metric)
+
+    def _time_call(self, owner, name, group, metric, *, count=None, transferred=None):
+        original = getattr(owner, name)
+        stats = self._stats[group]
+
+        @wraps(original)
+        def timed(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                result = original(*args, **kwargs)
+            finally:
+                stats[metric] += time.perf_counter() - started
+            if count is not None:
+                stats[count] += 1
+            if transferred is not None:
+                stats[transferred] += result.numel() * result.element_size()
+            return result
+
+        setattr(owner, name, timed)
 
     def configure_proposer(self, mode, references=None, reject_at=-1, passes=None, tail_salt=0):
         self.mode = mode
@@ -50,6 +122,7 @@ class ValidationWorker(TorchSpyreWorker):
         self.verification_steps = []
         self._last_blocks = None
         self._draft_context_end = 0
+        self._last_proposals = []
         if passes is not None:
             self.model_runner.drafter.model.xpress_num_passes = passes
 
@@ -62,6 +135,9 @@ class ValidationWorker(TorchSpyreWorker):
                     request=request,
                     drafts=len(scheduler.scheduled_spec_decode_tokens.get(request, [])),
                     sampled=list(sampled),
+                    position=int(
+                        self.model_runner._get_positions(scheduler.total_num_scheduled_tokens)[0]
+                    ),
                     finished_requests=sorted(scheduler.finished_req_ids),
                 )
             )
@@ -83,13 +159,21 @@ class ValidationWorker(TorchSpyreWorker):
             sampled=list(sampled[0]),
             committed_end=int(positions[valid - 1]) + 1,
             blocks=self._last_blocks.tolist(),
+            previous_proposals=list(self._last_proposals),
         )
         if self.mode in ("real", "real_scripted"):
             result = self._native_propose(
                 scheduler, sampled, sampling, hidden, sample_hidden, aux, spec, common, slots
             )
             self._draft_context_end = row["committed_end"]
-        if self.mode == "none" or not sampled[0]:
+            self._stats["drafter"]["context_tokens"] += valid
+            row["native_proposals"] = list(result[0])
+        if (
+            self.mode == "none"
+            or not sampled[0]
+            or row["committed_end"] + runner.num_spec_tokens + 1
+            > runner.effective_drafter_max_model_len
+        ):
             result = [[]]
         elif self.mode in ("scripted", "real_scripted"):
             count = int(runner.input_batch.num_tokens_no_spec[0])
@@ -113,11 +197,11 @@ class ValidationWorker(TorchSpyreWorker):
                     draft[i] = (draft[i] + self.tail_salt) % runner.model_config.get_vocab_size()
             result = [draft]
         row["proposals"] = result[0]
+        self._last_proposals = list(result[0])
         self.steps.append(row)
         return result
 
     def validation_state(self):
-        drafter = self.model_runner.drafter
         memory = torch.spyre.memory.memory_stats(0)
         return dict(
             steps=self.steps,
@@ -128,31 +212,8 @@ class ValidationWorker(TorchSpyreWorker):
                 "allocated_bytes": memory["allocated_bytes.all.current"],
                 "peak_allocated_bytes": memory["allocated_bytes.all.peak"],
             },
-            drafter={
-                name: getattr(drafter, name)
-                for name in (
-                    "proposal_calls",
-                    "proposal_seconds",
-                    "context_tokens",
-                    "context_seconds",
-                    "draft_forward_seconds",
-                )
-            },
-            model={
-                name: getattr(drafter.model, name)
-                for name in (
-                    "selection_calls",
-                    "device_to_host_seconds",
-                    "host_argmax_seconds",
-                    "host_topk_seconds",
-                    "host_to_device_seconds",
-                    "candidate_gather_seconds",
-                    "candidate_transfer_bytes",
-                    "refiner_seconds",
-                    "logits_seconds",
-                    "logits_transfer_bytes",
-                )
-            },
+            drafter=dict(self._stats["drafter"]),
+            model=dict(self._stats["model"]),
         )
 
     def save_cache_prefix(self, path, length, include_draft=False):

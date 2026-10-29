@@ -25,7 +25,9 @@ uv run --no-sync vllm serve Qwen/Qwen3-8B \
 ```
 
 Use `temperature=0` in requests. The same speculative configuration works with
-`vllm.LLM`. A full verification round needs at least 31 budgeted tokens because
+`vllm.LLM`; non-greedy requests are rejected before reaching the model worker.
+The end-to-end test pins the same model and checkpoint revisions as this example;
+update both together. A full verification round needs at least 31 budgeted tokens because
 vLLM reserves additional drafting slots; the adapter rejects a smaller budget.
 
 ## Refinement and compatibility
@@ -58,3 +60,8 @@ CPU recurrence and lifecycle tests pass. Device qualification remains open:
 the strict target-token comparison exposes a shape-dependent target score tie
 between ordinary decoding and block verification. The equality assertion remains
 in the test. Repeat device validation with C512 when qualifying that configuration.
+
+The 503-token case starts too close to the context limit to draft. A separate
+495-token case verifies that a previously nonempty draft is cleared at the limit
+and that the next target step has no scheduled draft tokens. Validation timings
+are collected by the test worker; the serving loop has no timing counters.

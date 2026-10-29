@@ -18,7 +18,6 @@
 # vLLM 0.32 lacks XPress (vllm#54448); test_xpress_vendored.py flags migration to its subclasses.
 # Retain Spyre context-KV, layout and refinement overrides when resolving #1417.
 
-import time
 from typing import cast
 
 import torch
@@ -94,22 +93,9 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        for layer in self.model.layers:
-            attention = cast(DFlashQwen3DecoderLayer, layer).self_attn
-            attention.attn.spyre_causal = attention.causal  # ty: ignore[invalid-assignment]
         self.xpress_head = None
         self.xpress_num_passes = 0
         self.xpress_topc = 0
-        self.device_to_host_seconds = 0.0
-        self.host_argmax_seconds = 0.0
-        self.host_topk_seconds = 0.0
-        self.host_to_device_seconds = 0.0
-        self.candidate_gather_seconds = 0.0
-        self.candidate_transfer_bytes = 0
-        self.refiner_seconds = 0.0
-        self.logits_seconds = 0.0
-        self.selection_calls = 0
-        self.logits_transfer_bytes = 0
         if hasattr(self.config, "xpress_rank"):
             self.xpress_topc = getattr(self.config, "xpress_topc", 128)
             self.xpress_head = XPressRefinerHead(
@@ -162,65 +148,43 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         return method.apply(self.lm_head, hidden_states)
 
     def _copy_logits_to_cpu(self, logits):
-        started = time.perf_counter()
         # Cast during D2H: device widening produces a nonstandard lane arrangement.
-        host_logits = logits.to(device="cpu", dtype=torch.float32)
-        self.device_to_host_seconds += time.perf_counter() - started
-        self.logits_transfer_bytes += host_logits.numel() * host_logits.element_size()
-        return host_logits
+        return logits.to(device="cpu", dtype=torch.float32)
 
     def _argmax_on_cpu(self, host_logits, candidates=None):
-        started = time.perf_counter()
         result = host_logits.argmax(-1)
         if candidates is not None:
             result = candidates.gather(-1, result.unsqueeze(-1)).squeeze(-1)
-        self.host_argmax_seconds += time.perf_counter() - started
-        self.selection_calls += 1
         return result
 
     def propose_block(self, hidden_states, anchor_ids):
         batch = anchor_ids.numel()
         hidden_blocks = hidden_states.view(batch, -1, hidden_states.shape[-1])
-        started = time.perf_counter()
         base = self.compute_device_logits(hidden_states).view(batch, hidden_blocks.shape[1], -1)
-        self.logits_seconds += time.perf_counter() - started
         host_base = self._copy_logits_to_cpu(base)[:, 1:]
         draft = self._argmax_on_cpu(host_base)
         if self.xpress_head is not None and self.xpress_num_passes:
-            started = time.perf_counter()
             cache = self._hidden_cache(hidden_blocks)
-            self.refiner_seconds += time.perf_counter() - started
             candidates = readout = None
             base = base[:, 1:]
             if self.xpress_topc:
-                started = time.perf_counter()
                 base_c, candidates = host_base.topk(
                     min(self.xpress_topc, host_base.shape[-1]), dim=-1
                 )
-                self.host_topk_seconds += time.perf_counter() - started
-                started = time.perf_counter()
                 # Flat indices avoid gather page splits across request axes.
                 candidate_ids = convert(candidates.flatten(), device=hidden_states.device)
                 base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
-                self.host_to_device_seconds += time.perf_counter() - started
-                self.candidate_transfer_bytes += candidates.numel() * 4 + base.numel() * 2
-                started = time.perf_counter()
                 readout = self._gather_readout(candidate_ids)
-                self.candidate_gather_seconds += time.perf_counter() - started
             for _ in range(self.xpress_num_passes):
                 # The verified anchor is also its own predecessor in merged XPress.
                 previous = torch.cat(
                     (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
                 )
-                started = time.perf_counter()
                 previous = convert(previous, device=hidden_states.device)
-                self.host_to_device_seconds += time.perf_counter() - started
-                started = time.perf_counter()
                 logits = (
                     self._refine(base, previous, cache)
                     if candidates is None
                     else self._refine_candidates(base, previous, cache, readout)
                 )
-                self.refiner_seconds += time.perf_counter() - started
                 draft = self._argmax_on_cpu(self._copy_logits_to_cpu(logits), candidates)
         return draft.tolist()

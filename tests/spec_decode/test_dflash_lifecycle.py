@@ -81,10 +81,6 @@ def test_skipped_final_proposal_commits_only_accepted_context():
             combine_hidden_states=lambda states: states,
             precompute_and_store_context_kv=lambda *args: writes.append(args),
         ),
-        context_tokens=0,
-        context_seconds=0.0,
-        proposal_calls=0,
-        proposal_seconds=0.0,
         draft_block_size=16,
         max_model_len=512,
     )
@@ -100,8 +96,6 @@ def test_skipped_final_proposal_commits_only_accepted_context():
         skip_proposal=True,
     )
     assert result == [[]]
-    assert drafter.proposal_calls == 0
-    assert drafter.context_tokens == 2
     assert len(writes) == 1
     context, positions, slots = writes[0]
     torch.testing.assert_close(context, features)
@@ -186,13 +180,9 @@ def proposer(monkeypatch):
         dtype=torch.float16,
         hidden_size=128,
         dflash_config={"target_layer_ids": [0]},
+        _context_warmed_rows=set(),
         _draft_warmed=False,
         parallel_drafting_token_id=42,
-        context_tokens=0,
-        context_seconds=0.0,
-        proposal_calls=0,
-        proposal_seconds=0.0,
-        draft_forward_seconds=0.0,
         build_per_group_and_layer_attn_metadata=build,
         vllm_config=None,
         _draft_attn_layer_names={"draft"},
@@ -214,7 +204,6 @@ def test_accepted_context_and_next_draft_use_the_request_pages(proposer, limit):
         ),
         max_model_len=limit,
     )
-    assert proposer.context_tokens == 2
     assert proposer.model.context[0][2].tolist() == [500, 501] + [0] * 14
     if limit == 143:
         assert result == [[]]
@@ -226,7 +215,7 @@ def test_accepted_context_and_next_draft_use_the_request_pages(proposer, limit):
         assert positions.tolist() == list(range(128, 144))
         assert proposer.metadata[0].slot_mapping.tolist() == list(range(128, 144))
         assert proposer.metadata[0].causal is False
-        assert proposer.proposal_calls == 1
+        assert len(proposer.model.forwards) == 1
 
 
 def test_partial_prefill_commits_context_without_a_proposal(proposer):
@@ -241,14 +230,50 @@ def test_partial_prefill_commits_context_without_a_proposal(proposer):
         ),
     )
     assert result == [[]]
-    assert proposer.context_tokens == 4
     assert proposer.model.context[0][2].tolist() == list(range(256, 260)) + [0] * 12
     assert not proposer.model.forwards
 
 
-def test_single_request_draft_warmup_runs_once(proposer, monkeypatch):
+def test_context_limit_replaces_previous_host_drafts_with_empty_rows(proposer):
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_dflash=lambda: True),
+        input_batch=SimpleNamespace(req_ids=["request"]),
+        use_async_scheduling=False,
+    )
+    for position, scheduled, drafts, expected_width in (
+        (494, 1, 0, 15),
+        (495, 16, 15, 15),
+        (496, 16, 15, 0),
+        (497, 1, 0, 0),
+    ):
+        positions = torch.arange(position, position + scheduled)
+        table = torch.tensor([[3, 1, 4, 2]])
+        common = SimpleNamespace(
+            query_start_loc_cpu=torch.tensor([0, scheduled]),
+            slot_mapping=table[0, positions // 128] * 128 + positions % 128,
+            block_table_tensor=table,
+        )
+        assert TorchSpyreModelRunner._input_fits_in_drafter(runner, common)
+        runner._draft_token_ids = SpyreDFlashProposer.propose_spyre(
+            proposer,
+            [[7]],
+            [torch.randn(scheduled, 128)],
+            positions,
+            SimpleNamespace(num_draft_tokens=[drafts]) if drafts else None,
+            common,
+        )
+        TorchSpyreModelRunner._copy_draft_token_ids_to_cpu(runner, None)
+        tokens, request_ids = TorchSpyreModelRunner._get_draft_token_ids_cpu(runner)
+        assert tokens == [[7] * expected_width]
+        assert request_ids == ["request"]
+        assert runner._draft_token_req_ids == ["request"]
+    assert len(proposer.model.forwards) == 2
+    assert len(proposer.model.context) == 4
+
+
+def test_context_warms_once_per_row_bucket_and_draft_warms_once(proposer, monkeypatch):
     monkeypatch.setattr(dflash.attn_layer, "publish_null_slots", lambda _: None)
-    for count in (16, 64):
+    for count in (16, 16, 64, 16, 64):
         SpyreDFlashProposer.dummy_run(proposer, count)
     assert len(proposer.model.context) == 2
     assert len(proposer.model.forwards) == 1

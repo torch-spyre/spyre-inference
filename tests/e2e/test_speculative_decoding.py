@@ -160,6 +160,11 @@ def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_
     repeated = tokenizer.encode("IBM develops computers, software, and consulting services. " * 64)
     cases += [
         dict(name="page_boundary", prompt={"prompt_token_ids": repeated[:127]}, max_tokens=24),
+        dict(
+            name="draft_limit_transition",
+            prompt={"prompt_token_ids": repeated[:495]},
+            max_tokens=17,
+        ),
         dict(name="context_limit", prompt={"prompt_token_ids": repeated[:503]}, max_tokens=8),
     ]
     chat = tokenizer.apply_chat_template(
@@ -279,6 +284,25 @@ def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_
             for previous, current in zip(state["steps"], state["steps"][1:]):
                 assert current["position"] == previous["committed_end"]
             verified = [s for s in state["steps"] if s["drafts"]]
+            if case["name"] == "context_limit" and mode.startswith("real"):
+                assert all(not s["native_proposals"] for s in state["steps"])
+            if case["name"] == "draft_limit_transition" and mode == "real_scripted":
+                skipped = [
+                    s
+                    for s in state["steps"]
+                    if s["previous_proposals"]
+                    and not s["proposals"]
+                    and s["committed_end"] + 16 > 512
+                ]
+                assert skipped, "Expected a nonempty draft followed by a context-limit skip"
+                for step in skipped:
+                    assert not step["native_proposals"]
+                    following = next(
+                        s
+                        for s in state["verification_steps"]
+                        if s["position"] == step["committed_end"]
+                    )
+                    assert following["drafts"] == 0, "Scheduler reused drafts after a skip"
             if label == "reject_first":
                 assert all(len(s["sampled"]) == 1 for s in verified)
             if label == "accept_all" and case["name"] == "prompt_0":

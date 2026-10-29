@@ -18,10 +18,65 @@ import pytest
 import torch
 
 from spyre_inference.v1.spec_decode.config import (
+    install_dflash_request_validation,
     normalize_speculative_config,
     validate_dflash_config,
 )
 from spyre_inference.v1.spec_decode.dflash import accepted_context_length
+
+
+def test_random_target_is_rejected_before_input_processing(monkeypatch):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    monkeypatch.setattr(InputProcessor, "_validate_params", InputProcessor._validate_params)
+    install_dflash_request_validation()
+    processor = object.__new__(InputProcessor)
+    processor.speculative_config = NS(use_dflash=lambda: True)
+    with pytest.raises(VLLMValidationError, match="temperature=0") as error:
+        processor.process_inputs(
+            "request",
+            {"type": "token", "prompt_token_ids": [42]},
+            SamplingParams(temperature=0.7),
+            ("generate",),
+        )
+    assert error.value.parameter == "temperature"
+
+
+def test_request_validation_is_scoped_to_each_engine_and_preserves_upstream(monkeypatch):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    calls = []
+
+    def original(processor, params, tasks):
+        calls.append((processor, params, tasks))
+        return False
+
+    monkeypatch.setattr(InputProcessor, "_validate_params", original)
+    install_dflash_request_validation()
+    validate = InputProcessor._validate_params
+    install_dflash_request_validation()
+    assert InputProcessor._validate_params is validate
+    draft = NS(speculative_config=NS(use_dflash=lambda: True))
+    plain = NS(speculative_config=None)
+    other = NS(speculative_config=NS(use_dflash=lambda: False))
+    random = SamplingParams(temperature=0.7)
+    greedy = SamplingParams(temperature=0.0)
+    for processor, params in (
+        (draft, greedy),
+        (plain, random),
+        (other, random),
+        (draft, PoolingParams(task="embed")),
+    ):
+        assert validate(processor, params, ("generate",)) is False
+        assert calls[-1] == (processor, params, ("generate",))
+        with pytest.raises(VLLMValidationError, match="temperature=0"):
+            validate(draft, random, ("generate",))
+    assert len(calls) == 4
 
 
 def test_platform_rejects_v2_before_constructing_a_worker(monkeypatch):

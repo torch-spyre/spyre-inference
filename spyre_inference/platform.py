@@ -201,6 +201,10 @@ class TorchSpyrePlatform(CpuPlatform):
         # to CpuPlatform.
         from vllm.engine.arg_utils import EngineArgs
 
+        from spyre_inference.v1.spec_decode.config import install_dflash_request_validation
+
+        install_dflash_request_validation()
+
         original = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
         if getattr(original, "_spyre_patched", False):
             return

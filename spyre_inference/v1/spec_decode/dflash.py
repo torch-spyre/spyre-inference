@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -67,11 +66,7 @@ class SpyreDFlashProposer(DFlashProposer):
         super().__init__(vllm_config, device, runner)
         self.spyre_device = runner._spyre_device
         self.draft_block_size = self.num_speculative_tokens + 1
-        self.proposal_seconds = 0.0
-        self.proposal_calls = 0
-        self.context_tokens = 0
-        self.context_seconds = 0.0
-        self.draft_forward_seconds = 0.0
+        self._context_warmed_rows: set[int] = set()
         self._draft_warmed = False
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None):
@@ -86,11 +81,15 @@ class SpyreDFlashProposer(DFlashProposer):
     def dummy_run(
         self, num_tokens, use_cudagraphs=True, is_graph_capturing=False, slot_mappings=None
     ):
-        taps = len(self.dflash_config["target_layer_ids"])
-        features = torch.zeros(num_tokens, taps * self.hidden_size, dtype=self.dtype)
-        positions = torch.zeros(num_tokens, dtype=torch.int64)
-        context = self.model.combine_hidden_states(convert(features, self.spyre_device))
-        self.model.precompute_and_store_context_kv(context, convert(positions, self.spyre_device))
+        if num_tokens not in self._context_warmed_rows:
+            taps = len(self.dflash_config["target_layer_ids"])
+            features = torch.zeros(num_tokens, taps * self.hidden_size, dtype=self.dtype)
+            positions = torch.zeros(num_tokens, dtype=torch.int64)
+            context = self.model.combine_hidden_states(convert(features, self.spyre_device))
+            self.model.precompute_and_store_context_kv(
+                context, convert(positions, self.spyre_device)
+            )
+            self._context_warmed_rows.add(num_tokens)
         if self._draft_warmed:
             return
         block = self.draft_block_size
@@ -117,9 +116,8 @@ class SpyreDFlashProposer(DFlashProposer):
         max_model_len: int | None = None,
     ):
         """Commit accepted context even when no further draft is needed."""
-        started = time.perf_counter()
-        if len(sampled_token_ids) != 1 or aux_hidden_states is None:
-            raise ValueError("Spyre DFlash requires one request and its auxiliary hidden states")
+        assert len(sampled_token_ids) == 1, "Spyre DFlash requires one active request"
+        assert aux_hidden_states is not None, "Spyre DFlash requires auxiliary hidden states"
         scheduled = target_positions.shape[0]
         if scheduled <= 0 or common_attn_metadata.query_start_loc_cpu.tolist() != [0, scheduled]:
             raise ValueError("DFlash request boundaries must cover the scheduled target rows")
@@ -137,12 +135,10 @@ class SpyreDFlashProposer(DFlashProposer):
         # Rejected and padded rows write the reserved null page.
         slots = torch.zeros(rows, dtype=torch.int64)
         slots[:valid] = common_attn_metadata.slot_mapping[:valid]
-        self.context_tokens += valid
         context = self.model.combine_hidden_states(features)
         self.model.precompute_and_store_context_kv(
             context, convert(positions, self.spyre_device), slots
         )
-        self.context_seconds += time.perf_counter() - started
         if not sampled or skip[0]:
             return [[]]
         block = self.draft_block_size
@@ -173,7 +169,6 @@ class SpyreDFlashProposer(DFlashProposer):
             causal=False,
         )
         _, per_layer = self.build_per_group_and_layer_attn_metadata(metadata)
-        forward_started = time.perf_counter()
         with set_forward_context(
             per_layer,
             self.vllm_config,
@@ -184,8 +179,4 @@ class SpyreDFlashProposer(DFlashProposer):
                 input_ids=convert(ids, self.spyre_device),
                 positions=convert(positions, self.spyre_device),
             )
-        self.draft_forward_seconds += time.perf_counter() - forward_started
-        proposals = self.model.propose_block(hidden, ids[:1])
-        self.proposal_calls += 1
-        self.proposal_seconds += time.perf_counter() - started
-        return proposals
+        return self.model.propose_block(hidden, ids[:1])

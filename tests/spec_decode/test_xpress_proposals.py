@@ -44,21 +44,15 @@ def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_s
         _gather_readout=head.gather_readout,
         _refine_candidates=head.refine_candidates,
     )
-    for name in (
-        "device_to_host_seconds",
-        "host_argmax_seconds",
-        "host_topk_seconds",
-        "host_to_device_seconds",
-        "candidate_gather_seconds",
-        "candidate_transfer_bytes",
-        "refiner_seconds",
-        "logits_seconds",
-        "selection_calls",
-        "logits_transfer_bytes",
-    ):
-        setattr(model, name, 0)
-    for name in ("_copy_logits_to_cpu", "_argmax_on_cpu"):
-        setattr(model, name, MethodType(getattr(SpyreDFlashQwen3ForCausalLM, name), model))
+    transferred_bytes = []
+
+    def copy_logits(logits):
+        result = SpyreDFlashQwen3ForCausalLM._copy_logits_to_cpu(model, logits)
+        transferred_bytes.append(result.numel() * result.element_size())
+        return result
+
+    model._copy_logits_to_cpu = copy_logits
+    model._argmax_on_cpu = MethodType(SpyreDFlashQwen3ForCausalLM._argmax_on_cpu, model)
     with torch.inference_mode():
         expected = [
             merged_refine(
@@ -72,4 +66,4 @@ def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_s
         ]
         actual = SpyreDFlashQwen3ForCausalLM.propose_block(model, hidden, anchor)
     assert actual == expected
-    assert model.logits_transfer_bytes == batch * (16 * vocab + passes * 15 * (topc or vocab)) * 4
+    assert sum(transferred_bytes) == batch * (16 * vocab + passes * 15 * (topc or vocab)) * 4

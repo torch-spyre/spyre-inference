@@ -99,9 +99,46 @@ def test_project_matches_upstream_projector(offset):
     raster = torch.randn(tiles, SIDE * SIDE, HIDDEN)
     with torch.no_grad():
         want = reference(raster)
-        got = Spyre._project(model, mine, raster[:, tile].reshape(-1, HIDDEN), offset)
+        got = Spyre._project(
+            model, mine, raster[:, tile].reshape(-1, HIDDEN), _down_weights(offset)
+        )
         got = unwindow(got, N, QUERY)
     torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def _down_weights(offset: int | None) -> torch.Tensor:
+    if offset is None:
+        return torch.full((4, 1, HIDDEN), 0.25)
+    down = torch.zeros(4, 1, HIDDEN)
+    down[offset] = 1.0
+    return down
+
+
+def test_every_projector_shares_one_compiled_graph():
+    """The eight projectors differ only in weights and downsample, both graph inputs, so one
+    compiled ``_project`` serves them all instead of one graph per projector."""
+    from spyre_inference.models.granite4_vision import (
+        SpyreGranite4VisionForConditionalGeneration as Spyre,
+    )
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    model = SimpleNamespace(patches_per_token=4, _query=QUERY, _window=WINDOW)
+    project = torch.compile(
+        lambda proj, tap, down: Spyre._project(model, proj, tap, down),
+        backend=backend,
+        fullgraph=True,
+        dynamic=False,
+    )
+    tap = torch.randn(2 * SIDE * SIDE, HIDDEN)
+    with torch.no_grad():
+        for offset in (None, None, 0, 1, 2, 3):
+            project(_projector(offset), tap, _down_weights(offset))
+    assert len(graphs) == 1
 
 
 def _postprocess_model(levels: int = 5) -> SimpleNamespace:

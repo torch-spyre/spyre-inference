@@ -58,6 +58,7 @@ from vllm.model_executor.models.utils import StageMissingLayer
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
 from spyre_inference.multimodal.utils import STICK, align_up
+from spyre_inference.v1.worker import compile_guard
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -257,6 +258,8 @@ class SpyreGranite4VisionForConditionalGeneration(
 ):
     """Upstream Granite 4 Vision with its vision encoder compiled per token budget."""
 
+    _down_mean: torch.Tensor
+
     # --- construction ---
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -296,6 +299,17 @@ class SpyreGranite4VisionForConditionalGeneration(
         self.out_hidden_size = cfg.text_config.hidden_size * self._levels
         self.vision_buffers = {"patches": VisionBuffer(self._patch_width)}
         self._tile_order, self._window_order = window_major_order(side, window, query)
+        # Each level's downsample as weights over the offset groups (a mean, or one offset), so
+        # every projector runs through one compiled graph. Kept as separate buffers: a device
+        # view at an offset off the stick reads as offset 0 (torch-spyre#3770).
+        merge2, hidden = self.patches_per_token, vision.hidden_size
+        self.register_buffer(
+            "_down_mean", torch.full((merge2, 1, hidden), 1.0 / merge2), persistent=False
+        )
+        for k in range(merge2):
+            onehot = torch.zeros(merge2, 1, hidden)
+            onehot[k] = 1.0
+            self.register_buffer(f"_down_offset{k}", onehot, persistent=False)
         max_tiles = max(
             (h // vision.image_size) * (w // vision.image_size) + 1
             for h, w in cfg.image_grid_pinpoints
@@ -410,30 +424,44 @@ class SpyreGranite4VisionForConditionalGeneration(
     ) -> torch.Tensor:
         return block(x)[0]
 
+    def compile_vision_graphs(self) -> None:
+        """The mixin's graphs, except that ``vision_project`` stays Python: it calls one
+        compiled projector graph per level, which every projector shares."""
+        if hasattr(self, "_spyre_vision_embed"):
+            return
+        super().compile_vision_graphs()
+        self._spyre_vision_project = self.vision_project
+        self._spyre_project = torch.compile(
+            self._project, backend="inductor", fullgraph=True, dynamic=False
+        )
+        compile_guard.watch(self._spyre_project, f"{type(self).__name__}._project")
+
     def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
         """Each level's projector over its tap, packed on the last dimension: the deepstack
         levels, then the spatial offsets, in the order of upstream's ``_ds_layer_indices``."""
+        project = getattr(self, "_spyre_project", self._project)
         layerwise = len(self.layerwise_projectors)
         levels = [
-            self._project(proj, taps[i], None) for i, proj in enumerate(self.layerwise_projectors)
+            project(proj, taps[i], self._down_mean)
+            for i, proj in enumerate(self.layerwise_projectors)
         ]
         levels += [
-            self._project(proj, taps[layerwise], offset)
-            for offset, proj in enumerate(self.spatial_projectors)
+            project(proj, taps[layerwise], cast(torch.Tensor, getattr(self, f"_down_offset{k}")))
+            for k, proj in enumerate(self.spatial_projectors)
         ]
         return torch.cat(levels, dim=-1)
 
-    def _project(self, proj: nn.Module, tap: torch.Tensor, offset: int | None) -> torch.Tensor:
+    def _project(self, proj: nn.Module, tap: torch.Tensor, down: torch.Tensor) -> torch.Tensor:
         """``WindowQFormerDownsampler.forward`` on window-major patches, to ``[tokens, H]``.
 
-        The downsample is the mean over the offset groups (upstream's area interpolation) or
-        one group (its spatial offset), both free views of the window.
+        ``down`` weighs the offset groups: a mean (upstream's area interpolation) or a one-hot
+        (its spatial offset).
         """
         merge2, queries = self.patches_per_token, self._query**2
         enc = proj.norm(tap).reshape(-1, self._window**2, tap.shape[-1])
         groups = enc.reshape(enc.shape[0], merge2, queries, -1)
-        down = groups.mean(dim=1) if offset is None else groups[:, offset]
-        out = _qformer(proj.qformer, proj.query + down, enc + proj.image_positions)
+        query = proj.query + (groups * down).sum(dim=1)
+        out = _qformer(proj.qformer, query, enc + proj.image_positions)
         return proj.out_linear(out).reshape(-1, proj.out_linear.out_features)
 
     def postprocess_encoder_output(

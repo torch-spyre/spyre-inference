@@ -1,0 +1,60 @@
+# XPress speculative decoding
+
+XPress runs a DFlash backbone once, refines a block of draft tokens, and lets
+the target model verify the proposals. The experimental Spyre integration loads
+the published `UIUC-SSAIL/Qwen3-8B-XPress-b16` checkpoint directly with
+`Qwen/Qwen3-8B`; checkpoint conversion is not required.
+
+Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
+the V1 runner, one active request, greedy target sampling, and prefix caching
+disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+
+## Run Qwen3-8B
+
+```bash
+export SPYRE_MODEL_RUNNER=v1
+export SPYRE_ATTN_QUERY_BUCKETS=1,16,64
+uv run --no-sync vllm serve Qwen/Qwen3-8B \
+  --revision b968826d9c46dd6066d109eabc6255188de91218 \
+  --tokenizer-revision b968826d9c46dd6066d109eabc6255188de91218 \
+  --dtype float16 --tensor-parallel-size 1 \
+  --max-num-seqs 1 --max-model-len 512 --max-num-batched-tokens 64 \
+  --no-enable-prefix-caching \
+  --compilation-config '{"compile_sizes": [1, 16, 64]}' \
+  --speculative-config '{"method": "dflash", "model": "UIUC-SSAIL/Qwen3-8B-XPress-b16", "revision": "f098ab5bbe4fce37c4a1093266bcd8ad15df5cb5", "num_speculative_tokens": 15, "xpress_topc": 128}'
+```
+
+Use `temperature=0` in requests. The same speculative configuration works with
+`vllm.LLM`. A full verification round needs at least 31 budgeted tokens because
+vLLM reserves additional drafting slots; the adapter rejects a smaller budget.
+
+## Refinement and compatibility
+
+The refiner follows [merged vLLM XPress](https://github.com/vllm-project/vllm/pull/54448):
+a fixed anchor, causal Jacobi updates, a block-wide hidden summary, and candidate
+sets fixed across passes. Target input embeddings and output-head weights are
+shared separately. Accepted target states populate the draft KV cache; rejected
+and padded rows write only the reserved null page.
+
+`xpress_topc` overrides the checkpoint field. Spyre defaults to 128 when neither
+supplies a value; explicit 512 retains the upstream default and 0 enables
+full-vocabulary refinement. A smaller shortlist can change acceptance. The
+checkpoint selects the pass count, with six as the default.
+
+The pinned vLLM 0.32 lacks native XPress registration, so this adapter uses its V1
+DFlash classes with a configuration bridge. The merged GPU speculator uses V2.
+Initial selection and per-pass argmax run on CPU; readout and refinement run on
+Spyre. Jagged attention and compiler extensions are optional follow-up work.
+
+## Validation
+
+```bash
+uv run --no-sync pytest tests/spec_decode -m 'not upstream'
+SPYRE_XPRESS_TEST_TOPC=128 uv run --no-sync pytest \
+  tests/e2e/test_speculative_decoding.py -m model_quality -s
+```
+
+CPU recurrence and lifecycle tests pass. Device qualification remains open:
+the strict target-token comparison exposes a shape-dependent target score tie
+between ordinary decoding and block verification. The equality assertion remains
+in the test. Repeat device validation with C512 when qualifying that configuration.

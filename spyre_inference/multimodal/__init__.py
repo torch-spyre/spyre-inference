@@ -18,8 +18,7 @@ One module per architecture, each exposing `apply(model, device)`. These monkeyp
 upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
 implementations by layer class. Architectures migrated to a registered subclass on
 `models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4, Granite 4 Vision)
-are not patched here;
-`siglip` holds the weight padding the Granite 4 Vision subclass reuses.
+are not patched here.
 """
 
 import torch

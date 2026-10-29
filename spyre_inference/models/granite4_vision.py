@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -57,8 +57,7 @@ from vllm.model_executor.models.utils import StageMissingLayer
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
-from spyre_inference.multimodal import siglip
-from spyre_inference.multimodal.utils import STICK
+from spyre_inference.multimodal.utils import STICK, align_up
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -101,6 +100,105 @@ def _qformer(qformer: Any, query: torch.Tensor, encoder: torch.Tensor) -> torch.
     h = layer.attention(h)
     h = layer.crossattention(h, encoder_hidden_states=encoder)
     return layer.output_query(layer.intermediate_query(h), h)
+
+
+def _pad_qkv_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) -> torch.Tensor:
+    """Zero-extend each head block of the Spyre-transposed fused QKV weight.
+
+    SpyreTransposedWeightMethod stores weight as Wᵀ with shape [hidden, 3*H*D]
+    (transposed from the original [3*H*D, hidden]).  We pad across the column
+    axis — each head's D columns become pad_d columns — and keep the result in
+    the same transposed layout [hidden, 3*H*D_pad] so the `x @ Wᵀ` forward
+    in SpyreTransposedWeightMethod.apply still works unchanged.
+    """
+    w = convert(w.detach(), device="cpu")
+    hidden = w.shape[0]
+    out = torch.zeros(hidden, 3 * num_heads * pad_d, dtype=w.dtype)
+    for b in range(3):  # Q, K, V blocks
+        for h in range(num_heads):
+            src = b * num_heads * orig_d + h * orig_d
+            dst = b * num_heads * pad_d + h * pad_d
+            out[:, dst : dst + orig_d] = w[:, src : src + orig_d]
+    return out
+
+
+def _pad_qkv_bias(b: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) -> torch.Tensor:
+    """Zero-extend each head block of a fused QKV bias [3*H*D] -> [3*H*D_pad]."""
+    b = convert(b.detach(), device="cpu")
+    out = torch.zeros(3 * num_heads * pad_d, dtype=b.dtype)
+    for blk in range(3):
+        for h in range(num_heads):
+            src = blk * num_heads * orig_d + h * orig_d
+            dst = blk * num_heads * pad_d + h * pad_d
+            out[dst : dst + orig_d] = b[src : src + orig_d]
+    return out
+
+
+def _pad_out_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) -> torch.Tensor:
+    """Zero-extend each head block of the Spyre-transposed out_proj weight.
+
+    SpyreTransposedWeightMethod stores out_proj weight as Wᵀ with shape
+    [H*D, hidden] (transposed from the original [hidden, H*D]).  We pad
+    across the row axis — each head's orig_d rows become pad_d rows — and
+    keep the result in the same transposed layout [H*D_pad, hidden] so the
+    `x @ Wᵀ` forward still works unchanged.
+    """
+    w = convert(w.detach(), device="cpu")
+    hidden = w.shape[1]
+    out = torch.zeros(num_heads * pad_d, hidden, dtype=w.dtype)
+    for h in range(num_heads):
+        src = h * orig_d
+        dst = h * pad_d
+        out[dst : dst + orig_d, :] = w[src : src + orig_d, :]
+    return out
+
+
+def pad_siglip_heads(tower: nn.Module) -> None:
+    """Pad every SigLIP attention's Q/K/V/O projections from head_dim=72 to 128.
+
+    SigLIP so400m has head_dim=72 (not stick-aligned). Any on-device op that materialises a
+    D=72 tensor triggers a restickify whose store index contains a fractional coefficient
+    (9*c2/8), which torch-spyre's inductor cannot lower (torch-spyre#1353). Each head block of
+    qkv_proj and out_proj is zero-extended to the stick-aligned width (mirroring hf-adapters'
+    ``pad_attention_heads_linear``), and ``attn.head_size`` is set to match so
+    ``SpyreMMEncoderAttention`` handles the attention natively on-device. It keeps the original
+    scale, which ``MMEncoderAttention`` fixed at construction.
+
+    The checkpoint is 72 wide, so this runs after loading. Each weight is pulled to the host
+    before the slice-assignments (a strided slice-assign is silently wrong on Spyre) and moved
+    back. A no-op for a head_dim that is already stick-aligned, and for a tower padded before.
+    """
+    for layer in tower.encoder.layers:
+        attn = layer.self_attn
+        if getattr(attn, "_spyre_head_dim_padded", False):
+            continue
+        orig = attn.head_dim
+        pad = align_up(orig, STICK)
+        if pad == orig:
+            return  # every layer shares the head dim
+        num_heads = attn.num_heads_per_partition
+
+        qkv, out = attn.qkv_proj, attn.out_proj
+        qkv_w = cast(torch.Tensor, qkv.weight)
+        dev = qkv_w.device
+        qkv.weight = nn.Parameter(
+            convert(_pad_qkv_weight(qkv_w.data, num_heads, orig, pad), device=dev),
+            requires_grad=False,
+        )
+        if qkv.bias is not None:
+            qkv_b = cast(torch.Tensor, qkv.bias)
+            qkv.bias = nn.Parameter(
+                convert(_pad_qkv_bias(qkv_b.data, num_heads, orig, pad), device=dev),
+                requires_grad=False,
+            )
+        out_w = cast(torch.Tensor, out.weight)
+        out.weight = nn.Parameter(
+            convert(_pad_out_weight(out_w.data, num_heads, orig, pad), device=dev),
+            requires_grad=False,
+        )
+        # out_proj bias is [hidden], the output dim, unchanged.
+        attn.attn.head_size = pad
+        attn._spyre_head_dim_padded = True
 
 
 class SpyreBlip2QFormerMultiHeadAttention(blip2.Blip2QFormerMultiHeadAttention):
@@ -216,7 +314,7 @@ class SpyreGranite4VisionForConditionalGeneration(
         tower = self.vision_tower.vision_model
         # Pads each head's q/k/v/out from 72 to 128 and sets MMEncoderAttention's head size, so
         # the blocks run through SpyreMMEncoderAttention.
-        siglip.patch_siglip_attention(self.vision_tower)
+        pad_siglip_heads(tower)
 
         emb = tower.embeddings
         conv = emb.patch_embedding

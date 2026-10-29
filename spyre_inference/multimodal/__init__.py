@@ -19,7 +19,7 @@ upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
 implementations by layer class. Architectures migrated to a registered subclass on
 `models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4, Granite 4 Vision)
 are not patched here;
-`blip2` and `siglip` hold the layer helpers the Granite 4 Vision subclass reuses.
+`siglip` holds the weight padding the Granite 4 Vision subclass reuses.
 """
 
 import torch

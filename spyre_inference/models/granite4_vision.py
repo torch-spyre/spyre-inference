@@ -49,14 +49,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.models.llava_next.modeling_llava_next import image_size_to_num_patches
-from vllm.model_executor.models import granite4_vision
+from vllm.model_executor.models import blip2, granite4_vision
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import StageMissingLayer
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
-from spyre_inference.multimodal import blip2, siglip
+from spyre_inference.multimodal import siglip
 from spyre_inference.multimodal.utils import STICK
 
 if TYPE_CHECKING:
@@ -102,6 +103,57 @@ def _qformer(qformer: Any, query: torch.Tensor, encoder: torch.Tensor) -> torch.
     return layer.output_query(layer.intermediate_query(h), h)
 
 
+class SpyreBlip2QFormerMultiHeadAttention(blip2.Blip2QFormerMultiHeadAttention):
+    """Q-Former attention that runs fully on Spyre.
+
+    Upstream's ``transpose_for_scores`` is a ``permute(0, 2, 1, 3)`` with no ``.contiguous()``,
+    which leaves non-contiguous stick layouts that Spyre's restickify and bmm_padding passes
+    cannot reconcile: the fused transpose -> SDPA lowering reads them with the wrong stick
+    layout and returns garbage. As in hf-adapters' ``make_encoder_block``, each head-shape
+    transpose is followed by ``.contiguous()``, so Spyre materialises a canonically tiled
+    buffer before the SDPA decomposition.
+
+    It adds no state, so ``use_spyre_qformer_attention`` can swap it onto a built module.
+    """
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        bsz, q_len, _ = hidden_states.shape
+
+        def project(proj: nn.Module, x: torch.Tensor) -> torch.Tensor:
+            return (
+                proj(x)
+                .view(bsz, x.shape[1], self.num_attention_heads, self.attention_head_size)
+                .transpose(1, 2)
+                .contiguous()
+            )
+
+        q = project(self.query, hidden_states)
+        kv_src = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        k = project(self.key, kv_src)
+        v = project(self.value, kv_src)
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=False, scale=self.scaling
+        )
+        # [B, H, Lq, D] -> [B, Lq, H*D]
+        return out.transpose(1, 2).reshape(bsz, q_len, self.all_head_size)
+
+
+def use_spyre_qformer_attention(root: nn.Module) -> int:
+    """Swap ``SpyreBlip2QFormerMultiHeadAttention`` onto every upstream Q-Former attention
+    under ``root``, in place and before weights load. Only this model's own modules change,
+    not the upstream class other models share. Returns how many it swapped."""
+    swapped = 0
+    for module in root.modules():
+        if type(module) is blip2.Blip2QFormerMultiHeadAttention:
+            module.__class__ = SpyreBlip2QFormerMultiHeadAttention
+            swapped += 1
+    return swapped
+
+
 class SpyreGranite4VisionForConditionalGeneration(
     SpyreVisionEncoderMixin, granite4_vision.Granite4VisionForConditionalGeneration
 ):
@@ -112,8 +164,8 @@ class SpyreGranite4VisionForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_spyre_vision()
-        # The Q-Former's attention keeps the global patch it had before this class existed.
-        blip2.patch_blip2_qformer_attention()
+        # Before weights load: the swap adds no parameters, so the checkpoint maps unchanged.
+        use_spyre_qformer_attention(self)
 
     def _init_spyre_vision(self) -> None:
         """Set the mixin's attributes. Separate from ``__init__`` so tests can run it without a

@@ -35,7 +35,10 @@ from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
         (24, None, False),
     ],
 )
-def test_output_limit_uses_tokens_already_appended_by_bookkeeping(output_count, max_tokens, skip):
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_output_limit_uses_tokens_already_appended_by_bookkeeping(
+    output_count, max_tokens, skip, all_greedy
+):
     calls = []
 
     def propose(*args, skip_proposal=False, max_model_len=None):
@@ -60,7 +63,7 @@ def test_output_limit_uses_tokens_already_appended_by_bookkeeping(output_count, 
         runner,
         SimpleNamespace(total_num_scheduled_tokens=4),
         [[3]],
-        SimpleNamespace(all_greedy=True),
+        SimpleNamespace(all_greedy=all_greedy),
         None,
         None,
         None,
@@ -70,6 +73,8 @@ def test_output_limit_uses_tokens_already_appended_by_bookkeeping(output_count, 
     )
     assert calls == [[skip]]
     assert result == ([[]] if skip else [[7]])
+    assert runner._draft_probs is None
+    assert runner._draft_prob_req_ids is None
 
 
 def test_skipped_final_proposal_commits_only_accepted_context():

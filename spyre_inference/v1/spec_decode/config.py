@@ -15,38 +15,7 @@
 # vLLM 0.32 predates XPress (vllm#54448); use upstream fields when its canary fails.
 # Retain Spyre validation when removing this bridge; cleanup: #1417.
 
-import functools
-
 import torch
-
-
-def install_dflash_request_validation() -> None:
-    from vllm.exceptions import VLLMValidationError
-    from vllm.sampling_params import SamplingParams
-    from vllm.v1.engine.input_processor import InputProcessor
-
-    original = InputProcessor._validate_params
-    if getattr(original, "_spyre_dflash_validation", False):
-        return
-
-    # Platform.validate_request receives no engine config in vLLM 0.32.
-    @functools.wraps(original)
-    def validate(self, params, supported_tasks):
-        spec = self.speculative_config
-        if (
-            spec is not None
-            and spec.use_dflash()
-            and isinstance(params, SamplingParams)
-            and params.temperature > 0
-        ):
-            raise VLLMValidationError(
-                "Spyre DFlash/XPress requires temperature=0 for target decoding",
-                parameter="temperature",
-            )
-        return original(self, params, supported_tasks)
-
-    validate._spyre_dflash_validation = True
-    InputProcessor._validate_params = validate  # ty: ignore[invalid-assignment]
 
 
 def normalize_speculative_config(engine_args) -> None:

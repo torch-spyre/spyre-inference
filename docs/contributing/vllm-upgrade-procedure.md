@@ -131,7 +131,6 @@ are missing.
 | `TorchSpyreModelRunner._sample` / `_bookkeeping_sync` (`spyre_inference/v1/worker/spyre_model_runner.py`) | The same methods in `vllm/v1/worker/gpu_model_runner.py`, as patched by vllm#62688 (unmerged) | Temporary port for #1420: restores the full state of CPU generators around sampling and hides them from upstream's `set_offset` rewind, which CPU generators lack. Delete both overrides once the pin includes vllm#62688; `tests/runtime/test_sampling_fallback.py::test_upstream_rewind_still_needs_the_cpu_generator_port` fails once upstream restores CPU generators itself. V1 only: MRV2 samples from `(seed, position)` and keeps no generator state. |
 | The sampler patch in `TorchSpyreModelRunner.__init__` | `Sampler` (`vllm/v1/sample/sampler.py`), its construction and `RejectionSampler(self.sampler)` (`vllm/v1/worker/gpu_model_runner.py`) | Relies on `Sampler` calling `self.greedy_sample` and `self.topk_topp_sampler`, and on the rejection sampler holding the same `Sampler` object. |
 | `use_spyre_dflash_proposer()` (`spyre_inference/v1/spec_decode/dflash.py`) | The `DFlashProposer` import, construction and `isinstance` checks in `vllm/v1/worker/gpu_model_runner.py` | Temporarily replaces the module's constructor during runner initialization. The replacement remains an upstream `DFlashProposer` subclass so later checks in `_prepare_inputs` and `sample_tokens` still pass after restoration. |
-| `install_dflash_request_validation()` (`spyre_inference/v1/spec_decode/config.py`) | `InputProcessor._validate_params` and `process_inputs` (`vllm/v1/engine/input_processor.py`) | Rejects non-greedy DFlash/XPress requests with a client validation error before admission. vLLM 0.32's platform request hook has no engine config; this wrapper reads each processor's speculative config and delegates all other validation. |
 
 `tests/spec_decode/test_xpress_vendored.py` deliberately fails if the new vLLM
 ships the XPress module or registers either XPress architecture. Follow
@@ -150,7 +149,7 @@ git diff v<current> v{VERSION} --stat -- \
   cmake/cpu_extension.cmake cmake/utils.cmake \
   vllm/v1/sample/ops/topk_topp_sampler.py vllm/v1/sample/sampler.py \
   vllm/v1/sample/rejection_sampler.py vllm/utils/cpu_triton_utils.py \
-  vllm/v1/worker/gpu_model_runner.py vllm/v1/engine/input_processor.py
+  vllm/v1/worker/gpu_model_runner.py
 ```
 
 For each changed file, port what applies and update the version in the `forward_native`

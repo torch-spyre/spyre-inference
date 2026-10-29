@@ -15,6 +15,7 @@
 """Qwen3-8B: target verification, cache rollback, DFlash and XPress on one card."""
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -110,7 +111,8 @@ def _check_acceptance_metrics(before, after, steps):
     return delta
 
 
-def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_property):
+@pytest.fixture()
+def xpress_engine(monkeypatch):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
     _cached_model(TARGET, TARGET_REVISION)
@@ -122,7 +124,7 @@ def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_
     monkeypatch.setenv(
         "PYTHONPATH", str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
     )
-    engine = LLM(
+    return LLM(
         model=TARGET,
         revision=TARGET_REVISION,
         tokenizer_revision=TARGET_REVISION,
@@ -143,6 +145,10 @@ def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_
             xpress_topc=int(os.environ.get("SPYRE_XPRESS_TEST_TOPC", "128")),
         ),
     )
+
+
+def test_qwen3_xpress_verification_and_generation(xpress_engine, tmp_path, record_property):
+    engine = xpress_engine
     tokenizer = engine.get_tokenizer()
     context = (
         "Read the following context. "
@@ -150,7 +156,7 @@ def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_
         + "\nName the company described above:"
     )
     prompts = [
-        "The capital of France is",
+        "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,",
         "What are the main businesses of IBM? Answer in one sentence.",
         context,
     ]
@@ -387,4 +393,91 @@ def test_qwen3_xpress_verification_and_generation(monkeypatch, tmp_path, record_
     )
     report["memory"] = reuse_state["memory"]
     save_report()
+    record_property("validation_report", str(path))
+
+
+def test_qwen3_xpress_stochastic_generation(xpress_engine, tmp_path, record_property):
+    engine = xpress_engine
+    tokenizer = engine.get_tokenizer()
+    repeated = tokenizer.encode("IBM develops computers, software, and consulting services. " * 64)
+    prompt = "Describe how a computer works in one paragraph:"
+    cases = [
+        ("temperature", prompt, 24, dict(temperature=1.2)),
+        ("topk", prompt, 24, dict(temperature=0.8, top_k=20)),
+        ("topp", prompt, 24, dict(temperature=0.8, top_p=0.9)),
+        (
+            "context_limit",
+            {"prompt_token_ids": repeated[:495]},
+            17,
+            dict(temperature=0.9, top_k=20, top_p=0.8),
+        ),
+    ]
+    report = []
+    path = tmp_path / "stochastic-validation.json"
+    for label, mode, passes in (
+        ("reference", "none", 0),
+        ("dflash", "real", 0),
+        ("xpress", "real", 6),
+    ):
+        for name, prompt, count, options in cases:
+            previous_tokens = previous_cache = None
+            for repetition in range(2):
+                engine.collective_rpc("configure_proposer", args=(mode, None, -1, passes))
+                metrics_before = _acceptance_metrics(engine)
+                result = engine.generate(
+                    prompt,
+                    SamplingParams(
+                        **options, seed=37, max_tokens=count, ignore_eos=True, logprobs=5
+                    ),
+                    use_tqdm=False,
+                )[0]
+                output = result.outputs[0]
+                tokens = list(output.token_ids)
+                assert len(tokens) == count and output.finish_reason == "length"
+                assert len(output.logprobs) == count
+                assert all(
+                    math.isfinite(row[token].logprob) for token, row in zip(tokens, output.logprobs)
+                )
+                state = engine.collective_rpc("validation_state")[0]
+                metrics = _check_acceptance_metrics(
+                    metrics_before, _acceptance_metrics(engine), state["verification_steps"]
+                )
+                for previous, current in zip(state["steps"], state["steps"][1:]):
+                    assert current["position"] == previous["committed_end"]
+                if mode == "real":
+                    assert any(step["native_proposals"] for step in state["steps"])
+                    verified = [step for step in state["verification_steps"] if step["drafts"]]
+                    assert verified
+                    assert any(len(step["sampled"]) <= step["drafts"] for step in verified)
+                    assert state["draft_context_end"] == len(result.prompt_token_ids) + count - 1
+                else:
+                    assert all(not step["drafts"] for step in state["verification_steps"])
+                cache_path = tmp_path / f"{label}_{name}_{repetition}.pt"
+                engine.collective_rpc(
+                    "save_cache_prefix",
+                    args=(
+                        str(cache_path),
+                        len(result.prompt_token_ids) + count - 1,
+                        mode == "real",
+                    ),
+                )
+                cache = torch.load(cache_path, weights_only=True)
+                if repetition:
+                    # Replaying one mode consumes the same RNG stream. Different
+                    # speculation modes need not produce the same seeded tokens.
+                    assert tokens == previous_tokens, (label, name)
+                    _compare_cache(cache, previous_cache, exact=True)
+                previous_tokens, previous_cache = tokens, cache
+                report.append(
+                    dict(
+                        mode=label,
+                        case=name,
+                        repetition=repetition,
+                        tokens=tokens,
+                        steps=state["steps"],
+                        verification_steps=state["verification_steps"],
+                        acceptance=metrics,
+                    )
+                )
+                path.write_text(json.dumps(report, indent=2))
     record_property("validation_report", str(path))

@@ -729,9 +729,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ):
         assert self.speculative_config is not None
         if self.speculative_config.use_dflash():
+            # Greedy proposals use the rejection sampler's point-mass distribution,
+            # including when the target uses stochastic sampling.
             self._draft_probs = None
             self._draft_prob_req_ids = None
-            assert sampling_metadata.all_greedy, "DFlash/XPress requires greedy target decoding"
             # CPU bookkeeping has already appended this step's sampled tokens.
             at_output_limit = []
             for request_id in self.input_batch.req_ids:

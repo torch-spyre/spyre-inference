@@ -6,7 +6,7 @@ the published `UIUC-SSAIL/Qwen3-8B-XPress-b16` checkpoint directly with
 `Qwen/Qwen3-8B`; checkpoint conversion is not required.
 
 Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
-the V1 runner, one active request, greedy target sampling, and prefix caching
+the V1 runner, one active request, and prefix caching
 disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
 
 ## Run Qwen3-8B
@@ -24,8 +24,10 @@ uv run --no-sync vllm serve Qwen/Qwen3-8B \
   --speculative-config '{"method": "dflash", "model": "UIUC-SSAIL/Qwen3-8B-XPress-b16", "revision": "f098ab5bbe4fce37c4a1093266bcd8ad15df5cb5", "num_speculative_tokens": 15, "xpress_topc": 128}'
 ```
 
-Use `temperature=0` in requests. The same speculative configuration works with
-`vllm.LLM`; non-greedy requests are rejected before reaching the model worker.
+Requests can use greedy (`temperature=0`) or stochastic target sampling,
+including temperature, top-k and top-p. The drafter remains greedy;
+vLLM treats its proposals as point-mass distributions during CPU rejection
+sampling. The same speculative configuration works with `vllm.LLM`.
 The end-to-end test pins the same model and checkpoint revisions as this example;
 update both together. A full verification round needs at least 31 budgeted tokens because
 vLLM reserves additional drafting slots; the adapter rejects a smaller budget.
@@ -43,10 +45,19 @@ supplies a value; explicit 512 retains the upstream default and 0 enables
 full-vocabulary refinement. A smaller shortlist can change acceptance. The
 checkpoint selects the pass count, with six as the default.
 
+Replaying a seeded request with the same configuration is deterministic.
+Changing between ordinary decoding, DFlash and XPress changes RNG consumption;
+the same seed need not produce identical tokens across these modes.
+
 The pinned vLLM 0.32 lacks native XPress registration, so this adapter uses its V1
 DFlash classes with a configuration bridge. The merged GPU speculator uses V2.
 Initial selection and per-pass argmax run on CPU; readout and refinement run on
 Spyre. Jagged attention and compiler extensions are optional follow-up work.
+
+Spyre's V2 runner is still a scaffold: model loading, KV-cache setup, compilation
+and warmup are unimplemented. After that runner is operational, XPress needs its
+auxiliary-state, draft-context and CPU-sampling hooks ported to V2's speculator
+interface. See [the V2 migration issue](https://github.com/torch-spyre/spyre-inference/issues/906).
 
 ## Validation
 
@@ -60,6 +71,10 @@ CPU recurrence and lifecycle tests pass. Device qualification remains open:
 the strict target-token comparison exposes a shape-dependent target score tie
 between ordinary decoding and block verification. The equality assertion remains
 in the test. Repeat device validation with C512 when qualifying that configuration.
+
+The stochastic hardware test currently exposes an upstream CUDA-generator offset
+rewind during seeded chunked prefill. CPU generators need state restoration at
+that boundary; shorter seeded reference runs pass. This remains a draft integration.
 
 The 503-token case starts too close to the context limit to draft. A separate
 495-token case verifies that a previously nonempty draft is cleared at the limit

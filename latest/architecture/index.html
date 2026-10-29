@@ -3090,7 +3090,8 @@ calibrated one.</p>
 <p>Key constraints:</p>
 <ul>
 <li><strong>KV length bucketing</strong>: padded block count on power-of-two buckets from <code>block_size</code>
-  to <code>max_model_len</code> (avoids per-step recompilation on Spyre)</li>
+  to <code>max_model_len</code> (avoids per-step recompilation on Spyre); <code>SPYRE_ATTN_KV_LADDER</code>
+  selects a denser preset</li>
 <li><strong>Query length bucketing</strong>: <code>[1] + multiples of min(512, max_num_batched_tokens)</code>
   (consistent tensor shapes for compilation)</li>
 <li><strong>Num-sequences bucketing</strong> (batched-decode kernel only, <code>SPYRE_BATCHED_DECODE=1</code>, the

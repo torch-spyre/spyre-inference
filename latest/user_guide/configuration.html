@@ -1087,6 +1087,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Tuning buckets for padding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#choosing-a-kv-ladder" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Choosing a KV ladder
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1745,6 +1762,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Tuning buckets for padding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#choosing-a-kv-ladder" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Choosing a KV ladder
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2096,6 +2130,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Tuning buckets for padding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#choosing-a-kv-ladder" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Choosing a KV ladder
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2324,12 +2375,78 @@ they are left to compile on first use (torch-spyre#5250 makes that limit configu
 lists. Each is clamped to its limit: entries above <code>--max-model-len</code> (KV) or
 <code>--max-num-batched-tokens</code> (query) are dropped, and the limit is appended if missing, so
 every schedulable length keeps a bucket.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_KV_BUCKETS</span><span class="o">=</span><span class="m">256</span>,1024,2048<span class="w">    </span><span class="c1"># default: powers of two from block_size</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_KV_BUCKETS</span><span class="o">=</span><span class="m">256</span>,1024,2048<span class="w">    </span><span class="c1"># default: the SPYRE_ATTN_KV_LADDER preset (pow2)</span>
 </span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,512<span class="w">         </span><span class="c1"># 1 = decode; 512 = prefill chunk</span>
 </span></code></pre></div>
-<p>The default KV buckets are geometric (powers of two) because the recorded set grows
-with both axes, even after filtering. If your context never exceeds 2048, dropping the
-higher powers removes variants from warmup at no serving cost.</p>
+<p>The default KV buckets are the powers of two from <code>block_size</code>; the denser presets below
+union them with a further series. The ladder stays geometric rather than uniform because the
+recorded set grows with both the KV and num-sequences axes, even after filtering, so each
+extra entry costs warmup time. If your context never exceeds 2048,
+dropping the higher entries removes variants from warmup at no serving cost.</p>
+<h3 id="choosing-a-kv-ladder">Choosing a KV ladder<a class="headerlink" href="#choosing-a-kv-ladder" title="Permanent link">&para;</a></h3>
+<p><code>SPYRE_ATTN_KV_LADDER</code> picks how finely the KV ladder subdivides, without having to write the
+buckets out. The default is <code>pow2</code>. Every preset keeps the powers of two, so a KV length's bucket
+can only move down relative to <code>pow2</code>, never up. The denser presets do not contain each other,
+though: at block_size 128, 2600 rounds to 2688 under <code>8_5</code> but to 2944 under <code>4_3</code>. Counts and
+overpay below are for block_size 128, at the <code>--max-model-len</code> each column names:</p>
+<table>
+<thead>
+<tr>
+<th>preset</th>
+<th>spacing</th>
+<th>buckets at 4096 / 16384 / 32768</th>
+<th>mean overpay at 4096 / 32768</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pow2</code> (default)</td>
+<td>powers of two only</td>
+<td>6 / 8 / 9</td>
+<td>39% / 39%</td>
+</tr>
+<tr>
+<td><code>8_5</code></td>
+<td>8/5 ratio</td>
+<td>10 / 15 / 18</td>
+<td>21% / 19%</td>
+</tr>
+<tr>
+<td><code>4_3</code></td>
+<td>4/3 ratio</td>
+<td>14 / 20 / 24</td>
+<td>15% / 13%</td>
+</tr>
+<tr>
+<td><code>9_8</code></td>
+<td>9/8 ratio</td>
+<td>20 / 34 / 41</td>
+<td>8% / 6%</td>
+</tr>
+<tr>
+<td><code>uniform</code></td>
+<td>odd sixteenths of <code>--max-model-len</code></td>
+<td>13 / 15 / 16</td>
+<td>14% / 14%</td>
+</tr>
+</tbody>
+</table>
+<p>Overpay is the bucket over the real KV length, averaged over every KV length above <code>block_size</code>,
+so it describes a workload whose lengths are spread out. Warmup cost tracks the number of distinct
+recorded kernels, which rises with the bucket count. The ratio presets put their buckets at fixed
+token counts; <code>uniform</code> places them as fractions of <code>--max-model-len</code>, so its buckets move up with
+the context while its count stays roughly flat. Short contexts that are not a power of two are the
+exception: there the step rounds down to a whole block and adds a few buckets (16 at 2047 against
+12 at 2048). Match <code>--max-model-len</code> to your real lengths before choosing it.</p>
+<p>As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
+saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
+it buys little for its warmup. Once the block count exceeds one chunk of <code>32 // num_seqs</code> blocks,
+the batched-decode kernel also pads it up to whole chunks, which takes back part of a denser
+preset's saving below 32 sequences. <code>8_5</code> is the recommended compromise, <code>9_8</code> the fastest when
+warmup time does not matter, and <code>pow2</code> the default because it has the shortest warmup.</p>
+<p>If the KV lengths are known and clustered, <code>SPYRE_ATTN_KV_BUCKETS</code> beats every preset: put the
+buckets where the lengths actually are. A workload that sits on one power of two gains nothing
+from any preset.</p>
 <p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
 the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.

@@ -22,6 +22,33 @@ import threading
 __version__ = importlib.metadata.version("spyre_inference")
 
 
+def _patch_granitemoehybrid_is_hybrid() -> None:
+    """Ensure models with layer_types=['full_attention', ...] are not misclassified as hybrid."""
+    try:
+        from vllm.config.model import ModelConfig
+
+        prop = getattr(ModelConfig, "is_hybrid", None)
+        if isinstance(prop, property) and not getattr(
+            ModelConfig, "_spyre_patched_is_hybrid", False
+        ):
+            orig_fget = prop.fget
+
+            def is_hybrid_fixed(self) -> bool:
+                if not self._model_info.is_hybrid:
+                    return False
+                layer_types = getattr(self.hf_config, "layer_types", None)
+                if layer_types is not None and all(
+                    layer in ("attention", "full_attention") for layer in layer_types
+                ):
+                    return False
+                return orig_fget(self)
+
+            ModelConfig.is_hybrid = property(is_hybrid_fixed)
+            ModelConfig._spyre_patched_is_hybrid = True
+    except Exception:
+        pass
+
+
 def register():
     """Register the Spyre platform."""
     # vLLM resolves the platform during `import vllm`, before vllm.triton_utils is
@@ -42,6 +69,8 @@ def register():
         init_logger(__name__).exception("Spyre Triton gate could not be applied")
     # VllmConfig.__post_init__ reads use_v2_model_runner before the platform hook.
     pin_model_runner(envs.SPYRE_MODEL_RUNNER)
+
+    _patch_granitemoehybrid_is_hybrid()
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 
@@ -87,6 +116,7 @@ def keep_sigterm_handler():
 
 def register_ops():
     """Register the Spyre OOT custom ops and model adaptations."""
+    _patch_granitemoehybrid_is_hybrid()
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
 

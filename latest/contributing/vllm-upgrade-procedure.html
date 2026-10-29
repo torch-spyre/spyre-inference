@@ -2404,6 +2404,11 @@ are missing.</p>
 <td>Temporary compatibility for vllm#54448 (<code>ce9467b757</code>), which postdates 0.32.0. Replace with upstream XPress model/head subclasses when available, retaining the Spyre overrides.</td>
 </tr>
 <tr>
+<td><code>csrc/cpu/spec_decode_utils.cpp</code>, <code>spyre_inference/v1/spec_decode/rejection_sampler.py</code> and the platform kernel hook</td>
+<td>The four rejection kernels in <code>csrc/cpu/spec_decode_utils.cpp</code> and their adapters in <code>vllm/utils/cpu_triton_utils.py</code> (v0.32.0, <code>5df63a7203</code>)</td>
+<td>Native kernels in <code>_spyre_C</code>, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels; #1417 tracks their independent cleanup condition.</td>
+</tr>
+<tr>
 <td>The sampler patch in <code>TorchSpyreModelRunner.__init__</code></td>
 <td><code>Sampler</code> (<code>vllm/v1/sample/sampler.py</code>), its construction and <code>RejectionSampler(self.sampler)</code> (<code>vllm/v1/worker/gpu_model_runner.py</code>)</td>
 <td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>
@@ -2419,10 +2424,12 @@ removing the canary. Keep the Spyre execution overrides and requalify the servin
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>&lt;vllm<span class="w"> </span>checkout&gt;<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>fetch<span class="w"> </span>--tags
 </span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>git<span class="w"> </span>diff<span class="w"> </span>v&lt;current&gt;<span class="w"> </span>v<span class="o">{</span>VERSION<span class="o">}</span><span class="w"> </span>--stat<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>csrc/cpu/cpu_types.hpp<span class="w"> </span>csrc/cpu/cpu_types_x86.hpp<span class="w"> </span>csrc/cpu/cpu_types_vsx.hpp<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>csrc/cpu/cpu_types_vxe.hpp<span class="w"> </span>csrc/cpu/sampling_kernels.cpp<span class="w"> </span>csrc/core/registration.h<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>cmake/cpu_extension.cmake<span class="w"> </span>cmake/utils.cmake<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>vllm/v1/sample/ops/topk_topp_sampler.py<span class="w"> </span>vllm/v1/sample/sampler.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">  </span>vllm/v1/sample/rejection_sampler.py<span class="w"> </span>vllm/v1/worker/gpu_model_runner.py
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>csrc/cpu/cpu_types_vxe.hpp<span class="w"> </span>csrc/cpu/sampling_kernels.cpp<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>csrc/cpu/spec_decode_utils.cpp<span class="w"> </span>csrc/cpu/torch_bindings.cpp<span class="w"> </span>csrc/core/registration.h<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>cmake/cpu_extension.cmake<span class="w"> </span>cmake/utils.cmake<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">  </span>vllm/v1/sample/ops/topk_topp_sampler.py<span class="w"> </span>vllm/v1/sample/sampler.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">  </span>vllm/v1/sample/rejection_sampler.py<span class="w"> </span>vllm/utils/cpu_triton_utils.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">  </span>vllm/v1/worker/gpu_model_runner.py
 </span></code></pre></div>
 <p>For each changed file, port what applies and update the version in the <code>forward_native</code>
 comment. If the new vLLM pins a different torch, move every torch pin in <code>pyproject.toml</code>
@@ -2430,9 +2437,11 @@ together: the extension links libtorch, so a mismatch fails at import. The list 
 places, including the ppc64le source build) is in §3b of the <code>upgrade-torch-spyre</code> skill,
 and torch-spyre must support the new torch as well.
 <code>uv sync</code> rebuilds the extension because <code>csrc/</code> and <code>pyproject.toml</code> are in its cache keys.</p>
-<p>Then check the kernels and the PyTorch fallback (CPU only, no card needed):</p>
+<p>Then check the kernels and ordinary-sampling PyTorch fallback (CPU only, no card needed).
+The rejection sampler requires the built extension:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/runtime/test_sampling_kernels.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>tests/runtime/test_sampling_fallback.py<span class="w"> </span>tests/runtime/test_spyre_topk_sampler.py<span class="w"> </span>--no-header
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>tests/runtime/test_sampling_fallback.py<span class="w"> </span>tests/runtime/test_spyre_topk_sampler.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>tests/spec_decode/test_rejection_sampler.py<span class="w"> </span>--no-header
 </span></code></pre></div>
 <ul>
 <li><code>test_sampling_kernels.py</code> checks the kernels against PyTorch baselines token for token:
@@ -2440,6 +2449,8 @@ and torch-spyre must support the new torch as well.
 <li><code>test_sampling_fallback.py</code> forces the fallback and checks it picks the same tokens as
   upstream's stock <code>Sampler</code>, which catches upstream sampler changes we haven't mirrored.</li>
 <li><code>test_spyre_topk_sampler.py</code> checks the sort-free top-k/top-p against upstream's sort.</li>
+<li><code>test_rejection_sampler.py</code> exercises the native kernels through vLLM's dispatchers,
+  including mixed dtypes, FP64 noise, synthetic acceptance and target-distribution checks.</li>
 </ul>
 <h2 id="step-3-triage-in-this-order">Step 3: Triage in This Order<a class="headerlink" href="#step-3-triage-in-this-order" title="Permanent link">&para;</a></h2>
 <p>Don't run the full <code>pytest</code> first — vLLM startup is ~30s per test file, and the failures cluster by category. Run the cheapest categories first so you can fix-and-rerun quickly.</p>

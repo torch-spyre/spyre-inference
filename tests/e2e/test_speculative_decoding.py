@@ -419,6 +419,7 @@ def test_qwen3_xpress_stochastic_generation(xpress_engine, tmp_path, record_prop
         ("dflash", "real", 0),
         ("xpress", "real", 6),
     ):
+        saw_rejection = False
         for name, prompt, count, options in cases:
             previous_tokens = previous_cache = None
             for repetition in range(2):
@@ -442,14 +443,40 @@ def test_qwen3_xpress_stochastic_generation(xpress_engine, tmp_path, record_prop
                 metrics = _check_acceptance_metrics(
                     metrics_before, _acceptance_metrics(engine), state["verification_steps"]
                 )
+                row = dict(
+                    mode=label,
+                    case=name,
+                    repetition=repetition,
+                    tokens=tokens,
+                    prompt_tokens=len(result.prompt_token_ids),
+                    steps=state["steps"],
+                    verification_steps=state["verification_steps"],
+                    draft_context_end=state["draft_context_end"],
+                    acceptance=metrics,
+                    validated=False,
+                )
+                report.append(row)
+                path.write_text(json.dumps(report, indent=2))
+                worker_tokens = [
+                    token for step in state["verification_steps"] for token in step["sampled"]
+                ]
+                # The scheduler clips a completed verification block at max_tokens,
+                # after the worker has committed its accepted context and metrics.
+                assert worker_tokens[:count] == tokens
+                assert count <= len(worker_tokens) < count + 16
                 for previous, current in zip(state["steps"], state["steps"][1:]):
                     assert current["position"] == previous["committed_end"]
                 if mode == "real":
                     assert any(step["native_proposals"] for step in state["steps"])
                     verified = [step for step in state["verification_steps"] if step["drafts"]]
                     assert verified
-                    assert any(len(step["sampled"]) <= step["drafts"] for step in verified)
-                    assert state["draft_context_end"] == len(result.prompt_token_ids) + count - 1
+                    saw_rejection |= any(
+                        len(step["sampled"]) <= step["drafts"] for step in verified
+                    )
+                    assert state["draft_context_end"] == (
+                        len(result.prompt_token_ids) + len(worker_tokens) - 1
+                    )
+                    assert not state["steps"][-1]["native_proposals"]
                 else:
                     assert all(not step["drafts"] for step in state["verification_steps"])
                 cache_path = tmp_path / f"{label}_{name}_{repetition}.pt"
@@ -468,16 +495,8 @@ def test_qwen3_xpress_stochastic_generation(xpress_engine, tmp_path, record_prop
                     assert tokens == previous_tokens, (label, name)
                     _compare_cache(cache, previous_cache, exact=True)
                 previous_tokens, previous_cache = tokens, cache
-                report.append(
-                    dict(
-                        mode=label,
-                        case=name,
-                        repetition=repetition,
-                        tokens=tokens,
-                        steps=state["steps"],
-                        verification_steps=state["verification_steps"],
-                        acceptance=metrics,
-                    )
-                )
+                row["validated"] = True
                 path.write_text(json.dumps(report, indent=2))
+        if mode == "real":
+            assert saw_rejection, label
     record_property("validation_report", str(path))

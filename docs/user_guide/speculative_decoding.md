@@ -72,9 +72,9 @@ the strict target-token comparison exposes a shape-dependent target score tie
 between ordinary decoding and block verification. The equality assertion remains
 in the test. Repeat device validation with C512 when qualifying that configuration.
 
-The stochastic hardware test currently exposes an upstream CUDA-generator offset
-rewind during seeded chunked prefill. CPU generators need state restoration at
-that boundary; shorter seeded reference runs pass. This remains a draft integration.
+Seeded chunked prefill preserves CPU RNG state when discarding intermediate
+samples. Ordinary seeded decoding, including long prefill, passes exact replay
+checks; qualification of the complete stochastic DFlash/XPress matrix is ongoing.
 
 The 503-token case starts too close to the context limit to draft. A separate
 495-token case verifies that a previously nonempty draft is cleared at the limit

@@ -40,12 +40,21 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _build_query_row_tables,
 )
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
 )
 
 pytestmark = pytest.mark.attention
+
+# Both tests pass under the Python walk (SPYRE_ATTN_FOR_EACH_TILE=0), so this is a
+# skipif on the walk, not an unconditional skip; the flag is read at import, ruling
+# out a monkeypatch.
+_token_major_batched_needs_python_walk = pytest.mark.skipif(
+    USE_FOR_EACH_TILE,
+    reason="token-major declines batched decode under the tiled walk; its FET port is separate",
+)
 
 NUM_HEADS = 4
 NUM_KV_HEADS = 2
@@ -566,6 +575,7 @@ class TestRecordBatchedDecode:
     def _expected(self, bucketer, batched: int) -> int:
         return len(_recordable(bucketer, self.PAGES)) + batched
 
+    @_token_major_batched_needs_python_walk
     def test_records_every_enumerated_batched_variant(self, impl, wide_cache, builder):
         bucketer = builder._attn_bucketer = make_bucketer()
 
@@ -602,6 +612,7 @@ class TestRecordBatchedDecode:
 
         assert _record(alibi_impl, wide_cache, builder) == self._expected(bucketer, 0)
 
+    @_token_major_batched_needs_python_walk
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """The gather's entry axis, not the block count, is what a small cache bounds."""
         bucketer = builder._attn_bucketer = make_bucketer()

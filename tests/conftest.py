@@ -20,32 +20,18 @@ from spyre_inference.v1.worker import compile_guard
 
 
 def pytest_collection_modifyitems(items):
-    """Skip batched decode until it composes with the default tiled page walk.
+    """Stamp each item's JUnit tags.
 
-    Also stamps each item's JUnit tags here, not in a fixture: pytest skips a
-    function-scoped autouse fixture entirely for a marked skip, a true skipif,
-    xfail(run=False), or when an earlier fixture already failed, so a fixture-based
-    tagger silently drops tags on exactly the cases that most need them. Collection
-    time has no such gap, same as the upstream-test tagging in pytest_plugin.py.
+    Done here, not in a fixture: pytest skips a function-scoped autouse fixture
+    entirely for a marked skip, a true skipif, xfail(run=False), or when an earlier
+    fixture already failed, so a fixture-based tagger silently drops tags on exactly
+    the cases that most need them. Collection time has no such gap, same as the
+    upstream-test tagging in pytest_plugin.py.
     """
-    skip = pytest.mark.skip(
-        reason="will be re-enabled once batched decode is working with for_each_tile"
-    )
     for item in items:
         params = getattr(getattr(item, "callspec", None), "params", {})
         for name, value in result_tags(params):
             item.user_properties.append((name, value))
-
-        # Match only the test id/class/parameter portion, not the file path: the
-        # global skip must not exclude the card-free entry-local CPU tests by filename.
-        nodeid = item.nodeid.partition("::")[2].lower()
-        if (
-            "batched_decode" in nodeid
-            or "batcheddecode" in nodeid
-            or "enable_batched_decode" in item.fixturenames
-            or "batched_decode_calls" in item.fixturenames
-        ):
-            item.add_marker(skip)
 
 
 @pytest.fixture(autouse=True)

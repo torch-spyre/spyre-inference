@@ -27,6 +27,19 @@ models:
         max_num_seqs: 32
 
   # ---- Granite decoder models ------------------------------------------
+  ibm-granite/granite-4.0-micro:
+    platforms: [x86_64, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 2048
+        max_num_seqs: 4
+      - tp_size: 1
+        max_model_len: 4096
+        max_num_seqs: 4
+      - tp_size: 2
+        max_model_len: 4096
+        max_num_seqs: 8
+
   ibm-granite/granite-3.3-8b-instruct:
     platforms: [x86_64, ppc64le]
     serving_configs:

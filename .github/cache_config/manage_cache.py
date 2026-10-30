@@ -22,6 +22,7 @@
 import argparse
 import hashlib
 import os
+import platform
 import shutil
 import sys
 import urllib.error
@@ -72,6 +73,10 @@ def _parse_entry(entry):
     return entry["repo"], entry.get("revision")
 
 
+def _skipped_on_this_arch(entry):
+    return not isinstance(entry, str) and platform.machine() in entry.get("skip_arch", [])
+
+
 # Duplicate pytorch dumps. Kept out of the cache when a safetensors copy exists.
 # A repo whose only weights are ``pytorch_model.bin`` (CLIP ViT-B/32) cannot use
 # this ignore: the offline jobs then open a snapshot that has no weights at all.
@@ -108,6 +113,9 @@ def _run_public(config, config_file):
     failed_models = []
     for entry in models:
         repo_id, revision = _parse_entry(entry)
+        if _skipped_on_this_arch(entry):
+            print(f"\n⏭️ Skipping {repo_id}: skip_arch includes {platform.machine()}")
+            continue
         print(f"\n🚀 Processing: {repo_id}...")
         try:
             cached = snapshot_download(

@@ -216,6 +216,21 @@ If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every p
 buckets where the lengths actually are. A workload that sits on one power of two gains nothing
 from any preset.
 
+#### A denser ladder for large batches only
+
+A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
+concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
+batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`
+(default 16, which with the default buckets means 9 or more sequences), while the per-sequence
+path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the dense buckets
+cost warmup without a measured gain. The second ladder is unioned with the first, so no length
+rounds up further.
+It is off by default, rejected at startup together with `SPYRE_ATTN_KV_BUCKETS`, which replaces
+the ladder it extends, and ignored with a warning when the threshold is above the largest
+num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
+`SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
+less warmup.
+
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
 the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.

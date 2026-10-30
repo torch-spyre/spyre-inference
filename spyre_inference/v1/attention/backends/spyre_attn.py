@@ -197,7 +197,7 @@ _batched_decode_compiled = torch.compile(
 )
 
 
-# Compiled: eager index_copy_ falls back to CPU and segfaults on vLLM output buffers.
+# Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
 def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     dst.index_copy_(0, rows, src[: rows.shape[0]])
     return dst
@@ -1915,8 +1915,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The decode prefix's query rows are range(num_decode_seqs), so the scatter
         # is a contiguous prefix write at (0, 0). Neither per-row
         # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
-        # via @compile_once and can return a stale binary) nor index_copy_
-        # (CPU-fallback segfaults on vLLM output buffers) is safe here.
+        # via @compile_once and can return a stale binary) nor eager index_copy_
+        # (rejects the int32 row index) is safe here.
         result_flat = result.reshape(b_seqs, num_heads, head_size)
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)

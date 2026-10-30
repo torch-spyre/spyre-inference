@@ -74,7 +74,7 @@ def patch_blip2_qformer_attention() -> None:
         # [B, H, Lq, D] -> [B, Lq, H*D]
         return attn_out.transpose(1, 2).reshape(bsz, q_len, self.all_head_size)
 
-    _blip2_attn_forward_spyre._spyre_patched = True  # type: ignore[attr-defined]
+    _blip2_attn_forward_spyre._spyre_patched = True
     Blip2QFormerMultiHeadAttention.forward = _blip2_attn_forward_spyre  # type: ignore[method-assign]
     logger.info(
         "Spyre: patched Blip2QFormerMultiHeadAttention.forward to use "

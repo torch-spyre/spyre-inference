@@ -403,9 +403,7 @@ class SpyreVisionEncoderMixin:
             batch = (
                 kwargs
                 if len(indices) == len(tokens)
-                else self.select_encoder_cudagraph_items(  # ty: ignore[unresolved-attribute]
-                    kwargs, indices
-                )
+                else self.select_encoder_cudagraph_items(kwargs, indices)
             )
             output = self.encoder_eager_forward(batch)
             self.postprocess_encoder_output(
@@ -427,9 +425,7 @@ class SpyreVisionEncoderMixin:
         image tokens arrive on the host: they are placed there at the bucketed ``[T, H]``, so
         the card sees one shape per token bucket whatever the image token count.
         """
-        text = super().embed_input_ids(  # ty: ignore[unresolved-attribute]
-            input_ids, (), is_multimodal=is_multimodal
-        )
+        text = super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return text
         assert is_multimodal is not None, "image tokens need is_multimodal"

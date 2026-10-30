@@ -175,7 +175,7 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
         attn_output, _ = self.out_proj(attn_out)
         return attn_output, None
 
-    _siglip_attention_forward._spyre_patched = True  # type: ignore[attr-defined]
+    _siglip_attention_forward._spyre_patched = True
     SiglipAttention.forward = _siglip_attention_forward  # type: ignore[method-assign]
     logger.info(
         "Spyre: padded SiglipAttention head_dim %d -> %d and replaced forward "

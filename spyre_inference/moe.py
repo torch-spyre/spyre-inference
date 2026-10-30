@@ -607,8 +607,8 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     )
     return _C.reinterpret_tensor_with_layout(
         pool,
-        [experts * chunks, c4, free],
-        [c4 * free, free, 1],
+        (experts * chunks, c4, free),
+        (c4 * free, free, 1),
         0,
         layout,
     )
@@ -631,8 +631,8 @@ def _down_chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
         )
     _check_pool_layout(pool, _expert_kernel_layout(pool))
     chunk_hidden = hidden // chunks
-    size = [experts * chunks, inter, chunk_hidden]
-    stride = [inter * chunk_hidden, chunk_hidden, 1]
+    size = (experts * chunks, inter, chunk_hidden)
+    stride = (inter * chunk_hidden, chunk_hidden, 1)
     layout = SpyreTensorLayout(size, stride, pool.dtype, [1, 0, 2])
     return _C.reinterpret_tensor_with_layout(pool, size, stride, 0, layout)
 

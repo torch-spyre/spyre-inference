@@ -317,17 +317,21 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
     num_decode_seqs: int = 0  # leading decode-only seqs; == num_seqs for pure-decode batches
-    num_decode_tokens: int = 0  # == num_decode_seqs since each decode contributes one token
+    num_decode_tokens: int = 0  # == num_decode_seqs * decode_query_len
+    # Query rows of every decode-prefix sequence: 1, or 1 + k under speculative decoding.
+    decode_query_len: int = 1
     decode_uniformity: float = 0.0  # mean/max decode block count; 0.0 when batched path ineligible
     padded_num_seqs: int | None = None
     padded_batch_blocks: int | None = None
     blocks_per_chunk: int | None = None
-    rep_row_ids_cpu: torch.Tensor | None = None  # [entries] int32
+    rep_row_ids_cpu: torch.Tensor | None = None  # [entries * decode_query_len] int32
     rep_row_ids_dev: torch.Tensor | None = None
     chunk_page_ids_cpu: torch.Tensor | None = None  # [padded_batch_blocks, B_seqs] int32
     chunk_page_ids_dev: torch.Tensor | None = None
-    # [padded_batch_blocks, B_seqs, KV or 1, 1, block] fp16; the KV extent is 1 unless the
-    # tiled walk needs it materialized (see the construction site).
+    # [padded_batch_blocks, B_seqs, KV or 1, 1 or M, block] fp16, M = decode_query_len *
+    # num_queries_per_kv: one row per verification token per query head of its group, 1
+    # (broadcast) at plain decode. The KV extent is 1 unless the tiled walk needs it
+    # materialized (see the construction site).
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
@@ -415,8 +419,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # compiles are exactly the ones build() can round onto.
         self._attn_bucketer = SpyreAttnBucketer(vllm_config)
 
+        # A verification of k drafts is a decode here: the batched kernel serves it.
         self._init_reorder_batch_threshold(
-            reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
+            reorder_batch_threshold=(
+                self._attn_bucketer.batched_decode_query_len if envs.SPYRE_BATCHED_DECODE else None
+            )
         )
 
     @property
@@ -906,8 +913,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         num_decode_seqs, _, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold or 1,
+            # The batched kernel serves one query width: a sequence the scheduler could
+            # not give all k drafts ends the prefix, and the per-seq loop takes the rest.
+            require_uniform=True,
             treat_short_extends_as_decodes=common_attn_metadata.is_prefilling is None,
         )
+        decode_query_len = num_decode_tokens // num_decode_seqs if num_decode_seqs else 1
         padded_num_seqs = None
         padded_batch_blocks = None
         blocks_per_chunk = None
@@ -916,15 +927,30 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         mask_by_chunk_cpu = None
         decode_groups = None
         decode_uniformity = 0.0
-        if not per_seq_only and envs.SPYRE_BATCHED_DECODE and num_decode_seqs > 0:
+        if (
+            not per_seq_only
+            and envs.SPYRE_BATCHED_DECODE
+            and num_decode_seqs > 0
+            # Only the width warmup recorded; a plain-decode prefix under speculative
+            # decoding would compile in the serving path.
+            and decode_query_len == self._attn_bucketer.batched_decode_query_len
+            # require_uniform tolerates zero-length rows, which have no query to serve.
+            and num_decode_tokens == num_decode_seqs * decode_query_len
+        ):
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
             b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
+            chunking = (
+                None
+                if b_seqs is None or b_blocks is None
+                else batched_decode_chunking(b_seqs, b_blocks, decode_query_len)
+            )
 
-            if b_seqs is not None and b_blocks is not None:
+            if chunking is not None:
+                assert b_seqs is not None and b_blocks is not None
                 # Mean/max block count: how uniform the contexts are, independent of
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
@@ -945,10 +971,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     query_start_loc,
                     active_block_indices,
                     attention_mask_stacks,
+                    decode_query_len,
                 )
-                # Guards the identity scatter used by _run_batched_decode_dispatch.
-                assert query_start_loc[:num_decode_seqs].tolist() == prefix
-                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
+                # Guards the identity scatter used by _run_batched_decode_dispatch: the
+                # prefix is num_decode_seqs runs of decode_query_len rows from row 0.
+                assert torch.equal(
+                    query_start_loc[: num_decode_seqs + 1].to(torch.int32),
+                    torch.arange(num_decode_seqs + 1, dtype=torch.int32) * decode_query_len,
+                )
+                # Groups scatter one row per sequence, so verification keeps one rectangle.
+                if envs.SPYRE_JAGGED_DECODE and decode_query_len == 1 and decode_uniformity < 1.0:
                     decode_groups = self._batched_decode_groups(
                         decode_blocks,
                         blocks_per_seq,
@@ -979,6 +1011,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             padded_num_blocks=padded_num_blocks,
             num_decode_seqs=num_decode_seqs,
             num_decode_tokens=num_decode_tokens,
+            decode_query_len=decode_query_len,
             decode_uniformity=decode_uniformity,
             padded_num_seqs=padded_num_seqs,
             padded_batch_blocks=padded_batch_blocks,
@@ -999,6 +1032,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         query_start_loc: torch.Tensor,
         active_block_indices: list | None,
         attention_mask_stacks: list[torch.Tensor],
+        decode_query_len: int = 1,
     ) -> tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
         block_size = self.block_size
         n = len(members)
@@ -1006,13 +1040,18 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Padding columns gather page 0 under an all--inf mask and
         # contribute zero; chunk 0 still holds every real row's block 0,
         # so the running max stays finite.
-        blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
+        chunking = batched_decode_chunking(b_seqs, b_blocks, decode_query_len)
+        assert chunking is not None
+        blocks_per_chunk, num_chunks = chunking
         padded_batch_blocks = num_chunks * blocks_per_chunk
         assert padded_batch_blocks >= b_blocks
-        query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
-        query_row_ids[:n] = query_start_loc[members].to(torch.int32)
-        # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
-        rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
+        # Token (s, t) is row s * decode_query_len + t; padded sequences read row 0.
+        query_row_ids = torch.zeros(b_seqs, decode_query_len, dtype=torch.int32)
+        query_row_ids[:n] = query_start_loc[members].to(torch.int32).unsqueeze(1) + torch.arange(
+            decode_query_len, dtype=torch.int32
+        )
+        # Entry order (j, s, t), block-slot major, matching chunk_page_ids and the mask.
+        rep_row_ids_cpu = query_row_ids.flatten().repeat(blocks_per_chunk)
 
         block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
         bt = block_table[members].to(torch.int32)
@@ -1036,7 +1075,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # -inf on padded rows/blocks and past-kv-len positions; 0 on
         # valid positions. The kernel broadcasts the mask to KV heads.
         mask_bs_bb = torch.full(
-            (b_seqs, padded_batch_blocks, block_size),
+            (b_seqs, padded_batch_blocks, decode_query_len, block_size),
             float("-inf"),
             dtype=self.model_dtype,
         )
@@ -1045,7 +1084,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # filled from those tiles; correct only because they are finfo.min.
             n_use = min(blocks_per_seq[m], b_blocks)
             if n_use:
-                mask_bs_bb[s, :n_use] = attention_mask_stacks[m][:n_use, 0]
+                # Every verification row, each with its own causal cutoff. The tile is
+                # wider when an overridden query ladder lacks this width; its leading
+                # rows are the real ones.
+                mask_bs_bb[s, :n_use] = attention_mask_stacks[m][:n_use, :decode_query_len]
         # A row past the batch is -inf in every block, so its softmax is NaN and
         # the in-graph store would publish it. A real row always has a valid
         # block 0, so its padded blocks can stay -inf and contribute zero.
@@ -1058,10 +1100,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         mask_by_chunk_cpu = (
             mask_bs_bb.transpose(0, 1)
             .unsqueeze(2)
-            .unsqueeze(3)
-            .expand(padded_batch_blocks, b_seqs, kv_extent, 1, block_size)
+            .expand(padded_batch_blocks, b_seqs, kv_extent, decode_query_len, block_size)
             .contiguous()
         )
+        if decode_query_len > 1:
+            # Row t * qpk + g serves token t for query head g, the kernel's M axis.
+            # Expanded here because torch-spyre cannot broadcast a 6-D view of the
+            # scores over the group: it fails to compile, or computes wrong values.
+            mask_by_chunk_cpu = mask_by_chunk_cpu.repeat_interleave(
+                self.num_heads // self.num_kv_heads, dim=3
+            )
         return (
             b_seqs,
             blocks_per_chunk,
@@ -1087,7 +1135,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[m] for m in members))
             if b_seqs is None or b_blocks is None:
                 return None
-            return batched_decode_chunking(b_seqs, b_blocks)[1]
+            chunking = batched_decode_chunking(b_seqs, b_blocks)
+            return None if chunking is None else chunking[1]
 
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
@@ -1166,13 +1215,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     ) -> SpyreAttentionMetadata:
         """Metadata for the all-decode batch that dispatches to ``bucket``.
 
-        ``num_seqs`` sequences of one query token each, all at the same length, so
-        ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
+        ``num_seqs`` sequences of ``verify_len`` query tokens each, all at the same length,
+        so ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
         values and ``decode_uniformity`` is 1.
         """
         num_seqs = bucket.num_seqs
+        verify_len = bucket.verify_len
         kv_len = bucket.num_blocks * self.block_size
-        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32) * verify_len
         metadata = self.build(
             common_prefix_len=0,
             common_attn_metadata=CommonAttentionMetadata(
@@ -1180,12 +1230,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 query_start_loc_cpu=query_start_loc,
                 seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
                 num_reqs=num_seqs,
-                num_actual_tokens=num_seqs,
-                max_query_len=1,
+                num_actual_tokens=num_seqs * verify_len,
+                max_query_len=verify_len,
                 max_seq_len=kv_len,
                 # Every block points at page 0, vLLM's null block: nothing real is read.
                 block_table_tensor=torch.zeros(num_seqs, bucket.num_blocks, dtype=torch.int32),
-                slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+                slot_mapping=torch.zeros(num_seqs * verify_len, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
             ),
@@ -1194,6 +1244,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             f"build() declined the batched path for {bucket}; the recorded variant would "
             "not be the one dispatch reaches"
         )
+        assert metadata.decode_query_len == verify_len
         return metadata
 
 
@@ -1481,7 +1532,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.blocks_per_chunk is not None
         # The recorder's bound: a gather of the whole cache faults the device
         # (torch-spyre#4033), so warmup skips these variants and the per-seq loop serves them.
-        return attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk < num_pages
+        entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
+        if entries >= num_pages:
+            return False
+        # The query gather has the same bound against the staging rows it reads.
+        return entries * attn_metadata.decode_query_len < self.staging_rows
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -1694,13 +1749,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Checked once, outside the try below: the store these recordings trace needs
         # staging at least as wide as the widest bucket, and swallowing that would
         # leave dispatch tracing the fallback scatter instead.
-        widest = max((v.num_seqs for v in variants), default=0)
+        widest = max((v.num_seqs * v.verify_len for v in variants), default=0)
         assert self.staging_rows >= widest, (
-            f"staging buffers hold {self.staging_rows} rows, below the widest num_seqs "
-            f"bucket {widest}; the recorded variants would not be the ones dispatch reaches"
+            f"staging buffers hold {self.staging_rows} rows, below the widest bucket's "
+            f"{widest} query rows; the recorded variants would not be the ones dispatch reaches"
         )
 
-        recorded: set[tuple[int, int, int]] = set()
+        recorded: set[tuple[int, int, int, int]] = set()
         for i, bucket in enumerate(variants, start=1):
             t0 = time.time()
             try:
@@ -1744,13 +1799,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         layer: AttentionLayer,
         kv_cache: SpyrePagedKVCache,
         builder: "SpyreAttentionMetadataBuilder",
-        recorded: "set[tuple[int, int, int]]",
+        recorded: "set[tuple[int, int, int, int]]",
         num_pages: int,
-    ) -> "tuple[int, int, int] | None":
+    ) -> "tuple[int, int, int, int] | None":
         """Trace the batched kernel ``bucket`` needs; None if already traced or unreachable.
 
-        Returns the ``(num_seqs, blocks_per_chunk, num_chunks)`` key the metadata
-        ``build()`` produced actually dispatches on, not ``bucket``'s own.
+        Returns the ``(num_seqs, blocks_per_chunk, num_chunks, verify_len)`` key the
+        metadata ``build()`` produced actually dispatches on, not ``bucket``'s own.
         """
         attn_metadata = builder.build_for_batched_decode_variant(bucket)
         assert attn_metadata.padded_num_seqs is not None
@@ -1760,13 +1815,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.padded_num_seqs,
             attn_metadata.blocks_per_chunk,
             attn_metadata.chunk_page_ids_cpu.shape[0] // attn_metadata.blocks_per_chunk,
+            attn_metadata.decode_query_len,
         )
         # Several requested buckets realize onto one kernel: a sliding window pads the
         # block count to its own per-bucket maximum, below the num_blocks bucket.
         # Without a window build() rounds onto the bucketer's own buckets, so a
         # mismatch means the two have drifted and dispatch can ask for a kernel
         # warmup never recorded.
-        requested = (bucket.num_seqs, bucket.blocks_per_chunk, bucket.num_chunks)
+        requested = (bucket.num_seqs, bucket.blocks_per_chunk, bucket.num_chunks, bucket.verify_len)
         if realized != requested and builder.sliding_window is None:
             logger.warning(
                 "Batched decode variant %s realized as %s without a sliding window; the "
@@ -1780,7 +1836,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # window pads the block count to its own tighter maximum, so this keys on
         # what build() realized, not the bucket's window-agnostic count, to skip
         # only the variants dispatch cannot reach either.
-        if attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk >= num_pages:
+        entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
+        if entries >= num_pages:
+            return None
+        # And the query gather's bound, as _batched_decode_preconditions_met applies it.
+        if entries * attn_metadata.decode_query_len >= self.staging_rows:
             return None
         if realized in recorded:
             return None
@@ -1872,10 +1932,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
         # each chunk block-major to avoid an int32 index relayout; and the result
         # scatter is a single contiguous copy_ at offset 0, valid because the decode
-        # prefix's query rows are range(num_decode_seqs) (asserted in the builder).
+        # prefix's query rows are range(num_decode_tokens) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
-        num_decode_seqs = attn_metadata.num_decode_seqs
+        verify_len = attn_metadata.decode_query_len
+        num_decode_tokens = attn_metadata.num_decode_tokens
         num_heads = self.num_heads
         head_size = self.head_size
         block_size = attn_metadata.block_size
@@ -1885,14 +1946,40 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
 
-        # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
-        # b_seqs, not the real count -- so the destination needs that many rows and a
-        # plain offset-0 layout; the scatter below covers every other case, including
-        # a query buffer narrower than the seq bucket. Re-checked per call: vLLM hands
-        # out a fresh buffer per layer.
+        q_staging, out_staging = self._staging_buffers(query_dev.device)
+        if verify_len > 1 and query_dev is not q_staging:
+            # Verification writes the token-major permute of its result. Stored into a
+            # narrow default-layout caller buffer it came out partly non-finite on Spyre,
+            # and the scatter below fared no better, so stage both ends the way the
+            # per-seq loop does; attn_layer's staged calls never get here.
+            batch_rows = query_dev.shape[0]
+            assert batch_rows < self.staging_rows
+            q_staging[:batch_rows] = query_dev
+            self._run_batched_decode(
+                q_staging,
+                attn_metadata.rep_row_ids_dev,
+                k_pages,
+                v_pages,
+                attn_metadata.chunk_page_ids_dev,
+                attn_metadata.mask_by_chunk_dev,
+                b_seqs,
+                blocks_per_chunk,
+                block_size,
+                out_staging,
+                verify_len,
+            )
+            output[:num_decode_tokens].copy_(out_staging[:num_decode_tokens])
+            return
+
+        # The kernel's store writes out[:b_seqs * verify_len] -- its num_seqs parameter
+        # receives b_seqs, not the real count -- so the destination needs that many rows
+        # and a plain offset-0 layout; the scatter below covers every other case,
+        # including a query buffer narrower than the seq bucket. Re-checked per call:
+        # vLLM hands out a fresh buffer per layer.
+        rows = b_seqs * verify_len
         store_out = (
-            query_dev.shape[0] >= b_seqs
-            and output.shape[0] >= b_seqs
+            query_dev.shape[0] >= rows
+            and output.shape[0] >= rows
             and output.dtype == query_dev.dtype
             and output.storage_offset() == 0
             and output.is_contiguous()
@@ -1908,18 +1995,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             blocks_per_chunk,
             block_size,
             output if store_out else None,
+            verify_len,
         )
         if store_out:
             return
 
-        # The decode prefix's query rows are range(num_decode_seqs), so the scatter
+        # The decode prefix's query rows are range(num_decode_tokens), so the scatter
         # is a contiguous prefix write at (0, 0). Neither per-row
         # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
         # via @compile_once and can return a stale binary) nor index_copy_
         # (CPU-fallback segfaults on vLLM output buffers) is safe here.
-        result_flat = result.reshape(b_seqs, num_heads, head_size)
-        src_block = result_flat[:num_decode_seqs].clone()
-        output[:num_decode_seqs].copy_(src_block)
+        result_flat = result.reshape(rows, num_heads, head_size)
+        src_block = result_flat[:num_decode_tokens].clone()
+        output[:num_decode_tokens].copy_(src_block)
 
     def _grouped_decode_preconditions_met(
         self, attn_metadata: "SpyreAttentionMetadata", num_pages: int
@@ -1949,6 +2037,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 group.metadata = replace(
                     attn_metadata,
                     num_decode_seqs=group.num_seqs,
+                    # Groups only form at decode_query_len 1: one token per sequence.
+                    num_decode_tokens=group.num_seqs,
                     padded_num_seqs=group.padded_num_seqs,
                     blocks_per_chunk=group.blocks_per_chunk,
                     padded_batch_blocks=group.padded_batch_blocks,
@@ -2003,6 +2093,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        verify_len: int,
     ) -> torch.Tensor:
         """Run the batch's decode attention. The point where a subclass swaps kernels."""
         return self._decode_fn(
@@ -2021,6 +2112,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.head_size,
             self.logits_soft_cap,
             out,
+            verify_len=verify_len,
         )
 
     def build_index_tables(

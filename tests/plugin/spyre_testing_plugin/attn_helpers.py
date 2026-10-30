@@ -116,7 +116,9 @@ def _build_metadata(
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
         causal=True,
-        is_prefilling=(query_lens_per_seq > 1),
+        # A speculative verification is up to the builder's decode width wide and is not
+        # prefilling; anything wider stands for a prompt.
+        is_prefilling=(query_lens_per_seq > (builder.reorder_batch_threshold or 1)),
     )
 
     return builder.build(

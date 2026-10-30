@@ -16,6 +16,7 @@
 // Copyright contributors to the vLLM project, Apache-2.0.
 
 #include "cpu_types.hpp"
+#include "gumbel_noise.hpp"
 
 #include <torch/all.h>
 
@@ -25,26 +26,11 @@
 
 namespace {
 
-// Gumbel-max: argmax_i(logit_i + g_i) with g_i ~ Gumbel(0, 1) matches
-// softmax. Noise is SplitMix64(seed, i), so tokens are independent and
-// consecutive seeds are not a 1-token table shift (vllm#59786).
-constexpr uint64_t SPLITMIX_GAMMA = 0x9E3779B97F4A7C15ULL;
-constexpr double GUMBEL_MAX = 37.5;  // 53-bit u in (0,1) => -log(-log u) < 37.5
-
-static inline uint64_t splitmix64(uint64_t z) {
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
-}
-
-static inline uint64_t noise_bits(uint64_t key, int64_t i) {
-  return splitmix64(key + uint64_t(i + 1) * SPLITMIX_GAMMA) >> 11;
-}
-
-static inline double gumbel_from_bits(uint64_t bits) {
-  const double u = (double(bits) + 0.5) * 0x1.0p-53;
-  return -std::log(-std::log(u));
-}
+using gumbel_noise::GUMBEL_MAX;
+using gumbel_noise::gumbel_from_bits;
+using gumbel_noise::noise_bits;
+using gumbel_noise::one_minus_u_from_bits;
+using gumbel_noise::splitmix64;
 
 static void fused_gumbel_argmax_row(int64_t* __restrict__ output,
                                     const float* __restrict__ row,
@@ -74,9 +60,7 @@ static void fused_gumbel_argmax_row(int64_t* __restrict__ output,
     const uint64_t bits = noise_bits(key, i);
     // Wins iff -log u < exp(dx - best_g); -log u >= 1 - u rejects most
     // tokens with one exp instead of two logs.
-    const double one_minus_u =
-        (double((1ULL << 53) - 1 - bits) + 0.5) * 0x1.0p-53;
-    if (one_minus_u >= std::exp(dx - best_g)) continue;
+    if (one_minus_u_from_bits(bits) >= std::exp(dx - best_g)) continue;
     const double g = gumbel_from_bits(bits);
     if (dx + g > best_g) {
       best_logit = row[i];

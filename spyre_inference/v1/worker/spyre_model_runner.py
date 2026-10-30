@@ -90,6 +90,7 @@ from spyre_inference.v1.pool.encoder_grid import (
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+from spyre_inference.v1.spec_decode import rejection_sampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import (
     block_sharing_defeated_by,
@@ -584,6 +585,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
         )
         self.sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]
+        if self.speculative_config is not None:
+            rejection_sampler.install()
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre
@@ -632,9 +635,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
         if hasattr(self, "drafter"):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
+            logger.warning_once("Temporarily allow drafter model.")
 
         fix_padded_model(self.model, self.model_config)
 
@@ -1084,7 +1085,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        if self.speculative_config is not None:
+        # Model-free proposers (ngram, suffix) have no draft attention layers.
+        if self.speculative_config is not None and self.speculative_config.uses_draft_kv_cache():
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(

@@ -38,3 +38,11 @@ except (ImportError, AttributeError) as e:
 def has_sampling_kernels() -> bool:
     """Whether the csrc/ sampling kernels are built and loaded."""
     return _HAS_SAMPLING_KERNELS
+
+
+def draw_seeds(num_rows: int, generators: dict[int, torch.Generator]) -> torch.Tensor:
+    """Per-row int64 seeds for the kernels' in-kernel noise; seeded rows reproduce."""
+    seeds = torch.randint(0, 2**62, (num_rows,), dtype=torch.long)
+    for i, generator in generators.items():
+        seeds[i] = torch.randint(0, 2**62, (1,), generator=generator)
+    return seeds

@@ -1655,6 +1655,53 @@ def test_head_major_batched_decode_correctness(
 
 
 @pytest.mark.parametrize(
+    "seq_lens,soft_cap,batched",
+    [
+        pytest.param([(4, 256), (4, 512), (4, 128), (4, 384)], None, True, id="verify(N=4)"),
+        pytest.param([(4, 256), (4, 384), (4, 130)], None, True, id="verify_pad(N=3_bucket=4)"),
+        # Verification rows straddling a block boundary.
+        pytest.param([(4, 129), (4, 130), (4, 131), (4, 256)], None, True, id="verify_boundary"),
+        pytest.param([(4, 256)] * 4 + [(64, 256)], None, True, id="verify_prefix_plus_prefill"),
+        # A verification short of k drafts ends the prefix; the rest go per-seq.
+        pytest.param([(4, 256), (4, 384), (2, 128), (4, 512)], None, True, id="non_uniform"),
+        pytest.param([(4, 256), (4, 512), (4, 128), (4, 384)], 50.0, True, id="verify_soft_cap"),
+        # Width 1 is not the recorded verification width: the per-seq loop serves it.
+        pytest.param([(1, 256), (1, 512)], None, False, id="plain_decode_stays_per_seq"),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_batched_verify_correctness(
+    default_vllm_config,
+    speculative_decoding,
+    batched_decode_calls,
+    seq_lens,
+    soft_cap,
+    batched,
+    configure_compilation,
+    configure_device,
+):
+    """Speculative verification (k = 3) through the batched kernel, against the CPU
+    reference; GQA with 8 KV heads, so the fold of the verify tokens is exercised."""
+    speculative_decoding(3)
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        soft_cap=soft_cap,
+    )
+    assert bool(batched_decode_calls) == batched
+
+
+@pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
@@ -1720,7 +1767,7 @@ def test_head_major_warmup_records_a_batched_decode_variant(
 
     realized = impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
-    assert realized == (num_seqs, blocks_per_chunk, num_chunks)
+    assert realized == (num_seqs, blocks_per_chunk, num_chunks, 1)
     assert batched_decode_calls, "the recorder traced the per-seq loop, not the batched kernel"
 
     del kv_cache

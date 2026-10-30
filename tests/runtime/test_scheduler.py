@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for TorchSpyreScheduler's partial-prefill cap.
+"""Tests for TorchSpyreScheduler's partial-prefill cap and draft padding.
 
 The cap lowers ``max_num_active_reqs`` around the upstream waiting loop, so these
 drive that real loop and count the prefills it admits per step. Stubbing ``schedule``
@@ -29,6 +29,7 @@ from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -157,3 +158,98 @@ def test_streaming_slots_counted_as_occupancy(monkeypatch, num_streaming):
     scheduler.schedule()
     # One decode in `running`, the streaming slots, and one free prefill slot.
     assert seen == [2 + num_streaming]
+
+
+NUM_SPEC_TOKENS = 3
+
+
+def _decoding(scheduler: TorchSpyreScheduler, rid: str = "d0", prompt_len: int = 16) -> Request:
+    """A request past its prefill, holding one sampled token and no drafts yet."""
+    request = Request(
+        request_id=rid,
+        prompt_token_ids=list(range(prompt_len)),
+        sampling_params=SamplingParams(max_tokens=64),
+        pooling_params=None,
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()  # the whole prompt in one chunk; advances num_computed_tokens
+    assert not request.is_prefill_chunk
+    request.append_output_token_ids(5)
+    return request
+
+
+def _speculative(scheduler: TorchSpyreScheduler, pad: bool = True) -> TorchSpyreScheduler:
+    # The pad gate itself is batched_decode_query_len's, covered in the bucketer tests.
+    scheduler.num_spec_tokens = NUM_SPEC_TOKENS
+    scheduler._pad_drafts = pad
+    return scheduler
+
+
+@pytest.mark.parametrize(
+    "drafts,expected",
+    [
+        ([], [-1, -1, -1]),
+        ([7], [7, -1, -1]),
+        ([7, 8, 9], [7, 8, 9]),
+    ],
+    ids=["none", "short", "full"],
+)
+def test_drafts_padded_to_k(drafts, expected):
+    scheduler = _speculative(_scheduler())
+    request = _decoding(scheduler)
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [list(drafts)]))
+    assert request.spec_token_ids == expected
+
+
+def test_drafts_left_alone_without_batched_spec_decode():
+    scheduler = _speculative(_scheduler(), pad=False)
+    request = _decoding(scheduler)
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[7]]))
+    assert request.spec_token_ids == [7]
+
+
+def test_prefill_chunk_gets_no_padding():
+    """Upstream drops drafts for a prefill chunk; padding must not bring them back."""
+    scheduler = _speculative(_scheduler())
+    request = Request(
+        request_id="p0",
+        prompt_token_ids=list(range(PROMPT_LEN + MAX_NUM_BATCHED_TOKENS)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert request.is_prefill_chunk
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[7]]))
+    assert request.spec_token_ids == []
+
+
+def test_padded_verification_is_scheduled_whole_and_kept_out_of_stats():
+    scheduler = _speculative(_scheduler())
+    request = _decoding(scheduler)
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[7]]))
+
+    output = scheduler.schedule()
+
+    rid = request.request_id
+    assert output.num_scheduled_tokens[rid] == 1 + NUM_SPEC_TOKENS
+    assert output.scheduled_spec_decode_tokens[rid] == [7, -1, -1]
+    assert output.num_invalid_spec_tokens == {rid: 2}
+
+
+def test_unpadded_verification_reports_no_invalid_drafts():
+    scheduler = _speculative(_scheduler())
+    request = _decoding(scheduler)
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[7, 8, 9]]))
+    assert not scheduler.schedule().num_invalid_spec_tokens
+
+
+def test_padding_only_step_is_not_counted_as_a_draft():
+    scheduler = _speculative(_scheduler())
+    scheduler.log_stats = True
+    stats = scheduler.make_spec_decoding_stats(None, 3, 2, None, "real")
+    stats = scheduler.make_spec_decoding_stats(stats, 3, 0, {"pad": 3}, "pad")
+    stats = scheduler.make_spec_decoding_stats(stats, 3, 1, {"part": 2}, "part")
+    assert stats.num_drafts == 2
+    assert stats.num_draft_tokens == 3 + 1
+    assert stats.num_accepted_tokens == 2 + 1

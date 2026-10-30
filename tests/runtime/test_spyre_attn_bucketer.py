@@ -26,6 +26,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _parse_buckets,
     _powers_of_two_up_to,
     batched_decode_chunking,
+    batched_decode_query_len,
 )
 
 BLOCK_SIZE = 64
@@ -39,8 +40,15 @@ def make_config(
     runner_type="generate",
     num_kv_heads=8,
     per_layer_kv_heads=None,
+    num_speculative_tokens=None,
 ):
     config = MagicMock()
+    if num_speculative_tokens is None:
+        config.speculative_config = None
+    else:
+        config.speculative_config.num_speculative_tokens = num_speculative_tokens
+        config.speculative_config.num_speculative_tokens_per_batch_size = None
+        config.speculative_config.parallel_drafting = False
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
     config.model_config.runner_type = runner_type
@@ -152,6 +160,28 @@ class TestBuckets:
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
         assert bucketer.query_buckets == [1, 512]
+
+    @pytest.mark.parametrize("k", [1, 3, 7])
+    def test_speculative_verification_width_gets_its_own_query_bucket(self, k):
+        """A 1+k verification request must not round up onto the prefill step."""
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=k))
+        assert b.query_buckets == [1, 1 + k, 512]
+        for query_len in range(2, k + 2):
+            assert b.find_query_bucket(query_len) == 1 + k
+
+    def test_speculative_width_beyond_the_prefill_cap_is_clamped(self):
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=4, num_speculative_tokens=7))
+        assert b.query_buckets == [1, 4]
+
+    def test_speculative_width_equal_to_the_step_adds_no_bucket(self):
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=511))
+        assert b.query_buckets == [1, 512]
+
+    def test_env_override_wins_over_the_speculative_default(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,512")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.query_buckets == [1, 512]
 
     def test_query_buckets_are_multiples_of_the_step(self):
         b = SpyreAttnBucketer(make_config(max_num_batched_tokens=2048))
@@ -671,3 +701,55 @@ class TestSingleKvHeadBlockFloorTokenMajor:
         envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config(num_kv_heads=1))
         assert min(b.num_blocks_buckets) == 1
+
+
+class TestSpeculativeVerifyWidth:
+    def test_no_speculative_decoding_is_plain_decode(self):
+        assert batched_decode_query_len(make_config()) == 1
+
+    @pytest.mark.parametrize("k", [1, 3, 7])
+    def test_speculative_decoding_verifies_one_plus_k(self, k):
+        assert batched_decode_query_len(make_config(num_speculative_tokens=k)) == 1 + k
+
+    def test_batched_decode_off_keeps_plain_decode(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+        envs.clear_env_cache()
+        assert batched_decode_query_len(make_config(num_speculative_tokens=3)) == 1
+
+    def test_per_batch_size_k_has_no_single_width(self):
+        config = make_config(num_speculative_tokens=3)
+        config.speculative_config.num_speculative_tokens_per_batch_size = [(1, 3), (8, 1)]
+        assert batched_decode_query_len(config) == 1
+
+    def test_v1_parallel_drafting_has_no_single_width(self):
+        """Its decode width is 1 + 2k, not the 1 + k the drafts pad to."""
+        config = make_config(num_speculative_tokens=3)
+        config.speculative_config.parallel_drafting = True
+        config.use_v2_model_runner = False
+        assert batched_decode_query_len(config) == 1
+
+    def test_variants_carry_the_one_verification_width(self):
+        plain = SpyreAttnBucketer(make_config())
+        spec = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert {v.verify_len for v in plain.batched_decode_variants()} == {1}
+        assert {v.verify_len for v in spec.batched_decode_variants()} == {4}
+        # One width, not a ladder: speculative decoding adds no variants.
+        assert len(spec.batched_decode_variants()) == len(plain.batched_decode_variants())
+
+    @pytest.mark.parametrize("verify_len", [2, 3, 4, 5, 6, 8])
+    @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8, 16, 32, 64])
+    @pytest.mark.parametrize("num_blocks", [1, 2, 4, 16, 64])
+    def test_verify_gather_fills_whole_sticks(self, verify_len, num_seqs, num_blocks):
+        """Spyre computes the query fold wrong unless its row count fills whole sticks."""
+        chunking = batched_decode_chunking(num_seqs, num_blocks, verify_len)
+        assert chunking is not None, "a power-of-two seq bucket always has a chunking"
+        blocks_per_chunk, num_chunks = chunking
+        entries = num_seqs * blocks_per_chunk
+        assert entries * verify_len % 32 == 0
+        assert entries <= max(32, num_seqs)
+        assert blocks_per_chunk * num_chunks >= num_blocks
+
+    def test_unreachable_verify_chunking_declines(self):
+        # Six sequences at width 3 would need 96 entries for whole sticks.
+        assert batched_decode_chunking(6, 8, 3) is None
+        assert batched_decode_chunking(6, 8, 1) == (5, 2)

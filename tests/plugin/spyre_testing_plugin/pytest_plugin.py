@@ -939,6 +939,33 @@ def default_vllm_config(monkeypatch):
     yield from _spyre_default_vllm_config(monkeypatch)
 
 
+@pytest.fixture()
+def speculative_decoding(default_vllm_config, monkeypatch):
+    """Return a setter giving the current VllmConfig ``k`` speculative tokens.
+
+    A stub rather than a SpeculativeConfig, which needs a draft model or method to
+    validate; the attention code reads only these fields. Call it before building the
+    metadata builder, whose decode width it sets.
+    """
+    from types import SimpleNamespace
+
+    from vllm.config import get_current_vllm_config
+
+    def enable(num_speculative_tokens: int) -> None:
+        monkeypatch.setattr(
+            get_current_vllm_config(),
+            "speculative_config",
+            SimpleNamespace(
+                method="ngram",
+                num_speculative_tokens=num_speculative_tokens,
+                num_speculative_tokens_per_batch_size=None,
+                parallel_drafting=False,
+            ),
+        )
+
+    return enable
+
+
 def _force_eager_vllm_runner(fixturedef):
     """Wrap the upstream ``vllm_runner`` so runners default to eager — otherwise
     every upstream model test compiles (STOCK) and CI time balloons. A test can

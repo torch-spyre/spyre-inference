@@ -53,6 +53,12 @@ void sample_recovered_tokens_kernel_impl(
     const std::optional<torch::Tensor>& draft_probs,
     const torch::Tensor& target_probs, const torch::Tensor& inv_q,
     int64_t vocab_size, bool no_draft_probs);
+void sample_recovered_tokens_seeded_kernel_impl(
+    torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids,
+    const std::optional<torch::Tensor>& draft_probs,
+    const torch::Tensor& target_probs, const torch::Tensor& seeds,
+    int64_t vocab_size, bool no_draft_probs);
 }  // namespace cpu_utils
 
 // A fixed namespace rather than TORCH_EXTENSION_NAME: every ISA variant
@@ -98,6 +104,14 @@ TORCH_LIBRARY(_spyre_C, ops) {
       "bool no_draft_probs) -> ()");
   ops.impl("sample_recovered_tokens_kernel_impl", torch::kCPU,
            &cpu_utils::sample_recovered_tokens_kernel_impl);
+  ops.def(
+      "sample_recovered_tokens_seeded_kernel_impl("
+      "Tensor(a!) output_token_ids, Tensor cu_num_draft_tokens, Tensor "
+      "draft_token_ids, "
+      "Tensor? draft_probs, Tensor target_probs, Tensor seeds, int vocab_size, "
+      "bool no_draft_probs) -> ()");
+  ops.impl("sample_recovered_tokens_seeded_kernel_impl", torch::kCPU,
+           &cpu_utils::sample_recovered_tokens_seeded_kernel_impl);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

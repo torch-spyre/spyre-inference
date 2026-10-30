@@ -170,6 +170,7 @@ class TorchSpyreWorker(Worker):
         # Ensure registration of Spyre decompositions before FX Graph tracing
         import time
 
+        import torch
         import torch._inductor.decomposition
         from torch_spyre._inductor.decompositions import spyre_decompositions
 
@@ -179,6 +180,29 @@ class TorchSpyreWorker(Worker):
                     "FIXME: Adding %s decomposition to work-around torch-spyre crash", op.name()
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
+
+        # NgramProposer.batch_propose() saves/restores Numba's thread count via
+        # numba.get_num_threads() / numba.set_num_threads().  When Numba uses the
+        # default "omp" threading layer (which shares libgomp with PyTorch), those
+        # calls are identical to torch.get/set_num_threads().  Numba lazily reports
+        # its thread count from the system default (e.g. 24) rather than from the
+        # actual current omp_num_threads value until a parallel region has run.  If
+        # we allow warming_up_model() to compile graphs while torch.get_num_threads()
+        # == 1 (set by Worker.load_model -> set_torch_threads_for_runtime), and then
+        # the first decode step calls numba.set_num_threads(24) during the restore,
+        # Dynamo's GlobalStateGuard detects num_threads changed (1 → 24) and
+        # recompiles everything.
+        #
+        # Fix: synchronise Numba's internal thread-count to the actual serving value
+        # right now, before any compilation.  After this call, numba.get_num_threads()
+        # returns the same value as torch.get_num_threads(), so the save/restore in
+        # batch_propose becomes a no-op and no longer poisons the OMP global state.
+        try:
+            from numba import set_num_threads as numba_set_num_threads
+
+            numba_set_num_threads(torch.get_num_threads())
+        except ImportError:
+            pass  # numba not installed; ngram speculative decoding won't be used
 
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()

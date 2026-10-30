@@ -19,6 +19,42 @@ import torch
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
+def gather_query(
+    query, rep_row_ids, entries, num_kv_heads, num_queries_per_kv, head_size, verify_len
+):
+    """Each entry's query rows as [entries, KV, verify_len * qpk, D].
+
+    Speculative verification folds its verify_len tokens into the GQA axis, the matmul's
+    row axis, since lower_bmm allows only the (entries, KV) batch axes. The rows are
+    gathered token-major, so the tokens are moved inside the head axis first; merging
+    the permuted pair needs the copy.
+    """
+    q = query.index_select(0, rep_row_ids)
+    if verify_len == 1:
+        return q.reshape(entries, num_kv_heads, num_queries_per_kv, head_size)
+    return (
+        q.reshape(entries, verify_len, num_kv_heads, num_queries_per_kv, head_size)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(entries, num_kv_heads, verify_len * num_queries_per_kv, head_size)
+    )
+
+
+def token_major_output(attn, num_seqs, num_kv_heads, num_queries_per_kv, verify_len):
+    """[num_seqs * verify_len, num_heads, D] from per-(seq, KV head) rows, undoing
+    ``gather_query``'s fold so row s * verify_len + t is sequence s's token t."""
+    head_size = attn.shape[-1]
+    num_heads = num_kv_heads * num_queries_per_kv
+    if verify_len == 1:
+        return attn.reshape(num_seqs, num_heads, head_size)
+    return (
+        attn.reshape(num_seqs, num_kv_heads, verify_len, num_queries_per_kv, head_size)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(num_seqs * verify_len, num_heads, head_size)
+    )
+
+
 def batched_decode_kernel(
     query,
     rep_row_ids,
@@ -35,6 +71,7 @@ def batched_decode_kernel(
     head_size,
     logits_soft_cap=0.0,
     out=None,
+    verify_len=1,
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
@@ -43,18 +80,23 @@ def batched_decode_kernel(
     that axis, and behind a 1-D index it is counted in whole 32-entry sticks, so
     a narrow 1-D gather has no splittable unit and runs on one core.
 
+    Every sequence has verify_len query rows: 1 at decode, 1 + k when verifying k
+    speculative drafts. M = verify_len * num_queries_per_kv is the matmul's row axis.
+
     k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
     chunk_page_ids: [padded_blocks, num_seqs] int32, row b holding each sequence's
-    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1,
-    block_size], broadcast across the query group in the kernel, and across KV heads
-    too unless the tiled walk materialized that axis. rep_row_ids: [entries] int32,
-    every query row repeated once per block slot. ``out`` None returns the result
+    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1 or M,
+    block_size]; at verify_len 1 it is broadcast across the query group in the kernel,
+    otherwise the builder expands it (torch-spyre cannot broadcast the group out of M),
+    and across KV heads too unless the tiled walk materialized that axis. rep_row_ids:
+    [entries * verify_len] int32, every query row repeated once per block slot.
+    ``out`` None returns the result, [num_seqs * verify_len, num_heads, head_size],
     instead of storing it.
     """
-    num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
-    q = query.index_select(0, rep_row_ids).reshape(
-        entries, num_kv_heads, num_queries_per_kv, head_size
+    m = verify_len * num_queries_per_kv
+    q = gather_query(
+        query, rep_row_ids, entries, num_kv_heads, num_queries_per_kv, head_size, verify_len
     )
 
     def reduce_chunk(probs, v_page):
@@ -62,9 +104,9 @@ def batched_decode_kernel(
         chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
         chunk_out = torch.sum(
             torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                probs.reshape(entries, num_kv_heads, m, block_size),
                 v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, m, head_size),
             dim=0,
             keepdim=True,
         )
@@ -96,9 +138,7 @@ def batched_decode_kernel(
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # Leading-axis split only: merging a permuted axis pair is what torch-spyre
         # rejects, and the mask's advancing read window must stay unflattened.
-        sc = scores.reshape(
-            blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
-        )
+        sc = scores.reshape(blocks_per_chunk, num_seqs, num_kv_heads, m, block_size)
         sc = sc + mask_rows
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
 
@@ -122,7 +162,7 @@ def batched_decode_kernel(
             tile_output * rescale + chunk_out,
         ), None
 
-    state_shape = (1, num_seqs, num_kv_heads, num_queries_per_kv, 1)
+    state_shape = (1, num_seqs, num_kv_heads, m, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
     (_, tile_sum, tile_output), _ = walk_tiles(
         chunk_body,
@@ -132,16 +172,15 @@ def batched_decode_kernel(
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),
-            torch.zeros(
-                (1, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
-                **state_kwargs,
-            ),
+            torch.zeros((1, num_seqs, num_kv_heads, m, head_size), **state_kwargs),
         ),
     )
-    attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+    attn = token_major_output(
+        tile_output / tile_sum, num_seqs, num_kv_heads, num_queries_per_kv, verify_len
+    )
     if out is not None:
         # The destination prefix starts at offset 0, so torch-spyre#3770 does not
         # apply; rows past the batch are don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
+        out[: num_seqs * verify_len].copy_(attn)
         return out
     return attn

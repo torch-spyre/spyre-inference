@@ -25,6 +25,8 @@
 
 #include <torch/all.h>
 
+#include "gumbel_noise.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -364,6 +366,81 @@ void sample_recovered_tokens_kernel_impl(
       output.store(token_idx, best_id);
     }
   });
+}
+
+// Not vendored: recovery with the noise drawn in-kernel, as fused_gumbel_argmax
+// draws it, instead of from a [batch, vocab] inv_q the caller fills with
+// exponential_. Gumbel-max over log(residual) has the distribution of
+// upstream's argmax(residual / q), and every draft position of a request reuses
+// that request's noise, as upstream's one q row per request does.
+void sample_recovered_tokens_seeded_kernel_impl(
+    torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids,
+    const std::optional<torch::Tensor>& draft_probs,
+    const torch::Tensor& target_probs, const torch::Tensor& seeds,
+    const int64_t vocab_size, const bool no_draft_probs) {
+  using gumbel_noise::GUMBEL_MAX;
+  const int64_t batch_size = cu_num_draft_tokens.numel();
+  const int64_t num_tokens = draft_token_ids.numel();
+  const IndexTensor output(output_token_ids, "output"),
+      ends(cu_num_draft_tokens, "cumulative"),
+      draft(draft_token_ids, "draft IDs");
+  TORCH_CHECK(output_token_ids.dim() == 1 && draft_token_ids.dim() == 1 &&
+                  output_token_ids.numel() == num_tokens,
+              "output and draft IDs must be 1-D with matching lengths");
+  check_spans(cu_num_draft_tokens, ends, num_tokens, num_tokens);
+  check_ids(draft, num_tokens, vocab_size);
+  const float* target =
+      check_probs(target_probs, "target probabilities", num_tokens, vocab_size);
+  const float* proposal = nullptr;
+  if (!no_draft_probs) {
+    TORCH_CHECK(draft_probs, "draft probabilities are required");
+    proposal = check_probs(*draft_probs, "draft probabilities", num_tokens,
+                           vocab_size);
+  }
+  check_tensor(seeds, "seeds");
+  TORCH_CHECK(seeds.scalar_type() == torch::kInt64 && seeds.dim() == 1 &&
+                  seeds.numel() == batch_size,
+              "seeds must be int64 [batch]");
+  const int64_t* req_seeds = seeds.const_data_ptr<int64_t>();
+  _Pragma("omp parallel for if(num_tokens > 1) schedule(static)") for (
+      int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    const int64_t req_idx = ends.request_for(token_idx, batch_size);
+    const int64_t draft_id = draft[token_idx];
+    const float* token_target = target + token_idx * vocab_size;
+    const float* token_draft =
+        no_draft_probs ? nullptr : proposal + token_idx * vocab_size;
+    const uint64_t key =
+        gumbel_noise::splitmix64(static_cast<uint64_t>(req_seeds[req_idx]));
+    // Scores are log(prob) + g, kept in probability space until a token can
+    // win: prob <= prune cannot (g < GUMBEL_MAX), and prob * inv_best bounds
+    // -log u from below, so most tokens cost no log at all. prune starts at 0,
+    // so a zero (or NaN) residual is never drawn; an all-zero row gives 0.
+    int64_t best_id = -1;
+    double best_score = 0.0, prune = 0.0, inv_best = 0.0;
+    for (int64_t v = 0; v < vocab_size; ++v) {
+      float prob = token_target[v];
+      if (no_draft_probs) {
+        if (v == draft_id) prob = 0.0f;
+      } else {
+        prob = std::max(prob - token_draft[v], 0.0f);
+      }
+      if (!(prob > prune)) continue;
+      const uint64_t bits = gumbel_noise::noise_bits(key, v);
+      if (best_id >= 0 &&
+          gumbel_noise::one_minus_u_from_bits(bits) >= prob * inv_best)
+        continue;
+      const double score =
+          std::log(double(prob)) + gumbel_noise::gumbel_from_bits(bits);
+      if (best_id < 0 || score > best_score) {
+        best_id = v;
+        best_score = score;
+        prune = std::exp(best_score - GUMBEL_MAX);
+        inv_best = std::exp(-best_score);
+      }
+    }
+    output.store(token_idx, best_id < 0 ? 0 : best_id);
+  }
 }
 
 }  // namespace cpu_utils

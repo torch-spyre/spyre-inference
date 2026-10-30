@@ -262,8 +262,11 @@ def test_random_rejection_with_zero_draft_probability():
     assert output.tolist() == [[0, -1]]
 
 
+@pytest.mark.parametrize("spyre", [False, True])
 @pytest.mark.parametrize("with_draft_probs", [False, True])
-def test_random_rejection_preserves_target_distribution(with_draft_probs):
+def test_random_rejection_preserves_target_distribution(with_draft_probs, spyre, monkeypatch):
+    if spyre:
+        monkeypatch.setattr(upstream, "rejection_sample", native.rejection_sample)
     torch.manual_seed(129)
     n = 12000
     p = torch.tensor([0.1, 0.3, 0.6])
@@ -386,3 +389,234 @@ def test_recovery_preserves_zero_times_infinite_noise(dtype, no_draft):
         max_spec_len=2,
     )
     assert output.tolist() == [1, 1]
+
+
+# Seeded recovery: native.sample_recovered_tokens replaces upstream's, drawing the noise
+# in-kernel from one seed per request.
+
+
+def _residual(target, draft_ids, draft_probs):
+    if draft_probs is not None:
+        return (target - draft_probs).clamp(min=0.0)
+    residual = target.clone()
+    for row, draft_id in enumerate(draft_ids.tolist()):
+        if draft_id >= 0:
+            residual[row, draft_id] = 0.0
+    return residual
+
+
+def _seeded_recover(cumulative, draft_ids, target, seeds, draft_probs=None):
+    output = torch.empty_like(draft_ids)
+    torch.ops._spyre_C.sample_recovered_tokens_seeded_kernel_impl(
+        output,
+        cumulative,
+        draft_ids,
+        draft_probs,
+        target,
+        seeds,
+        target.shape[1],
+        draft_probs is None,
+    )
+    return output.tolist()
+
+
+@pytest.mark.parametrize("no_draft", [True, False])
+def test_seeded_recovery_matches_fused_gumbel_argmax(no_draft):
+    """The same SplitMix64 noise as fused_gumbel_argmax over log(residual), one key per request."""
+    torch.manual_seed(7)
+    vocab = 1000
+    cumulative = torch.tensor([2, 2, 5, 6])
+    target = torch.randn(6, vocab).mul(3).softmax(dim=-1)
+    draft_probs = None if no_draft else torch.randn(6, vocab).mul(3).softmax(dim=-1)
+    draft_ids = torch.tensor([3, -1, 17, 999, 0, 42])
+    seeds = torch.tensor([11, 22, 33, 2**62 - 1])
+    per_token_seeds = seeds.repeat_interleave(torch.tensor([2, 0, 3, 1]))
+    expected = torch.ops._spyre_C.fused_gumbel_argmax(
+        _residual(target, draft_ids, draft_probs).log(), per_token_seeds
+    )
+    assert _seeded_recover(cumulative, draft_ids, target, seeds, draft_probs) == expected.tolist()
+
+
+def test_seeded_recovery_draws_only_from_the_residual():
+    target = torch.zeros(3, 8)
+    target[0, 7] = 1.0  # a pad (-1) excludes nothing, not the last id
+    target[1, [2, 6]] = torch.tensor([0.9, 0.1])  # the real draft 2 is excluded
+    target[2, 4] = 1.0  # the draft takes all the mass: nothing to draw from
+    result = _seeded_recover(torch.tensor([3]), torch.tensor([-1, 2, 4]), target, torch.tensor([5]))
+    assert result == [7, 6, 0]
+
+
+def test_seeded_recovery_shares_noise_across_a_requests_positions():
+    torch.manual_seed(3)
+    row = torch.randn(1, 500).softmax(dim=-1)
+    target = row.expand(4, -1).contiguous()
+    result = _seeded_recover(torch.tensor([4]), torch.full((4,), -1), target, torch.tensor([1234]))
+    assert len(set(result)) == 1
+
+
+def test_seeded_recovery_reproduces_seeded_requests_and_skips_empty_ones():
+    target = torch.randn(2, 64).softmax(dim=-1)
+    idle = torch.Generator().manual_seed(1)
+    idle_state = idle.get_state()
+
+    def draw():
+        metadata = SimpleNamespace(generators={0: idle, 1: torch.Generator().manual_seed(99)})
+        return native.sample_recovered_tokens(
+            2, [0, 2], torch.tensor([0, 2]), torch.tensor([-1, -1]), None, target, metadata, "cpu"
+        ).tolist()
+
+    assert draw() == draw()
+    torch.testing.assert_close(idle.get_state(), idle_state, rtol=0, atol=0)
+
+
+def test_seeded_recovery_draws_no_exponential_noise():
+    target = torch.randn(3, 64).softmax(dim=-1)
+    metadata = SimpleNamespace(generators={})
+    with patch.object(torch.Tensor, "exponential_", wraps=torch.Tensor.exponential_) as exp:
+        native.sample_recovered_tokens(
+            2, [1, 2], torch.tensor([1, 3]), torch.tensor([0, 1, -1]), None, target, metadata, "cpu"
+        )
+    exp.assert_not_called()
+
+
+def test_fp64_gumbel_keeps_upstream_recovery(monkeypatch):
+    calls = []
+    monkeypatch.setattr(native, "_upstream_sample_recovered_tokens", lambda *a: calls.append(a))
+    native.sample_recovered_tokens(
+        1,
+        [1],
+        torch.tensor([1]),
+        torch.tensor([0]),
+        None,
+        torch.ones(1, 4) / 4,
+        SimpleNamespace(generators={}),
+        "cpu",
+        True,
+    )
+    assert len(calls) == 1
+
+
+def test_install_routes_upstream_rejection_sample(monkeypatch):
+    monkeypatch.setattr(upstream, "rejection_sample", upstream.rejection_sample)
+    native.install()
+    assert upstream.rejection_sample is native.rejection_sample
+
+
+def _greedy_and_random_batch():
+    """Request 0 greedy, request 1 random; three draft positions each."""
+    torch.manual_seed(5)
+    return dict(
+        draft_token_ids=torch.tensor([3, 1, 4, 1, 5, 9]),
+        num_draft_tokens=[3, 3],
+        max_spec_len=3,
+        cu_num_draft_tokens=torch.tensor([3, 6]),
+        draft_probs=None,
+        target_logits=torch.randn(6, 16),
+        bonus_token_ids=torch.tensor([[7], [8]]),
+    )
+
+
+@pytest.mark.parametrize("all_greedy", [True, False])
+def test_rejection_sample_takes_the_target_argmax_with_greedy_argmax(all_greedy, monkeypatch):
+    from spyre_inference.v1.sample import sampler
+
+    calls = []
+    greedy_argmax = sampler.greedy_sample
+    monkeypatch.setattr(
+        sampler, "greedy_sample", lambda logits: calls.append(logits.shape) or greedy_argmax(logits)
+    )
+    batch = _greedy_and_random_batch()
+    metadata = SimpleNamespace(
+        all_greedy=all_greedy,
+        all_random=False,
+        temperature=torch.tensor([0.0, 0.0 if all_greedy else 1.0]),
+        generators={},
+    )
+    result = native.rejection_sample(**batch, sampling_metadata=metadata)
+    expected = upstream.rejection_sample(**batch, sampling_metadata=metadata)
+    assert calls == [(6, 16)]
+    # Greedy rows are deterministic, so they match upstream exactly.
+    assert result[0].tolist() == expected[0].tolist()
+    if all_greedy:
+        assert result.tolist() == expected.tolist()
+
+
+def test_rejection_sample_with_no_draft_tokens():
+    metadata = SimpleNamespace(all_greedy=True, all_random=False)
+    result = native.rejection_sample(
+        torch.empty(0, dtype=torch.int64),
+        [0, 0],
+        2,
+        torch.tensor([0, 0]),
+        None,
+        torch.empty(0, 16),
+        torch.tensor([[7], [8]]),
+        metadata,
+    )
+    assert result.tolist() == [[7, -1, -1], [8, -1, -1]]
+
+
+# Padded drafts: TorchSpyreScheduler pads every draft list to k with -1, which the
+# rejection kernels must always reject without disturbing the real drafts before it.
+
+PAD = -1
+
+
+def test_greedy_kernel_rejects_padded_draft():
+    output = torch.full((1, 4), upstream.PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    native.greedy_sample(
+        output,
+        torch.tensor([3]),
+        torch.tensor([10, PAD, PAD]),
+        torch.tensor([10, 20, 30]),
+        torch.tensor([40]),
+        None,
+        3,
+        None,
+        None,
+        False,
+    )
+    # The real draft is accepted; the first pad is replaced by the target's own token,
+    # which is what the bonus slot would have held without padding.
+    assert output.tolist() == [[10, 20, -1, -1]]
+
+
+def test_random_kernel_rejects_padded_draft_even_at_zero_uniform():
+    vocab = 8
+    output = torch.full((1, 3), upstream.PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    native.random_sample(
+        output,
+        torch.tensor([2]),
+        torch.tensor([3, PAD]),
+        None,
+        torch.full((2, vocab), 1.0 / vocab),
+        torch.tensor([7]),
+        torch.tensor([0, 5]),
+        # 0.0 accepts any real draft: only the pad check can reject position 1.
+        torch.zeros(2, dtype=torch.float64),
+        torch.tensor([False]),
+        2,
+        vocab,
+        None,
+        True,
+        False,
+    )
+    assert output.tolist() == [[3, 5, -1]]
+
+
+def test_greedy_rejection_sample_padded_verification():
+    """Two requests at k=3: one fully drafted, one with a single real draft."""
+    target_logits = torch.full((6, 100), -10.0)
+    for row, token in enumerate([10, 20, 30, 11, 21, 31]):
+        target_logits[row, token] = 10.0
+    result = native.rejection_sample(
+        torch.tensor([10, 20, 30, 11, PAD, PAD]),
+        [3, 3],
+        3,
+        torch.tensor([3, 6]),
+        None,
+        target_logits,
+        torch.tensor([[40], [41]]),
+        SimpleNamespace(all_greedy=True, all_random=False),
+    )
+    assert result.tolist() == [[10, 20, 30, 40], [11, 21, -1, -1]]

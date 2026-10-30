@@ -849,6 +849,63 @@ def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, siz
     assert vllm_config.compilation_config.compile_sizes[-len(sizes) :] == sizes
 
 
+def _speculative_defaults_config(num_speculative_tokens: int, max_num_seqs: int) -> VllmConfig:
+    from vllm.config import SpeculativeConfig
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    vllm_config.speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=num_speculative_tokens,
+        prompt_lookup_max=4,
+        prompt_lookup_min=2,
+    )
+    return vllm_config
+
+
+def test_compile_sizes_default_adds_verification_ladder_for_speculative_decoding():
+    """A decode step packs up to 1+k tokens per sequence; it must not pad to the prefill bucket."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _speculative_defaults_config(num_speculative_tokens=3, max_num_seqs=5)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 5, 8, 16, 20, 512]
+
+
+def test_compile_sizes_verification_ladder_adapts_to_num_speculative_tokens():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _speculative_defaults_config(num_speculative_tokens=1, max_num_seqs=4)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    # rungs {1,2,4} x (1+k=2) = {2,4,8}
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 8, 512]
+
+
+def test_compile_sizes_verification_ladder_is_clamped_to_the_prefill_bucket():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _speculative_defaults_config(num_speculative_tokens=7, max_num_seqs=128)
+    vllm_config.scheduler_config.max_num_batched_tokens = 512
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    sizes = vllm_config.compilation_config.compile_sizes
+    assert max(sizes) == 512
+    assert sizes == sorted(set(sizes))
+
+
+def test_compile_sizes_user_provided_wins_over_the_verification_ladder():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _speculative_defaults_config(num_speculative_tokens=3, max_num_seqs=5)
+    vllm_config.compilation_config.compile_sizes = [8, 512]
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [8, 512]
+
+
 def test_compile_sizes_empty_list_opts_out():
     """An explicit empty list disables bucketing and leaves the scheduler alone."""
     from spyre_inference.platform import TorchSpyrePlatform

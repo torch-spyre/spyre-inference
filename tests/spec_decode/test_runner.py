@@ -70,7 +70,7 @@ def recording_runner(monkeypatch):
         _spyre_kv_caches={"target": object(), "draft.0": object(), "draft.1": object()},
         attn_groups=[[SimpleNamespace(layer_names=["target"])]],
         _attn_metadata_builders=lambda: {},
-        speculative_config=object(),
+        speculative_config=SimpleNamespace(uses_draft_kv_cache=lambda: True),
         drafter=SimpleNamespace(
             model=SimpleNamespace(
                 get_draft_kv_cache_layer_names=lambda: ["draft.0", "draft.1"],
@@ -94,6 +94,16 @@ def test_attention_warmup_reads_causality_from_draft_model(recording_runner, wit
         {"target": True, "draft.0": False, "draft.1": True} if with_draft else {"target": True}
     )
     assert record.call_args.kwargs["causal_by_layer"] == expected
+
+
+def test_attention_warmup_skips_model_free_proposer(recording_runner):
+    runner, record = recording_runner
+    # An ngram proposer has no model and no draft layers.
+    runner.speculative_config = SimpleNamespace(uses_draft_kv_cache=lambda: False)
+    runner.drafter = SimpleNamespace()
+    runner._spyre_kv_caches = {"target": object()}
+    TorchSpyreModelRunner._record_attention_graphs(runner)
+    assert record.call_args.kwargs["causal_by_layer"] == {"target": True}
 
 
 def test_attention_warmup_requires_draft_model_causality(recording_runner):

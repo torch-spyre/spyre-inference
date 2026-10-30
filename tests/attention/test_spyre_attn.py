@@ -2819,3 +2819,138 @@ def test_sliding_window_is_left_unpadded(default_vllm_config):
         [(7, 300)], block_size=64, sliding_window=128, max_num_blocks=_num_blocks_buckets()[-1]
     )
     assert metadata.padded_num_blocks is None
+
+
+@pytest.mark.parametrize("page_layout", ["token_major", "head_major"])
+@pytest.mark.parametrize(
+    "k,num_kv_heads,qpk", [(3, 2, 4), (2, 12, 1), (2, 2, 4)], ids=["k3_gqa", "k2_mha", "k2_gqa"]
+)
+@pytest.mark.parametrize(
+    "seq_lens,num_batched",
+    [
+        pytest.param([(4, 70), (4, 200), (4, 129)], 3, id="verify_padded_batch"),
+        # Verification rows straddling a block boundary each get their own cutoff.
+        pytest.param([(4, 128), (4, 130), (4, 66), (4, 64)], 4, id="verify_block_boundary"),
+        # A verification the scheduler could not give all k drafts ends the prefix.
+        pytest.param([(4, 90), (4, 200), (2, 100), (4, 70)], 2, id="non_uniform_prefix"),
+    ],
+)
+def test_batched_verify_matches_fp32_reference(
+    default_vllm_config,
+    speculative_decoding,
+    monkeypatch,
+    seq_lens,
+    num_batched,
+    page_layout,
+    k,
+    num_kv_heads,
+    qpk,
+) -> None:
+    """Builder metadata for speculative verification, through either batched kernel.
+
+    Card-free and in fp32 against ``ref_attn``: pins the row ids, the expanded causal
+    mask and the kernels' fold of the verify tokens into the query-group axis, with
+    more than one KV head so a head/token mix-up cannot hide.
+    """
+    from spyre_testing_plugin.attn_helpers import _build_metadata, ref_attn
+
+    from spyre_inference.v1.attention.ops import batched_decode_head_major
+    from spyre_inference.v1.attention.ops.batched_decode_head_major import (
+        batched_decode_head_major_kernel,
+    )
+
+    # The Python walk: eager on CPU, and the plain [blocks, seqs] page-id layout.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
+    speculative_decoding(k)
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    # The fixture's widths are k = 3's; a narrower verification truncates them.
+    seq_lens = [(min(q, k + 1), kv) for q, kv in seq_lens]
+
+    block_size, head_size = 64, 64
+    num_heads = num_kv_heads * qpk
+    scale = head_size**-0.5
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    num_tokens = sum(query_lens)
+
+    max_blocks = 4
+    num_pages = len(seq_lens) * max_blocks + 1
+    # Distinct pages per sequence; page 0 stays the padding page.
+    block_table = (
+        torch.arange(len(seq_lens) * max_blocks, dtype=torch.int32).reshape(len(seq_lens), -1) + 1
+    )
+    k_tm = torch.randn(num_pages, block_size, num_kv_heads, head_size)
+    v_tm = torch.randn(num_pages, block_size, num_kv_heads, head_size)
+    query = torch.randn(num_tokens, num_heads, head_size)
+
+    md = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(
+            0, dtype=torch.int32
+        ),
+        block_table=block_table,
+        slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
+    )
+    assert md.padded_num_seqs is not None, "the builder declined the batched path"
+    assert md.decode_query_len == k + 1
+    assert md.num_decode_seqs == num_batched
+    assert md.mask_by_chunk_cpu.shape[3] == (k + 1) * qpk
+
+    # Staging-shaped: wider than every gathered row, as the impl's buffer is.
+    staging = torch.zeros(512, num_heads, head_size)
+    staging[:num_tokens] = query
+    if page_layout == "token_major":
+        kernel, k_pages, v_pages = batched_decode_kernel, k_tm, v_tm
+    else:
+        kernel = batched_decode_head_major_kernel
+        k_pages = k_tm.permute(0, 2, 1, 3).contiguous()
+        v_pages = v_tm.permute(0, 2, 1, 3).contiguous()
+    actual = kernel(
+        staging,
+        md.rep_row_ids_cpu,
+        k_pages,
+        v_pages,
+        md.chunk_page_ids_cpu,
+        md.mask_by_chunk_cpu.float(),
+        scale,
+        md.padded_num_seqs,
+        md.blocks_per_chunk,
+        num_kv_heads,
+        qpk,
+        block_size,
+        head_size,
+        verify_len=md.decode_query_len,
+    )
+
+    expected = ref_attn(
+        query=query,
+        key_cache=k_tm,
+        value_cache=v_tm,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_table,
+        block_size=block_size,
+        scale=scale,
+    )
+    n = md.num_decode_tokens
+    assert actual.shape == (md.padded_num_seqs * (k + 1), num_heads, head_size)
+    assert torch.isfinite(actual).all(), "a padded row would publish NaN through the store"
+    torch.testing.assert_close(actual[:n], expected[:n], atol=1e-4, rtol=1e-4)
+
+
+def test_plain_decode_prefix_under_speculative_decoding_stays_per_seq(
+    default_vllm_config, speculative_decoding
+) -> None:
+    """Warmup records only the verification width, so a width-1 prefix must not dispatch."""
+    from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
+
+    speculative_decoding(3)
+    md = _padded_mask_metadata([(1, 100), (1, 200)], num_kv_heads=2, num_query_heads=8)
+    assert md.decode_query_len == 1
+    assert md.padded_num_seqs is None

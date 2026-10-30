@@ -71,7 +71,11 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return list(mm_kwargs["tokens"])
 
     def select_encoder_cudagraph_items(self, mm_kwargs, indices):
-        return {"tokens": [mm_kwargs["tokens"][i] for i in indices], "ids": indices}
+        ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
+        return {
+            "tokens": [mm_kwargs["tokens"][i] for i in indices],
+            "ids": [ids[i] for i in indices],
+        }
 
     def vision_inputs(self, mm_kwargs):
         ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
@@ -125,6 +129,19 @@ def test_user_budgets_below_the_largest_item_fail_at_startup():
         _manager(_FakeVisionModel(max_tokens=300), budgets=[16, 64])
 
 
+def test_user_budgets_above_the_largest_item_round_up_on_every_path():
+    """User budgets round up on every path; a path with its own minimum doubles up to them."""
+    from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphPathConfig
+
+    model = _FakeVisionModel(max_tokens=300)
+    config = model.get_encoder_cudagraph_config()
+    paths = {"default": EncoderCudaGraphPathConfig(), "wide": EncoderCudaGraphPathConfig(64)}
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, paths=paths)
+
+    budgets = _manager(model, budgets=[16, 300, 1000]).path_token_budgets
+    assert budgets == {"default": [16, 304, 1008], "wide": [64, 128, 256, 512, 1008]}
+
+
 def test_encoder_data_parallel_is_rejected():
     with pytest.raises(NotImplementedError, match="mm_encoder_tp_mode"):
         _manager(_FakeVisionModel(), tp_mode="data")
@@ -144,6 +161,26 @@ def test_execute_packs_pads_per_block_and_splits_per_item():
     assert [o.shape[0] for o in outputs] == [10, 30]
     for i, out in enumerate(outputs):
         assert out.device.type == "cpu"
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def test_packing_stops_at_vision_pack_tokens_and_larger_items_run_alone():
+    """Unlimited, upstream packs all three into 256; capped, the small two pack into 32."""
+
+    class _Model(_FakeVisionModel):
+        vision_pack_tokens = 40
+
+    model = _Model(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    model.forward_patches.clear()
+
+    outputs = manager.execute({"tokens": [10, 200, 10]})
+
+    assert model.forward_patches == [32 * MERGE_PATCHES, 256 * MERGE_PATCHES]
+    assert (manager.graph_hits, manager.graph_misses) == (3, 0)
+    assert [o.shape[0] for o in outputs] == [10, 200, 10]
+    for i, out in enumerate(outputs):
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
 
 

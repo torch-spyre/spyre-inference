@@ -112,6 +112,14 @@ def register_models() -> None:
         ModelRegistry.register_model(arch, model_cls)
 
 
+def spyre_model_cls(architecture: str) -> type | None:
+    target = spyre_models().get(architecture)
+    if target is None:
+        return None
+    module_name, _, cls_name = target.partition(":")
+    return getattr(importlib.import_module(module_name), cls_name)
+
+
 def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
     """Fail if ``architecture`` has a Spyre adaptation that ``model`` was not built as.
 
@@ -124,14 +132,12 @@ def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
     Raises:
         RuntimeError: if ``model`` is not an instance of the Spyre class.
     """
-    target = spyre_models().get(architecture)
-    if target is None:
+    spyre_cls = spyre_model_cls(architecture)
+    if spyre_cls is None:
         return
-    module_name, _, cls_name = target.partition(":")
-    spyre_cls = getattr(importlib.import_module(module_name), cls_name)
     if not isinstance(model, spyre_cls):
         raise RuntimeError(
-            f"{architecture} was built as {type(model).__name__}, not {cls_name}: vLLM "
+            f"{architecture} was built as {type(model).__name__}, not {spyre_cls.__name__}: vLLM "
             "resolved it before the Spyre model adaptations were registered. Make sure "
             "VLLM_PLUGINS allows the spyre_inference general plugin."
         )

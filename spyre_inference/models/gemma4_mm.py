@@ -508,6 +508,25 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             )
         return super().embed_multimodal(**kwargs)
 
+    def encoder_cache_rows(self, output: torch.Tensor) -> torch.Tensor:
+        """The tail in fp32 on the host, as upstream: its scale can overflow fp16.
+
+        ``vision_project`` only pools, so its rows are the vision width. The table and the
+        prompt merge are the text width; this is the projection that gets them there.
+
+        Known gap for the on-card encoder table: the whole encoder output is downloaded,
+        the tail runs here, and ``store`` uploads the projected rows. A budget of 1120
+        tokens moves about four times the rows of a 280-token image, both ways. The tail
+        stays on the host until it can run on the card without that fp16 overflow.
+        """
+        tail = self._spyre_vision_tail
+        x = convert(output, device="cpu").float() * tail.scale
+        if tail.std_bias is not None and tail.std_scale is not None:
+            x = (x - tail.std_bias) * tail.std_scale
+        # embed_vision: a weightless RMSNorm, then the projection.
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
+        return (x @ tail.weight.t()).to(tail.dtype)
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],
@@ -517,15 +536,18 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """The tail in fp32 on the host, as upstream: its scale can overflow fp16."""
+        """Slice the projected rows into ``dest``. With a table, store them and scatter handles.
+
+        Download the whole encoder output (offset 0) and drop the budget's padding on the
+        host before the fp32 tail. Slicing on the card is a narrowed view, and running the
+        tail over that padding is a budget/actual multiple of host matmul.
+        """
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
-        tail = self._spyre_vision_tail
-        x = outputs["default"][:num_tokens].float() * tail.scale
-        if tail.std_bias is not None and tail.std_scale is not None:
-            x = (x - tail.std_bias) * tail.std_scale
-        # embed_vision: a weightless RMSNorm, then the projection.
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
-        tokens = (x @ tail.weight.t()).to(tail.dtype)
+        downloaded = convert(outputs["default"], device="cpu")
+        tokens = self.encoder_cache_rows(downloaded[:num_tokens])
+        table = getattr(self, "output_table", None)
+        if table is not None:
+            tokens = table.store(tokens)
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:

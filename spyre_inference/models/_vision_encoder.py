@@ -26,8 +26,10 @@ serving) is shared. The encoder runs in three graphs, compiled once per upstream
 Units follow upstream: an *image token* is one position of ``vision_project``'s output, the unit
 of the token budgets, and every image token is ``patches_per_token`` patches.
 
-The image tokens then merge into the prompt embeddings in ``embed_input_ids``: placed on the
-host, combined on the card by ``vision_merge``, a fourth graph compiled per token bucket.
+The image tokens then merge into the prompt embeddings in ``embed_input_ids``. With an
+``EncoderOutputTable`` the encoder output stays on the card: the cache holds row handles, and
+``vision_gather_merge`` gathers them per token bucket. Without one (tests, and models that
+still return embeddings) the rows are placed on the host and combined by ``vision_merge``.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -52,6 +55,8 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
 from spyre_inference.custom_ops.utils import convert, place_row_gathered
 from spyre_inference.multimodal.utils import STICK, align_up
 from spyre_inference.v1.worker import compile_guard
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -123,11 +128,307 @@ def one_hot_segments(item_ids: torch.Tensor) -> torch.Tensor:
     return F.one_hot(item_ids, STICK).to(torch.float16)
 
 
+def _index_dtype(device: torch.device) -> torch.dtype:
+    """int32 on Spyre (no int64; compiled ``index_copy_`` takes it); int64 elsewhere.
+
+    Eager ``index_copy_`` rejects int32 and falls back to the CPU, so a Spyre write goes
+    through the compiled function below, including under ``enforce_eager``.
+    """
+    return torch.int32 if device.type == "spyre" else torch.int64
+
+
+def _copy_encoder_rows(
+    table: torch.Tensor, index: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    """Overwrite ``table`` rows.
+
+    On CPU a repeated index keeps the last row. The compiled Spyre kernel cannot repeat one:
+    dbo-opt rejects it ("external allocations with repeated dimensions"), so every compiled
+    write uses unique indices.
+    """
+    table.index_copy_(0, index, rows)
+    return table
+
+
+def _gather_cached_rows(
+    table: torch.Tensor, text: torch.Tensor, src_idx: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """``where(mask, table.index_select(0, src_idx), text)``.
+
+    ``table`` is an argument so the compiled graph reads it on every call, including rows
+    written after the graph was compiled. ``mask`` is ``[T, 1]``, built on the host.
+    """
+    return torch.where(mask, table.index_select(0, src_idx), text)
+
+
+class EncoderOutputTable:
+    """Device-resident ``[C + pad, H]`` table of encoder outputs, plus one trash row.
+
+    ``C`` is upstream's encoder cache bound, in image tokens. The trash row is last, so a
+    gather of a prompt is a strict subset of the table (torch-spyre#4033). Rows between
+    ``C`` and the trash row are not cache slots: a short write pads onto them so a partly
+    full cache reuses a warmed ``index_copy_`` instead of compiling a new one. The host
+    cache stores ``[n, 1]`` row handles, not the embeddings.
+    """
+
+    def __init__(
+        self, cache_size: int, hidden: int, dtype: torch.dtype, device: torch.device, *, rows: int
+    ) -> None:
+        if cache_size <= 0 or hidden <= 0 or rows <= cache_size:
+            raise ValueError(
+                f"encoder output table needs cache_size > 0, hidden > 0 and rows > cache_size; "
+                f"got cache_size={cache_size}, hidden={hidden}, rows={rows}"
+            )
+        self.cache_size = cache_size
+        self.hidden = hidden
+        self.trash = rows - 1
+        self._in_use: set[int] = set()
+        blank = torch.zeros(rows, hidden, dtype=dtype)
+        try:
+            if device.type == "spyre":
+                # Rows outermost, the layout a gather needs. CPU tests never take this branch.
+                self.table = place_row_gathered(
+                    blank, lambda t: t.to(device=device, dtype=dtype), "encoder output table"
+                )
+            else:
+                self.table = blank.to(device=device, dtype=dtype)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Cannot allocate the encoder output table ({rows} x {hidden} {dtype} on "
+                f"{device}). It holds {cache_size} image tokens, the scheduler's encoder "
+                "cache (the larger of --encoder-cache-size and the biggest multimodal item), "
+                "and does not change the KV cache."
+            ) from exc
+        self._free = list(range(cache_size))
+        self._writes: dict[int, Any] = {}
+
+    def store(
+        self, rows: torch.Tensor, *, keep: int | None = None, exact: bool = False
+    ) -> torch.Tensor:
+        """Copy ``rows`` ``[n, H]`` into free slots. Returns host handles ``[keep, 1]``.
+
+        ``keep`` defaults to every row. The copy is a length warmup already compiled:
+        the budget tensor itself when that length was warmed, otherwise the next warmed
+        length. Padding past the free list uses the spare rows, which are not cache slots,
+        so a partly full cache does not compile a new graph. A short tensor is padded with
+        a copied last row. Pointing the tail at one repeated index, including the trash
+        row, does not compile. ``exact`` is warmup, which records its own length.
+        """
+        if rows.ndim != 2 or rows.shape[1] != self.hidden:
+            raise RuntimeError(
+                f"encoder output is {tuple(rows.shape)}, table rows are [*, {self.hidden}]"
+            )
+        total = rows.shape[0]
+        keep = total if keep is None else keep
+        if keep < 0 or keep > total:
+            raise RuntimeError(f"encoder output has {total} rows, this call keeps {keep}")
+        if keep == 0:
+            return torch.empty(0, 1, dtype=torch.int64)
+        if keep > len(self._free):
+            raise RuntimeError(
+                f"Encoder output table has {len(self._free)} free rows, this call needs {keep}. "
+                f"The table holds {self.cache_size} image tokens (the scheduler's encoder cache)."
+            )
+        target = total if exact else self._write_count(keep, total)
+        spare = self.trash - self.cache_size
+        use_spare = not exact and target > len(self._free)
+        if (exact and target > len(self._free)) or (use_spare and target - keep > spare):
+            raise RuntimeError(
+                f"Encoder output table has {len(self._free)} free rows and {spare} spare "
+                f"rows, this write needs {target}."
+            )
+        body = self._rows_for_write(rows, target)
+        # A host projection (Gemma 4's tail) arrives on the CPU. The write runs where the table is.
+        if body.device != self.table.device:
+            body = convert(body, device=self.table.device, dtype=self.table.dtype)
+        n_cache = keep if use_spare else target
+        chosen = [self._free.pop() for _ in range(n_cache)]
+        self._in_use.update(chosen)
+        if use_spare:
+            # Distinct rows, so the index does not repeat. They are not cache slots.
+            chosen.extend(range(self.cache_size, self.cache_size + (target - keep)))
+        index = torch.tensor(chosen, dtype=_index_dtype(body.device), device=body.device)
+        self._write(body, index)
+        handles = torch.tensor(chosen, dtype=torch.int64).view(-1, 1)
+        if not use_spare and keep < target:
+            self.release(handles[keep:])
+        return handles[:keep]
+
+    def _write_count(self, keep: int, total: int) -> int:
+        """Rows this write copies: at least ``keep``.
+
+        A length warmup compiled is written whole. Anything else grows to the smallest
+        already-compiled write that can hold ``keep``. The extra rows come from the free
+        list when it has room, and otherwise from the spare rows, so the real token
+        count does not compile a graph of its own.
+        """
+        free = len(self._free)
+        spare = self.trash - self.cache_size
+
+        def fits(n: int) -> bool:
+            if n < keep:
+                return False
+            extra = n - keep
+            return n <= free or extra <= spare
+
+        if not self._writes:
+            return total if total <= free else keep
+        if total in self._writes and fits(total):
+            return total
+        warmed = [n for n in self._writes if fits(n)]
+        if warmed:
+            return min(warmed)
+        return keep
+
+    def _rows_for_write(self, rows: torch.Tensor, target: int) -> torch.Tensor:
+        total = rows.shape[0]
+        if target == total:
+            return rows
+        if target < total:
+            # Prefix at offset 0. A non-zero device offset reads as row 0 (torch-spyre#3770).
+            return rows[:target]
+        # A copied tail, not expand(): a zero-stride view is the same repeated-dimension
+        # failure as pointing every padding index at the trash row.
+        if rows.device.type != "cpu":
+            rows = convert(rows, device="cpu")
+        return torch.cat([rows, rows[-1:].repeat(target - total, 1)], dim=0)
+
+    def release(self, handles: torch.Tensor) -> None:
+        """Return stored rows to the free list. The trash row is not a stored row."""
+        for row in handles.detach().cpu().view(-1).tolist():
+            row = int(row)
+            if row not in self._in_use:
+                logger.debug(
+                    "Encoder output table skipped releasing row %s; it is not in use.", row
+                )
+                continue
+            self._in_use.remove(row)
+            self._free.append(row)
+
+    def warmup_write(self, rows: torch.Tensor) -> None:
+        """Compile the largest write this output can make, then free it.
+
+        The encoder's padded budget can be thousands of rows while the cache holds fewer.
+        The scheduler never stores more real tokens than the cache, and a compiled
+        ``index_copy_`` cannot repeat an index, so this writes one unique row per free
+        slot. Every budget that fits is its own shape. Every budget past the cache shares
+        that one cache-sized write, so those do not add another graph.
+        """
+        n = min(rows.shape[0], len(self._free))
+        if n == 0:
+            return
+        # Prefix at offset 0. A non-zero device offset reads as row 0 (torch-spyre#3770).
+        # exact: a larger warmed write must not swallow this budget, or serving a
+        # smaller budget would compile it on the first request.
+        prefix = rows if n == rows.shape[0] else rows[:n]
+        self.release(self.store(prefix, exact=True))
+
+    def _write(self, rows: torch.Tensor, index: torch.Tensor) -> None:
+        # Eager int32 index_copy_ falls back to the CPU, so the card always runs the compiled
+        # function, including under enforce_eager. One function per warmed row count.
+        # store() pads onto a warmed count, using spare rows when the free list is short,
+        # so serving does not compile a new length. The size is recorded on every device
+        # so a later call can see that this length was already written.
+        n = rows.shape[0]
+        if rows.device.type != "spyre":
+            _copy_encoder_rows(self.table, index, rows)
+            self._writes.setdefault(n, None)
+            return
+        fn = self._writes.get(n)
+        if fn is None:
+            fn = torch.compile(
+                _copy_encoder_rows, backend="inductor", fullgraph=True, dynamic=False
+            )
+            self._writes[n] = fn
+        fn(self.table, index, rows)
+
+
+class EncoderOutputCache(dict):
+    """``encoder_cache`` that frees table rows when upstream pops or clears an entry.
+
+    Values are ``[n, 1]`` host handles. A floating-point value (prompt embeds, or a model
+    that still returns embeddings) is left alone.
+    """
+
+    def __init__(self, table: EncoderOutputTable) -> None:
+        super().__init__()
+        self.table = table
+
+    def __setitem__(self, key: str, value: torch.Tensor) -> None:
+        previous = self.get(key)
+        super().__setitem__(key, value)
+        if previous is not None and previous is not value:
+            self._release(previous)
+
+    def __delitem__(self, key: str) -> None:
+        value = self[key]
+        super().__delitem__(key)
+        self._release(value)
+
+    def pop(self, key: str, *args: Any) -> Any:
+        if key not in self and args:
+            return args[0]
+        value = super().pop(key)
+        self._release(value)
+        return value
+
+    def clear(self) -> None:
+        values = list(self.values())
+        super().clear()
+        for value in values:
+            self._release(value)
+
+    def popitem(self) -> tuple[Any, Any]:
+        key, value = super().popitem()
+        self._release(value)
+        return key, value
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        # A plain dict, so this does not recurse into the releasing ``__setitem__``.
+        incoming: dict[Any, Any] = {}
+        incoming.update(*args, **kwargs)
+        for key, value in incoming.items():
+            self[key] = value
+
+    def _release(self, value: Any) -> None:
+        if isinstance(value, torch.Tensor) and not value.is_floating_point():
+            self.table.release(value)
+
+
 def segment_mask(segments: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Additive `[1, 1, P, P]` mask keeping each patch to its own item."""
     # A matmul: Spyre cannot lay out a column-minus-row broadcast.
     segments = segments.to(dtype)
     return ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
+
+
+def _mixed_embedding_kinds(embeddings: Any) -> bool:
+    """True when one step holds both floating embeddings and integer handles.
+
+    ``_flatten_embeddings`` concatenates every item. A prompt-embeds tensor is
+    ``[m, H]`` float and an image handle is ``[n, 1]`` int, so the concat either
+    fails on the shape or promotes the handles to float and merges them as embeddings.
+    """
+    floating: set[bool] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, torch.Tensor):
+            floating.add(value.is_floating_point())
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list | tuple):
+            for item in value:
+                walk(item)
+
+    walk(embeddings)
+    return len(floating) > 1
 
 
 class SpyreVisionEncoderMixin:
@@ -245,11 +546,27 @@ class SpyreVisionEncoderMixin:
         """
         return torch.where(mask, image, text)
 
+    def vision_gather_merge(
+        self, text: torch.Tensor, src_idx: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Graph 4 when encoder outputs live in ``output_table``.
+
+        ``src_idx`` is ``[T]`` into the table (the trash row everywhere that is not an image
+        token). ``mask`` is ``[T, 1]``, built on the host: unsqueezing it on the card faults
+        a later ``index_select`` (torch-spyre#5230).
+        """
+        table = self.output_table
+        assert table is not None, "vision_gather_merge needs an encoder output table"
+        return _gather_cached_rows(table.table, text, src_idx, mask)
+
     # --- 3. Used by the runner ---
 
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
     # the manager is built, and read by get_encoder_cudagraph_budget_range.
     max_tokens_per_item: int
+    # On-card rows of encoder outputs. Set by the runner when the model loads; absent means the
+    # host still receives the embeddings.
+    output_table: EncoderOutputTable | None = None
 
     def compile_vision_graphs(self) -> None:
         """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with
@@ -261,11 +578,36 @@ class SpyreVisionEncoderMixin:
         self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
         self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
+        self.compile_output_merge()
+        # vision_gather_merge is watched inside compile_output_merge.
         for name in ("vision_embed", "vision_project", "vision_merge"):
-            compile_guard.watch(getattr(self, f"_spyre_{name}"), f"{type(self).__name__}.{name}")
+            compiled = getattr(self, f"_spyre_{name}", None)
+            if compiled is not None:
+                compile_guard.watch(compiled, f"{type(self).__name__}.{name}")
         for block in self.vision_blocks():
             block.compile(**compile_kwargs)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
+
+    def compile_output_merge(self, *, watch: bool = True) -> None:
+        """Compile the table gather. The tower may stay eager; this op cannot.
+
+        Eager ``index_select`` rejects the int32 index and falls back to the CPU, and an
+        eager gather of this layout has faulted the card. ``enforce_eager`` has no shape
+        bucketer, so nothing warms a prompt length ahead of time: the wrapper is installed
+        with the table, and the first merge of each prompt length traces it. That trace
+        is not watched. A compiled tower warms every token bucket before the guard arms.
+        """
+        if getattr(self, "output_table", None) is None:
+            return
+        if hasattr(self, "_spyre_vision_gather_merge"):
+            return
+        self._spyre_vision_gather_merge = torch.compile(
+            _gather_cached_rows, backend="inductor", fullgraph=True, dynamic=False
+        )
+        if watch:
+            compile_guard.watch(
+                self._spyre_vision_gather_merge, f"{type(self).__name__}.vision_gather_merge"
+            )
 
     # --- 4. Upstream's SupportsEncoderCudaGraph, in the order the manager calls it ---
 
@@ -328,10 +670,11 @@ class SpyreVisionEncoderMixin:
     def encoder_cudagraph_forward(
         self, inputs: dict[str, torch.Tensor], path: str = "default"
     ) -> torch.Tensor:
-        """Run the three graphs on padded device buffers and return the output on the host.
+        """Run the three graphs on padded device buffers.
 
-        One copy to the host here: device views at offsets off the stick read as offset 0
-        (torch-spyre#3770), and the embedding merge runs on the host anyway.
+        With an ``output_table`` the output stays on the card and the cache stores row handles.
+        Otherwise it is copied to the host: a device view at a non-zero offset reads as offset 0
+        (torch-spyre#3770), and the host merge needs the rows.
         """
         embed = getattr(self, "_spyre_vision_embed", self.vision_embed)
         project = getattr(self, "_spyre_vision_project", self.vision_project)
@@ -350,7 +693,10 @@ class SpyreVisionEncoderMixin:
             if i in wanted:
                 hidden[i] = x
         taps = [hidden[t % depth] for t in self.vision_taps]
-        return convert(project(x, taps), device="cpu")
+        out = project(x, taps)
+        if getattr(self, "output_table", None) is None:
+            return convert(out, device="cpu")
+        return out
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"
@@ -371,6 +717,16 @@ class SpyreVisionEncoderMixin:
             {key: convert(value, device=device) for key, value in padded.items()}
         )
 
+    def encoder_cache_rows(self, output: torch.Tensor) -> torch.Tensor:
+        """The rows stored in the output table.
+
+        Default: ``vision_project`` already returns ``[tokens, out_hidden_size]``. Override when
+        the cached rows are a projection of that output (Gemma 4's tail widens the vision width
+        to the text width). Warmup writes whatever this returns, so the compiled write matches
+        the rows serving stores.
+        """
+        return output
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],
@@ -383,9 +739,17 @@ class SpyreVisionEncoderMixin:
         """Upstream's default: slice the output into ``dest``, one item at a time.
 
         Overridable, as upstream models do, when placeholders differ from the encoder's image
-        tokens (e.g. unpadding or newline tokens). ``outputs["default"]`` is already on the host.
+        tokens (e.g. unpadding or newline tokens). With an ``output_table`` each item is a
+        ``[n, 1]`` host tensor of table rows; otherwise it is the embedding.
         """
-        scatter_output_slices(outputs["default"], indices, per_item_out_tokens, dest, clone)
+        output = outputs["default"]
+        table = getattr(self, "output_table", None)
+        if table is not None:
+            num_tokens = sum(per_item_out_tokens[i] for i in indices)
+            # The whole budget tensor, not a device slice: store writes that warmed shape
+            # and frees the padding rows. Slicing on the card first is a narrowed view.
+            output = table.store(self.encoder_cache_rows(output), keep=num_tokens)
+        scatter_output_slices(output, indices, per_item_out_tokens, dest, clone)
 
     def embed_multimodal(self, **kwargs: object) -> Any:
         """Upstream's entry point when the manager is not used (eager mode, profiling): the same
@@ -420,12 +784,12 @@ class SpyreVisionEncoderMixin:
         *,
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Upstream's text embedding, then the merge through ``vision_merge``.
+        """Upstream's text embedding, then the image merge.
 
         Upstream's chain runs with no image tokens, so model overrides and its handling of
-        out-of-vocabulary placeholders still apply, and it returns before its own merge. The
-        image tokens arrive on the host: they are placed there at the bucketed ``[T, H]``, so
-        the card sees one shape per token bucket whatever the image token count.
+        out-of-vocabulary placeholders still apply, and it returns before its own merge.
+        Handles from the output table are gathered on the card, one graph per token bucket.
+        Embedding tensors are still placed on the host.
         """
         text = super().embed_input_ids(  # ty: ignore[unresolved-attribute]
             input_ids, (), is_multimodal=is_multimodal
@@ -433,6 +797,13 @@ class SpyreVisionEncoderMixin:
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return text
         assert is_multimodal is not None, "image tokens need is_multimodal"
+        if getattr(self, "output_table", None) is not None and _mixed_embedding_kinds(
+            multimodal_embeddings
+        ):
+            raise RuntimeError(
+                "This step mixes floating-point prompt embeddings with integer image handles. "
+                "The encoder output table stores handles, so the two cannot share one merge."
+            )
         mask = convert(is_multimodal, device="cpu")
         rows = convert(vllm_utils._flatten_embeddings(multimodal_embeddings), device="cpu")
         if rows.shape[0] != int(mask.sum()):
@@ -441,13 +812,41 @@ class SpyreVisionEncoderMixin:
                 f"Attempted to assign {expr} = {rows.shape[0]} multimodal tokens to "
                 f"{int(mask.sum())} placeholders"
             )
-        # TODO(#1278): keep the image tokens on the card and gather them there, instead of
-        # placing the whole bucket's [T, H] on the host and uploading it every image step.
+        mask_col = mask[:, None]
+        if not rows.is_floating_point():
+            return self._merge_handles(text, rows.view(-1), mask, mask_col)
         image = torch.zeros(text.shape, dtype=text.dtype)
         image[mask] = rows.to(text.dtype)
         merge = getattr(self, "_spyre_vision_merge", self.vision_merge)
         return merge(
-            text, convert(image, device=text.device), convert(mask[:, None], device=text.device)
+            text, convert(image, device=text.device), convert(mask_col, device=text.device)
+        )
+
+    def _merge_handles(
+        self,
+        text: torch.Tensor,
+        handles: torch.Tensor,
+        mask: torch.Tensor,
+        mask_col: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather table rows for ``handles`` and merge. ``mask_col`` was unsqueezed on the host."""
+        table = self.output_table
+        src_idx = torch.full((text.shape[0],), table.trash, dtype=_index_dtype(text.device))
+        src_idx[mask] = handles.to(dtype=src_idx.dtype)
+        merge = getattr(self, "_spyre_vision_gather_merge", None)
+        if text.device.type == "spyre":
+            # Installed with the table. Compiling here would be an unwatched graph on
+            # the serving path.
+            assert merge is not None, (
+                "encoder output table gather was not compiled when the table was installed"
+            )
+        else:
+            merge = _gather_cached_rows
+        return merge(
+            table.table,
+            text,
+            convert(src_idx, device=text.device),
+            convert(mask_col, device=text.device),
         )
 
     # --- Private helpers ---

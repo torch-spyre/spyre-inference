@@ -217,6 +217,33 @@ def test_padding_does_not_leak_into_images():
     torch.testing.assert_close(tight[:n], loose[:n], atol=2e-2, rtol=1e-2)
 
 
+def test_warmup_stores_the_projected_rows_not_the_vision_width():
+    """The table is the text width. ``vision_project`` is still the vision width, and warmup
+    writes ``encoder_cache_rows``, the same projection serving stores."""
+    from spyre_inference.models._vision_encoder import EncoderOutputTable
+
+    model = _spyre_model(_tower_config(num_layers=1))
+    pooled = torch.randn(8, HIDDEN)
+    rows = model.encoder_cache_rows(pooled)
+    assert rows.shape == (8, TEXT_HIDDEN)
+    assert rows.dtype == torch.float16
+
+    table = EncoderOutputTable(8, TEXT_HIDDEN, torch.float16, torch.device("cpu"), rows=9)
+    with pytest.raises(RuntimeError, match="table rows"):
+        table.store(pooled)
+    table.warmup_write(rows)
+    assert len(table._free) == 8
+
+    # The tail runs on the real prefix after a full-tensor host download. Slicing a
+    # device tensor first is the download that faulted eager Gemma 4.
+    model.output_table = table
+    padded = torch.randn(8, HIDDEN)
+    dest: list[torch.Tensor | None] = [None]
+    model.postprocess_encoder_output({"default": padded}, [0], [3], dest)
+    assert dest[0] is not None and dest[0].shape == (3, 1)
+    assert len(table._free) == 5
+
+
 def test_offset_major_sum_matches_the_stock_pooler():
     """Summed offset groups, scaled, equal stock's position-driven average."""
     from spyre_inference.models._vision_encoder import offset_major

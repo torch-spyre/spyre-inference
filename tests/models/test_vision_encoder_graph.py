@@ -24,7 +24,13 @@ import torch
 import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
-from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
+from spyre_inference.models._vision_encoder import (
+    EncoderOutputCache,
+    EncoderOutputTable,
+    SpyreVisionEncoderMixin,
+    VisionBuffer,
+    _copy_encoder_rows,
+)
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
 MERGE_PATCHES = 4  # 2x2 merge
@@ -632,3 +638,228 @@ def test_eager_path_respects_the_items_per_call_cap():
     assert [o.shape[0] for o in outputs] == [5, 10, 15, 20, 25]
     for i, out in enumerate(outputs):
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def _table(cache_size: int = 8, rows: int = 16) -> EncoderOutputTable:
+    return EncoderOutputTable(cache_size, 8, torch.float16, torch.device("cpu"), rows=rows)
+
+
+def test_output_table_round_trips_and_releases_on_cache_pop():
+    """Stored rows are gathered back by handle, and popping the cache frees them."""
+    table = _table()
+    rows = torch.arange(16, dtype=torch.float16).view(2, 8)
+    handles = table.store(rows)
+    assert handles.shape == (2, 1)
+    assert len(table._free) == 6
+
+    cache = EncoderOutputCache(table)
+    cache["img"] = handles
+    cache["img"] = handles
+    assert len(table._free) == 6
+    cache.pop("img")
+    assert len(table._free) == 8
+
+    model = _FakeVisionModel()
+    model.output_table = table
+    again = table.store(rows)
+    input_ids, is_multimodal = _prompt([4, 5])
+    got = model.embed_input_ids(input_ids, [again], is_multimodal=is_multimodal)
+    torch.testing.assert_close(got[4:6], rows)
+    text = input_ids.to(torch.float16)[:, None].expand(-1, 8)
+    torch.testing.assert_close(got[~is_multimodal], text[~is_multimodal])
+
+
+def test_output_cache_clear_del_and_update_release_rows():
+    """clear, del, update, setdefault and popitem free rows.
+
+    Those dict mutators would otherwise skip the release and leak until store raises.
+    """
+    table = _table()
+    first = table.store(torch.zeros(2, 8, dtype=torch.float16))
+    cache = EncoderOutputCache(table)
+    cache["a"] = first
+    del cache["a"]
+    assert len(table._free) == 8
+
+    second = table.store(torch.ones(2, 8, dtype=torch.float16))
+    cache.update({"a": second})
+    assert len(table._free) == 6
+    replacement = table.store(torch.full((2, 8), 3, dtype=torch.float16))
+    cache.update({"a": replacement})
+    assert len(table._free) == 6
+    assert cache.popitem()[0] == "a"
+    assert len(table._free) == 8
+
+    fresh = table.store(torch.zeros(2, 8, dtype=torch.float16))
+    cache.setdefault("b", fresh)
+    assert len(table._free) == 6
+    cache.setdefault("b", second)
+    assert cache["b"] is fresh
+    assert len(table._free) == 6
+    cache.clear()
+    assert len(table._free) == 8
+    assert not cache
+
+
+def test_store_keep_writes_the_budget_and_frees_the_tail():
+    """A budget-length write keeps the real prefix and returns the padding rows."""
+    table = _table(cache_size=8, rows=10)
+    rows = torch.arange(6 * 8, dtype=torch.float16).view(6, 8)
+    handles = table.store(rows, keep=2)
+    assert handles.shape == (2, 1)
+    assert len(table._free) == 6
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows[:2])
+
+
+def test_store_pads_an_unwarmed_budget_up_to_a_warmed_write():
+    """A tensor longer than the real prefix is not compiled when a warmed write fits.
+
+    The tail is a copied row with its own slots. A repeated trash index does not compile.
+    """
+    table = _table(cache_size=8, rows=10)
+    table._writes[6] = object()
+    rows = torch.arange(4 * 8, dtype=torch.float16).view(4, 8)
+    handles = table.store(rows, keep=2)
+    assert handles.shape == (2, 1)
+    assert len(table._free) == 6
+    assert int((table.table[:8].abs().sum(-1) > 0).sum()) == 6
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows[:2])
+
+
+def test_warmup_write_records_its_own_count_beside_a_larger_one():
+    """Each budget is its own write, including when a larger one is already warmed."""
+    table = _table(cache_size=8, rows=10)
+    table._writes[8] = object()
+    rows = torch.arange(4 * 8, dtype=torch.float16).view(4, 8)
+    table.warmup_write(rows)
+    assert len(table._free) == 8
+    assert len(table._in_use) == 0
+    assert int((table.table[:8].abs().sum(-1) > 0).sum()) == 4
+
+
+def test_store_pads_a_short_pack_up_to_a_warmed_write():
+    """A real token count that was not warmed reuses the next warmed write.
+
+    The extra rows are copies with their own slots, not a repeated trash index.
+    """
+    table = _table(cache_size=8, rows=10)
+    table._writes[6] = object()
+    rows = torch.arange(3 * 8, dtype=torch.float16).view(3, 8)
+    handles = table.store(rows)
+    assert handles.shape == (3, 1)
+    assert len(table._free) == 5
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows)
+
+
+def test_embed_rejects_handles_mixed_with_embeddings():
+    table = _table()
+    handles = table.store(torch.ones(2, 8, dtype=torch.float16))
+    model = _FakeVisionModel()
+    model.output_table = table
+    input_ids, is_multimodal = _prompt([1, 2, 3, 4])
+    with pytest.raises(RuntimeError, match="mixes floating-point prompt embeddings"):
+        model.embed_input_ids(
+            input_ids,
+            [handles, torch.ones(2, 8, dtype=torch.float16)],
+            is_multimodal=is_multimodal,
+        )
+
+
+def test_output_table_refuses_more_rows_than_the_cache():
+    table = _table(cache_size=2, rows=4)
+    with pytest.raises(RuntimeError, match="free rows"):
+        table.store(torch.zeros(3, 8, dtype=torch.float16))
+
+
+def test_partly_full_cache_reuses_the_capped_budget_write():
+    """A budget above the cache warms one write of ``cache_size``.
+
+    With some of those rows still held, the next image pads onto the spare rows.
+    ``_writes`` gains no new length.
+    """
+    table = _table(cache_size=4, rows=8)
+    budget = torch.arange(1120 * 8, dtype=torch.float16).view(1120, 8)
+    table.warmup_write(budget)
+    assert set(table._writes) == {4}
+    assert len(table._free) == 4
+
+    held = table.store(torch.ones(2, 8, dtype=torch.float16))
+    assert held.shape == (2, 1)
+    assert set(table._writes) == {4}
+    assert len(table._free) == 2
+
+    rows = torch.full((2, 8), 2, dtype=torch.float16)
+    handles = table.store(rows)
+    assert handles.shape == (2, 1)
+    assert set(table._writes) == {4}
+    assert len(table._free) == 0
+    assert len(table._in_use) == 4
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows)
+
+
+def test_release_skips_a_stale_handle():
+    """Releasing a row twice does not put it on the free list twice."""
+    table = _table()
+    handles = table.store(torch.zeros(1, 8, dtype=torch.float16))
+    table.release(handles)
+    assert len(table._free) == 8
+    table.release(handles)
+    assert len(table._free) == 8
+    assert len(table._in_use) == 0
+
+
+def test_warmup_write_caps_a_budget_at_the_cache():
+    """A padded encoder budget can be far larger than the cache. Warmup compiles a write of
+    the free rows only; serving never stores more than that, and a repeated index does not
+    compile."""
+    table = _table(cache_size=4, rows=6)
+    rows = torch.arange(20 * 8, dtype=torch.float16).view(20, 8)
+    table.warmup_write(rows)
+    assert len(table._free) == 4
+    assert len(table._in_use) == 0
+
+
+def test_duplicate_index_copy_keeps_the_last_row():
+    """On CPU a repeated index keeps the last row. The compiled card write never repeats one:
+
+    dbo-opt rejects it ("external allocations with repeated dimensions"), so warmup and serving
+    use unique indices only.
+    """
+    table = torch.zeros(4, 2)
+    index = torch.tensor([3, 3])
+    rows = torch.tensor([[1.0, 0.0], [2.0, 5.0]])
+    _copy_encoder_rows(table, index, rows)
+    torch.testing.assert_close(table[3], torch.tensor([2.0, 5.0]))
+    assert table[:3].eq(0).all()
+
+
+def test_compiled_unique_index_copy_on_spyre():
+    """The write serving compiles: unique rows, in the table's gathered layout."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    from spyre_inference.custom_ops.utils import convert
+
+    table = EncoderOutputTable(4, 64, torch.float16, torch.device("spyre"), rows=5)
+    rows = torch.tensor([[1.0] * 64, [2.0] * 64], dtype=torch.float16)
+    handles = table.store(rows)
+    got = convert(table.table, device="cpu")
+    for handle, row in zip(handles.view(-1).tolist(), rows, strict=True):
+        torch.testing.assert_close(got[handle], row)
+
+
+def test_manager_caches_row_handles_and_capture_frees_its_warmup_rows():
+    """Capture compiles a write per budget and releases those rows; execute returns handles."""
+    model = _FakeVisionModel(max_tokens=16)
+    model.output_table = _table(cache_size=64, rows=80)
+    manager = _manager(model, budgets=[16])
+    manager.capture(graph_pool=None)
+    assert len(model.output_table._free) == 64
+
+    outputs = manager.execute({"tokens": [4]})
+    assert len(outputs) == 1 and outputs[0].shape == (4, 1)
+    gathered = model.output_table.table.index_select(0, outputs[0].view(-1))
+    torch.testing.assert_close(gathered, torch.full_like(gathered, 1.0))

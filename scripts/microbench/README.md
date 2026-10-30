@@ -2,7 +2,10 @@
 
 Measures the Spyre paged-attention kernel with the torch profiler. Spyre has no
 CUDA-graph equivalent for excluding host overhead, so device time attributed to a
-`record_function` span is the signal.
+`record_function` span is the signal. `--timing wall` switches to synchronized wall
+latency per forward — `perf_counter_ns` between two `torch.spyre.synchronize()`
+fences — which puts dispatch and host work inside the number and needs no profiler
+build.
 
 > **Notation:** `bs=64` / `bs=128` mean **`block_size`**, not batch size.
 
@@ -15,6 +18,20 @@ SPYRE_ATTN_PROFILING=1 .venv/bin/python3 scripts/microbench/spyre_attn_microbenc
 
 Reports device time for the whole emulated attention layer. `--span` narrows that
 to one scope; see below.
+
+### Wall-clock timing
+
+```bash
+.venv/bin/python3 scripts/microbench/spyre_attn_microbench.py --timing wall \
+    --config scripts/microbench/configs/granite33_8b_bs128_decode.json
+```
+
+`ms`/`min_ms`/`max_ms` become synchronized wall latency per forward; the
+profiler-only columns (`device_time_memory_us`, `memory_share_pct`,
+`kernels_attributed`) are empty and the kernel-attribution check is skipped.
+`--threads` defaults to 1 under profiler (device time is thread-insensitive, so
+fewer threads means less host jitter) and 8 under wall, where host work is inside
+the measured interval; the applied value is recorded in the `threads` column.
 
 `granite33_8b_e2e_ref.json` reproduces the shapes of one specific end-to-end run,
 as a reference point for checking the harness against it. It declares the shapes
@@ -154,6 +171,10 @@ Device events only appear if torch-spyre was built with `USE_SPYRE_PROFILER=1`
 ldd .venv/lib/python3.12/site-packages/torch_spyre/_C.so | grep libaiupti
 ```
 
+`--timing wall` needs the opposite build: the AIUPTI instrumentation would land
+inside the measured interval and inflate it. The runner checks the wheel with
+`ldd` and refuses the mismatched build in either direction.
+
 The runner's startup guard aborts when the probe profile has no device events
 rather than reporting plausible-looking zeros.
 
@@ -194,9 +215,9 @@ Give one form or the other, not both.
 Tab-separated, written after every measurement (a crash keeps what completed) plus
 a `_final.csv`.
 
-`ms`/`min_ms`/`max_ms` are **device time, not wall clock** — median/min/max over
-`--iterations` separate profiled windows, so they are not comparable to GPU
-wall-clock numbers. Spyre-specific columns: `device_time_memory_us` and
+`ms`/`min_ms`/`max_ms` are **device time, not wall clock** (under `--timing wall`,
+synchronized wall latency per forward) — median/min/max over `--iterations` separate
+profiled windows, so they are not comparable to GPU wall-clock numbers. Spyre-specific columns: `device_time_memory_us` and
 `memory_share_pct` (memcpy/memset/restickify/d2d-copy share), `cpu_time_ms`,
 `fallback_clean`, `num_outliers`, `span`, `kv_layout`, `kv_write`,
 `attn_path`, `num_decode_seqs`, `padded_num_seqs`, `decode_uniformity`,

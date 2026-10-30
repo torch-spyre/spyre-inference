@@ -283,6 +283,39 @@ def test_spyre_bool_mask_index_put(spyre_device):
     torch.testing.assert_close(t.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A scatter along the last (stick) dim does not compile (torch-spyre#4404), and "
+        "torch-spyre#3878 keeps topk's indices in fp16, which scatter rejects. With "
+        "#4404's fix, a last-dim scatter still writes wrong values (torch-spyre#4403). "
+        "spyre_inference.moe._topk_probs masks the logits with keep_by_index instead. "
+        "When this probe passes, revisit that workaround."
+    ),
+)
+def test_spyre_topk_scatter_dense_routing(spyre_device):
+    """Dense top-k routing weights: topk, then scatter the softmaxed weights back.
+
+    The canonical form of vLLM's ``topk_softmax`` routing, as ``_topk_probs`` wrote it
+    before the keep_by_index workaround.
+    """
+    tokens, experts, top_k = 16, 64, 4
+    gen = torch.Generator().manual_seed(0)
+    # Distinct logits per row, so the selected set has no fp16 ties.
+    ranks = torch.stack([torch.randperm(experts, generator=gen) for _ in range(tokens)])
+    logits = (ranks.float() / experts * 4 - 2).to(torch.float16)
+
+    @torch.compile(dynamic=False)
+    def fn(logits):
+        weights, ids = torch.topk(logits, top_k, dim=-1)
+        return torch.zeros_like(logits).scatter(-1, ids, torch.softmax(weights, dim=-1))
+
+    weights, ids = torch.topk(logits.float(), top_k, dim=-1)
+    expected = torch.zeros(tokens, experts).scatter(-1, ids, torch.softmax(weights, dim=-1))
+    out = fn(logits.to(spyre_device))
+    torch.testing.assert_close(out.cpu().float(), expected, atol=2e-3, rtol=2e-3)
+
+
 # ---------------------------------------------------------------------------
 # 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------

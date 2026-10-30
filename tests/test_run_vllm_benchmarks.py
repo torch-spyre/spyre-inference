@@ -26,6 +26,7 @@ breaks these invariants fails here.
 """
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,7 @@ LATENCY_TESTS = _CONFIGS / "latency-tests.yaml"
 THROUGHPUT_TESTS = _CONFIGS / "throughput-tests.yaml"
 LATENCY_DEV_TESTS = _CONFIGS / "latency-tests-dev.yaml"
 THROUGHPUT_DEV_TESTS = _CONFIGS / "throughput-tests-dev.yaml"
+WARMUP_TESTS = _CONFIGS / "warmup-tests.yaml"
 
 
 def _write(tmp_path, raw) -> Path:
@@ -313,6 +315,115 @@ def test_unknown_suite_aborts_the_run(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         runner.main()
     assert exc.value.code == 2
+
+
+def test_warmup_is_opt_in(monkeypatch, tmp_path):
+    ran = []
+    for name in ("run_benchmarks_from_file", "run_serve_benchmarks_from_file"):
+        monkeypatch.setattr(runner, name, lambda **kw: (ran.append(kw), (0, 0))[1])
+    monkeypatch.setattr(
+        runner, "run_warmup_benchmarks_from_file", lambda **kw: pytest.fail("warmup ran")
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_vllm_benchmarks.py", "--configs-dir", str(tmp_path), "--results-dir", str(tmp_path)],
+    )
+
+    runner.main()
+
+    assert ran
+
+
+# ── warmup ──
+
+
+def test_warmup_times_cold_then_populated_on_one_fresh_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("TORCHINDUCTOR_FORCE_DISABLE_CACHES", "1")
+    monkeypatch.setenv("SAVE_TO_PYTORCH_BENCHMARK_FORMAT", "1")
+    starts = []
+
+    @runner.contextlib.contextmanager
+    def fake_server(server_parameters, env, config_env, results_dir, log_name, health_timeout):
+        starts.append((log_name, env))
+        cache = Path(env["TORCHINDUCTOR_CACHE_DIR"])
+        if len(starts) == 1:
+            (cache / "kernels").mkdir(parents=True)
+            for i in range(3):
+                (cache / "kernels" / f"k{i}").touch()
+        else:
+            (cache / "late").touch()
+        yield 100.0 if len(starts) == 1 else 10.0
+
+    monkeypatch.setattr(runner, "running_server", fake_server)
+
+    assert runner.run_warmup_benchmark(
+        test_name="warmup_m_tp1",
+        server_parameters={"model": "m", "tensor-parallel-size": 1},
+        env_config={},
+        results_dir=tmp_path,
+        spyre_devices="0",
+        aiu_world_size="1",
+        health_timeout=10,
+    )
+
+    (cold_name, cold_env), (populated_name, populated_env) = starts
+    assert (cold_name, populated_name) == (
+        "warmup_m_tp1_cold_server",
+        "warmup_m_tp1_populated_server",
+    )
+    assert cold_env == populated_env
+    assert "TORCHINDUCTOR_FORCE_DISABLE_CACHES" not in cold_env
+    cache_dir = Path(cold_env["TORCHINDUCTOR_CACHE_DIR"])
+    assert not cache_dir.parent.exists(), "the fresh cache outlived the test"
+    assert json.loads((tmp_path / "warmup_m_tp1.json").read_text()) == {
+        "model": "m",
+        "cold_cache_startup_sec": 100.0,
+        "cold_cache_new_files": 3,
+        "populated_cache_startup_sec": 10.0,
+        "populated_cache_new_files": 1,
+    }
+    records = json.loads((tmp_path / "warmup_m_tp1.pytorch.json").read_text())
+    assert {r["metric"]["name"]: r["metric"]["benchmark_values"] for r in records} == {
+        "cold_cache_startup_sec": [100.0],
+        "cold_cache_new_files": [3],
+        "populated_cache_startup_sec": [10.0],
+        "populated_cache_new_files": [1],
+    }
+
+
+def test_warmup_fails_without_a_result_when_a_start_fails(monkeypatch, tmp_path):
+    @runner.contextlib.contextmanager
+    def fake_server(*args):
+        yield None
+
+    monkeypatch.setattr(runner, "running_server", fake_server)
+
+    assert not runner.run_warmup_benchmark(
+        test_name="w",
+        server_parameters={"model": "m"},
+        env_config={},
+        results_dir=tmp_path,
+        spyre_devices="0",
+        aiu_world_size="1",
+        health_timeout=10,
+    )
+    assert not (tmp_path / "w.json").exists()
+
+
+def test_warmup_tests_yaml_derives_consistently():
+    configs = runner._load_configs(WARMUP_TESTS)
+    assert configs
+
+    for config in configs:
+        name = config["test_name"]
+        tp = runner._config_tp(config)
+        assert tp is not None, name
+        # run_mode is the name's first token downstream.
+        assert name.startswith("warmup_") and f"_tp{tp}" in name, name
+        assert config["environment_variables"]["SPYRE_DEVICES"].split(",") == [
+            str(i) for i in range(tp)
+        ]
+        assert "parameters" not in config, name
 
 
 def test_matrix_skips_dev_configs(tmp_path):

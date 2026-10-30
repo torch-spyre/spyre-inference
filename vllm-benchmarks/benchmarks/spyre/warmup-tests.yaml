@@ -1,0 +1,43 @@
+# Server preparation benchmarks for Spyre devices: the time from spawning
+# `vllm serve` to its first healthy /health, which is mostly the warmup compile.
+#
+# run_vllm_benchmarks.py starts each entry's server twice on one fresh compile
+# cache (TORCHINDUCTOR_CACHE_DIR and VLLM_CACHE_ROOT in a temp dir): first with
+# the cache cold, then populated by that first run. It records both as
+# cold_cache_startup_sec and populated_cache_startup_sec, and the files each
+# run adds to the cache as *_cache_new_files. No requests are sent.
+#
+# server_parameters mirror the serve-tests.yaml entry of the same model, so the
+# graphs compiled here are the ones a serve run compiles.
+
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_KERNEL_CACHE: 1
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 4
+    max-num-batched-tokens: 512
+    enable-prefix-caching: true
+
+tests:
+  - test_name: warmup_micro-g3.3-8b_tp1_smoke
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
+      tensor-parallel-size: 1
+      max-model-len: 2048
+
+  - test_name: warmup_gemma4-26b-a4b_tp1
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 1
+      max-model-len: 8192
+
+  - test_name: warmup_gemma4-26b-a4b_tp4
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 8192

@@ -10,6 +10,13 @@ per `(model, shape)`:
 - `throughput-tests.yaml` → `vllm bench throughput`
 - `serve-tests.yaml` → `vllm bench serve` (starts a server, waits for health,
   then benchmarks against it)
+- `warmup-tests.yaml` → server preparation time: starts `vllm serve` twice on
+  one fresh compile cache and records `cold_cache_startup_sec` and
+  `populated_cache_startup_sec`, the time to the first healthy `/health` with
+  nothing compiled and with the first run's artifacts on disk, plus
+  `cold_cache_new_files` and `populated_cache_new_files`, the files each run
+  adds to the cache (the populated run should add none). Opt-in: only
+  `BENCH_TYPES=warmup` runs it.
 
 `latency-tests-dev.yaml`, `throughput-tests-dev.yaml` and `serve-tests-dev.yaml` are not run in CI. The offline ones run the offline benchmarks at the serve context lengths, and the serve one holds every `serve-tests.yaml` entry plus a 32k entry per model replaying the `all_sequences` trace. Each takes hours per model, so run them on your own pod with `make perf-tests BENCH_SUITE=dev`. `SPYRE_DEVICES` / `AIU_WORLD_SIZE` are derived from each entry's tensor-parallel size rather than spelled out per test.
 
@@ -28,8 +35,8 @@ which combine — a test runs only if it passes all of them:
   all models.
 - `TPS` — comma-separated tensor-parallel sizes, e.g. `TPS=1,4`. Empty = all
   sizes.
-- `BENCH_TYPES` — comma-separated subset of `latency,throughput,serve`. Empty =
-  all types.
+- `BENCH_TYPES` — comma-separated subset of `latency,throughput,serve,warmup`.
+  Empty = all types but `warmup`.
 
 ```bash
 # Everything (all models, all bench types)
@@ -40,6 +47,10 @@ make perf-tests RESULTS_DIR=benchmark-results \
   MODELS=ibm-granite/granite-3.3-8b-instruct \
   TPS=4 \
   BENCH_TYPES=serve
+
+# Server startup time, cold then populated compile cache, for the smoke model
+make perf-tests RESULTS_DIR=benchmark-results BENCH_TYPES=warmup \
+  MODELS=ibm-ai-platform/micro-g3.3-8b-instruct-1b
 
 # The long-context dev configs for one model
 make perf-tests RESULTS_DIR=benchmark-results BENCH_SUITE=dev \

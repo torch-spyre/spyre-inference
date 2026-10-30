@@ -414,12 +414,12 @@ endif
 # comma-separated set of model names -- CI passes the per-model matrix entry
 # here so each job benches a single model. TPS narrows to a comma-separated set
 # of tensor-parallel sizes, e.g. TPS=1,4. BENCH_TYPES narrows to a subset of
-# latency,throughput,serve for quick local iteration. BENCH_SUITE=dev runs the
+# latency,throughput,serve,warmup for quick local iteration. BENCH_SUITE=dev runs the
 # *-tests-dev.yaml configs, which are too long for CI.
 MODELS ?=
 TPS ?=
 BENCH_TYPES ?=
-# Directory holding the {latency,throughput,serve}-tests.yaml files to run.
+# Directory holding the {latency,throughput,serve,warmup}-tests.yaml files to run.
 BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks/spyre
 BENCH_SUITE ?=
 
@@ -443,7 +443,7 @@ else
 BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve,warmup (empty = all but warmup). Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
 	mkdir -p "$(RESULTS_DIR)"
 	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \

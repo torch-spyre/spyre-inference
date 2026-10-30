@@ -16,7 +16,9 @@
 
 Reads benchmark configs from the specified directory, builds the appropriate
 `vllm bench latency` / `vllm bench throughput` / `vllm bench serve` commands,
-and executes them.
+and executes them. A `warmup` config starts `vllm serve` twice on one fresh
+compile cache and records how long the server took to become healthy with the
+cache cold and then populated.
 """
 
 import contextlib
@@ -31,6 +33,7 @@ import signal
 import string
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from argparse import ArgumentParser
@@ -104,7 +107,8 @@ def parse_args():
         "--bench-types",
         type=str,
         default="",
-        help="comma-separated subset of latency,throughput,serve to run (empty = all)",
+        help="comma-separated subset of latency,throughput,serve,warmup to run "
+        "(empty = all but warmup)",
     )
     parser.add_argument(
         "--suite",
@@ -299,6 +303,16 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
     return env_vars
 
 
+def bench_env(env_config: dict, spyre_devices: str, aiu_world_size: str) -> tuple[dict, dict]:
+    """The benchmark process env, and the config's own part of it (applied last, so it wins)."""
+    env = os.environ.copy()
+    env["SPYRE_DEVICES"] = spyre_devices
+    env["AIU_WORLD_SIZE"] = aiu_world_size
+    config_env = build_env_vars(env_config)
+    env.update(config_env)
+    return env, config_env
+
+
 def format_command(cmd: list[str], env_vars: dict[str, str]) -> str:
     """Render a command as a copy-pasteable shell line, prefixed by its env vars.
 
@@ -342,13 +356,7 @@ def run_benchmark(
     cmd.extend(build_command_args(parameters))
     cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
 
-    # The CLI device values are only a base: env_config carries the per-test
-    # values from _derive_config and is applied last, so it wins.
-    env = os.environ.copy()
-    env["SPYRE_DEVICES"] = spyre_devices
-    env["AIU_WORLD_SIZE"] = aiu_world_size
-    config_env = build_env_vars(env_config)
-    env.update(config_env)
+    env, config_env = bench_env(env_config, spyre_devices, aiu_world_size)
 
     cmd_line = record_command(cmd, config_env, results_dir / f"{test_name}.cmd")
 
@@ -414,26 +422,28 @@ def run_benchmarks_from_file(
     return passed, failed
 
 
-def run_serve_benchmark(
-    test_name: str,
-    server_parameters: dict,
-    bench_parameters: dict,
-    env_config: dict,
-    results_dir: Path,
-    spyre_devices: str,
-    aiu_world_size: str,
-    health_timeout: int = 180,
-) -> bool:
-    """Start vllm serve, wait for health, run bench serve, cleanup."""
-    # As in run_benchmark: env_config is applied last and overrides the CLI
-    # device values.
-    env = os.environ.copy()
-    env["SPYRE_DEVICES"] = spyre_devices
-    env["AIU_WORLD_SIZE"] = aiu_world_size
-    config_env = build_env_vars(env_config)
-    env.update(config_env)
+def _kill_server(proc: subprocess.Popen) -> None:
+    """Kill the server and its entire process group."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
-    # Build server command
+
+@contextlib.contextmanager
+def running_server(
+    server_parameters: dict,
+    env: dict,
+    config_env: dict,
+    results_dir: Path,
+    log_name: str,
+    health_timeout: int,
+):
+    """Start `vllm serve`; yield its seconds to healthy /health (None on failure), then kill it."""
     server_params = dict(server_parameters)
     model = server_params.pop("model")
     host = str(server_params.get("host", "127.0.0.1"))
@@ -441,25 +451,10 @@ def run_serve_benchmark(
     server_cmd = [*VLLM_CLI, "serve", model]
     server_cmd.extend(build_command_args(server_params))
 
-    server_cmd_line = record_command(
-        server_cmd, config_env, results_dir / f"{test_name}_server.cmd"
-    )
-
-    log.info("=== Starting vLLM server for serve test: %s ===", test_name)
+    server_cmd_line = record_command(server_cmd, config_env, results_dir / f"{log_name}.cmd")
     log.info("Server command: %s", server_cmd_line)
 
-    def _kill_server(proc: subprocess.Popen) -> None:
-        """Kill the server and its entire process group."""
-        with contextlib.suppress(OSError):
-            os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-
-    server_log = results_dir / f"{test_name}_server.log"
+    server_log = results_dir / f"{log_name}.log"
     with open(server_log, "w") as server_lf:
         server_lf.write(f"# {server_cmd_line}\n")
         server_lf.flush()
@@ -480,9 +475,8 @@ def run_serve_benchmark(
             while time.monotonic() < deadline:
                 if server_proc.poll() is not None:
                     log.error("Server process died with exit code %d", server_proc.returncode)
-                    if server_log.exists():
-                        log.error("Server log:\n%s", server_log.read_text())
-                    return False
+                    log.error("Server log:\n%s", server_log.read_text())
+                    break
                 try:
                     urllib.request.urlopen(health_url, timeout=2)
                     server_startup_sec = round(time.monotonic() - server_start_ts, 1)
@@ -490,46 +484,64 @@ def run_serve_benchmark(
                     break
                 except Exception:
                     time.sleep(1)
-
-            if server_startup_sec is None:
+            else:
                 log.error("Server did not become healthy within %ds", health_timeout)
-                if server_log.exists():
-                    log.error("Server log:\n%s", server_log.read_text())
-                return False
-
-            # Run bench serve
-            bench_cmd = [*VLLM_CLI, "bench", "serve"]
-            bench_cmd.extend(build_command_args(bench_parameters))
-            bench_cmd.extend(
-                [
-                    # The trace prompts already carry their chat template;
-                    # re-applying it would change token counts and the
-                    # prefix-cache hit rate.
-                    "--skip-chat-template",
-                    "--save-result",
-                    "--result-dir",
-                    str(results_dir),
-                    "--result-filename",
-                    f"{test_name}.json",
-                ]
-            )
-
-            bench_cmd_line = record_command(
-                bench_cmd, config_env, results_dir / f"{test_name}_bench.cmd"
-            )
-
-            log.info("=== Running serve benchmark: %s ===", test_name)
-            log.info("Bench command: %s", bench_cmd_line)
-
-            bench_log = results_dir / f"{test_name}_bench.log"
-            with open(bench_log, "w") as blf:
-                blf.write(f"# {bench_cmd_line}\n")
-                blf.flush()
-                result = subprocess.run(
-                    bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
-                )
+                log.error("Server log:\n%s", server_log.read_text())
+            yield server_startup_sec
         finally:
             _kill_server(server_proc)
+
+
+def run_serve_benchmark(
+    test_name: str,
+    server_parameters: dict,
+    bench_parameters: dict,
+    env_config: dict,
+    results_dir: Path,
+    spyre_devices: str,
+    aiu_world_size: str,
+    health_timeout: int = 180,
+) -> bool:
+    """Start vllm serve, wait for health, run bench serve, cleanup."""
+    env, config_env = bench_env(env_config, spyre_devices, aiu_world_size)
+
+    log.info("=== Starting vLLM server for serve test: %s ===", test_name)
+    with running_server(
+        server_parameters, env, config_env, results_dir, f"{test_name}_server", health_timeout
+    ) as server_startup_sec:
+        if server_startup_sec is None:
+            return False
+        # Run bench serve
+        bench_cmd = [*VLLM_CLI, "bench", "serve"]
+        bench_cmd.extend(build_command_args(bench_parameters))
+        bench_cmd.extend(
+            [
+                # The trace prompts already carry their chat template;
+                # re-applying it would change token counts and the
+                # prefix-cache hit rate.
+                "--skip-chat-template",
+                "--save-result",
+                "--result-dir",
+                str(results_dir),
+                "--result-filename",
+                f"{test_name}.json",
+            ]
+        )
+
+        bench_cmd_line = record_command(
+            bench_cmd, config_env, results_dir / f"{test_name}_bench.cmd"
+        )
+
+        log.info("=== Running serve benchmark: %s ===", test_name)
+        log.info("Bench command: %s", bench_cmd_line)
+
+        bench_log = results_dir / f"{test_name}_bench.log"
+        with open(bench_log, "w") as blf:
+            blf.write(f"# {bench_cmd_line}\n")
+            blf.flush()
+            result = subprocess.run(
+                bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
+            )
 
     if result.returncode != 0:
         log.error("Serve test %s failed with exit code %d", test_name, result.returncode)
@@ -602,7 +614,138 @@ def run_serve_benchmarks_from_file(
     return passed, failed
 
 
-VALID_BENCH_TYPES = ("latency", "throughput", "serve")
+# Inherited switches that would keep warmup runs off the compile cache under test.
+CACHE_DISABLING_ENV_VARS = (
+    "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
+    "TORCHINDUCTOR_FX_GRAPH_CACHE",
+    "TORCHINDUCTOR_AUTOGRAD_CACHE",
+    "VLLM_DISABLE_COMPILE_CACHE",
+)
+WARMUP_CACHE_STATES = ("cold", "populated")
+
+
+def _pytorch_records(model: str, server_parameters: dict, metrics: dict[str, float]) -> list:
+    """`metrics` in the `*.pytorch.json` shape vLLM writes, which the ingest reads."""
+    return [
+        {
+            "benchmark": {"name": "vLLM benchmark", "extra_info": {"args": server_parameters}},
+            "model": {"name": model},
+            "metric": {"name": name, "benchmark_values": [value], "extra_info": {}},
+        }
+        for name, value in metrics.items()
+    ]
+
+
+def _count_files(root: Path) -> int:
+    return sum(len(files) for _, _, files in os.walk(root))
+
+
+def run_warmup_benchmark(
+    test_name: str,
+    server_parameters: dict,
+    env_config: dict,
+    results_dir: Path,
+    spyre_devices: str,
+    aiu_world_size: str,
+    health_timeout: int,
+) -> bool:
+    """Time server startup on an empty compile cache, then on the one it filled.
+
+    Also counts the files each run adds to the cache: the populated run should add none.
+    """
+    with tempfile.TemporaryDirectory(prefix=f"{test_name}-cache-") as cache_dir:
+        env_config = {
+            **env_config,
+            "TORCHINDUCTOR_CACHE_DIR": str(Path(cache_dir) / "inductor"),
+            "VLLM_CACHE_ROOT": str(Path(cache_dir) / "vllm"),
+        }
+        env, config_env = bench_env(env_config, spyre_devices, aiu_world_size)
+        for var in CACHE_DISABLING_ENV_VARS:
+            if var not in config_env:
+                env.pop(var, None)
+
+        metrics = {}
+        files_before = 0
+        for state in WARMUP_CACHE_STATES:
+            log.info(
+                "=== Starting vLLM server for warmup test: %s (%s cache) ===", test_name, state
+            )
+            with running_server(
+                server_parameters,
+                env,
+                config_env,
+                results_dir,
+                f"{test_name}_{state}_server",
+                health_timeout,
+            ) as sec:
+                if sec is None:
+                    log.error("Warmup test %s failed with a %s cache", test_name, state)
+                    return False
+            files_after = _count_files(Path(cache_dir))
+            metrics[f"{state}_cache_startup_sec"] = sec
+            metrics[f"{state}_cache_new_files"] = files_after - files_before
+            files_before = files_after
+
+    model = server_parameters["model"]
+    (results_dir / f"{test_name}.json").write_text(
+        json.dumps({"model": model, **metrics}, indent=2)
+    )
+    # Same switch as vLLM's own .pytorch.json, which is what the ingest reads.
+    if os.environ.get("SAVE_TO_PYTORCH_BENCHMARK_FORMAT"):
+        (results_dir / f"{test_name}.pytorch.json").write_text(
+            json.dumps(_pytorch_records(model, server_parameters, metrics), indent=2)
+        )
+    log.info(
+        "Warmup test %s passed (cold %.1fs, %d files; populated %.1fs, %d files)",
+        test_name,
+        metrics["cold_cache_startup_sec"],
+        metrics["cold_cache_new_files"],
+        metrics["populated_cache_startup_sec"],
+        metrics["populated_cache_new_files"],
+    )
+    return True
+
+
+def run_warmup_benchmarks_from_file(
+    config_file: Path,
+    results_dir: Path,
+    spyre_devices: str,
+    aiu_world_size: str,
+    models: set[str],
+    tps: set[int],
+) -> tuple[int, int]:
+    """Run all warmup benchmarks from a config file. Returns (passed, failed) counts."""
+    if not config_file.exists():
+        log.info("No %s config found, skipping", config_file.name)
+        return 0, 0
+
+    configs = _load_configs(config_file)
+    if configs is None:
+        return 0, 1
+
+    passed = 0
+    failed = 0
+    for config in _select_configs(configs, models, tps):
+        success = run_warmup_benchmark(
+            test_name=config.get("test_name", "unknown"),
+            server_parameters=config.get("server_parameters", {}),
+            env_config=config.get("environment_variables", {}),
+            results_dir=results_dir,
+            spyre_devices=spyre_devices,
+            aiu_world_size=aiu_world_size,
+            health_timeout=int(config.get("server_health_timeout", 180)),
+        )
+        if success:
+            passed += 1
+        else:
+            failed += 1
+
+    return passed, failed
+
+
+VALID_BENCH_TYPES = ("latency", "throughput", "serve", "warmup")
+# warmup is opt-in: it adds two full server startups per entry to a CI job.
+DEFAULT_BENCH_TYPES = ("latency", "throughput", "serve")
 
 
 def _suite_config_files(configs_dir: Path, suite: str, bench_types: set[str]) -> dict[str, Path]:
@@ -641,7 +784,7 @@ def main():
         log.error("Unknown bench types %s; valid: %s", sorted(unknown), VALID_BENCH_TYPES)
         sys.exit(2)
     if not bench_types:
-        bench_types = set(VALID_BENCH_TYPES)
+        bench_types = set(DEFAULT_BENCH_TYPES)
 
     suite = args.suite.strip()
     config_files = _suite_config_files(configs_dir, suite, bench_types)
@@ -699,6 +842,18 @@ def main():
             )
             total_passed += passed
             total_failed += failed
+
+    if "warmup" in bench_types:
+        passed, failed = run_warmup_benchmarks_from_file(
+            config_file=config_files["warmup"],
+            results_dir=results_dir,
+            spyre_devices=args.spyre_devices,
+            aiu_world_size=args.aiu_world_size,
+            models=models,
+            tps=tps,
+        )
+        total_passed += passed
+        total_failed += failed
 
     # Summary
     log.info("=== Benchmark Summary ===")

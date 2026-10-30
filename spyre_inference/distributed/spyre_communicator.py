@@ -54,9 +54,10 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         # Workaround: deeptools' L3 scheduler fails to build the eager sum kernel for many
         # rank-2 and rank-3 shapes: no valid core split for a [T, H] of ~2**17+ elements
         # unless H is a multiple of 2048, and a bound assert for [1, 528, 1024]. A flat
-        # view has one dim to split and chunk.
+        # view has one dim to split and chunk. Compiled collectives accept ranked
+        # tensors directly; flattening them creates avoidable view materialization.
         orig_shape = input_.shape
-        flattened = input_.dim() > 1
+        flattened = not torch.compiler.is_compiling() and input_.dim() > 1
         if flattened:
             input_ = input_.reshape(-1)
 

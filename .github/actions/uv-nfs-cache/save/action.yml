@@ -1,0 +1,52 @@
+name: uv cache save (NFS)
+description: >-
+  Save half of uv-nfs-cache: ships a uv cache dir to the shared mount under the
+  key uv-nfs-cache/restore computed. Writes main on push-to-main and pr-<N> on
+  PRs, nothing otherwise, and skips when the key is already readable. Gate it
+  on the step that filled the cache, not just job success.
+
+inputs:
+  storage-root:
+    description: Same value as the restore step.
+    required: true
+  key:
+    description: The restore step's cache-key output.
+    required: true
+  cache-dir:
+    description: The restore step's cache-dir output.
+    required: true
+  exclude:
+    description: Newline-separated tar --exclude patterns, anchored at the cache root (e.g. ./builds-v*).
+    required: false
+    default: ''
+  keep:
+    description: Tars to retain per scope and arch.
+    required: false
+    default: '5'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        STORAGE_ROOT: ${{ inputs.storage-root }}
+        KEY: ${{ inputs.key }}
+        CACHE_DIR: ${{ inputs.cache-dir }}
+        EXCLUDE: ${{ inputs.exclude }}
+        KEEP: ${{ inputs.keep }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        if [[ -z "$STORAGE_ROOT" ]]; then
+          echo "::warning::storage-root is empty; skipping uv cache save"
+          exit 0
+        fi
+        if [[ -z "$KEY" || -z "$CACHE_DIR" ]]; then
+          echo "uv cache: no key or cache dir from the restore step; skipping save"
+          exit 0
+        fi
+        args=()
+        while read -r p; do [[ -n "$p" ]] && args+=(--exclude "$p"); done <<< "$EXCLUDE"
+        python3 -I "$GITHUB_ACTION_PATH/../../../scripts/nfs_uv_cache.py" save \
+          --nfs-root "$STORAGE_ROOT" --local-dir "$CACHE_DIR" --key "$KEY" --keep "$KEEP" \
+          --pr-number "$PR_NUMBER" --uv uv "${args[@]}" \
+          || echo "::warning::uv cache helper failed; continuing"

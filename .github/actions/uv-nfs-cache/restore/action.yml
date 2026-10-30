@@ -1,0 +1,66 @@
+name: uv cache restore (NFS)
+description: >-
+  Restore half of uv-nfs-cache, for jobs that save explicitly with
+  uv-nfs-cache/save (or never). Same scopes and key as the combined action.
+  See .github/scripts/nfs_uv_cache.py.
+
+inputs:
+  storage-root:
+    description: Repo-scoped cache root on the shared mount, e.g. /storage-1/<repo>/.cache/uv.
+    required: true
+  key-files:
+    description: Newline-separated files (relative to the workspace) hashed into the cache key.
+    required: false
+    default: ''
+  key-salt:
+    description: Extra string hashed into the key, e.g. a dependency group list. Enough on its own.
+    required: false
+    default: ''
+  local-dir:
+    description: Dir the tar is extracted into. Defaults to $RUNNER_TEMP/uv-cache.
+    required: false
+    default: ''
+  merge-into-default:
+    description: >-
+      'true' to hardlink the restored cache into uv's default cache dir (existing
+      entries win) instead of exporting UV_CACHE_DIR, so a cache baked into the
+      image stays in use. A later save then snapshots that whole dir, image
+      entries included. On a merge failure cache-dir is empty and save skips.
+    required: false
+    default: 'false'
+
+outputs:
+  cache-hit:
+    description: "'true' when the exact key was found on the mount."
+    value: ${{ steps.restore.outputs.cache-hit }}
+  cache-key:
+    description: The key to pass to uv-nfs-cache/save.
+    value: ${{ steps.restore.outputs.cache-key }}
+  cache-dir:
+    description: The uv cache dir the job uses, to pass to uv-nfs-cache/save.
+    value: ${{ steps.restore.outputs.cache-dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: restore
+      shell: bash
+      env:
+        STORAGE_ROOT: ${{ inputs.storage-root }}
+        KEY_FILES: ${{ inputs.key-files }}
+        KEY_SALT: ${{ inputs.key-salt }}
+        LOCAL_DIR: ${{ inputs.local-dir }}
+        MERGE: ${{ inputs.merge-into-default }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        if [[ -z "$STORAGE_ROOT" ]]; then
+          echo "::warning::storage-root is empty; uv uses its default cache"
+          exit 0
+        fi
+        args=()
+        while read -r f; do [[ -n "$f" ]] && args+=(--key-file "$GITHUB_WORKSPACE/$f"); done <<< "$KEY_FILES"
+        [[ "$MERGE" == true ]] && args+=(--merge-into-default)
+        python3 -I "$GITHUB_ACTION_PATH/../../../scripts/nfs_uv_cache.py" restore \
+          --nfs-root "$STORAGE_ROOT" --local-dir "${LOCAL_DIR:-$RUNNER_TEMP/uv-cache}" \
+          --key-salt "$KEY_SALT" --pr-number "$PR_NUMBER" --uv uv "${args[@]}" \
+          || echo "::warning::uv cache helper failed; uv uses its default cache"

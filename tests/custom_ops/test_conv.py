@@ -14,9 +14,9 @@
 
 """Tests for `SpyreConv2d` (custom_ops/conv.py), the Pixtral patch-embed conv.
 
-`SpyreConv2d` is registered OOT for every `Conv2dLayer`, but its tiled layouts only
-suit a patch embed, so `_layouts_supported` — the gate keeping other convs on the
-stock path — is the test that matters most. The layout and numeric tests need a card.
+`SpyreConv2d` is registered OOT for every `Conv2dLayer` but only handles a patch
+embed, so `_layouts_supported` — the gate keeping other convs on the stock path — is
+the test that matters most. The numeric test needs a card.
 """
 
 import sys
@@ -80,10 +80,19 @@ def test_layouts_supported_accepts_a_patch_embed():
 
 
 @pytest.mark.conv
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_layouts_supported_accepts_multi_batch(batch):
+    from spyre_inference.custom_ops.conv import _layouts_supported
+
+    x = torch.randn(batch, 3, 64, 64, dtype=torch.float16)
+    weight = torch.randn(OUT_CHANNELS, 3, PATCH, PATCH, dtype=torch.float16)
+    assert _layouts_supported(x, weight) is True
+
+
+@pytest.mark.conv
 @pytest.mark.parametrize(
     "x_shape,w_shape,reason",
     [
-        ((2, 3, 64, 64), (OUT_CHANNELS, 3, PATCH, PATCH), "batch > 1"),
         ((1, 65, 64, 64), (OUT_CHANNELS, 65, PATCH, PATCH), "in_channels > 64"),
         ((1, 3, 64, 64), (100, 3, PATCH, PATCH), "out_channels not a multiple of 64"),
         ((1, 3, 64), (OUT_CHANNELS, 3, PATCH, PATCH), "input not 4-D"),
@@ -107,7 +116,7 @@ def test_unsupported_shape_falls_back_to_forward_native():
     from spyre_inference.custom_ops.conv import SpyreConv2d
 
     # groups=1, kernel != stride -> enable_linear False, and out_channels 100
-    # is not a multiple of 64, so the tiled layouts do not apply.
+    # is not a multiple of 64, so it is not a patch embed.
     layer = _layer(in_ch=3, out_ch=100, kernel=3, stride=1)
     assert isinstance(layer, SpyreConv2d)
 
@@ -122,7 +131,7 @@ def test_unsupported_patch_shape_falls_back_to_conv_not_mulmat():
     from spyre_inference.custom_ops.conv import SpyreConv2d, _layouts_supported
 
     # kernel == stride and no padding -> enable_linear; out_channels 100 is not a
-    # multiple of 64, so the tiled layouts do not apply and it must fall back.
+    # multiple of 64, so it is not a patch embed and must fall back.
     layer = _layer(in_ch=3, out_ch=100, kernel=16, stride=16)
     assert isinstance(layer, SpyreConv2d)
     assert layer.enable_linear is True
@@ -137,24 +146,6 @@ def test_unsupported_patch_shape_falls_back_to_conv_not_mulmat():
 
 
 # ---------------------------------------------------------------------------
-# Layout derivation (needs torch-spyre, not necessarily a card)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.conv
-@pytest.mark.parametrize("out_ch", [64, 128, OUT_CHANNELS])
-@pytest.mark.parametrize("hw", [(64, 64), (48, 80)])
-def test_layouts_build_for_valid_shapes(out_ch, hw):
-    """Layouts are derived from tensor shape, not hardcoded: any 64-aligned
-    out-channel count and any image size must build without raising."""
-    pytest.importorskip("torch_spyre")
-    from spyre_inference.custom_ops.conv import _input_layout, _weight_layout
-
-    assert _weight_layout(torch.randn(out_ch, 3, PATCH, PATCH, dtype=torch.float16)) is not None
-    assert _input_layout(torch.randn(1, 3, *hw, dtype=torch.float16)) is not None
-
-
-# ---------------------------------------------------------------------------
 # Numeric correctness on-card
 # ---------------------------------------------------------------------------
 
@@ -165,21 +156,20 @@ def test_layouts_build_for_valid_shapes(out_ch, hw):
     [
         (16, 64, 64),  # stick-aligned patch grid (4x4 patches)
         (16, 272, 272),  # 17x17 patches — coprime with the stick; stock im2col fails
-        (14, 336, 308),  # 24x22 at Ministral-3's patch size. NON-SQUARE on purpose:
-        # `_input_layout` derives strides from (h, w), so an H/W swap is invisible
-        # while height == width.
+        (14, 336, 308),  # 24x22 at Ministral-3's patch size, non-square to catch an H/W swap
     ],
 )
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias):
-    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`."""
+@pytest.mark.parametrize("batch", [1, 2, 5])
+def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias, batch):
+    """`F.conv2d` through `SpyreConv2d` matches a plain CPU `F.conv2d` at any batch."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     layer = _layer(kernel=patch, stride=patch, bias=use_bias)
 
     torch.manual_seed(3)
-    x = torch.randn(1, 3, height, width, dtype=torch.float16)
+    x = torch.randn(batch, 3, height, width, dtype=torch.float16)
     expected = F.conv2d(
         x,
         layer.weight.data,
@@ -188,7 +178,6 @@ def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias):
     )
 
     layer = layer.to("spyre")
-    layer.process_weights_after_loading()
     actual = layer.forward_oot(x.to("spyre"))
 
     assert actual.shape == expected.shape

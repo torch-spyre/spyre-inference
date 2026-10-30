@@ -22,7 +22,6 @@ from vllm.config import ModelConfig
 from vllm.model_executor.layers.attention.attention import Attention
 
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
-from spyre_inference.custom_ops.conv import SpyreConv2d
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_qk_norm_eps,
@@ -65,12 +64,9 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
 
 
 def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
-    """Move the layer weights to Spyre and place SpyreConv2d weights in their tiled layout."""
+    """Move the layer weights to Spyre."""
     # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
     # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
     # an nn.Module, but just the attention implementation.
     Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
     model.to(device=device)
-    for module in model.modules():
-        if isinstance(module, SpyreConv2d):
-            module.process_weights_after_loading()

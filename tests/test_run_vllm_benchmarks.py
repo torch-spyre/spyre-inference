@@ -26,7 +26,9 @@ breaks these invariants fails here.
 """
 
 import importlib.util
+import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,7 @@ _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / ".github" / "scripts" / "run_vllm_benchmarks.py"
 # The runner imports its sibling resource_sampler, which loading by path does not resolve.
 sys.path.insert(0, str(_SCRIPT.parent))
+resource_sampler = importlib.import_module("resource_sampler")
 _spec = importlib.util.spec_from_file_location("run_vllm_benchmarks", _SCRIPT)
 runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(runner)
@@ -430,3 +433,179 @@ def test_offline_tests_yaml_derives_consistently(config_file):
             continue
         half = parameters["max-model-len"] // 2
         assert parameters[input_key] == parameters[output_key] == half, name
+
+
+def _sampler(monkeypatch, cpu=(), mem=()):
+    """A ContainerSampler with canned samples, so no cgroup is read."""
+    monkeypatch.setattr(resource_sampler, "_read_cgroup_cpu_usec", lambda root: 0)
+    sampler = resource_sampler.ContainerSampler(interval=1.0)
+    sampler._cpu_samples = list(cpu)
+    sampler._mem_samples = list(mem)
+    return sampler
+
+
+def test_runner_imports_the_resource_sampler():
+    assert runner.write_resource_metrics is resource_sampler.write_resource_metrics
+    assert runner.ContainerSampler is resource_sampler.ContainerSampler
+
+
+def test_sampler_summary_is_mean_peak_p99(monkeypatch):
+    sampler = _sampler(monkeypatch, cpu=[10.0, 20.0, 30.0], mem=[100.0, 200.0, 300.0])
+    assert sampler.summary() == {
+        "host_cpu_pct_total": {"mean": 20.0, "peak": 30.0, "p99": 30.0},
+        "host_mem_mb": {"mean": 200.0, "peak": 300.0, "p99": 300.0},
+    }
+
+
+def test_sampler_summary_prefixes_the_phase(monkeypatch):
+    summary = _sampler(monkeypatch, cpu=[1.0], mem=[2.0]).summary(phase="compile")
+    assert set(summary) == {"compile_host_cpu_pct_total", "compile_host_mem_mb"}
+
+
+def test_sampler_summary_is_empty_without_samples(monkeypatch):
+    assert _sampler(monkeypatch).summary() == {}
+
+
+def test_write_resource_metrics_writes_one_flat_record_per_stat(tmp_path):
+    summary = {"host_cpu_pct_total": {"mean": 20.0, "peak": 30.0}}
+    resource_sampler.write_resource_metrics("serve_m_tp1", tmp_path, summary, model="org/m")
+    # Named by test, with the suffix the ingest's host-resource pass reads.
+    lines = (tmp_path / "serve_m_tp1.host_resources.json").read_text().splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {
+            "test_name": "serve_m_tp1",
+            "metric": "host_cpu_pct_total_mean",
+            "value": 20.0,
+            "model": "org/m",
+        },
+        {
+            "test_name": "serve_m_tp1",
+            "metric": "host_cpu_pct_total_peak",
+            "value": 30.0,
+            "model": "org/m",
+        },
+    ]
+
+
+def test_write_resource_metrics_omits_an_empty_model(tmp_path):
+    resource_sampler.write_resource_metrics("t", tmp_path, {"host_mem_mb": {"mean": 1.5}})
+    (record,) = [
+        json.loads(line) for line in (tmp_path / "t.host_resources.json").read_text().splitlines()
+    ]
+    assert "model" not in record
+
+
+def test_write_resource_metrics_writes_nothing_for_an_empty_summary(tmp_path):
+    resource_sampler.write_resource_metrics("t", tmp_path, {})
+    assert list(tmp_path.iterdir()) == []
+
+
+_MOUNT = "49 47 0:30 {root} /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw,nsdelegate\n"
+
+
+@pytest.mark.parametrize(
+    "mount_root, own, expected",
+    [
+        # Host or shared cgroupns: the mount is the whole tree, the process sits below it.
+        ("/", "/kubepods/pod1/ctr", "/sys/fs/cgroup/kubepods/pod1/ctr"),
+        # Private cgroupns: the process is its namespace's root.
+        ("/", "/", "/sys/fs/cgroup"),
+        # A bind-mounted subtree: the 0:: path is below the mount root, not under the mountpoint.
+        ("/kubepods/pod1/ctr", "/kubepods/pod1/ctr", "/sys/fs/cgroup"),
+        ("/kubepods/pod1", "/kubepods/pod1/ctr", "/sys/fs/cgroup/ctr"),
+        # A process outside the mounted subtree sees only the mount's top.
+        ("/kubepods/pod1/ctr", "/other", "/sys/fs/cgroup"),
+    ],
+)
+def test_resolve_cgroup_finds_the_processes_own_directory(mount_root, own, expected):
+    resolved = resource_sampler._resolve_cgroup(f"0::{own}\n", _MOUNT.format(root=mount_root))
+    assert resolved == Path(expected)
+
+
+def test_resolve_cgroup_on_a_spyre_perf_pod():
+    """Private cgroupns, as read on a pod: /sys/fs/cgroup is already the pod's cgroup."""
+    mountinfo = (
+        "1457 1454 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime"
+        " - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot\n"
+    )
+    assert resource_sampler._resolve_cgroup("0::/\n", mountinfo) == Path("/sys/fs/cgroup")
+
+
+def test_resolve_cgroup_ignores_v1_lines_and_other_mounts():
+    proc_cgroup = "12:memory:/legacy\n0::/pod/ctr\n"
+    mountinfo = "30 25 0:27 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n" + _MOUNT.format(
+        root="/"
+    )
+    assert resource_sampler._resolve_cgroup(proc_cgroup, mountinfo) == Path(
+        "/sys/fs/cgroup/pod/ctr"
+    )
+
+
+@pytest.mark.parametrize(
+    "proc_cgroup, mountinfo",
+    [
+        ("12:memory:/legacy\n", _MOUNT.format(root="/")),  # cgroup v1 only: no 0:: line
+        ("0::/pod\n", "30 25 0:27 / /sys/fs/cgroup rw - cgroup cgroup rw,memory\n"),  # no cgroup2
+        ("", ""),
+    ],
+)
+def test_resolve_cgroup_returns_none_when_it_cannot_tell(proc_cgroup, mountinfo):
+    assert resource_sampler._resolve_cgroup(proc_cgroup, mountinfo) is None
+
+
+def test_cgroup_root_falls_back_to_the_mountpoint_when_unreadable(monkeypatch):
+    def unreadable(self, *args, **kwargs):
+        raise OSError("no /proc")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert resource_sampler._cgroup_root() == Path("/sys/fs/cgroup")
+
+
+def test_cgroup_root_of_this_process_has_the_files_the_sampler_reads():
+    root = resource_sampler._cgroup_root()
+    if not (root / "cpu.stat").exists():
+        pytest.skip("no cgroup v2 accounting on this host")
+    assert (root / "memory.current").exists()
+    resource_sampler._read_cgroup_cpu_usec(root)
+    resource_sampler._read_cgroup_mem_mb(root)
+
+
+def test_make_sampler_degrades_to_a_noop_without_cgroup_metrics(monkeypatch):
+    def unavailable():
+        raise OSError("no cgroup")
+
+    monkeypatch.setattr(runner, "ContainerSampler", unavailable)
+    sampler = runner._make_sampler()
+    sampler.stop()
+    assert sampler.summary(phase="compile") == {}
+
+
+def test_make_sampler_degrades_to_a_noop_on_a_malformed_interval(monkeypatch):
+    """A ValueError from the env parse must not escape: the server is already running."""
+    monkeypatch.setenv("RESOURCE_SAMPLER_INTERVAL", "1s")
+    sampler = runner._make_sampler()
+    assert isinstance(sampler, runner._Noop)
+    sampler.stop()
+    assert sampler.summary() == {}
+
+
+def test_sampler_thread_survives_an_unparsable_sample(monkeypatch):
+    """A ValueError (e.g. an unexpected cpu.stat line) skips one sample, not the thread."""
+    monkeypatch.setattr(resource_sampler, "_read_cgroup_cpu_usec", lambda root: 0)
+    sampler = resource_sampler.ContainerSampler(interval=0.01)
+    calls = []
+
+    def collect():
+        calls.append(None)
+        if len(calls) == 1:
+            raise ValueError("invalid literal for int()")
+        return 1.0, 2.0
+
+    monkeypatch.setattr(sampler, "_collect", collect)
+    sampler.start()
+    deadline = time.monotonic() + 5
+    while not sampler._cpu_samples and time.monotonic() < deadline:
+        time.sleep(0.01)
+    sampler.stop()
+
+    assert sampler._cpu_samples and sampler._mem_samples == [2.0] * len(sampler._cpu_samples)

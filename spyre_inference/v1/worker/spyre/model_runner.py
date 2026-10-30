@@ -23,9 +23,11 @@ from typing import Any
 
 import torch
 from vllm.config import VllmConfig
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 
@@ -36,6 +38,8 @@ class SpyreModelRunnerV2(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, torch.device("cpu"))
         self.spyre_device = device
+        # Filled by initialize_kv_cache; warmup records the attention kernels against them.
+        self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
@@ -53,6 +57,16 @@ class SpyreModelRunnerV2(GPUModelRunner):
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
         self.cudagraph_manager = bucketing.SpyreBucketManager.from_runner(self)
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # Upstream copies over self.kv_caches, which kv_cache.py leaves empty, so a
+        # copy would be dropped and the request would read the shared block's tail.
+        if scheduler_output.kv_cache_block_copies:
+            raise NotImplementedError(
+                "Prefix-cache copy-on-write block copies are not supported on the Spyre "
+                "V2 runner (#1240)."
+            )
+        super().update_requests(scheduler_output)
 
     def pool(self, *args: Any, **kwargs: Any) -> Any:
         return pool_output.pool_sync(self, *args, **kwargs)

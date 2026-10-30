@@ -177,6 +177,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             SpyreShapeBucketer(runner.vllm_config) if bucket_sizes else None
         )
         runner.max_num_reqs = MAX_NUM_REQS
+        runner.num_spec_tokens = 0
         runner.scheduler_config = types.SimpleNamespace(
             max_num_batched_tokens=64,
             max_num_seqs=MAX_NUM_REQS,

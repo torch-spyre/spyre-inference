@@ -185,7 +185,10 @@ def _run_head_major_attn_test(
     from vllm.config import get_current_vllm_config
 
     max_num_blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
-    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    # The bucketer must see this test's block_size, not the fixture default.
+    bucketer_config = get_current_vllm_config()
+    bucketer_config.cache_config.block_size = block_size
+    buckets = SpyreAttnBucketer(bucketer_config).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
@@ -883,6 +886,55 @@ def test_head_major_dispatches_by_query_width(
     assert sorted(called) == ["decode", "prefill"], called
 
 
+# Not named "batched_decode": tests/conftest.py skips those under the tiled walk.
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], id="long_and_shorts"),
+        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], id="graded"),
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], id="with_prefill"),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_grouped_decode_matches_reference(
+    default_vllm_config, monkeypatch, seq_lens, configure_compilation, configure_device
+):
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    envs.clear_env_cache()
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.model_config.max_model_len = 8192
+
+    groups_run = []
+    run_grouped = SpyreAttentionImpl._run_grouped_decode
+
+    def spy(self, query_dev, k_pages, v_pages, attn_metadata, output, device):
+        groups_run.append(len(attn_metadata.decode_groups))
+        return run_grouped(self, query_dev, k_pages, v_pages, attn_metadata, output, device)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_grouped_decode", spy)
+
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+
+
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -1015,7 +1067,10 @@ def test_head_major_matches_token_major(
     from vllm.config import get_current_vllm_config
 
     blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
-    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    # The bucketer must see this test's block_size, not the fixture default.
+    bucketer_config = get_current_vllm_config()
+    bucketer_config.cache_config.block_size = block_size
+    buckets = SpyreAttnBucketer(bucketer_config).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(blocks_per_seq, buckets)
     if padded_width is not None:
         blocks_per_seq = max(blocks_per_seq, padded_width)

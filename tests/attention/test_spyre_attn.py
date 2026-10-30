@@ -1173,6 +1173,20 @@ def test_kv_cache_dtype_that_disagrees_with_the_model_is_rejected(default_vllm_c
         SpyreAttentionImpl(kv_cache_dtype="bfloat16", **kwargs)
 
 
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_e5m2", "fp8_inc", "nvfp4", "fp8_per_token_head"])
+def test_unsupported_quantized_kv_cache_dtype_is_named(default_vllm_config, kv_cache_dtype):
+    """Upstream sizes these as uint8 bytes like fp8, so the constructor is the only guard
+    against storing them as e4m3; the message names the dtypes Spyre does take."""
+    from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+        SpyreHeadMajorAttentionImpl,
+    )
+
+    with pytest.raises(ValueError, match=f"{kv_cache_dtype} is not supported on Spyre.*fp8_e4m3"):
+        SpyreHeadMajorAttentionImpl(
+            num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype=kv_cache_dtype
+        )
+
+
 def test_attention_sinks_are_rejected(default_vllm_config):
     """Sink models (gpt-oss natively, and the Transformers backend) pass
     sinks to the impl, and nothing screens sink models out before this constructor:

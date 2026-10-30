@@ -27,8 +27,9 @@ it — advertised shape, allocation, kernels, index tables — are duplicated ra
 parameterised. This layout does not carry ALiBi.
 """
 
-import contextlib
-from typing import ClassVar
+from collections.abc import Callable
+from contextvars import copy_context
+from typing import ClassVar, TypeVar
 
 import torch
 from vllm.config import get_current_vllm_config
@@ -92,6 +93,7 @@ compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kern
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
+_T = TypeVar("_T")
 
 
 def _lx_max_cores(output_units: int) -> int:
@@ -107,22 +109,20 @@ def _lx_max_cores(output_units: int) -> int:
     return 0 if output_units >= _SPYRE_CORES else _LX_ATTN_CORES
 
 
-@contextlib.contextmanager
-def _capped_cores(output_units: int):
+def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], *args) -> _T:
     # work_division reads config.sencores per compile, which is what keeps the rest of
     # the model uncapped.
     max_cores = _lx_max_cores(output_units)
     if not max_cores:
-        yield
-        return
+        return fn(*args)
     from torch_spyre._inductor import config as ts_config
 
-    prev = ts_config.sencores
-    ts_config.sencores = max_cores
-    try:
-        yield
-    finally:
-        ts_config.sencores = prev
+    def run():
+        ts_config.sencores = max_cores
+        return fn(*args)
+
+    # Config overrides are context-local; leave the caller's unset state intact.
+    return copy_context().run(run)
 
 
 class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
@@ -318,25 +318,26 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         scale, v_args = self._read_scales()
-        with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
-            return self._decode_fn(
-                query_dev,
-                rep_row_ids,
-                k_pages,
-                v_pages,
-                chunk_index_tables,
-                mask_by_chunk,
-                scale,
-                b_seqs,
-                blocks_per_chunk,
-                self.num_kv_heads,
-                self.num_queries_per_kv,
-                block_size,
-                self.head_size,
-                self.logits_soft_cap,
-                out,
-                *v_args,
-            )
+        return _run_with_capped_cores(
+            b_seqs * blocks_per_chunk * self.num_kv_heads,
+            self._decode_fn,
+            query_dev,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_index_tables,
+            mask_by_chunk,
+            scale,
+            b_seqs,
+            blocks_per_chunk,
+            self.num_kv_heads,
+            self.num_queries_per_kv,
+            block_size,
+            self.head_size,
+            self.logits_soft_cap,
+            out,
+            *v_args,
+        )
 
     def _run_page_attn(
         self,
@@ -366,37 +367,14 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
-            with _capped_cores(self.num_kv_heads * padded_query_len):
-                return _page_attn_prefill_compiled(
-                    query,
-                    row_table,
-                    k_pages,
-                    v_pages,
-                    index_table,
-                    mask_stack,
-                    scale,
-                    num_blocks,
-                    padded_query_len,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_size,
-                    self.logits_soft_cap,
-                    out,
-                    *v_args,
-                )
-
-        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
-        kv_row_pool = self._kv_row_pool(k_pages.shape[0], query.device)
-        # The folded kernel carries num_heads output units; lifting the cap for it
-        # measured no difference, so it is left as is.
-        with _capped_cores(self.num_kv_heads * padded_query_len):
-            return self._decode_attn_fn(
+            return _run_with_capped_cores(
+                self.num_kv_heads * padded_query_len,
+                _page_attn_prefill_compiled,
                 query,
                 row_table,
-                k_folded,
-                v_folded,
+                k_pages,
+                v_pages,
                 index_table,
-                kv_row_pool,
                 mask_stack,
                 scale,
                 num_blocks,
@@ -404,11 +382,36 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_size,
-                self.block_size,
                 self.logits_soft_cap,
                 out,
                 *v_args,
             )
+
+        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
+        kv_row_pool = self._kv_row_pool(k_pages.shape[0], query.device)
+        # The folded kernel carries num_heads output units; lifting the cap for it
+        # measured no difference, so it is left as is.
+        return _run_with_capped_cores(
+            self.num_kv_heads * padded_query_len,
+            self._decode_attn_fn,
+            query,
+            row_table,
+            k_folded,
+            v_folded,
+            index_table,
+            kv_row_pool,
+            mask_stack,
+            scale,
+            num_blocks,
+            padded_query_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self.block_size,
+            self.logits_soft_cap,
+            out,
+            *v_args,
+        )
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list
     # `kv_write_index` publishes; ty cannot see that the pair co-evolves.

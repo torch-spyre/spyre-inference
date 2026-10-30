@@ -233,14 +233,14 @@ def test_dataset_path_expands_from_env(monkeypatch, tmp_path):
     assert selected["parameters"]["dataset-path"] == str(trace)
 
 
-def test_unset_dataset_var_falls_back_to_host_default(monkeypatch):
+def test_unset_dataset_var_falls_back_to_fetch_cache(monkeypatch, tmp_path):
     monkeypatch.delenv("SPYRE_AIOPS_DATASET", raising=False)
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
     config = _serve_config("${SPYRE_AIOPS_DATASET}")
     runner._resolve_dataset_path(config)
 
-    assert (
-        config["parameters"]["dataset-path"] == runner.DATASET_PATH_DEFAULTS["SPYRE_AIOPS_DATASET"]
-    )
+    expected = tmp_path / runner.fetch_bench_datasets.ARTIFACTS["SPYRE_AIOPS_DATASET"]["path"]
+    assert config["parameters"]["dataset-path"] == str(expected)
 
 
 def test_missing_dataset_aborts_the_run(monkeypatch, tmp_path):

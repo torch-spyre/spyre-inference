@@ -12,25 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: per-block compile, suppressing MRV2's whole-model stock compile.
+"""MRV2: suppress MRV2's whole-model stock compile.
 
-STOCK_TORCH_COMPILE on MRV2 doesn't exist before vLLM 0.32 (vllm#59079);
-compiles one block at a time instead, through the same shared helpers V1
-uses (repeated_block_lists, compile_granularity, compile_blocks in
-v1/worker/compile_granularity.py).
+Under STOCK_TORCH_COMPILE, upstream's load_model ends with
+compile_model_with_stock_torch(self.model), which would trace the whole model over
+the per-block graphs load.py has already installed, through vLLM's own backend
+rather than Spyre's inductor. Spyre compiles in load.py through the shared
+compile_for_spyre instead.
 """
 
-from typing import TYPE_CHECKING
+import contextlib
+from collections.abc import Iterator
+from typing import Any
 
-if TYPE_CHECKING:
-    from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
-
-
-def suppress_whole_model_compile(runner: "SpyreModelRunnerV2") -> None:
-    """Stop MRV2 from stock-compiling the whole model."""
-    raise NotImplementedError
+from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 
 
-def compile_blocks(runner: "SpyreModelRunnerV2", fullgraph: bool = True) -> int:
-    """Compile each repeated transformer block once. Returns the block count."""
-    raise NotImplementedError
+@contextlib.contextmanager
+def no_stock_compile() -> Iterator[None]:
+    """Make upstream's compile_model_with_stock_torch a no-op for the duration."""
+    stock_compile = upstream_model_runner.compile_model_with_stock_torch
+
+    def skip(model: Any, vllm_config: Any) -> None:
+        pass
+
+    upstream_model_runner.compile_model_with_stock_torch = skip  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        upstream_model_runner.compile_model_with_stock_torch = stock_compile

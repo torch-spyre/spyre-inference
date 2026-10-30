@@ -22,6 +22,7 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -43,9 +44,15 @@ class SpyreModelRunnerV2(GPUModelRunner):
         self.spyre_device = device
         # Filled by initialize_kv_cache; warmup records the attention kernels against them.
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+        # Set by load_model.
+        self.pooling_on_spyre = False
+        self.compiled_tower_blocks = 0
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
+
+    def get_model(self) -> nn.Module:
+        return load.unwrap(self.model)
 
     def initialize_kv_cache(
         self,

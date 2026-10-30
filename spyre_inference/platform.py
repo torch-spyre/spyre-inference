@@ -685,6 +685,24 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
     @classmethod
+    def _reject_unsupported_v2_features(cls, vllm_config: VllmConfig) -> None:
+        """MRV2 features the Spyre V2 runner does not implement, refused at startup rather
+        than at their first, silently wrong, use."""
+        parallel_config = vllm_config.parallel_config
+        unsupported = {
+            # MRV2 builds self.speculator, which load.py refuses only once the model loads.
+            "speculative decoding": vllm_config.speculative_config is not None,
+            # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
+            "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),
+            # A CUDA-graph encoder manager; Spyre compiles towers per budget at warmup.
+            "cudagraph_mm_encoder": vllm_config.compilation_config.cudagraph_mm_encoder,
+            "prefill context parallelism": parallel_config.prefill_context_parallel_size > 1,
+        }
+        for feature, requested in unsupported.items():
+            if requested:
+                raise ValueError(f"The Spyre V2 model runner does not support {feature}.")
+
+    @classmethod
     def _warn_if_not_in_registry(cls, vllm_config: VllmConfig) -> None:
         """Warn when the requested model/tp/max_model_len/platform is not in the registry.
 
@@ -835,6 +853,9 @@ class TorchSpyrePlatform(CpuPlatform):
                     "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
                     "runner."
                 )
+
+        if runner == "v2":
+            cls._reject_unsupported_v2_features(vllm_config)
 
         # The pin holds only if the resolved property agrees; anything new that outranks
         # the env var must fail here rather than at the first runner-specific code path.

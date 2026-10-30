@@ -124,9 +124,17 @@ class SpyreMoERecipe:
     layout without selecting top-k a second time.
     """
 
-    activation: Literal["gelu_tanh", "silu"]
+    activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # Reorders ``w13``'s output rows (dim 1) into ``[gate | up]`` halves. gpt-oss interleaves
+    # them, ``[gate0, up0, gate1, ...]``; the gate/up split below takes the first half as gate.
+    prepare_gate_up_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+
+def deinterleave_gate_up(weight: torch.Tensor) -> torch.Tensor:
+    """``[E, 2M, ...]`` with gate on even rows, up on odd, as ``[gate | up]`` halves."""
+    return torch.cat([weight[:, 0::2], weight[:, 1::2]], dim=1)
 
 
 def _validate_recipe(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> None:
@@ -190,6 +198,17 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
             f"Spyre MoE recipe requires activation={recipe.activation!r}, "
             f"got {layer.activation.value!r}."
         )
+    if recipe.activation == "swigluoai":
+        # The constants are vLLM's swigluoai_and_mul, which the layer's own limit/alpha do not
+        # reach on any backend; a model that sets other values would be silently wrong.
+        limit, alpha = moe.swiglu_limit, moe.swiglu_alpha
+        if (limit is not None and limit != _SWIGLUOAI_LIMIT) or (
+            alpha is not None and alpha != _SWIGLUOAI_ALPHA
+        ):
+            raise NotImplementedError(
+                f"Spyre swigluoai uses limit={_SWIGLUOAI_LIMIT} and alpha={_SWIGLUOAI_ALPHA}; "
+                f"the layer asks for limit={limit}, alpha={alpha}."
+            )
     layer = cast("RoutedExperts", layer)
     layer.spyre_moe_recipe = recipe
     layer.spyre_moe_regions = {}
@@ -240,9 +259,17 @@ def _routing_weights(
     return weights, indices
 
 
+_SWIGLUOAI_LIMIT, _SWIGLUOAI_ALPHA = 7.0, 1.702
+
+
 def _activation(x: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
     if activation == "gelu_tanh":
         return F.gelu(x, approximate="tanh") * up
+    if activation == "swigluoai":
+        # gpt-oss: (clamp(up, +-limit) + 1) * gate * sigmoid(alpha * gate), gate clamped above.
+        gate = torch.clamp(x, max=_SWIGLUOAI_LIMIT)
+        up = torch.clamp(up, -_SWIGLUOAI_LIMIT, _SWIGLUOAI_LIMIT)
+        return (up + 1) * gate * torch.sigmoid(gate * _SWIGLUOAI_ALPHA)
     return F.silu(x) * up
 
 
@@ -665,6 +692,9 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # TP can leave intermediate shards mid-stick; zero-padding is inert because those
     # activation lanes multiply zero rows in the down stack.
     pad = -inter % stick
+    recipe = layer.spyre_moe_recipe
+    if recipe.prepare_gate_up_weight is not None:
+        w13 = recipe.prepare_gate_up_weight(w13)
     # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
@@ -673,7 +703,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
-    transform_down = layer.spyre_moe_recipe.prepare_down_weight
+    transform_down = recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
     # Keep the complete stack for persistent compute and expose a view for gathered decode.

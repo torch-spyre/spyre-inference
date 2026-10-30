@@ -632,6 +632,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
 
         fix_padded_model(self.model, self.model_config)
+        from spyre_inference.config.kernel_hints import configure_kernel_hints
+
+        configure_kernel_hints(self.model, self.vllm_config)
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.

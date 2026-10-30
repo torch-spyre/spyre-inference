@@ -138,6 +138,8 @@ def _run_head_major_attn_test(
     configure_compilation: str,
     configure_device: str,
     soft_cap: float | None = None,
+    use_sinks: bool = False,
+    tolerance: tuple[float, float] | None = None,
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
@@ -165,6 +167,8 @@ def _run_head_major_attn_test(
 
     # This layout does not carry ALiBi; the impl rejects slopes at construction.
     alibi_slopes = None
+    # gpt-oss-20b's sinks span -2.45..8.19: from negligible to most of the softmax mass.
+    sinks = torch.linspace(-2.5, 8.5, num_query_heads).to(DTYPE) if use_sinks else None
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -246,6 +250,7 @@ def _run_head_major_attn_test(
         sliding_window=sliding_window,
         kv_cache_dtype=kv_cache_dtype,
         logits_soft_cap=soft_cap,
+        sinks=sinks,
     )
     assert attn_impl.block_size == block_size
 
@@ -317,9 +322,13 @@ def _run_head_major_attn_test(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         alibi_slopes=alibi_slopes,
+        sinks=sinks,
     )
 
-    atol, rtol = (0.3, 0.2) if max(query_lens) >= 32 else (0.2, 0.2)
+    if tolerance is not None:
+        atol, rtol = tolerance
+    else:
+        atol, rtol = (0.3, 0.2) if max(query_lens) >= 32 else (0.2, 0.2)
     assert_close_outliers(
         output.to("cpu"),
         ref_output,
@@ -1001,6 +1010,71 @@ def test_head_major_attn_soft_cap(
         configure_device=configure_device,
         soft_cap=soft_cap,
     )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "sliding_window", "multi_seq_decode"),
+    [
+        # The per-seq decode (LX-resident) and prefill kernels.
+        pytest.param([(1, 300), (64, 200)], None, False, id="per_seq_mixed"),
+        pytest.param([(1, 300), (64, 200)], 128, False, id="per_seq_sliding_window(128)"),
+        # The multi-sequence decode kernel, which serves decode by default: kv 512 at block
+        # 64 spans several chunks, so its per-slot merge runs and must count each sink
+        # once. Named apart from "batched_decode", which tests/conftest.py skips wholesale.
+        pytest.param([(1, 512), (1, 300), (1, 64)], None, True, id="multi_seq_decode"),
+    ],
+)
+# One KV head cannot tell the kv-major sink order from a transposed one; two can.
+@pytest.mark.parametrize(
+    "num_kv_heads", [pytest.param(1, id="8q_1kv"), pytest.param(2, id="8q_2kv")]
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_attn_sinks(
+    default_vllm_config,
+    monkeypatch,
+    seq_lens,
+    sliding_window,
+    multi_seq_decode,
+    num_kv_heads,
+    configure_compilation,
+    configure_device,
+):
+    """Attention sinks (gpt-oss: 64 q / 8 kv heads, head_dim 64; 8 / 1 per rank at TP8)."""
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1" if multi_seq_decode else "0")
+    envs.clear_env_cache()
+    calls: list[str] = []
+    real_decode_fn = hm._batched_decode_compiled
+
+    def spy(*args, **kwargs):
+        calls.append("multi_seq")
+        return real_decode_fn(*args, **kwargs)
+
+    # Patched before the impl is built: __init__ reads this global into the impl.
+    monkeypatch.setattr(hm, "_batched_decode_compiled", spy)
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=64,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_sinks=True,
+        # Measured within 0.007 of the reference; dropping the sinks moves the output by up
+        # to 0.3 here, which the default 0.2 + 20% bound would absorb.
+        tolerance=(0.05, 0.05),
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        head_size=64,
+    )
+    assert bool(calls) == multi_seq_decode, calls
 
 
 @pytest.mark.parametrize(

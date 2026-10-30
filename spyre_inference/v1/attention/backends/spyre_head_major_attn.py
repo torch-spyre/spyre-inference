@@ -109,17 +109,17 @@ def _lx_max_cores(output_units: int) -> int:
     return 0 if output_units >= _SPYRE_CORES else _LX_ATTN_CORES
 
 
-def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], *args) -> _T:
+def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], *args, **kwargs) -> _T:
     # work_division reads config.sencores per compile, which is what keeps the rest of
     # the model uncapped.
     max_cores = _lx_max_cores(output_units)
     if not max_cores:
-        return fn(*args)
+        return fn(*args, **kwargs)
     from torch_spyre._inductor import config as ts_config
 
     def run():
         ts_config.sencores = max_cores
-        return fn(*args)
+        return fn(*args, **kwargs)
 
     # Config overrides are context-local; leave the caller's unset state intact.
     return copy_context().run(run)
@@ -337,6 +337,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             self.logits_soft_cap,
             out,
             *v_args,
+            sinks=self._device_sinks(query_dev.device),
         )
 
     def _run_page_attn(
@@ -385,6 +386,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
+                sinks=self._device_sinks(query.device),
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
@@ -411,6 +413,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             self.logits_soft_cap,
             out,
             *v_args,
+            sinks=self._device_sinks(query.device),
         )
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list

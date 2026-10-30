@@ -17,6 +17,7 @@
 import torch
 
 from spyre_inference.v1.attention.ops import tile_loop
+from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -36,6 +37,7 @@ def page_attn_kernel(
     logits_soft_cap=0.0,
     alibi_stack=None,
     out=None,
+    sinks=None,
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
 
@@ -58,6 +60,7 @@ def page_attn_kernel(
             per-query-row constants — see the derivation at the bias-tile
             construction site in _online_softmax_attention.
         out: buffer to store into, or None to return the result instead.
+        sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
 
     Returns [padded_query_len, num_heads, head_size], or ``out`` when this
     kernel stored the result itself.
@@ -137,7 +140,7 @@ def page_attn_kernel(
 
     state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = walk_tiles(
+    (tile_max, tile_sum, tile_output), _ = walk_tiles(
         block_body,
         tuple(operands),
         dims=tuple(dims),
@@ -151,7 +154,10 @@ def page_attn_kernel(
             ),
         ),
     )
-    attn = tile_output / tile_sum
+    # The state has a query-row axis the sinks broadcast over.
+    attn = normalize(
+        tile_max, tile_sum, tile_output, None if sinks is None else sinks.unsqueeze(-1)
+    )
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
     attn = attn.reshape(padded_query_len, num_heads, head_size)
     if out is not None:

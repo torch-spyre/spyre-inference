@@ -28,6 +28,7 @@ Only the temporary softmax state grows; the permanent KV cache is unchanged.
 
 import torch
 
+from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
 
 
@@ -77,13 +78,19 @@ def _merge_entry_local(
     num_kv_heads,
     num_queries_per_kv,
     head_size,
+    sinks=None,
 ):
-    """Rescale slots to a common maximum, sum them, then normalize once."""
+    """Rescale slots to a common maximum, sum them, then normalize once.
+
+    The sink joins after the merge, so a sequence counts it once rather than once per slot.
+    """
     merged_max = torch.amax(tile_max, dim=0, keepdim=True)
     weight = torch.exp(tile_max - merged_max)
     merged_sum = torch.sum(weight * tile_sum, dim=0)
     merged_out = torch.sum(weight * tile_output, dim=0)
-    return (merged_out / merged_sum).reshape(num_seqs, num_kv_heads * num_queries_per_kv, head_size)
+    return normalize(merged_max[0], merged_sum, merged_out, sinks).reshape(
+        num_seqs, num_kv_heads * num_queries_per_kv, head_size
+    )
 
 
 def batched_decode_head_major_kernel(
@@ -103,6 +110,7 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
     v_scale=None,
+    sinks=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -118,7 +126,8 @@ def batched_decode_head_major_kernel(
     layout places each page ID in a separate stick so entries can split across cores.
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
-    output; the caller folds k_scale into ``scale``.
+    output; the caller folds k_scale into ``scale``. sinks: [num_kv_heads,
+    num_queries_per_kv, 1] per-head sink logits, or None.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -227,14 +236,22 @@ def batched_decode_head_major_kernel(
             torch.zeros(out_shape, **state_kwargs),
         ),
     )
+    tile_max, tile_sum, tile_output = carry
     if use_entry_local:
-        tile_max, tile_sum, tile_output = carry
         attn = _merge_entry_local(
-            tile_max, tile_sum, tile_output, num_seqs, num_kv_heads, num_queries_per_kv, head_size
+            tile_max,
+            tile_sum,
+            tile_output,
+            num_seqs,
+            num_kv_heads,
+            num_queries_per_kv,
+            head_size,
+            sinks,
         )
     else:
-        _, tile_sum, tile_output = carry
-        attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+        attn = normalize(tile_max, tile_sum, tile_output, sinks).reshape(
+            num_seqs, num_heads, head_size
+        )
     if v_scale is not None and v_scale != 1.0:
         attn = attn * v_scale
     if out is not None:

@@ -24,6 +24,7 @@ does not have (torch-spyre#4123).
 
 import torch
 
+from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -45,6 +46,7 @@ def page_attn_head_major_decode_kernel(
     logits_soft_cap=0.0,
     out=None,
     v_scale=None,
+    sinks=None,
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
@@ -68,6 +70,7 @@ def page_attn_head_major_decode_kernel(
         out: buffer to store into, or None to return the result instead.
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
+        sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
@@ -124,7 +127,7 @@ def page_attn_head_major_decode_kernel(
 
     state_shape = (num_kv_heads, num_queries_per_kv, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = walk_tiles(
+    (tile_max, tile_sum, tile_output), _ = walk_tiles(
         block_body,
         (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q, kv_row_pool),
         dims=(0, None, None, 0, None, None),
@@ -135,7 +138,7 @@ def page_attn_head_major_decode_kernel(
             torch.zeros((num_kv_heads, num_queries_per_kv, head_size), **state_kwargs),
         ),
     )
-    attn = (tile_output / tile_sum).reshape(1, num_heads, head_size)
+    attn = normalize(tile_max, tile_sum, tile_output, sinks).reshape(1, num_heads, head_size)
     if v_scale is not None and v_scale != 1.0:
         attn = attn * v_scale
     if out is not None:

@@ -213,8 +213,13 @@ def ref_attn(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     alibi_slopes: list[float] | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reference implementation of attention for validation."""
+    """Reference implementation of attention for validation.
+
+    ``sinks`` ([num_query_heads]) adds one logit per head to the softmax denominator, as
+    an extra column that contributes no value (gpt-oss, upstream ``sinks``).
+    """
     num_seqs = len(query_lens)
     block_tables_np = block_tables.cpu().numpy()
 
@@ -264,7 +269,12 @@ def ref_attn(
             bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
             attn = attn + bias
         attn.masked_fill_(mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        if sinks is not None:
+            sink_col = sinks.float().view(-1, 1, 1).expand(-1, query_len, 1)
+            attn = torch.softmax(torch.cat([attn, sink_col], dim=-1), dim=-1)[..., :-1]
+        else:
+            attn = torch.softmax(attn, dim=-1)
+        attn = attn.to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
 
         outputs.append(out)

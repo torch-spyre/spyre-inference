@@ -260,11 +260,6 @@ def test_recorder_passes_explicit_causality_to_metadata(
     assert all(call.args[5].causal is causal for call in forward.call_args_list)
 
 
-def test_attention_sinks_are_rejected(default_vllm_config):
-    with pytest.raises(NotImplementedError, match="attention sinks"):
-        SpyreAttentionImpl(NUM_HEADS, HEAD_SIZE, 1.0, NUM_KV_HEADS, sinks=torch.zeros(NUM_HEADS))
-
-
 def _record(impl, kv_cache, builder) -> int:
     """``record_graphs`` as the runner calls it; ``forward`` ignores the layer."""
     return impl.record_graphs(MagicMock(), kv_cache, builder)
@@ -362,6 +357,17 @@ class TestRecordGraphs:
         base = impl.graph_key()
         setattr(impl, attr, getattr(impl, attr) * 2)
         assert impl.graph_key() != base
+
+    def test_graph_key_tells_apart_sink_layers(self, impl):
+        """Sinks are a kernel input, so a sink layer cannot replay a no-sink layer's graphs."""
+        sink_impl = SpyreAttentionImpl(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=impl.scale,
+            num_kv_heads=NUM_KV_HEADS,
+            sinks=torch.zeros(NUM_HEADS),
+        )
+        assert sink_impl.graph_key() != impl.graph_key()
 
     def test_buckets_collapsing_onto_one_kernel_record_once(
         self, impl, kv_cache, sliding_window_builder

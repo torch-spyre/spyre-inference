@@ -16,6 +16,7 @@
 
 import torch
 
+from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -35,6 +36,7 @@ def batched_decode_kernel(
     head_size,
     logits_soft_cap=0.0,
     out=None,
+    sinks=None,
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
@@ -49,7 +51,8 @@ def batched_decode_kernel(
     block_size], broadcast across the query group in the kernel, and across KV heads
     too unless the tiled walk materialized that axis. rep_row_ids: [entries] int32,
     every query row repeated once per block slot. ``out`` None returns the result
-    instead of storing it.
+    instead of storing it. sinks: [num_kv_heads, num_queries_per_kv, 1] per-head
+    sink logits, or None.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -124,7 +127,7 @@ def batched_decode_kernel(
 
     state_shape = (1, num_seqs, num_kv_heads, num_queries_per_kv, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = walk_tiles(
+    (tile_max, tile_sum, tile_output), _ = walk_tiles(
         chunk_body,
         (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
         dims=(0, 0, None, None, None),
@@ -138,7 +141,7 @@ def batched_decode_kernel(
             ),
         ),
     )
-    attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+    attn = normalize(tile_max, tile_sum, tile_output, sinks).reshape(num_seqs, num_heads, head_size)
     if out is not None:
         # The destination prefix starts at offset 0, so torch-spyre#3770 does not
         # apply; rows past the batch are don't-care and kept finite by the builder.

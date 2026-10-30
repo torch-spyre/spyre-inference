@@ -691,6 +691,20 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
     torch.testing.assert_close(output.to("cpu"), ref, atol=0.2, rtol=0.2)
 
 
+def test_attention_sinks_are_rejected(default_vllm_config):
+    """openai_privacy_filter passes sinks to an encoder-only layer, and nothing upstream
+    screens it out on Spyre. These kernels never read sinks, so without the raise it would
+    silently run plain attention."""
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        SpyreEncoderAttentionImpl(
+            num_heads=8,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=8,
+            sinks=torch.zeros(8, dtype=torch.float16),
+        )
+
+
 @torch.inference_mode()
 def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config) -> None:
     """Second layer's forward() must reuse the first layer's plans, not rebuild them."""

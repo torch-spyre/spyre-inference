@@ -248,9 +248,9 @@ A denser ladder pays off in proportion to the tokens it saves times the batch si
 concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
 batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`
 (default 16, which with the default buckets means 9 or more sequences), while the per-sequence
-path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the
-batched kernel already pads to whole chunks, so at short contexts dense buckets there would
-mostly compile duplicate kernels. The second ladder is unioned with the first, so no length rounds up further.
+path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the dense buckets
+cost warmup without a measured gain. The second ladder is unioned with the first, so no length
+rounds up further.
 It is off by default, rejected at startup together with `SPYRE_ATTN_KV_BUCKETS`, which replaces
 the ladder it extends, and ignored with a warning when the threshold is above the largest
 num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with

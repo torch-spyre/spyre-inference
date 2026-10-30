@@ -327,8 +327,8 @@ class SpyreAttnBucketer:
 
         validate_kv_ladder_env()
 
-        # Batched decode only: below the threshold the chunking already pads to whole chunks,
-        # so dense buckets there mostly compile duplicate kernels. Unioned, so none rounds up.
+        # Batched decode only: below the threshold the dense buckets cost warmup without a
+        # measured gain. Unioned, so none rounds up.
         self._large_batch_min_seqs = envs.SPYRE_ATTN_LARGE_BATCH_MIN_SEQS
         self._large_batch_blocks_buckets = self._num_blocks_buckets
         large = envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH
@@ -342,6 +342,7 @@ class SpyreAttnBucketer:
             )
         elif large:
             dense = kv_ladder(large, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH")(max_model_len, block_size)
+            # Clamped to the base ladder's floor, which the single-KV-head rule may raise to 2.
             self._large_batch_blocks_buckets = sorted(
                 set(self._num_blocks_buckets)
                 | {
@@ -399,7 +400,11 @@ class SpyreAttnBucketer:
         return self._round_up(num_blocks, self._num_blocks_buckets)
 
     def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
-        """The num_blocks buckets batched decode records and dispatches onto at this batch size."""
+        """The num_blocks buckets batched decode records and dispatches onto at this batch size.
+
+        The default ``SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`` is tuned to ``batched_decode_chunking``;
+        revisit it if that chunking changes.
+        """
         if num_seqs_bucket >= self._large_batch_min_seqs:
             return self._large_batch_blocks_buckets
         return self._num_blocks_buckets

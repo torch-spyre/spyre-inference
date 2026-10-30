@@ -227,7 +227,10 @@ def test_the_real_layers_opt_in() -> None:
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
     from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
     from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
-    from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreUnquantizedLMHeadMethod,
+    )
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
     )
@@ -237,6 +240,7 @@ def test_the_real_layers_opt_in() -> None:
         (SpyreLayerNorm, "_spyre_forward"),
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
+        (SpyreFp8LMHeadMethod, "_project"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
     ):
         assert issubclass(cls, CompileOutermost), cls.__name__

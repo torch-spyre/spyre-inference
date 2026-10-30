@@ -17,11 +17,17 @@ Test SpyreParallelLMHead custom op correctness against a reference implementatio
 """
 
 import sys
+import warnings
 
 import pytest
 import torch
 import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
+
+# FP8 ``_scaled_mm`` fails to compile for K < 256
+# (``No system in place for splatting of data formats with <16b``).
+_FP8_LM_HEAD_HIDDEN = 256
+_FP8_LM_HEAD_HIDDEN_MM = 4096
 
 
 def reference_lm_head(
@@ -164,27 +170,31 @@ def test_lm_head_oot_dispatch(tp_group):
 
 
 @pytest.mark.parallel_lm_head
+@pytest.mark.fp8
 def test_lm_head_fp8_config_accepted(tp_group):
-    """SpyreParallelLMHead accepts Fp8Config without raising.
-
-    Fp8Config.get_quant_method returns None for ParallelLMHead (it only
-    handles LinearBase/Attention), so upstream falls back to
-    UnquantizedEmbeddingMethod, which we then replace with
-    SpyreUnquantizedLMHeadMethod. The LM head always runs FP16 regardless
-    of the checkpoint's quantization config.
-    """
+    """An FP8 model's head takes the FP8 method at construction; loading quantizes it."""
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
         SpyreParallelLMHead,
-        SpyreUnquantizedLMHeadMethod,
     )
 
-    layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
+    layer = ParallelLMHead(
+        128, _FP8_LM_HEAD_HIDDEN, params_dtype=torch.float16, quant_config=Fp8Config()
+    )
 
     assert isinstance(layer, SpyreParallelLMHead)
-    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    # Sampled at construction, while the vLLM config context is live.
+    assert "spyre_compile_enabled" in layer.quant_method.__dict__
+
+    if not spyre_available():
+        pytest.skip("Loading DMAs the head into qfp8wt, which needs Spyre")
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.padded_weight_t.dtype == torch.float8_e4m3fn
+    assert hasattr(layer, "weight_scale")
 
 
 def _apply_tracked(layer):
@@ -629,6 +639,322 @@ def spyre_or_cpu_device():
         return torch.device("spyre")
     except Exception:
         return torch.device("cpu")
+
+
+def _fp8_round_trip(w_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    from spyre_inference.custom_ops.parallel_lm_head import quantize_weight_t_per_channel
+
+    q, scale = quantize_weight_t_per_channel(w_t)
+    return q.float() * scale.float(), scale
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("vocab_size", [64, 128, 51200])
+def test_fp8_head_quantizes_per_vocab_column(vocab_size):
+    """One float16 scale per vocab column, and the round trip stays within e4m3 error."""
+    from spyre_inference.custom_ops.parallel_lm_head import quantize_weight_t_per_channel
+
+    torch.manual_seed(0)
+    w_t = torch.randn(_FP8_LM_HEAD_HIDDEN, vocab_size, dtype=torch.float16) * 0.01
+    q, scale = quantize_weight_t_per_channel(w_t)
+
+    assert q.dtype == torch.float8_e4m3fn
+    assert q.shape == w_t.shape
+    assert scale.dtype == torch.float16
+    assert scale.shape == (1, vocab_size)
+    assert bool((scale > 0).all())
+    # e4m3 keeps 3 mantissa bits: relative error is at most 2^-4 of each column's amax.
+    deq, _ = _fp8_round_trip(w_t)
+    amax = w_t.float().abs().amax(dim=0, keepdim=True)
+    assert bool(((deq - w_t.float()).abs() <= amax / 16).all())
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_head_columns_quantize_independently():
+    """A large-norm vocab entry does not coarsen the others, as one per-tensor scale would."""
+    torch.manual_seed(0)
+    w_t = torch.randn(_FP8_LM_HEAD_HIDDEN, 128, dtype=torch.float16) * 0.01
+    alone, _ = _fp8_round_trip(w_t)
+    w_t[:, 0] *= 1000
+    with_outlier, _ = _fp8_round_trip(w_t)
+    torch.testing.assert_close(with_outlier[:, 1:], alone[:, 1:], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_head_zero_padded_columns_get_a_finite_scale():
+    """Padded vocab columns are all zero; their scale must not underflow to 0 and NaN."""
+    w_t = torch.randn(_FP8_LM_HEAD_HIDDEN, 128, dtype=torch.float16)
+    w_t[:, 100:] = 0
+    deq, scale = _fp8_round_trip(w_t)
+    assert bool((scale > 0).all())
+    assert bool(torch.isfinite(deq).all())
+    assert bool((deq[:, 100:] == 0).all())
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_loading_dmas_qfp8wt(tp_group):
+    """Loading leaves a qfp8wt head on Spyre and a host per-column scale."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreFp8LMHeadMethod
+
+    layer = _build_fp8_lm_head(128, _FP8_LM_HEAD_HIDDEN)
+    padded_vocab = layer.padded_weight_t.shape[1]
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    assert layer.padded_weight_t.device.type == "spyre"
+    assert layer.padded_weight_t.dtype == torch.float8_e4m3fn
+    assert layer.weight_scale.shape == (1, padded_vocab)
+    assert layer.weight_scale.device.type == "cpu"
+    assert layer.weight.device.type == "cpu"
+
+    layer.to("spyre")
+    assert layer.weight_scale.device.type == "spyre"
+    # Once `padded_weight_t` exists, the FP16 `weight` is runtime-dead and stays home.
+    assert layer.weight.device.type == "cpu"
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_reload_requantizes_the_head(tp_group):
+    """Weight reload runs the FP8 method's process_weights_after_loading: qfp8wt again."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    layer = _build_fp8_lm_head(128, _FP8_LM_HEAD_HIDDEN)
+    vocab = layer.weight.shape[0]
+    # Large enough that every real column's scale is a normal float16, where doubling
+    # is exact; the padded zero columns stay at the clamp, so they are left out.
+    layer.weight.data.copy_(torch.randn(layer.weight.shape, dtype=torch.float16) * 0.1)
+    layer.quant_method.process_weights_after_loading(layer)
+    old_scale = layer.weight_scale.detach().clone()
+    layer.weight.data.mul_(2)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.padded_weight_t.dtype == torch.float8_e4m3fn
+    assert layer.padded_weight_t.device.type == "spyre"
+    torch.testing.assert_close(layer.weight_scale[:, :vocab], old_scale[:, :vocab] * 2)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_reload_after_the_device_move_still_projects(tp_group):
+    """A reload after ``model.to("spyre")`` keeps the new scale beside the qfp8wt head."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
+    layer = _build_fp8_lm_head(49216, embedding_dim).to("spyre")
+    layer.weight.data.mul_(2)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.weight_scale.device.type == "spyre"
+
+    x = torch.randn(4, embedding_dim, dtype=torch.float16) * 0.01
+    expected = reference_lm_head(x, layer.weight.data)
+    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.02, rtol=0.01)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_head_dma_round_trips_the_loaded_weight(tp_group):
+    """The qfp8wt head read back and dequantized is the loaded weight, to e4m3 error."""
+    layer = _build_fp8_lm_head(49216, _FP8_LM_HEAD_HIDDEN)
+    vocab = layer.weight.shape[0]
+    deq = layer.padded_weight_t.cpu().float() * layer.weight_scale.float()
+    expected = layer.weight.t().float()
+    amax = expected.abs().amax(dim=0, keepdim=True)
+    assert bool(((deq[:, :vocab] - expected).abs() <= amax / 16).all())
+    assert bool((deq[:, vocab:] == 0).all())
+
+
+def _lm_head_with_prefix():
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    return ParallelLMHead(128, 64, params_dtype=torch.float16, prefix="lm_head")
+
+
+def _fp8_config(ignored_layers: list[str]):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    return Fp8Config(ignored_layers=ignored_layers)
+
+
+def _ct_config(ignore: list[str]):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    return CompressedTensorsConfig(
+        target_scheme_map={}, ignore=ignore, quant_format="float-quantized"
+    )
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize(
+    ("make_config", "expected"),
+    [
+        (lambda: _fp8_config([]), True),
+        (lambda: _fp8_config(["lm_head"]), False),
+        (lambda: _ct_config([]), True),
+        (lambda: _ct_config(["lm_head"]), False),
+        (lambda: _ct_config(["re:.*lm_head"]), False),
+        (lambda: None, False),
+    ],
+    ids=["fp8", "fp8-ignored", "ct", "ct-ignored", "ct-ignored-regex", "unknown"],
+)
+def test_checkpoint_opt_out_keeps_the_head_fp16(tp_group, make_config, expected):
+    """Every cached Granite FP8 checkpoint ships ``"ignore": ["lm_head"]``."""
+    from spyre_inference.custom_ops.parallel_lm_head import checkpoint_quantizes_head
+
+    assert checkpoint_quantizes_head(_lm_head_with_prefix(), make_config()) is expected
+
+
+def _ct_fp8_config(ignore: list[str]):
+    """A compressed-tensors FP8 W8A8 config, as the Granite FP8 checkpoints carry."""
+    from compressed_tensors.quantization import QuantizationArgs
+
+    config = _ct_config(ignore)
+    config.target_scheme_map = {
+        "Linear": {
+            "weights": QuantizationArgs(num_bits=8, type="float", strategy="channel"),
+            "input_activations": QuantizationArgs(
+                num_bits=8, type="float", strategy="token", dynamic=True
+            ),
+        }
+    }
+    return config
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize(
+    ("make_config", "compiled", "fp8_head"),
+    [
+        (lambda: None, True, False),
+        (lambda: _ct_config([]), True, False),
+        (lambda: _fp8_config([]), True, True),
+        (lambda: _ct_fp8_config([]), True, True),
+        (lambda: _ct_fp8_config(["lm_head"]), True, False),
+        (lambda: _ct_fp8_config([]), False, False),
+    ],
+    ids=["no-quant", "ct-not-fp8", "fp8", "ct-fp8", "checkpoint-opt-out", "enforce-eager"],
+)
+def test_construction_picks_the_head_method(tp_group, monkeypatch, make_config, compiled, fp8_head):
+    """The head's method is chosen from the quant config at construction, without a card."""
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationMode
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops import lazy_compile
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreUnquantizedLMHeadMethod,
+    )
+
+    mode = CompilationMode.STOCK_TORCH_COMPILE if compiled else CompilationMode.NONE
+    monkeypatch.setattr(
+        lazy_compile, "get_cached_compilation_config", lambda: SimpleNamespace(mode=mode)
+    )
+    head = ParallelLMHead(
+        128, 64, params_dtype=torch.float16, quant_config=make_config(), prefix="lm_head"
+    )
+
+    expected = SpyreFp8LMHeadMethod if fp8_head else SpyreUnquantizedLMHeadMethod
+    assert type(head.quant_method) is expected
+
+
+def _build_fp8_lm_head(vocab_size: int, embedding_dim: int, *, seed: int = 42):
+    """FP8 LM head with known weights, a qfp8wt ``padded_weight_t`` and ``weight_scale``.
+
+    The production path: an FP8 config picks ``SpyreFp8LMHeadMethod`` at construction,
+    and the loader's ``process_weights_after_loading`` builds the padded ``Wᵀ``,
+    quantizes it and DMAs it. The DMA needs Spyre, so callers skip without it.
+    """
+    if not spyre_available():
+        pytest.skip("Loading DMAs the head into qfp8wt, which needs Spyre")
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreFp8LMHeadMethod
+
+    torch.manual_seed(seed)
+    layer = ParallelLMHead(
+        vocab_size, embedding_dim, params_dtype=torch.float16, quant_config=Fp8Config()
+    )
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16) * 0.01
+    layer.weight.data.copy_(loaded)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert hasattr(layer, "weight_scale")
+    return layer
+
+
+def _fp8_lm_head_apply(layer, x):
+    """Call SpyreFp8LMHeadMethod.apply on Spyre; error on silent CPU fallback."""
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        actual = layer.quant_method.apply(layer, x)
+    assert actual.device.type == "spyre", actual.device
+    return actual
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_lm_head_apply_rejects_bias(tp_group):
+    """bias is not supported; raise before any Spyre GEMM."""
+    layer = _build_fp8_lm_head(128, _FP8_LM_HEAD_HIDDEN)
+    x = torch.randn(2, _FP8_LM_HEAD_HIDDEN, dtype=torch.float16)
+    bias = torch.zeros(128, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="embedding_bias"):
+        layer.quant_method.apply(layer, x, bias)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("num_tokens", [1, 4, 7])
+@pytest.mark.parametrize("vocab_size", [49216, 51200])
+def test_fp8_lm_head_apply_matches_reference(tp_group, num_tokens, vocab_size):
+    """SpyreFp8LMHeadMethod.apply matches F.linear after FP8 round-trip.
+
+    Hidden=4096 so torch-spyre can compile FP8 ``scaled_mm``. Vocab 49216/51200
+    hits the ``spyre_row_padding`` unpad, and the whole padded vocab is one GEMM.
+    Tighter than the fp16 LM-head test (atol=1e-1 / rtol=5e-2): both operands
+    quantize to FP8, but logits stay in a small range (weights/acts ``* 0.01``).
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
+    layer = _build_fp8_lm_head(vocab_size, embedding_dim)
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16) * 0.01
+    expected = reference_lm_head(x, layer.weight.data)
+
+    layer = layer.to("spyre")
+    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
+
+    assert actual.dtype == torch.float16
+    assert actual.shape == (num_tokens, vocab_size)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_lm_head_apply_rejects_3d(tp_group):
+    """3-D input is rejected with NotImplementedError.
+
+    Column-slice of a ``scaled_mm`` output followed by ``reshape`` reads garbage on
+    Spyre (torch-spyre bug — the 3-D branch is unreachable in serving).
+    """
+    layer = _build_fp8_lm_head(49216, _FP8_LM_HEAD_HIDDEN_MM)
+    x = torch.randn(2, 3, _FP8_LM_HEAD_HIDDEN_MM, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="2-D"):
+        layer.quant_method.apply(layer, x)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,6 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
 from vllm.model_executor.layers.pooler.seqwise.heads import (
@@ -45,7 +44,7 @@ from vllm.model_executor.models.roberta import RobertaClassificationHead
 from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingCursor
 
-from spyre_inference.custom_ops.linear import _PAD_ROWS, spyre_linear_t
+from spyre_inference.custom_ops.linear import spyre_linear_t
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
@@ -542,10 +541,10 @@ class SpyreClassifierLinear(nn.Linear):
     """Classifier Linear: decoder-style ``x @ Wᵀ`` on Spyre, bias in the same op.
 
     Isolated ``F.linear`` of a CLS row lowers as fp32 ``batchmatmul``. Store
-    ``Wᵀ`` like the decoder and pad short rows. Bias stays in ``spyre_linear_t``,
-    the same on-device add every decoder linear uses, so a RoBERTa dense → tanh
-    → out_proj chain does not bounce through the host. Activations must already
-    be fp16; a leftover fp32 row is cast on the host so the matmul stays fp16.
+    ``Wᵀ`` like the decoder. Bias stays in ``spyre_linear_t``, the same on-device
+    add every decoder linear uses, so a RoBERTa dense → tanh → out_proj chain does
+    not bounce through the host. Activations must already be fp16; a leftover
+    fp32 row is cast on the host so the matmul stays fp16.
     """
 
     @classmethod
@@ -566,7 +565,7 @@ class SpyreClassifierLinear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         weight = self.weight
         x = _match_weight(input, weight)
-        return spyre_linear_t(x, weight, self.bias, pad_rows=True)
+        return spyre_linear_t(x, weight, self.bias)
 
 
 @torch.compile(backend="inductor", dynamic=False)
@@ -577,20 +576,9 @@ def _roberta_classifier_head_kernel(
     out_wt: torch.Tensor,
     out_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused ``dense -> tanh -> out_proj`` for a RoBERTa-style classifier head.
-
-    Row count is constant across both matmuls (CLS pooling leaves one row per
-    request), so the short-row pad/slice (torch-spyre#4032) happens once here
-    instead of once per ``spyre_linear_t`` call.
-    """
-    rows = x.shape[0]
-    if 0 < rows < _PAD_ROWS:
-        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
+    """Fused ``dense -> tanh -> out_proj`` for a RoBERTa-style classifier head."""
     h = torch.tanh(torch.matmul(x, dense_wt) + dense_b)
-    out = torch.matmul(h, out_wt) + out_b
-    if 0 < rows < _PAD_ROWS:
-        out = out[:rows]
-    return out
+    return torch.matmul(h, out_wt) + out_b
 
 
 compile_guard.watch(_roberta_classifier_head_kernel, "roberta classifier head")

@@ -1181,11 +1181,11 @@ def test_spyre_fp32_linear_for_pooling_heads(spyre_device, mode):
 @pytest.mark.xfail(
     strict=False,
     reason=(
-        "A 1-row matmul against a fused gate/up weight is slower than the same weight "
-        "against a full 8-row block, so padding the activation out to the 8 PT rows "
-        "is faster despite the extra rows. When this XPASSes, re-measure decode and "
-        "drop custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
-        "constants it reads. Tracked by torch-spyre#4032."
+        "A 1-row matmul against a fused gate/up weight costs more than the same weight "
+        "against a full 8-row block; the 8-row row padding that used to hide this was "
+        "removed in #1125, so the 1-row cost is now on the shipped decode path. When "
+        "this XPASSes, the removal cost nothing and this probe can be dropped. "
+        "Tracked by torch-spyre#4032."
     ),
 )
 def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):

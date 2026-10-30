@@ -37,7 +37,12 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+    TransformersForSequenceClassification,
+    TransformersMultiModalEmbeddingModel,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -305,3 +310,75 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
 # against "TransformersForCausalLM", so the subclass has to keep answering to that name.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
+
+
+def _patch_encoder_gather(model: nn.Module) -> None:
+    """Replace gather-based token_type_ids in HF encoder embeddings with explicit zeros."""
+    patched = 0
+    for module in model.modules():
+        buf = getattr(module, "token_type_ids", None)
+        if isinstance(buf, torch.Tensor) and hasattr(module, "word_embeddings"):
+            original_forward = module.forward
+
+            def _patched_forward(
+                *args,
+                _orig=original_forward,
+                **kwargs,
+            ) -> torch.Tensor:
+                if kwargs.get("token_type_ids") is None:
+                    input_ids = (
+                        kwargs.get("input_ids")
+                        if "input_ids" in kwargs
+                        else (args[0] if len(args) > 0 else None)
+                    )
+                    inputs_embeds = (
+                        kwargs.get("inputs_embeds")
+                        if "inputs_embeds" in kwargs
+                        else (args[3] if len(args) > 3 else None)
+                    )
+                    ref = input_ids if input_ids is not None else inputs_embeds
+                    if ref is not None:
+                        kwargs["token_type_ids"] = torch.zeros(
+                            ref.shape[:2], dtype=torch.long, device=ref.device
+                        )
+                return _orig(*args, **kwargs)
+
+            module.forward = _patched_forward
+            patched += 1
+
+    if patched:
+        logger.debug(
+            "Patched %d HF embedding module(s) to skip aten::gather on token_type_ids.",
+            patched,
+        )
+
+
+class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
+    """Transformers-backend embedding model with Spyre-specific fixes."""
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        _patch_encoder_gather(self.model)
+        return result
+
+
+SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
+
+
+class SpyreTransformersForSequenceClassification(TransformersForSequenceClassification):
+    """Transformers-backend sequence-classification model with Spyre-specific fixes."""
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        _patch_encoder_gather(self.model)
+        return result
+
+
+SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"
+
+
+class SpyreTransformersMultiModalEmbeddingModel(TransformersMultiModalEmbeddingModel):
+    """Transformers-backend multimodal embedding model; patches added here as needed."""
+
+
+SpyreTransformersMultiModalEmbeddingModel.__name__ = "TransformersMultiModalEmbeddingModel"

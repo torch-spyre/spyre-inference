@@ -406,3 +406,116 @@ def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
 
     assert vllm_config.model_config.hf_config is before
     assert vllm_config.load_config.load_format == "auto"
+
+
+def test_patch_encoder_gather_wraps_module_forward():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.roberta.modeling_roberta import RobertaConfig, RobertaEmbeddings
+
+    from spyre_inference.transformers_backend import _patch_encoder_gather
+
+    cfg = RobertaConfig(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = RobertaEmbeddings(cfg)
+
+    model = FakeModel()
+    orig_forward = model.embeddings.forward
+
+    _patch_encoder_gather(model)
+
+    assert model.embeddings.forward is not orig_forward
+    # When token_type_ids is None, patched forward supplies zeros to bypass gather
+    x = torch.randint(0, 100, (1, 4))
+    out = model.embeddings(input_ids=x)
+    assert out.shape == (1, 4, 16)
+
+
+def test_patch_encoder_gather_wraps_bert_embeddings():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.bert.modeling_bert import BertConfig, BertEmbeddings
+
+    from spyre_inference.transformers_backend import _patch_encoder_gather
+
+    cfg = BertConfig(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = BertEmbeddings(cfg)
+
+    model = FakeModel()
+    orig_forward = model.embeddings.forward
+
+    _patch_encoder_gather(model)
+
+    assert model.embeddings.forward is not orig_forward
+    x = torch.randint(0, 100, (1, 4))
+    out = model.embeddings(input_ids=x)
+    assert out.shape == (1, 4, 16)
+
+
+def test_patch_encoder_gather_wraps_albert_embeddings():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.albert.modeling_albert import AlbertConfig, AlbertEmbeddings
+
+    from spyre_inference.transformers_backend import _patch_encoder_gather
+
+    cfg = AlbertConfig(
+        embedding_size=16,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = AlbertEmbeddings(cfg)
+
+    model = FakeModel()
+    x = torch.randint(0, 100, (1, 4))
+    ref = model.embeddings(input_ids=x)
+
+    _patch_encoder_gather(model)
+    out = model.embeddings(input_ids=x)
+    assert out.shape == (1, 4, 16)
+    assert torch.equal(out, ref)
+
+
+def test_patch_encoder_gather_noop_without_buffer():
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _patch_encoder_gather
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    model = FakeLayer()
+    _patch_encoder_gather(model)
+    assert "forward" not in model.__dict__
+    assert all("forward" not in m.__dict__ for m in model.modules())

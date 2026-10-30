@@ -91,7 +91,8 @@ def test_continuous_batching_queue_admission(monkeypatch: pytest.MonkeyPatch) ->
 
         # 2. Continuous batched execution with queue admission
         sampling_params_list = [
-            SamplingParams(temperature=0.0, max_tokens=max_tok, ignore_eos=True) for max_tok in max_tokens
+            SamplingParams(temperature=0.0, max_tokens=max_tok, ignore_eos=True)
+            for max_tok in max_tokens
         ]
         batched_res = engine.generate(_PROMPTS, sampling_params_list, use_tqdm=False)
         batched_outputs = [r.outputs[0].token_ids for r in batched_res]

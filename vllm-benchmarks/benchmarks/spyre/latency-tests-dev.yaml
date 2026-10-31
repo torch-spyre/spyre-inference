@@ -18,7 +18,6 @@
 
 defaults:
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
   parameters:

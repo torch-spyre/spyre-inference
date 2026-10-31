@@ -18,9 +18,18 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.core.kv_cache_utils import (
+    _max_memory_usage_bytes_from_groups,
+    _pool_bytes_per_block,
+    get_kv_cache_groups,
+)
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec, UniformTypeKVCacheSpecs
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from spyre_inference import envs, keep_sigterm_handler
@@ -32,6 +41,47 @@ from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
+
+
+def _kv_block_layout(
+    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+) -> tuple[int, int, int] | None:
+    """``(pool bytes per block, Spyre bytes per block, batch-area blocks)``, or None
+    without a KV cache.
+
+    Grouping is upstream's (``get_kv_cache_groups``), so sliding-window and Mamba
+    groups count what they really hold per request. Upstream overlays its groups on one
+    buffer and needs ``pool bytes`` per block; Spyre allocates every layer's own page per
+    block, the unpadded one where upstream pads (a Mamba state). The batch area is
+    max_num_seqs requests at max_model_len plus the null block.
+    """
+    if not kv_cache_spec:
+        return None
+    groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
+    if not groups:
+        return None
+    pool_bytes = _pool_bytes_per_block(vllm_config, groups)
+    spyre_bytes = sum(
+        _unpadded_page_bytes(_layer_spec(group, name))
+        for group in groups
+        for name in group.layer_names
+    )
+    per_request = _max_memory_usage_bytes_from_groups(vllm_config, groups) // pool_bytes
+    batch_blocks = vllm_config.scheduler_config.max_num_seqs * per_request + 1
+    return pool_bytes, spyre_bytes, batch_blocks
+
+
+def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.kv_cache_specs[layer_name]
+    return spec
+
+
+def _unpadded_page_bytes(spec: KVCacheSpec) -> int:
+    # Attention and Mamba specs pad their page to a shared size; the Spyre allocation
+    # does not.
+    return getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
 
 
 def _get_spyre_pcie_address(local_rank: int) -> str:
@@ -150,20 +200,66 @@ class TorchSpyreWorker(Worker):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
+        # As Worker.init_device does, after the distributed init. The platform reports
+        # device_type "cpu", so the snapshot is given the Spyre device explicitly.
+        self.init_snapshot = MemorySnapshot(device=self._spyre_memory_device())
+        self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+
         # Construct the model runner directly — no monkey-patching needed.
         self.model_runner = TorchSpyreModelRunner(
             self.vllm_config,
             torch.device("spyre"),
         )
 
+    def _spyre_memory_device(self) -> torch.device:
+        # getMemoryInfo checks the index against the card the runtime opened, which is
+        # LOCAL_RANK under TP, not spyre:0.
+        return torch.device("spyre", torch.accelerator.current_device_index())
+
     def determine_available_memory(self) -> int:
-        # Spyre's KV cache lives on-device with a fixed budget set by
-        # TorchSpyrePlatform.check_and_update_config (via VLLM_CPU_KVCACHE_SPACE).
-        # For decoder models num_gpu_blocks_override is also set; pooling /
-        # encoder models leave it unset (no KV cache). This return is an upper
-        # bound sanity check for the engine.
-        assert self.cache_config.kv_cache_memory_bytes is not None
-        return self.cache_config.kv_cache_memory_bytes
+        """Upstream's Worker sizing from free device memory, capped at the pages a full
+        batch at max_model_len can use.
+
+        The runner's profile_run is a no-op, so what upstream measures is what loading
+        consumed; a forward's activations come out of the 1 - gpu_memory_utilization
+        headroom.
+
+        Upstream turns the returned bytes into blocks by its pool's bytes per block,
+        while Spyre gives every layer its own page per block (``allocate_spyre_kv_caches``),
+        which costs more wherever groups would share a page. So the measured device bytes
+        are converted into blocks at Spyre's cost per block, capped at the batch area in
+        blocks, and handed back in upstream's units.
+        """
+        available = super().determine_available_memory()
+        layout = _kv_block_layout(self.vllm_config, self.model_runner.get_kv_cache_spec())
+        if layout is None:
+            return available
+        pool_bytes, spyre_bytes, batch_blocks = layout
+        blocks = max(available, 0) // spyre_bytes
+        if blocks > batch_blocks:
+            logger.info(
+                "Capping the KV cache at %d blocks (%s GiB on the device), what %d "
+                "sequences at max_model_len=%d can use.",
+                batch_blocks,
+                format_gib(batch_blocks * spyre_bytes),
+                self.scheduler_config.max_num_seqs,
+                self.model_config.max_model_len,
+            )
+        elif available > 0:
+            logger.warning(
+                "The KV cache holds %d of the %d blocks that %d sequences at "
+                "max_model_len=%d need; requests queue for pages instead. Raise "
+                "--gpu-memory-utilization or lower --max-num-seqs / --max-model-len "
+                "to fill the batch.",
+                blocks,
+                batch_blocks,
+                self.scheduler_config.max_num_seqs,
+                self.model_config.max_model_len,
+            )
+        if available <= 0:
+            return available
+        return min(blocks, batch_blocks) * pool_bytes
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420

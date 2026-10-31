@@ -14,7 +14,6 @@
 
 """Unit tests for platform.py configuration logic."""
 
-import math
 import os
 from types import SimpleNamespace
 
@@ -115,95 +114,31 @@ def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
     assert torch.accelerator.get_memory_info() == (123, 456)
 
 
-def test_num_gpu_blocks_override_homogeneous():
-    """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
+@pytest.mark.parametrize("runner_type", ["generate", "pooling"])
+def test_kv_cache_size_is_left_to_the_worker(monkeypatch, runner_type):
+    """Neither the block count nor the KV budget is fixed here: the worker measures the
+    card (spyre-inference#901), and both flags stay user bypasses."""
     from spyre_inference.platform import TorchSpyrePlatform
 
+    monkeypatch.delenv("VLLM_CPU_KVCACHE_SPACE", raising=False)
     model_config = ModelConfig(
         model="Qwen/Qwen3-0.6B",
         max_model_len=1024,
         dtype=torch.float16,
         trust_remote_code=True,
     )
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
+    object.__setattr__(model_config, "runner_type", runner_type)
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-    blocks_per_seq = math.ceil(
-        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
-    )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
-
-
-def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
-    """Hybrid models get the same block count: one collapsed KV cache group.
-
-    ``disable_hybrid_kv_cache_manager`` merges every layer into a single group, so the
-    single-group formula applies unchanged.
-    """
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    # Simulate a hybrid model with two interleaved attention types.
-    interleaved = ["sliding_attention", "full_attention"] * 13
-    model_config.hf_config.layer_types = interleaved
-    model_config.hf_text_config.layer_types = interleaved
-
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-    blocks_per_seq = math.ceil(
-        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
-    )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
-
-
-def test_num_gpu_blocks_override_skipped_for_pooling():
-    """Encoder/pooling models have no KV cache — do not invent a block count."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    object.__setattr__(model_config, "runner_type", "pooling")
-
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
     )
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.num_gpu_blocks_override is None
+    assert vllm_config.cache_config.kv_cache_memory_bytes is None
+    assert "VLLM_CPU_KVCACHE_SPACE" not in os.environ
 
 
 def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):

@@ -29,8 +29,10 @@ own gpu_worker.py carries the same ``# type: ignore`` for its V2 one.
 import os
 
 import torch
+from vllm.utils.mem_utils import MemorySnapshot
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.utils import request_memory
 
 from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
@@ -113,6 +115,12 @@ class SpyreWorkerV2(TorchSpyreWorker):
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
+
+        # As Worker.init_device does, after the distributed init. The platform reports
+        # device_type "cpu", so the snapshot is given the Spyre device explicitly.
+        self.init_snapshot = MemorySnapshot(device=self._spyre_memory_device())
+        self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
 
         device_shims.install()  # MRV2-only: torch.cuda Stream/Event placeholders
         kernels.bind_or_raise()  # MRV2-only: the kernel seam (DEFAULT_PATH_KERNELS)

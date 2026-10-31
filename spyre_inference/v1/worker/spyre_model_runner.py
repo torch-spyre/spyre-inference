@@ -898,8 +898,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Nothing else traces the tower before the compile guard arms: the dummy runs
         reach the text body only, and upstream's ``profile_run`` (one pass at
-        ``mm_max_items_per_batch``) never runs, as ``TorchSpyreWorker`` overrides
-        ``determine_available_memory``. Under ``dynamic=False`` every width is its own
+        ``mm_max_items_per_batch``) is a no-op here. Under ``dynamic=False`` every width is its own
         graph, for marked encoder blocks and ``SpyreConv2d`` alike, so each runs here
         (spyre-inference#1182).
 
@@ -1131,6 +1130,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         bucketer = self.spyre_shape_bucketer
         padded = bucketer.warmed_bucket(num_tokens) if bucketer is not None else None
         return None if padded is None else BatchDescriptor(num_tokens=padded)
+
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        """A no-op, so Worker.determine_available_memory measures what loading consumed.
+
+        Upstream's runs one forward at max_num_tokens before the KV cache exists, and on
+        Spyre the first forward is the trace. Without pages the attention layers trace
+        no KV write (attn_layer resolves its device from the KV cache), so warmup would
+        retrace every block, and an eager model compiles its per-op kernels before
+        warmup's compilation settings apply.
+        """
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):

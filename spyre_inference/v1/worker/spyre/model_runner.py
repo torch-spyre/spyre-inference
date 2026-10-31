@@ -84,3 +84,7 @@ class SpyreModelRunnerV2(GPUModelRunner):
 
     def warming_up_model(self) -> None:
         warmup.run(self)
+
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        # A no-op for the reasons TorchSpyreModelRunner.profile_run gives.
+        pass

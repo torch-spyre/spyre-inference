@@ -1256,3 +1256,43 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 14. fp32-accumulating matmul (DeepSeek-V3-style MoE router GEMM)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "form",
+    ["fp32_operands", "out_dtype"],
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#<issue>: Spyre has no matmul that accumulates and returns fp32. "
+        "batchmatmul on DataFormats.IEEE_FP32 is unsupported, and "
+        "mm(..., out_dtype=float32) is CUDA/XPU only, so an fp16 router GEMM loses "
+        "the noaux_tc top-k. When this XPASS-es, move the host fp32 router "
+        "(spyre_inference/host_router.py) on device."
+    ),
+)
+def test_spyre_fp32_accum_matmul(spyre_device, form):
+    """fp16 activations and weights, fp32 accumulation and result, from a compiled graph.
+
+    The tolerance is a tenth of an fp16 ulp of the largest logit, so an fp16
+    accumulation or output (the device GEMM today, about 1e-2 off here) fails it.
+    """
+    torch.manual_seed(0)
+    x = (torch.randn(64, 2048) * 0.02).half()
+    w_t = (torch.randn(2048, 256) * 0.7).half()
+    expected = x.float() @ w_t.float()
+
+    def fn(a, b):
+        if form == "out_dtype":
+            return torch.mm(a, b, out_dtype=torch.float32)
+        return a.float() @ b.float()
+
+    out = torch.compile(fn, dynamic=False)(x.to(spyre_device), w_t.to(spyre_device))
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=0)

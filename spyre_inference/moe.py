@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts as _RoutedExperts,
     )
+    from vllm.model_executor.layers.fused_moe.router.cpu_router import CPURouter
 
     class RoutedExperts(_RoutedExperts):
         spyre_moe_recipe: SpyreMoERecipe
@@ -62,6 +63,9 @@ if TYPE_CHECKING:
         spyre_moe_chunk_scale: torch.Tensor
         spyre_moe_chunk_offsets: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
+        spyre_moe_host_router: bool
+        # Set by host_router._prepare_layer on host-router layers only.
+        spyre_host_router: CPURouter
 
 
 logger = init_logger(__name__)
@@ -113,6 +117,13 @@ def _derive_moe_chunks(
         if cores_used > best_cores:
             best_cores, best_chunks = cores_used, chunks
     return best_chunks
+
+
+# Not a recipe an adapter picks: the routing a layer takes when its model's gate is
+# ``HostFp32GateLinear`` (a TEMPORARY CPU FALLBACK, see ``spyre_inference.host_router``).
+# The router logits are then the dense [tokens, experts] routing weights that the layer's
+# own upstream router config gives, computed on the host.
+HOST_ROUTING_TABLE = "host_routing_table"
 
 
 @dataclass(frozen=True)
@@ -193,6 +204,10 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
     layer = cast("RoutedExperts", layer)
     layer.spyre_moe_recipe = recipe
     layer.spyre_moe_regions = {}
+    # The same model check that gives its gate fp32 host logits.
+    from spyre_inference.custom_ops.gate_linear import host_fp32_router_requested
+
+    layer.spyre_moe_host_router = host_fp32_router_requested()
 
 
 def _topk(values: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -233,6 +248,9 @@ def _routing_weights(
     if routing == "full_softmax":
         selected_values, indices = _topk(_probs(router_logits, reduce_dtype), top_k)
         weights = selected_values / selected_values.sum(-1, keepdim=True)
+    elif routing == HOST_ROUTING_TABLE:
+        # Exactly top_k positive weights a row, already renormalized and scaled.
+        weights, indices = _topk(router_logits, top_k)
     else:
         # ``reduce_dtype`` gates the expert dim; this reduces over ``top_k`` instead.
         selected_logits, indices = _topk(router_logits, top_k)
@@ -432,7 +450,9 @@ def _moe_persistent_in_graph(
     return result.squeeze(0)
 
 
-def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+def _gathered(
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, routing: str
+) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
     chunks = layer.spyre_moe_chunks
     gate, up, down = (
@@ -450,7 +470,7 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         chunks,
         layer.spyre_moe_stick,
         layer.spyre_moe_route_dtype,
-        recipe.routing,
+        routing,
         recipe.activation,
         chunk_scale=layer.spyre_moe_chunk_scale,
         chunk_offsets=layer.spyre_moe_chunk_offsets,
@@ -458,12 +478,12 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 
 
 def _gathered_tokens(
-    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, routing: str
 ) -> torch.Tensor:
     # The gathered kernel only lowers at one token. ``dynamic=False`` specializes this loop to
     # the packed bucket, so slicing, expert calls, and assembly stay in one compiled region.
     rows = [
-        _gathered(layer, x[token : token + 1], router_logits[token : token + 1])
+        _gathered(layer, x[token : token + 1], router_logits[token : token + 1], routing)
         for token in range(x.shape[0])
     ]
     return torch.cat(rows)
@@ -752,6 +772,10 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "Spyre MoE backend requires an explicit model-specific recipe; "
                 "this architecture has not opted in."
             )
+        if getattr(layer, "spyre_moe_host_router", False):
+            from spyre_inference import host_router
+
+            host_router._prepare_layer(cast("RoutedExperts", layer))
         _prepare_layer(cast("RoutedExperts", layer))
         # MoERunner._forward_impl initializes this lazily. Traced, that check becomes a guard
         # which warmup's first call flips, so the first real request would re-trace the block.
@@ -766,6 +790,13 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
         tokens = x.shape[0]
+        recipe = layer.spyre_moe_recipe
+        routing = recipe.routing
+        if getattr(layer, "spyre_moe_host_router", False):
+            from spyre_inference.host_router import host_routing_table
+
+            router_logits = host_routing_table(layer, router_logits, x)
+            routing = HOST_ROUTING_TABLE
         if torch.compiler.is_compiling():
             # Traced into the block graph, which SpyreMoERunner only does for stick-aligned
             # batches: the persistent form runs inline, without compiled regions or their
@@ -773,9 +804,10 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             # logits' dtype.
             # Note: This branching here is solely done to support eager and compiled
             # execution of the experts.
-            recipe = layer.spyre_moe_recipe
-            if recipe.routing == "full_softmax":
+            if routing == "full_softmax":
                 route = _route(layer, _probs(router_logits, router_logits.dtype))
+            elif routing == HOST_ROUTING_TABLE:
+                route = _route_selected(layer, router_logits)
             else:
                 route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
             return _moe_persistent_in_graph(
@@ -794,13 +826,16 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         ):
             with moe_scope:
                 if tokens == 1:
-                    return _region(layer, "gathered", _gathered)(layer, x, router_logits)
-                return _region(layer, "gathered_batch", _gathered_tokens)(layer, x, router_logits)
+                    return _region(layer, "gathered", _gathered)(layer, x, router_logits, routing)
+                return _region(layer, "gathered_batch", _gathered_tokens)(
+                    layer, x, router_logits, routing
+                )
         with moe_scope:
-            recipe = layer.spyre_moe_recipe
-            if recipe.routing == "full_softmax":
+            if routing == "full_softmax":
                 probs = _region(layer, "probs", _probs)(router_logits, layer.spyre_moe_route_dtype)
                 route = _region(layer, "route", _route)(layer, probs)
+            elif routing == HOST_ROUTING_TABLE:
+                route = _region(layer, "route_selected", _route_selected)(layer, router_logits)
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)

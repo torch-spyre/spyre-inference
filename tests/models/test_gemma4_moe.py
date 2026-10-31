@@ -608,6 +608,40 @@ def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, rou
     assert resets == [1]
 
 
+@pytest.mark.parametrize("compiling", [False, True])
+def test_a_host_routed_layer_routes_from_the_host_table(monkeypatch, compiling):
+    """A layer of a host-router model turns its gate's fp32 host logits into the dense
+    routing table first, and both forms then take that table as already-selected routes."""
+    from spyre_inference import host_router
+    from spyre_inference import moe as moe_module
+
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
+    table = torch.full((8, EXPERTS), 0.5)
+    tables = []
+    monkeypatch.setattr(
+        host_router, "host_routing_table", lambda layer, logits, x: tables.append(logits) or table
+    )
+    seen = []
+    if compiling:
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+        monkeypatch.setattr(moe_module, "_moe_persistent_in_graph", lambda *args: None)
+    else:
+        calls, _ = _dispatch_recorder(monkeypatch)
+        monkeypatch.setattr(
+            moe_module, "_region", lambda layer, name, fn: lambda *args: seen.append((name, args))
+        )
+    monkeypatch.setattr(moe_module, "_route_selected", lambda layer, t: seen.append(t))
+    layer = _dispatch_layer("topk_softmax")
+    layer.spyre_moe_host_router = True
+    _apply(layer, tokens=8)
+    assert len(tables) == 1 and tables[0].shape == (8, EXPERTS)
+    if compiling:
+        assert seen == [table]
+    else:
+        assert [name for name, _ in seen] == ["route_selected", "experts"]
+        assert seen[0][1][1] is table
+
+
 def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
     """Unconditional reset: on an Inductor cache hit stale names leak into the next graph."""
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
@@ -859,6 +893,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
             layer,
             x.to("spyre"),
             logits.to("spyre"),
+            layer.spyre_moe_recipe.routing,
         )
 
     fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]

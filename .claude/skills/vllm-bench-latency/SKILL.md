@@ -48,12 +48,12 @@ export SPYRE_NUM_CPUS=8   # required on every leg — see Hard constraints
 
 Two independent things trigger graph recording, and both must be settled *before* the timed window.
 
-**Token count** — the platform builds one graph per entry in `compile_sizes`. The default is **already sparse**: powers of two from 1 up to `--max-num-seqs`, plus one prefill bucket at `min(max_num_batched_tokens, 512)` (`platform.py` `apply_config_platform_defaults`). Overriding it pays off only when the benchmark runs *fewer* concurrent sequences than `--max-num-seqs` allows (a serving default of 256 gives 10 buckets; `--max-concurrency 4` needs 4), or to pin the ladder so a later `--max-num-seqs` / `--max-model-len` change cannot move it. **Read the real ladder before assuming there is anything to trim** — it is printed verbatim in the `core.py:121 Initializing a V1 LLM engine ... with config:` dump (one enormous line; grep it for `compile_sizes`). The `Warming up model with <N> bucket sizes` line gives only the count, min and max.
+**Token count** — the platform builds one graph per entry in `compile_sizes`. The default is **already sparse**: powers of two from 1 up to `--max-num-seqs`, plus one prefill bucket at `min(max_num_batched_tokens, 512)` (`platform.py` `apply_config_platform_defaults`). A `--max-num-batched-tokens` passed explicitly is honored instead: the prefill bucket becomes that value and 512 stays in the ladder for short prefills. Overriding it pays off only when the benchmark runs *fewer* concurrent sequences than `--max-num-seqs` allows (a serving default of 256 gives 10 buckets; `--max-concurrency 4` needs 4), or to pin the ladder so a later `--max-num-seqs` / `--max-model-len` change cannot move it. **Read the real ladder before assuming there is anything to trim** — it is printed verbatim in the `core.py:121 Initializing a V1 LLM engine ... with config:` dump (one enormous line; grep it for `compile_sizes`). The `Warming up model with <N> bucket sizes` line gives only the count, min and max.
 
 ```bash
 # Decode steps schedule exactly (number of running requests) tokens, so cover
-# 1..batch-size; prefill chunks fill the batched-token budget. Keep 512
-# (torch-spyre's max shape) as the largest entry: platform.py sets
+# 1..batch-size; prefill chunks fill the batched-token budget. Keep the
+# budget (512 by default) as the largest entry: platform.py sets
 # max_num_batched_tokens = max(compile_sizes), so a smaller max silently
 # reshapes scheduling instead of just cutting compile time.
 CSIZES='[1,2,4,512]'   # at bs=4/512 this IS the default -- pins it, saves nothing
@@ -61,7 +61,7 @@ CSIZES='[1,2,4,512]'   # at bs=4/512 this IS the default -- pins it, saves nothi
 
 Derive the list from the config, don't copy it. `bs=1`, `in64/out64/max128`: decode schedules 1 token, the prompt prefills in one chunk, so `[1,64]` is the complete cover — and a max of 64 is safe here precisely because 64 already holds the whole prompt. `bs=4` with a 3200-token prompt: decode schedules 1–4, prefill chunks fill the budget, so `[1,2,4,512]` (`find_bucket` pads 3 up to 4).
 
-At the 8k shape (`bs=1/in4096`) the prompt no longer fits one chunk: 4096 > 512, so prefill arrives as 8 full 512-token chunks and decode schedules 1, making `[1,512]` the cover. Keep 512 as the max regardless — dropping it would cut `max_num_batched_tokens` and re-chunk the prefill instead of saving compile.
+At the 8k shape (`bs=1/in4096`) the prompt no longer fits one chunk: 4096 > 512, so prefill arrives as 8 full 512-token chunks and decode schedules 1, making `[1,512]` the cover (with `--max-num-batched-tokens 1024`, 4 chunks and `[1,512,1024]`). Keep the budget as the max regardless — dropping it would cut `max_num_batched_tokens` and re-chunk the prefill instead of saving compile.
 
 **KV block count** — attention specializes on the padded KV block count, which `compile_sizes` does *not* cover. It is bucketed separately (`SpyreAttnBucketer`: powers of two from `block_size` up to `--max-model-len`). With `SPYRE_ATTN_RECORD=1` (the default), warmup records per-sequence bucket pairs whose smallest real query length fits the block count, subject to allocated page capacity. When batched decode is supported, it also records variants with `padded_num_seqs * blocks_per_chunk < num_pages`. The recorded set grows with the bucket lists, but is not their full cross product. A short `SPYRE_ATTN_KV_BUCKETS` override is extended to `max_model_len`, so schedulable lengths remain covered. Setting `SPYRE_ATTN_RECORD=0` or a failed warmup recording can still cause compilation mid-window. Check the `Recorded N/M per-seq and N/M batched-decode attention variants` log line and any `failed to record` warnings.
 

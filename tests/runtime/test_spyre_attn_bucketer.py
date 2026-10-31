@@ -60,8 +60,8 @@ def make_config(
             layer.kv = n
             layers.append(layer)
         arch.__getitem__.side_effect = layers.__getitem__
-        config.model_config.get_num_kv_heads.side_effect = (
-            lambda _pc, arch_config=None: num_kv_heads if arch_config is None else arch_config.kv
+        config.model_config.get_num_kv_heads.side_effect = lambda _pc, arch_config=None: (
+            num_kv_heads if arch_config is None else arch_config.kv
         )
     return config
 
@@ -69,6 +69,10 @@ def make_config(
 def _list_pow2(limit: int, start: int = 1) -> list[int]:
     """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
     return list(_powers_of_two_up_to(limit, start=start))
+
+
+def _list_default(limit, start=BLOCK_SIZE):
+    return _list_pow2(limit, start=start)
 
 
 @pytest.fixture()
@@ -85,9 +89,46 @@ def _clear_env_cache(monkeypatch):
 
 
 class TestBuckets:
-    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
-        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
+    def test_kv_buckets_are_the_default_ladder_to_max_model_len(self, bucketer):
+        assert bucketer.kv_buckets == _list_default(2048)
         assert bucketer.kv_buckets[-1] == 2048
+
+    def test_kv_buckets_contain_every_power_of_two(self, bucketer):
+        assert set(_list_pow2(2048, start=BLOCK_SIZE)) <= set(bucketer.kv_buckets)
+
+    def test_8_5_ladder_is_denser_than_powers_of_two(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "8_5")
+        b = SpyreAttnBucketer(make_config())
+        assert b.kv_buckets == [64, 128, 256, 384, 512, 640, 1024, 1664, 2048]
+
+    @pytest.mark.parametrize("max_model_len", [8192, 40960, 65536, 131072])
+    def test_8_5_ladder_below_a_length_does_not_depend_on_max_model_len(
+        self, monkeypatch, max_model_len
+    ):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "8_5")
+        b = SpyreAttnBucketer(make_config(max_model_len=max_model_len, block_size=128))
+        short = [v for v in b.kv_buckets if v <= 4096]
+        assert short == [128, 256, 384, 512, 640, 1024, 1664, 2048, 2688, 4096]
+        assert all(v % 128 == 0 for v in b.kv_buckets)
+
+    @pytest.mark.parametrize("max_model_len", [2048, 4096, 8192, 16384, 32768])
+    def test_8_5_ladder_never_rounds_up_further_than_powers_of_two(
+        self, monkeypatch, max_model_len
+    ):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "8_5")
+        b = SpyreAttnBucketer(make_config(max_model_len=max_model_len))
+        pow2 = _list_pow2(max_model_len, start=BLOCK_SIZE)
+
+        def bucket_for(kv, ladder):
+            return next(v for v in ladder if kv <= v)
+
+        for kv in range(1, max_model_len + 1):
+            assert bucket_for(kv, b.kv_buckets) <= bucket_for(kv, pow2)
+
+    @pytest.mark.parametrize("block_size", [64, 128, 256, 512])
+    def test_kv_buckets_are_whole_numbers_of_blocks(self, block_size):
+        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
+        assert [v for v in b.kv_buckets if v % block_size] == []
 
     def test_kv_buckets_start_at_block_size(self, bucketer):
         """Buckets below block_size all collapse to num_blocks == 1, so the
@@ -97,14 +138,16 @@ class TestBuckets:
     @pytest.mark.parametrize("block_size", [64, 128, 256])
     def test_kv_buckets_start_tracks_block_size(self, block_size):
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
-        assert b.kv_buckets == _list_pow2(4096, start=block_size)
+        assert b.kv_buckets == _list_default(4096, start=block_size)
+        assert b.kv_buckets[0] == block_size
 
     def test_kv_buckets_round_non_power_of_two_block_size_up(self):
         """The platform only forces block_size to a multiple of 64, so a
-        non-power-of-two value is reachable; buckets stay a clean doubling
+        non-power-of-two value is reachable; the default ladder stays a clean doubling
         sequence by starting at the next power of two."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
-        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+        assert b.kv_buckets == _list_default(4096, start=256)
+        assert b.kv_buckets[0] == 256
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
@@ -120,7 +163,8 @@ class TestBuckets:
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
-        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.kv_buckets == _list_default(3000)
+        assert b.kv_buckets[-1] == 3000
         assert b.query_buckets == [1, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
@@ -134,6 +178,78 @@ class TestBuckets:
             b = SpyreAttnBucketer(make_config(max_model_len=limit, max_num_batched_tokens=limit))
             assert b.kv_buckets == sorted(set(b.kv_buckets))
             assert b.query_buckets == sorted(set(b.query_buckets))
+
+    @pytest.mark.parametrize("ladder", ["pow2", "8_5", "4_3", "9_8", "uniform"])
+    @pytest.mark.parametrize("bs", [64, 128, 256])
+    @pytest.mark.parametrize("mml", [1024, 3000, 4096, 5000, 32768])
+    def test_no_preset_rounds_a_length_above_the_powers_of_two(self, monkeypatch, ladder, bs, mml):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", ladder)
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=mml, block_size=bs))
+        pow2 = list(_powers_of_two_up_to(mml, start=bs))
+        for kv_len in range(1, mml + 1):
+            assert b.find_kv_bucket(kv_len) <= next(x for x in pow2 if x >= kv_len)
+
+    @pytest.mark.parametrize("ladder", ["8_5", "4_3", "9_8", "uniform"])
+    @pytest.mark.parametrize("bs", [64, 128, 256])
+    @pytest.mark.parametrize("mml", [3000, 4096, 5000, 32768])
+    def test_every_preset_but_pow2_adds_buckets(self, monkeypatch, ladder, bs, mml):
+        # Not at 1024 / block_size 256: every 8_5 bucket rounds onto a power of two there.
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", ladder)
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=mml, block_size=bs))
+        assert set(b.kv_buckets) > set(_powers_of_two_up_to(mml, start=bs))
+
+    @pytest.mark.parametrize("ladder", ["pow2", "8_5", "4_3", "9_8", "uniform"])
+    @pytest.mark.parametrize("bs", [64, 128, 256])
+    @pytest.mark.parametrize("mml", [4096, 5000])
+    def test_every_preset_bucket_is_a_whole_number_of_blocks(self, monkeypatch, ladder, bs, mml):
+        # max_model_len itself need not be block-aligned.
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", ladder)
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=mml, block_size=bs))
+        assert all(kv % bs == 0 for kv in b.kv_buckets[:-1])
+
+    def test_the_presets_are_ordered_by_bucket_count_and_mean_overpay(self, monkeypatch):
+        # Aggregates only: the presets are not supersets (8_5 has 2688, 4_3 does not).
+        counts, overpay = [], []
+        for name in ("pow2", "8_5", "4_3", "9_8"):
+            monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", name)
+            envs.clear_env_cache()
+            buckets = SpyreAttnBucketer(make_config(max_model_len=4096)).kv_buckets
+            counts.append(len(buckets))
+            lengths = range(129, 4097)
+            overpay.append(
+                sum(next(b for b in buckets if b >= kv) / kv for kv in lengths) / len(lengths)
+            )
+        assert counts == sorted(counts), counts
+        assert overpay == sorted(overpay, reverse=True), overpay
+
+    def test_an_unknown_ladder_name_is_rejected_with_the_valid_set(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "7_4")
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match="8_5"):
+            SpyreAttnBucketer(make_config())
+
+    def test_a_block_size_too_small_for_the_ratio_is_rejected_not_looped_on(self, monkeypatch):
+        # At 9/8, v * 9 // 8 == v for v < 8: the series would never reach max_model_len.
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "9_8")
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match="block_size=5"):
+            SpyreAttnBucketer(make_config(max_model_len=4096, block_size=5))
+
+    def test_explicit_buckets_skip_the_ladder_name(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "7_4")
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "256,1024")
+        envs.clear_env_cache()
+        assert SpyreAttnBucketer(make_config(max_model_len=4096)).kv_buckets == [256, 1024, 4096]
+
+    def test_explicit_buckets_still_win_over_a_preset(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "9_8")
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "256,1024")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=4096))
+        assert b.kv_buckets == [256, 1024, 4096]
 
 
 class TestPoolingQueryBucketCap:

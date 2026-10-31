@@ -1,0 +1,43 @@
+direction: down
+classes: {
+  upstream: {style: {fill: "#37474f"; stroke: "#263238"; font-color: "#ffffff"}}
+  plugin: {style: {fill: "#2e7d32"; stroke: "#1b5e20"; font-color: "#ffffff"; bold: true}}
+  device: {style: {fill: "#1565c0"; stroke: "#0d47a1"; font-color: "#ffffff"}}
+  container: {style: {fill: "#e0e0e0"; stroke: "#9e9e9e"; font-color: "#212121"}}
+}
+
+upstream: "vLLM 0.32 — reused contracts" {
+  class: container
+  factories: "KVConnectorFactory / OffloadingSpecFactory\nPublic module-path configuration" {class: upstream}
+  scheduler: "OffloadingConnectorScheduler" {class: upstream}
+}
+
+plugin: "spyre-inference — connector integration" {
+  class: container
+  connector: "SpyreOffloadingConnector\nExplicitly installs Spyre connector worker" {class: plugin}
+  runner: "Model runner\nRegister dense K/V; transfer hooks and output" {class: plugin}
+  adapter: "Dense-cache adapter\nTyped K/V refs; original allocations retained" {class: plugin}
+  worker: "Spyre transfer worker\nStore / load / completion / shutdown" {class: plugin}
+  runner -> adapter: "register caches"
+  connector -> adapter: "worker-side ingestion"
+  adapter -> worker: "spec.get_worker"
+}
+
+policy: "Scheduler-side policy" {
+  class: container
+  local: "M1: CPUOffloadingManager\nInstance-local ownership" {class: upstream}
+  shared: "M2/M3 target: shared manager\nShared claims; complete pinned lookup" {class: plugin}
+}
+
+runtime: "torch-spyre + device runtime" {
+  class: container
+  copy: "Validated raw page copy\nFence producers → copy pages → wait" {class: device}
+  pools: "Slot-addressed data pool\nHost memory OR secondary memory" {class: device}
+  copy -> pools: "byte-exact; no format conversion"
+}
+
+upstream.factories -> plugin.connector: "connector selection"
+upstream.scheduler -> policy.local: "local spec"
+upstream.scheduler -> policy.shared: "shared spec"
+plugin.worker -> runtime.copy: "tensor + page identity + pool/slot"
+policy.shared -> runtime.pools: "shared-directory locations" {style.stroke-dash: 3}

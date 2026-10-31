@@ -14,20 +14,54 @@
 
 """MRV2: attention-group construction (vllm/v1/worker/gpu/attn_utils.py:init_attn_backend).
 
-Splits each group by per-layer sliding window after init_attn_backend
-runs: FullAttentionSpec.merge collapses a hybrid decoder onto one window,
-clamping its full-attention layers too. MRV2 counterpart of V1's
-_split_attn_groups_by_layer_window (spyre_model_runner.py).
+Upstream's init_attn_backend, then the sliding-window split V1 also uses
+(split_attn_groups_by_window).
 """
 
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import Any
 
+import torch
+from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.attn_utils import get_attn_cg_support
+from vllm.v1.worker.ubatch_utils import get_num_ubatches
+from vllm.v1.worker.utils import AttentionGroup
 
-if TYPE_CHECKING:
-    from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+from spyre_inference.v1.worker.kv_cache_setup import split_attn_groups_by_window
 
 
-def init(runner: "SpyreModelRunnerV2", kv_cache_config: KVCacheConfig, **kwargs: Any) -> None:
-    """Build runner.attn_groups and runner.kernel_block_sizes, split by window."""
-    raise NotImplementedError
+def init(
+    upstream_init_attn_backend: Callable[..., Any],
+    kv_cache_config: KVCacheConfig,
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[list[list[AttentionGroup]], Any, list[int]]:
+    attn_groups, attn_cg_support, kernel_block_sizes = upstream_init_attn_backend(
+        kv_cache_config, vllm_config, device, *args, **kwargs
+    )
+    split_attn_groups_by_window(attn_groups, get_layers_from_vllm_config(vllm_config, Attention))
+    # Upstream builds builders before the split, so the groups it creates have none.
+    split = False
+    for kv_cache_group_id, groups in enumerate(attn_groups):
+        for group in groups:
+            if group.metadata_builders:
+                continue
+            split = True
+            group.create_metadata_builders(
+                vllm_config=vllm_config,
+                device=device,
+                kernel_block_size=(
+                    kernel_block_sizes[kv_cache_group_id]
+                    if kv_cache_group_id < len(kernel_block_sizes)
+                    else None
+                ),
+                num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
+            )
+    if split:
+        # Upstream computed it over the pre-split groups.
+        attn_cg_support = get_attn_cg_support(attn_groups, vllm_config)
+    return attn_groups, attn_cg_support, kernel_block_sizes

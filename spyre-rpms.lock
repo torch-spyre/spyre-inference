@@ -12,59 +12,59 @@ version = 2
 tree = ""
 
 [bundle]
-id = "main_nightly_2026_10_15"
+id = "main_nightly_2026_10_27"
 
 [bundle.build_hashes]
 aiu-toolbox = "3307e2f9ae8747787b3ae5bcec5f88aed7d83c37"
-deeptools = "57e4f2f35fc3bc560cee32dffe031bc13cb08b00"
-flex = "e066296616826cbf3f32b13a5a5627408e7c65d9"
-libaiupti = "3c1815cb2f05cc501ff288c5cafd19806ddf9a49"
-senlib = "9b2385fa8aea16c23bfd2838b691ab92224f4d87"
-spyre-comms = "435e481696ea69228976228154f01f81651dfc8f"
+deeptools = "1bd1496ed937a144e295b6d80099696c7889b1fe"
+flex = "f661f200e0ab2bcde14d6befd321a2529cea0774"
+libaiupti = "69b1967d229b6676209d5184d52950844cda89f9"
+senlib = "9f36e2822e3f3737135ea9b7c18ef76062c45151"
+spyre-comms = "8c113d350806069528d31bf657d38f6a6dad54e5"
 spyre-meta-rpm = "a8ee829aaced5915bedb8d7e6d9e0c57acb01de9"
-timestamp = "2026-10-16 02:02:37"
+timestamp = "2026-10-22 16:56:00"
 branch = "main"
-build_number = "301"
+build_number = "306"
 bundle_subpath = "main"
 
 # x86_64
 [packages]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+39.3307e2f_173" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+2831.57e4f2f_490" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2831.57e4f2f_490" }
-ibm-flex              = { version = "2.0.0-0.main.1+700.e066296_608" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+700.e066296_608" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+316.9b2385f_451" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+316.9b2385f_451" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+316.9b2385f_451" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+217.435e481_315" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+217.435e481_315" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+50.3c1815c_96" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+39.3307e2f_177" }
+ibm-deeptools         = { version = "2.1.0-0.main.1+2878.1bd1496_504" }
+ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2878.1bd1496_504" }
+ibm-flex              = { version = "2.0.0-0.main.1+721.f661f20_633" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+721.f661f20_633" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+328.9f36e28_466" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+328.9f36e28_466" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+328.9f36e28_466" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+224.8c113d3_326" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+224.8c113d3_326" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+51.69b1967_101" }
 
 # Power
 [overrides.ppc64le]
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+39.3307e2f_*" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+2831.57e4f2f_*" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2831.57e4f2f_*" }
-ibm-flex              = { version = "2.0.0-0.main.1+700.e066296_*" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+700.e066296_*" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+316.9b2385f_*" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+316.9b2385f_*" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+316.9b2385f_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+217.435e481_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+217.435e481_*" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+50.3c1815c_*" }
+ibm-deeptools         = { version = "2.1.0-0.main.1+2878.1bd1496_*" }
+ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2878.1bd1496_*" }
+ibm-flex              = { version = "2.0.0-0.main.1+721.f661f20_*" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+721.f661f20_*" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+328.9f36e28_*" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+328.9f36e28_*" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+328.9f36e28_*" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+224.8c113d3_*" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+224.8c113d3_*" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+51.69b1967_*" }
 
 # Z
 [overrides.s390x]
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+39.3307e2f_*" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+2831.57e4f2f_*" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2831.57e4f2f_*" }
-ibm-flex              = { version = "2.0.0-0.main.1+700.e066296_*" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+700.e066296_*" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+316.9b2385f_*" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+316.9b2385f_*" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+316.9b2385f_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+217.435e481_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+217.435e481_*" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+50.3c1815c_*" }
+ibm-deeptools         = { version = "2.1.0-0.main.1+2878.1bd1496_*" }
+ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2878.1bd1496_*" }
+ibm-flex              = { version = "2.0.0-0.main.1+721.f661f20_*" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+721.f661f20_*" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+328.9f36e28_*" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+328.9f36e28_*" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+328.9f36e28_*" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+224.8c113d3_*" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+224.8c113d3_*" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+51.69b1967_*" }

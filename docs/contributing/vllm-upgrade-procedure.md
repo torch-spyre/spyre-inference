@@ -126,7 +126,15 @@ are missing.
 | `csrc/cpu/sampling_kernels.cpp` | same path (added in vllm#53913, after v0.28.0) | Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); `greedy_argmax` matches `torch.argmax` on NaN; inputs are checked. Port performance and correctness changes, never the table. |
 | `csrc/core/registration.h`, `cmake/utils.cmake`, `cmake/cpu_extension.cmake` | same paths | Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of `-march=native`, so wheels are portable. |
 | `SpyreTopKTopPSampler.forward_native` (`spyre_inference/v1/sample/topk_topp_sampler.py`) | `TopKTopPSampler.forward_native` (`vllm/v1/sample/ops/topk_topp_sampler.py`) | Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors. |
+| `spyre_inference/v1/spec_decode/{xpress_head,checkpoint}.py` | `vllm/model_executor/models/{qwen3_xpress,qwen3_dflash}.py` | Temporary compatibility for vllm#54448 (`ce9467b757`), which postdates 0.32.0. Replace with upstream XPress model/head subclasses when available, retaining the Spyre overrides. |
+| `csrc/cpu/spec_decode_utils.cpp`, `spyre_inference/v1/spec_decode/rejection_sampler.py` and the platform kernel hook | The four rejection kernels in `csrc/cpu/spec_decode_utils.cpp` and their adapters in `vllm/utils/cpu_triton_utils.py` (v0.32.0, `5df63a7203`) | Native kernels in `_spyre_C`, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels; #1417 tracks their independent cleanup condition. |
 | The sampler patch in `TorchSpyreModelRunner.__init__` | `Sampler` (`vllm/v1/sample/sampler.py`), its construction and `RejectionSampler(self.sampler)` (`vllm/v1/worker/gpu_model_runner.py`) | Relies on `Sampler` calling `self.greedy_sample` and `self.topk_topp_sampler`, and on the rejection sampler holding the same `Sampler` object. |
+
+`tests/spec_decode/test_xpress_vendored.py` deliberately fails if the new vLLM
+ships the XPress module or registers either XPress architecture. Follow
+[the cleanup issue](https://github.com/torch-spyre/spyre-inference/issues/1417)
+to migrate the temporary head, loader/config bridge and registrations before
+removing the canary. Keep the Spyre execution overrides and requalify the serving path.
 
 Diff the upstream side between the current pin and the target:
 
@@ -134,10 +142,12 @@ Diff the upstream side between the current pin and the target:
 cd <vllm checkout> && git fetch --tags
 git diff v<current> v{VERSION} --stat -- \
   csrc/cpu/cpu_types.hpp csrc/cpu/cpu_types_x86.hpp csrc/cpu/cpu_types_vsx.hpp \
-  csrc/cpu/cpu_types_vxe.hpp csrc/cpu/sampling_kernels.cpp csrc/core/registration.h \
+  csrc/cpu/cpu_types_vxe.hpp csrc/cpu/sampling_kernels.cpp \
+  csrc/cpu/spec_decode_utils.cpp csrc/cpu/torch_bindings.cpp csrc/core/registration.h \
   cmake/cpu_extension.cmake cmake/utils.cmake \
   vllm/v1/sample/ops/topk_topp_sampler.py vllm/v1/sample/sampler.py \
-  vllm/v1/sample/rejection_sampler.py vllm/v1/worker/gpu_model_runner.py
+  vllm/v1/sample/rejection_sampler.py vllm/utils/cpu_triton_utils.py \
+  vllm/v1/worker/gpu_model_runner.py
 ```
 
 For each changed file, port what applies and update the version in the `forward_native`
@@ -147,11 +157,13 @@ places, including the ppc64le source build) is in §3b of the `upgrade-torch-spy
 and torch-spyre must support the new torch as well.
 `uv sync` rebuilds the extension because `csrc/` and `pyproject.toml` are in its cache keys.
 
-Then check the kernels and the PyTorch fallback (CPU only, no card needed):
+Then check the kernels and ordinary-sampling PyTorch fallback (CPU only, no card needed).
+The rejection sampler requires the built extension:
 
 ```bash
 uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
-  tests/runtime/test_sampling_fallback.py tests/runtime/test_spyre_topk_sampler.py --no-header
+  tests/runtime/test_sampling_fallback.py tests/runtime/test_spyre_topk_sampler.py \
+  tests/spec_decode/test_rejection_sampler.py --no-header
 ```
 
 - `test_sampling_kernels.py` checks the kernels against PyTorch baselines token for token:
@@ -159,6 +171,8 @@ uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
 - `test_sampling_fallback.py` forces the fallback and checks it picks the same tokens as
   upstream's stock `Sampler`, which catches upstream sampler changes we haven't mirrored.
 - `test_spyre_topk_sampler.py` checks the sort-free top-k/top-p against upstream's sort.
+- `test_rejection_sampler.py` exercises the native kernels through vLLM's dispatchers,
+  including mixed dtypes, FP64 noise, synthetic acceptance and target-distribution checks.
 
 ## Step 3: Triage in This Order
 

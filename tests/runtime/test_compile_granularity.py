@@ -34,9 +34,10 @@ from spyre_inference.multimodal.utils import mark_blocks_compilable
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import (
     _is_decoder_attention_like,
+    compile_blocks,
+    compile_for_spyre,
     repeated_block_lists,
 )
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 
 @pytest.fixture
@@ -174,15 +175,16 @@ class _Model(nn.Module):
         return self.model(input_ids)
 
 
-def _runner(model: nn.Module, enforce_eager: bool = False) -> TorchSpyreModelRunner:
-    """A runner with only the attributes _compile_for_spyre reads."""
-    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner.model = model
-    runner.compilation_config = types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE)
-    runner.vllm_config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(enforce_eager=enforce_eager)
+def _compile(model: nn.Module, enforce_eager: bool = False) -> tuple[nn.Module, int]:
+    vllm_config = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+        model_config=types.SimpleNamespace(enforce_eager=enforce_eager),
     )
-    return runner
+    return compile_for_spyre(model, vllm_config)  # ty: ignore[invalid-argument-type]
+
+
+def _compile_blocks(model: nn.Module) -> tuple[int, int]:
+    return compile_blocks(repeated_block_lists(model))
 
 
 def test_finds_the_transformer_block_list() -> None:
@@ -418,7 +420,7 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     assert repeated_block_lists(model) == [(decoder_layers, False)]
 
     originals = list(vision_layers)
-    assert _runner(model)._compile_blocks() == 3
+    assert _compile_blocks(model)[0] == 3
     assert all(block._compiled_call_impl is None for block in originals)
     assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
 
@@ -427,10 +429,11 @@ def test_a_marked_tower_alone_falls_back_to_the_whole_model_graph() -> None:
     """Only decoder blocks are counted, so a tower alone still sends the decoder to the
     whole-model graph; the tower compiles beside it."""
     model = _VLM()
-    runner = _runner(model)
-    assert runner._compile_blocks() == 0
+    assert _compile_blocks(model) == (0, 2)
     assert all(b._compiled_call_impl is not None for b in model.vision_tower.encoder.layers)
-    assert runner._compiled_tower_blocks == 2
+    fresh = _VLM()
+    compiled, tower = _compile(fresh)
+    assert compiled is not fresh and compiled._orig_mod is fresh and tower == 2
 
 
 def test_a_marked_tower_compiles_beside_the_decoder_and_is_watched() -> None:
@@ -438,9 +441,7 @@ def test_a_marked_tower_compiles_beside_the_decoder_and_is_watched() -> None:
     runs the tower at every image-batch width, so a later compile is a missed shape."""
     model = _VLM(decoder=True)
     compile_guard.reset()
-    runner = _runner(model)
-    assert runner._compile_blocks() == 3
-    assert runner._compiled_tower_blocks == 2
+    assert _compile_blocks(model) == (3, 2)
     tower_blocks = model.vision_tower.encoder.layers
     assert all(b._compiled_call_impl is not None for b in tower_blocks)
     watched = compile_guard._guard.watched_labels().values()
@@ -452,7 +453,7 @@ def test_compile_blocks_wraps_every_block_in_place() -> None:
     model = _Model(num_layers=4)
     originals = list(model.model.layers)
 
-    assert _runner(model)._compile_blocks() == 4
+    assert _compile_blocks(model)[0] == 4
 
     for i, original in enumerate(originals):
         assert model.model.layers[i] is original
@@ -469,7 +470,7 @@ def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
     model.model.cross_decoder.decoder_layers = model.model.layers[2:]
     assert len(repeated_block_lists(model)) == 3
 
-    assert _runner(model)._compile_blocks() == 4
+    assert _compile_blocks(model)[0] == 4
     assert all(block._compiled_call_impl is not None for block in model.model.layers)
 
 
@@ -478,7 +479,7 @@ def test_compile_blocks_preserves_parameter_names() -> None:
     model = _Model(num_layers=4)
     before = [name for name, _ in model.named_parameters()]
 
-    _runner(model)._compile_blocks()
+    _compile_blocks(model)
 
     after = [name for name, _ in model.named_parameters()]
     assert after == before
@@ -487,7 +488,7 @@ def test_compile_blocks_preserves_parameter_names() -> None:
 
 def test_pp_missing_layers_are_not_compiled() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert _runner(model)._compile_blocks() == 2
+    assert _compile_blocks(model)[0] == 2
     assert all(isinstance(layer, PPMissingLayer) for layer in model.model.layers[2:])
 
 
@@ -495,14 +496,14 @@ def test_rejects_an_unknown_granularity_even_when_eager(monkeypatch) -> None:
     """Validation runs before the eager short-circuit, so typos are never silent."""
     monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "blocks")
     with pytest.raises(ValueError, match="SPYRE_COMPILE_GRANULARITY"):
-        _runner(_Model(num_layers=2), enforce_eager=True)._compile_for_spyre()
+        _compile(_Model(num_layers=2), enforce_eager=True)
 
 
 def test_empty_granularity_falls_back_to_block(monkeypatch) -> None:
     """`export SPYRE_COMPILE_GRANULARITY=$UNSET` must mean unset, not invalid."""
     monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "")
     model = _Model(num_layers=2)
-    _runner(model)._compile_for_spyre()
+    _compile(model)
     assert all(block._compiled_call_impl is not None for block in model.model.layers)
 
 
@@ -512,8 +513,7 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
 
     model = _Model(num_layers=2)
-    runner = _runner(model)
-    runner._compile_for_spyre()
+    assert _compile(model) == (model, 0)
 
     assert compiled == [model]
     assert all(block._compiled_call_impl is None for block in model.model.layers)
@@ -530,7 +530,7 @@ def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None
             self.linear = nn.Linear(4, 4)
 
     model = NoBlocks()
-    _runner(model)._compile_for_spyre()
+    _compile(model)
     assert compiled == [model]
 
 
@@ -539,7 +539,7 @@ def test_eager_compiles_nothing(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
 
     model = _Model(num_layers=2)
-    _runner(model, enforce_eager=True)._compile_for_spyre()
+    assert _compile(model, enforce_eager=True) == (model, 0)
 
     assert compiled == []
     assert all(block._compiled_call_impl is None for block in model.model.layers)
@@ -559,7 +559,7 @@ def test_identical_blocks_share_compiled_artifacts_regardless_of_depth(
         counters.clear()
         with fresh_cache():
             model = _Model(hidden=32, num_layers=num_layers)
-            _runner(model)._compile_blocks()
+            _compile_blocks(model)
             with torch.inference_mode():
                 model(torch.zeros(2, 4, dtype=torch.long))
             return (

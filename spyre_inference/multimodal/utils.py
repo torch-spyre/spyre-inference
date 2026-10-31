@@ -174,7 +174,7 @@ def _key_pad_mask_key(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.
     and the tail write cannot lower on Spyre. The key, not the row, is the constant: a
     tensor constant becomes a graph attribute torch-spyre cannot lay out, while the dict
     read in `padded_sdpa` makes the row a guarded graph input. Needs `dynamic=False`,
-    which `_compile_blocks` passes because Spyre rejects SymInt shapes.
+    which `compile_blocks` passes because Spyre rejects SymInt shapes.
     """
     key = (seq, seq_pad, dtype, device)
     if key not in _KEY_PAD_MASKS:

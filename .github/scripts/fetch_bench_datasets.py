@@ -16,10 +16,9 @@
 """Put the vLLM benchmark trace files on this host, then print their env vars.
 
 The serve benchmarks replay recorded traces. Until now every host was expected
-to have them pre-mounted under /models, which only the x86_64 benchmark hosts
-do, so the s390x and ppc64le perf lanes could not run a serve config at all.
-This fetches them from the artifact store into a cache dir instead, so any
-arch can run.
+to have them pre-mounted, which only some x86_64 benchmark hosts do, so the
+s390x and ppc64le perf lanes could not run a serve config at all. This fetches
+them from the artifact store into a cache dir instead, so any arch can run.
 
 Cache-first by design: a file whose SHA256 already matches ARTIFACTS is left
 alone and never re-downloaded, so a warm host does no network I/O. Only a

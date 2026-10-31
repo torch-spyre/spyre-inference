@@ -47,6 +47,7 @@ from spyre_inference.custom_ops.vocab_parallel_embedding import (
     SpyreVocabParallelEmbedding,
 )
 from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.compile_granularity import compile_blocks, repeated_block_lists
 from spyre_inference.v1.worker.compile_guard import (
     CompileGuardLevel,
     UnexpectedCompileError,
@@ -71,7 +72,7 @@ class _Block(torch.nn.Module):
     """One transformer block's stand-in: compiled once, guarded on its row count.
 
     Carries a real ``Attention`` so ``repeated_block_lists`` recognises the list as a
-    decoder stack, which is what makes ``_compile_blocks`` compile and register it.
+    decoder stack, which is what makes ``compile_blocks`` compile and register it.
     """
 
     def __init__(self, attn: Attention) -> None:
@@ -177,6 +178,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             SpyreShapeBucketer(runner.vllm_config) if bucket_sizes else None
         )
         runner.max_num_reqs = MAX_NUM_REQS
+        runner.num_spec_tokens = 0
         runner.scheduler_config = types.SimpleNamespace(
             max_num_batched_tokens=64,
             max_num_seqs=MAX_NUM_REQS,
@@ -218,7 +220,10 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             autospec=True,
             side_effect=lambda self, **kw: real_compile(self, **{**kw, "backend": "eager"}),
         ):
-            assert runner._compile_blocks() == 1, "the stub decoder was not recognised"
+            num_blocks, runner._compiled_tower_blocks = compile_blocks(
+                repeated_block_lists(decoder)
+            )
+            assert num_blocks == 1, "the stub decoder was not recognised"
 
         # Wrapped after compile, as ``load_model`` does.
         runner.model = _SpyreModelWrapper(
@@ -253,7 +258,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
 def warmed_runner(build_runner):
     """A runner whose warmup really compiled ``BODY_BUCKETS``, plus its block.
 
-    Blocks are compiled and registered by the production ``_compile_blocks``, not by
+    Blocks are compiled and registered by the production ``compile_blocks``, not by
     the test: hand-registering here would keep passing if that call site ever stopped
     watching, which is the regression this file exists to catch.
     """

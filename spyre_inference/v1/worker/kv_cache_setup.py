@@ -23,7 +23,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.worker.utils import AttentionGroup
 
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
@@ -73,11 +73,18 @@ def split_attn_groups_by_window(
 def _allocate_mamba_states(
     num_blocks: int, spec: MambaSpec, device: torch.device
 ) -> tuple[torch.Tensor, ...]:
-    """One device tensor per state, ``num_blocks`` slots each, as upstream views its page."""
-    return tuple(
-        convert(torch.zeros((num_blocks, *shape), dtype=dtype), device=device)
-        for shape, dtype in zip(spec.shapes, spec.dtypes)
-    )
+    """One device tensor per state, ``num_blocks`` slots each, as upstream views its page.
+
+    Slot-outermost: the mixer kernels gather and scatter whole slots in-graph, which on
+    the default tiled layout relayout the whole cache, so their cost would grow with
+    the slot count rather than the batch.
+    """
+    states = []
+    for shape, dtype in zip(spec.shapes, spec.dtypes):
+        full = (num_blocks, *shape)
+        layout = row_outermost_layout(full, dtype) if device.type == "spyre" else None
+        states.append(convert(torch.zeros(full, dtype=dtype), device=device, device_layout=layout))
+    return tuple(states)
 
 
 def allocate_spyre_kv_caches(

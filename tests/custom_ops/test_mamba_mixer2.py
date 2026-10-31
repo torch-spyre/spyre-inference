@@ -113,7 +113,49 @@ class _Mixer:
         self.conv1d = torch.nn.Module()
         self.conv1d.weight = torch.nn.Parameter(p["conv_w"].float()[:, None, :])
         self.conv1d.bias = torch.nn.Parameter(p["conv_b"].float())
-        self.kv_cache = (conv_cache.to("spyre"), ssm_cache.to("spyre"))
+        self.kv_cache = _serving_states(conv_cache, ssm_cache)
+
+
+def _serving_states(conv_cache, ssm_cache):
+    """The states on device in the layout serving allocates them in, filled from the host."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from spyre_inference.v1.worker.kv_cache_setup import _allocate_mamba_states
+
+    spec = MambaSpec(
+        shapes=(tuple(conv_cache.shape[1:]), tuple(ssm_cache.shape[1:])),
+        dtypes=(conv_cache.dtype, ssm_cache.dtype),
+        block_size=1,
+    )
+    # A layout-pinned allocation does not start the runtime; serving has loaded the
+    # model by then.
+    torch.spyre.synchronize()
+    states = _allocate_mamba_states(conv_cache.shape[0], spec, torch.device("spyre"))
+    for state, host in zip(states, (conv_cache, ssm_cache)):
+        state.copy_(host)
+    return states
+
+
+def test_slot_writes_do_not_relayout_the_whole_state(caplog):
+    """An in-graph slot scatter into an allocated state must not copy the whole cache in
+    and out: that made the kernels' cost grow with the slot count, not the batch."""
+    from torch_spyre import logging_config
+
+    logging_config.set_log_level("spyre.inductor.nonstick_dim_order", "INFO")
+    conv, ssm = _serving_states(
+        torch.zeros(SLOTS, K - 1, CD).half(), torch.zeros(SLOTS, H, P, N).half()
+    )
+    slots = torch.tensor([3, 7]).to("spyre")
+
+    def write(conv, ssm, slots):
+        ssm[slots] = ssm[slots] + 1
+        conv[slots] = conv[slots] + 1
+
+    with caplog.at_level("INFO", logger="spyre.inductor.nonstick_dim_order"):
+        torch.compile(write, dynamic=False)(conv, ssm, slots)
+    assert not [r for r in caplog.records if "mutation relayout copy" in r.getMessage()]
+    assert (ssm.cpu()[[3, 7]] == 1).all() and (ssm.cpu()[[0, 1, 2, 4, 5, 6, 8]] == 0).all()
+    assert (conv.cpu()[[3, 7]] == 1).all() and (conv.cpu()[[0, 1, 2, 4, 5, 6, 8]] == 0).all()
 
 
 @pytest.mark.parametrize("batch", [1, 3, 4])

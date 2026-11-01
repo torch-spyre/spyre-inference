@@ -38,6 +38,8 @@ from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
@@ -178,8 +180,6 @@ class TorchSpyrePlatform(CpuPlatform):
     @classmethod
     def _decoder_backend_path(cls) -> str:
         """The decoder attention backend for the requested KV cache layout."""
-        from spyre_inference import envs
-
         layout = envs.SPYRE_ATTN_KV_LAYOUT
         if layout not in cls._KV_LAYOUTS:
             raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
@@ -675,7 +675,7 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
-        # The attention KV buckets are powers of two starting at block_size; a
+        # Every KV ladder keeps the powers of two starting at block_size; a
         # non-power-of-two block size makes that ladder start off-grid, so block
         # counts stop being a clean doubling sequence.
         if aligned & (aligned - 1):
@@ -784,6 +784,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
+        # Validate the ladder name now; the bucketer only reads it in the worker, after model load.
+        if not envs.SPYRE_ATTN_KV_BUCKETS:
+            from spyre_inference.v1.attention.spyre_attn_bucketer import kv_ladder
+
+            kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
         from spyre_inference.threading_config import configure_threading
@@ -791,7 +797,7 @@ class TorchSpyrePlatform(CpuPlatform):
         configure_threading(parallel_config.world_size)
 
         # ---- worker ----
-        from spyre_inference import envs, pin_model_runner
+        from spyre_inference import pin_model_runner
         from spyre_inference.v1.worker.spyre import triton_gate
 
         # Read fresh, not from the cache register() filled, so a value changed after
@@ -799,13 +805,7 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        gate = "open" if runner == "v2" else "closed"
-        if triton_gate.state() != gate:
-            raise ValueError(
-                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
-                f"{triton_gate.state() or 'not applied'}: set SPYRE_MODEL_RUNNER before "
-                "vLLM is imported, and the same in every process."
-            )
+        triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 

@@ -667,6 +667,25 @@ def test_bfloat16_is_accepted_at_tp1():
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize(("kv_buckets", "raises"), [(None, True), ("256,1024", False)])
+def test_an_unknown_kv_ladder_fails_at_startup(monkeypatch, kv_buckets, raises):
+    from spyre_inference import envs
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Built first: VllmConfig runs this hook on construction too.
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "7_4")
+    if kv_buckets:
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", kv_buckets)
+    envs.clear_env_cache()
+
+    if raises:
+        with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER='7_4'"):
+            TorchSpyrePlatform.check_and_update_config(vllm_config)
+    else:
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_raise_dynamo_recompile_limits_survives_a_clobber():
     """torch_spyre's autoload lowers cache_size_limit to 1024; re-asserting must win."""
     import torch._dynamo

@@ -205,7 +205,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         if not self.kv_cache_fp8:
             return ()
         assert self._kv_scales is not None, (
-            "KV scales unresolved: the runner reads them at load (_resolve_kv_scales)"
+            "KV scales unresolved: the runner reads them at load (resolve_kv_scales)"
         )
         return self._kv_scales
 

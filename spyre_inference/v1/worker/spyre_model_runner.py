@@ -72,7 +72,6 @@ from spyre_inference.models.roberta import offset_host_positions, roberta_positi
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
-    SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
@@ -91,12 +90,7 @@ from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_r
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.compile_granularity import (
-    block_sharing_defeated_by,
-    compile_blocks,
-    compile_granularity,
-    repeated_block_lists,
-)
+from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
     encoder_pad_token_id,
@@ -110,6 +104,7 @@ from spyre_inference.v1.worker.model_load import (
     fix_padded_model,
     install_pad_loaders,
     move_model_to_spyre,
+    resolve_kv_scales,
 )
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -640,7 +635,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
-        self._resolve_kv_scales()
+        resolve_kv_scales(self.model, self.compilation_config.static_forward_context)
 
         move_model_to_spyre(self.model, self._spyre_device)
 
@@ -660,7 +655,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         apply_multimodal_patches(self.model, self._spyre_device)
 
         # Compile for Spyre (no-op if enforce_eager=True)
-        self._compile_for_spyre()
+        self.model, self._compiled_tower_blocks = compile_for_spyre(self.model, self.vllm_config)
 
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
@@ -697,137 +692,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
-    def _resolve_kv_scales(self) -> bool:
-        """Read each float8-cache layer's KV scales into its impl; True when any changed."""
-        changed = False
-        pairs = set()
-        shared = []
-        for module in self.get_model().modules():
-            impl = getattr(module, "impl", None)
-            if not (isinstance(module, Attention) and isinstance(impl, SpyreAttentionImpl)):
-                continue
-            if getattr(module, "kv_sharing_target_layer_name", None) is not None:
-                shared.append(module)
-                continue
-            if not impl.kv_cache_fp8:
-                continue
-            k_scale = getattr(module, "_k_scale", None)
-            if isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1:
-                # Upstream's per-head scheme reduces the heads to their max scale, so a head
-                # with a much smaller one keeps only a few e4m3 steps of its range.
-                logger.warning_once(
-                    "The checkpoint carries per-head KV cache scales; the fp8 KV cache uses "
-                    "one scale per layer, the largest head's, which coarsens the others."
-                )
-            old = impl._kv_scales
-            impl.prepare_kv_scales(module)
-            changed |= old is not None and impl._kv_scales != old
-            pairs.add(impl._kv_scales)
-        # A sharing layer reads the cache its target wrote, so it dequantizes with the
-        # target's scales; its own usually default to 1.0, as it stores nothing.
-        static_ctx = self.compilation_config.static_forward_context if shared else {}
-        for module in shared:
-            target = static_ctx[module.kv_sharing_target_layer_name]
-            if module.impl.kv_cache_fp8 != target.impl.kv_cache_fp8:
-                # It reads the target's pages, so it must decode them in the dtype they hold.
-                raise ValueError(
-                    f"KV-sharing layer {module.layer_name} and its target "
-                    f"{module.kv_sharing_target_layer_name} disagree on the fp8 KV cache; "
-                    "list both or neither in kv_cache_dtype_skip_layers."
-                )
-            if not module.impl.kv_cache_fp8:
-                continue
-            old = module.impl._kv_scales
-            module.impl._kv_scales = target.impl._kv_scales
-            changed |= old is not None and module.impl._kv_scales != old
-        if len(pairs) > 1:
-            # The scales are graph constants, so each distinct pair is its own compile.
-            logger.warning_once(
-                "The fp8 KV cache has %d distinct per-layer (k_scale, v_scale) pairs; the "
-                "transformer block and every recorded attention kernel compile once per "
-                "pair, which lengthens warmup.",
-                len(pairs),
-            )
-        return changed
-
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
         # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
         # The graphs that read them guard on their values, so only those retrace; warming
         # here does that before the next request, which an armed compile guard would fail.
-        if self._resolve_kv_scales():
+        if resolve_kv_scales(self.get_model(), self.compilation_config.static_forward_context):
             logger.warning(
                 "KV cache scales changed on weight reload; re-warming the graphs that "
                 "depend on them."
             )
             with compile_guard.allow_compile("KV cache scales changed on weight reload"):
                 self.warming_up_model()
-
-    def _compile_for_spyre(self) -> None:
-        """Install torch.compile wrappers; tracing happens on the first forward.
-
-        `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
-        """
-        mode = self.compilation_config.mode
-        if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
-            raise ValueError(
-                f"Unsupported compilation mode {mode} for Spyre. Only "
-                f"CompilationMode.NONE and CompilationMode.STOCK_TORCH_COMPILE "
-                f"are supported."
-            )
-
-        # Validated before the eager short-circuit so a typo is not silently ignored.
-        # Per-block is the default: identical blocks share a ``forward`` code object,
-        # so the backend compiles one block rather than a program that grows with depth.
-        granularity = compile_granularity()
-        self._compiled_tower_blocks = 0
-
-        if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
-            logger.info("Compilation disabled (enforce_eager=True)")
-            return
-
-        model_name = type(self.model).__name__
-
-        if granularity == "block":
-            defeated_by = block_sharing_defeated_by()
-            if defeated_by:
-                logger.warning(
-                    "SPYRE_COMPILE_GRANULARITY=block will not share one artifact across "
-                    "blocks: %s. Expect compile time to grow with layer count; "
-                    "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
-                    defeated_by,
-                )
-            num_blocks = self._compile_blocks()
-            tower = self._compiled_tower_blocks
-            if num_blocks:
-                logger.info(
-                    "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre.",
-                    num_blocks,
-                    f" and {tower} tower blocks" if tower else "",
-                    model_name,
-                )
-                return
-            logger.warning(
-                "Found no attention-bearing block ModuleList in %s; falling back to a "
-                "whole-model graph. Models whose attention is not a vLLM Attention "
-                "(MLA, encoder-only vision towers) take this path.",
-                model_name,
-            )
-
-        self.model = torch.compile(
-            self.model,
-            backend="inductor",
-            fullgraph=True,
-            dynamic=False,
-        )
-        compile_guard.watch(self.model, f"{model_name} (whole-model graph)")
-        logger.info("Wrapped %s as a single graph for Spyre.", model_name)
-
-    def _compile_blocks(self) -> int:
-        num_blocks, self._compiled_tower_blocks = compile_blocks(
-            repeated_block_lists(cast(nn.Module, self.model))
-        )
-        return num_blocks
 
     def warming_up_model(self) -> None:
         """Warm kernels / compile.

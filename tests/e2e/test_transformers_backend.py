@@ -22,6 +22,8 @@ is the reference here instead.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 
 import pytest
@@ -429,15 +431,48 @@ def test_patch_encoder_gather_wraps_module_forward():
             self.embeddings = RobertaEmbeddings(cfg)
 
     model = FakeModel()
+    received_token_type_ids = []
     orig_forward = model.embeddings.forward
 
+    @functools.wraps(orig_forward)
+    def intercept_forward(*args, **kwargs):
+        bound = inspect.signature(orig_forward).bind_partial(*args, **kwargs)
+        if "token_type_ids" in bound.arguments:
+            received_token_type_ids.append(bound.arguments["token_type_ids"])
+        return orig_forward(*args, **kwargs)
+
+    model.embeddings.forward = intercept_forward
     _patch_encoder_gather(model)
 
     assert model.embeddings.forward is not orig_forward
-    # When token_type_ids is None, patched forward supplies zeros to bypass gather
+
+    # 1. Keyword call with token_type_ids=None -> receives int32 zeros
     x = torch.randint(0, 100, (1, 4))
     out = model.embeddings(input_ids=x)
     assert out.shape == (1, 4, 16)
+    assert len(received_token_type_ids) == 1
+    t = received_token_type_ids[0]
+    assert isinstance(t, torch.Tensor)
+    assert t.dtype == torch.int32
+    assert t.shape == (1, 4)
+    assert torch.equal(t, torch.zeros((1, 4), dtype=torch.int32))
+
+    # 2. Positional call (x, None)
+    received_token_type_ids.clear()
+    out = model.embeddings(x, None)
+    assert out.shape == (1, 4, 16)
+    assert len(received_token_type_ids) == 1
+    t = received_token_type_ids[0]
+    assert isinstance(t, torch.Tensor)
+    assert t.dtype == torch.int32
+    assert torch.equal(t, torch.zeros((1, 4), dtype=torch.int32))
+
+    # 3. Explicit non-zero segment ids preserved
+    received_token_type_ids.clear()
+    seg = torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
+    model.embeddings(input_ids=x, token_type_ids=seg)
+    assert len(received_token_type_ids) == 1
+    assert torch.equal(received_token_type_ids[0], seg)
 
 
 def test_patch_encoder_gather_wraps_bert_embeddings():
@@ -519,3 +554,41 @@ def test_patch_encoder_gather_noop_without_buffer():
     _patch_encoder_gather(model)
     assert "forward" not in model.__dict__
     assert all("forward" not in m.__dict__ for m in model.modules())
+
+
+def test_spyre_transformers_wrappers_disable_is_roberta():
+    from unittest.mock import MagicMock, patch
+
+    from vllm.model_executor.models.transformers import (
+        TransformersEmbeddingModel,
+        TransformersForSequenceClassification,
+    )
+
+    from spyre_inference.transformers_backend import (
+        SpyreTransformersEmbeddingModel,
+        SpyreTransformersForSequenceClassification,
+        _SpyreTransformersEncoderMixin,
+    )
+
+    mock_config = MagicMock()
+    mock_config.model_config.hf_config.model_type = "xlm-roberta"
+    mock_config.model_config.hf_config.architectures = ["XLMRobertaForSequenceClassification"]
+    mock_config.model_config.hf_config.pad_token_id = 1
+    mock_config.model_config.hf_text_config.model_type = "xlm-roberta"
+    mock_config.model_config.hf_text_config.pad_token_id = 1
+    mock_config.model_config.hf_config.num_labels = 2
+    mock_config.model_config.hf_config.problem_type = None
+
+    with (
+        patch.object(TransformersEmbeddingModel, "__init__", return_value=None),
+        patch.object(TransformersForSequenceClassification, "__init__", return_value=None),
+    ):
+        embed_model = SpyreTransformersEmbeddingModel(vllm_config=mock_config)
+        embed_model.is_roberta = True
+        _SpyreTransformersEncoderMixin.__init__(embed_model, vllm_config=mock_config)
+        assert embed_model.is_roberta is False
+
+        seq_model = SpyreTransformersForSequenceClassification(vllm_config=mock_config)
+        seq_model.is_roberta = True
+        _SpyreTransformersEncoderMixin.__init__(seq_model, vllm_config=mock_config)
+        assert seq_model.is_roberta is False

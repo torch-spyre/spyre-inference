@@ -61,9 +61,6 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "TransformersForSequenceClassification": (
         "spyre_inference.transformers_backend:SpyreTransformersForSequenceClassification"
     ),
-    "TransformersMultiModalEmbeddingModel": (
-        "spyre_inference.transformers_backend:SpyreTransformersMultiModalEmbeddingModel"
-    ),
 }
 
 

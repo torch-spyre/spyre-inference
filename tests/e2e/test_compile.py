@@ -162,8 +162,8 @@ def test_transformers_backend_encoder_compile(monkeypatch: pytest.MonkeyPatch) -
     Exercises the whole-model ``torch.compile`` path taken by
     ``SpyreTransformersEmbeddingModel``: encoder-only models have no repeated
     ``Attention`` block list, so ``_compile_for_spyre`` compiles the full graph
-    in one shot.  Verifies that the XLM-RoBERTa gather-free embedding patch and
-    RoPE cache survive compilation and produce correct output.
+    in one shot.  Verifies that the XLM-RoBERTa gather-free embedding patch
+    survives compilation and produces correct output.
     """
     from vllm import LLM
 

@@ -153,11 +153,11 @@ def test_pipeline_matches_upstream(tp_group, num_images):
 
 
 def test_padding_does_not_leak_into_images(tp_group):
-    """Bucket padding must not change any image's embedding: padding slots have their own
-    segment, and each offset block is padded separately."""
+    """Bucket padding must not change the image's embedding: padding keys are masked, and each
+    offset block is padded separately."""
     args = _args(num_layers=1)
     model = _spyre_model(args)
-    images = _images()
+    images = _images()[:1]
     values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
     config = model.get_encoder_cudagraph_config()
 
@@ -171,6 +171,14 @@ def test_padding_does_not_leak_into_images(tp_group):
         tight, loose = run(128), run(256)
     n = sum(t.shape[0] for t in model.embed_multimodal(images=images))
     torch.testing.assert_close(tight[:n], loose[:n], atol=1e-3, rtol=1e-3)
+
+
+def test_encoder_call_carries_one_image(tp_group):
+    """The key-pad mask has no same-image term, so a packed call must never reach it."""
+    model = _spyre_model(_args(num_layers=1))
+    assert model.vision_max_items_per_call == 1
+    with pytest.raises(AssertionError, match="one image per encoder call"):
+        model.vision_inputs({"images": _images()})
 
 
 def test_offset_major_merge_matches_upstream_merger(tp_group):
@@ -296,7 +304,7 @@ def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
     from spyre_inference.custom_ops.utils import convert
 
     args = _args()
-    images = _images()
+    images = _images()[:1]
     model = _spyre_model(args).to("spyre")
     model.compile_vision_graphs()
     values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
@@ -337,7 +345,7 @@ def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group):
         pytest.skip("Spyre device not available")
 
     args = _args()
-    images = _images()
+    images = _images()[:1]
     model = _spyre_model(args).to("spyre")
     inputs = _padded_device_inputs(model, images, token_budget=64)
     tokens = sum(model.vision_item_tokens({"images": images}))

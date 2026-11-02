@@ -41,14 +41,11 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
-    SEGMENT_ITEMS,
+    _MASK_MIN,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
     offset_major,
-    one_hot_segments,
-    segment_buffer,
-    segment_mask,
     unbind_items,
 )
 from spyre_inference.multimodal.utils import (
@@ -160,7 +157,8 @@ class SpyrePixtralForConditionalGeneration(
 ):
     """Upstream Pixtral with its vision encoder compiled per token budget."""
 
-    vision_max_items_per_call = SEGMENT_ITEMS
+    # One image per call, so attention needs a [P] key-pad row, not a dense [P, P] image mask.
+    vision_max_items_per_call = 1
 
     # --- construction ---
 
@@ -180,7 +178,7 @@ class SpyrePixtralForConditionalGeneration(
         self._patch_width = align_up(args.num_channels * args.patch_size**2)
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
-            "segments": segment_buffer(),
+            "key_pad": VisionBuffer(None, pad=_MASK_MIN),
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
         # [cos | sin] per position, gathered on the card in vision_embed.
@@ -241,25 +239,22 @@ class SpyrePixtralForConditionalGeneration(
         ]
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Offset-major patches of every image, each flattened as ``(c, py, px)`` like the conv
-        weight, with its one-hot image and its RoPE position."""
+        """Offset-major patches of one image, each flattened as ``(c, py, px)`` like the conv
+        weight, with its RoPE position."""
         images = _images(mm_kwargs)
+        assert len(images) == 1, f"one image per encoder call, got {len(images)}"
+        (img,) = images
         p, m = self.vision_args.patch_size, self._merge
-        flat_patches, seg, pos = [], [], []
-        for i, img in enumerate(images):
-            c, h, w = img.shape
-            assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
-            hp, wp = h // p, w // p
-            patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
-            flat_patches.append(offset_major(patches.reshape(hp, wp, -1), m))
-            grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
-            pos.append(offset_major(grid, m))
-            seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
-        flat = torch.cat(flat_patches, dim=1).flatten(0, 1).to(torch.float16)
+        c, h, w = img.shape
+        assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
+        hp, wp = h // p, w // p
+        patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
+        flat = offset_major(patches.reshape(hp, wp, -1), m).flatten(0, 1).to(torch.float16)
+        grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
         return {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
-            "segments": one_hot_segments(torch.cat(seg, dim=1).flatten()),
-            "positions": torch.cat(pos, dim=1).flatten().to(torch.int64),
+            "key_pad": torch.zeros(flat.shape[0], dtype=torch.float16),
+            "positions": offset_major(grid, m).flatten().to(torch.int64),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -267,7 +262,7 @@ class SpyrePixtralForConditionalGeneration(
         # [patch width, D] since process_weights_after_loading.
         patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
-        mask = segment_mask(values["segments"], x.dtype)
+        mask = values["key_pad"][None, None, None, :]
         rope = self.spyre_rope_table.gather(values["positions"])
         freqs_cis = (rope[:, : self._head_dim], rope[:, self._head_dim :])
         return x, {"mask": mask, "freqs_cis": freqs_cis}

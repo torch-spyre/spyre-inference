@@ -15,17 +15,16 @@
 """The Triton gate, in fresh interpreters: vllm.triton_utils binds HAS_TRITON once."""
 
 import importlib.util
-import os
 import platform
-import subprocess
 import sys
-import textwrap
 import types
 
 import pytest
 import vllm.platforms
 
 from spyre_inference.v1.worker.spyre import triton_gate
+
+from .subproc import run_script
 
 _HAS_TRITON_CPU = triton_gate.has_triton_cpu()
 
@@ -55,16 +54,7 @@ def test_x86_has_triton_cpu() -> None:
 
 
 def _run(script: str, **env: str) -> list[str]:
-    # Without the VLLM_USE_V2_MODEL_RUNNER an earlier in-process VllmConfig pinned.
-    base = {k: v for k, v in os.environ.items() if k != "VLLM_USE_V2_MODEL_RUNNER"}
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script)],
-        capture_output=True,
-        text=True,
-        env={**base, **env},
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout.split()
+    return run_script(script, **env).split()
 
 
 def _probe(first: str, **env: str) -> list[str]:

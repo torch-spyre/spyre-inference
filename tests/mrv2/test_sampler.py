@@ -15,14 +15,11 @@
 """MRV2's upstream Sampler and grammar bitmask, unmodified, on host logits through
 triton-cpu. HAS_TRITON is fixed per process, so each check runs in a fresh V2 one."""
 
-import os
-import subprocess
-import sys
-import textwrap
-
 import pytest
 
 from spyre_inference.v1.worker.spyre import triton_gate
+
+from .subproc import run_script
 
 pytestmark = [
     pytest.mark.triton_cpu,
@@ -43,7 +40,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.worker.spyre import device_shims
 
-NUM_REQS, VOCAB = 4, 32
+NUM_REQS, VOCAB, DRAWS = 4, 32, 32
 cpu = torch.device("cpu")
 device_shims.install()
 config = VllmConfig(model_config=ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=256))
@@ -64,35 +61,52 @@ def sample(params, logits):
     return sampler(logits.clone(), batch)
 
 
+def draws(params, logits, n):
+    return [sample(params, logits).sampled_token_ids.view(-1).tolist() for _ in range(n)]
+
+
+def all_in(picks, windows):
+    return all(tok in windows[i] for pick in picks for i, tok in enumerate(pick))
+
+
 with set_current_vllm_config(config):
     # A CPU generator: torch.manual_seed also seeds Spyre, which the parent may hold.
-    logits = torch.randn(NUM_REQS, VOCAB, generator=torch.Generator().manual_seed(0))
+    base = torch.randn(NUM_REQS, VOCAB, generator=torch.Generator().manual_seed(0))
     print("RESULT has_triton", HAS_TRITON)
+    # Spyre's lm_head hands the sampler fp16 logits; fp32 is upstream's own case.
+    for name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+        logits = base.to(dtype)
+        ref = logits.float()
 
-    greedy = sample(SamplingParams(temperature=0.0), logits).sampled_token_ids.view(-1)
-    print("RESULT greedy_matches_v1", greedy.tolist() == greedy_sample(logits).view(-1).tolist())
+        greedy = sample(SamplingParams(temperature=0.0), logits).sampled_token_ids.view(-1)
+        # V1's greedy_argmax takes fp32 only.
+        v1 = greedy_sample(ref).view(-1).tolist()
+        print(f"RESULT {name}_greedy_matches_v1", greedy.tolist() == v1)
 
-    picked = sample(SamplingParams(temperature=1.0, top_k=2), logits).sampled_token_ids.view(-1)
-    top2 = logits.topk(2, dim=-1).indices
-    in_window = all(int(picked[i]) in top2[i].tolist() for i in range(NUM_REQS))
-    print("RESULT top_k_in_window", in_window)
+        # Many draws: one draw over 4 rows lands in the window by chance often enough
+        # to pass with the parameter ignored.
+        top2 = [set(row) for row in ref.topk(2, dim=-1).indices.tolist()]
+        picks = draws(SamplingParams(temperature=1.0, top_k=2), logits, DRAWS)
+        print(f"RESULT {name}_top_k_in_window", all_in(picks, top2))
 
-    kept = logits.softmax(-1).sort(dim=-1, descending=True)
-    nucleus = [set(kept.indices[i][: int((kept.values[i].cumsum(0) < 0.5).sum()) + 1].tolist())
-               for i in range(NUM_REQS)]
-    picked = sample(SamplingParams(temperature=1.0, top_p=0.5), logits).sampled_token_ids.view(-1)
-    print("RESULT top_p_in_nucleus", all(int(picked[i]) in nucleus[i] for i in range(NUM_REQS)))
+        kept = ref.softmax(-1).sort(dim=-1, descending=True)
+        nucleus = [set(kept.indices[i][: int((kept.values[i].cumsum(0) < 0.5).sum()) + 1].tolist())
+                   for i in range(NUM_REQS)]
+        picks = draws(SamplingParams(temperature=1.0, top_p=0.5), logits, DRAWS)
+        print(f"RESULT {name}_top_p_in_nucleus", all_in(picks, nucleus))
 
-    lp = sample(SamplingParams(temperature=0.0, logprobs=3), logits).logprobs_tensors
-    want = torch.log_softmax(logits, -1).topk(3, dim=-1)
-    print("RESULT logprobs_match",
-          torch.allclose(lp.logprobs[:, 1:], want.values, atol=1e-5)
-          and lp.logprob_token_ids[:, 1:].tolist() == want.indices.tolist()
-          and lp.logprob_token_ids[:, 0].tolist() == greedy.tolist())
+        lp = sample(SamplingParams(temperature=0.0, logprobs=3), logits).logprobs_tensors
+        want = torch.log_softmax(ref, -1).topk(3, dim=-1)
+        atol = 1e-2 if dtype == torch.float16 else 1e-5
+        print(f"RESULT {name}_logprobs_match",
+              torch.allclose(lp.logprobs[:, 1:].float(), want.values, atol=atol)
+              and lp.logprob_token_ids[:, 1:].tolist() == want.indices.tolist()
+              and lp.logprob_token_ids[:, 0].tolist() == greedy.tolist())
 
-    draws = [sample(SamplingParams(temperature=1.0, seed=11), logits).sampled_token_ids.view(-1)
-             .tolist() for _ in range(2)]
-    print("RESULT seeded_reproducible", draws[0] == draws[1])
+        seeded = draws(SamplingParams(temperature=1.0, seed=11), logits, 2)
+        other = draws(SamplingParams(temperature=1.0, seed=12), logits, 1)
+        print(f"RESULT {name}_seeded_reproducible", seeded[0] == seeded[1])
+        print(f"RESULT {name}_seed_changes_the_draw", seeded[0] != other[0])
 """
 
 _GRAMMAR = """
@@ -125,27 +139,24 @@ print("RESULT grammar_mask_matches", torch.equal(logits, want))
 
 
 def _run(script: str) -> dict[str, str]:
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script)],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "SPYRE_MODEL_RUNNER": "v2"},
-        timeout=600,
-    )
-    assert result.returncode == 0, result.stderr[-3000:]
-    results = [line.split(" ", 2) for line in result.stdout.splitlines()]
+    results = [
+        line.split(" ", 2) for line in run_script(script, SPYRE_MODEL_RUNNER="v2").splitlines()
+    ]
     return {r[1]: r[2] for r in results if r[0] == "RESULT"}
 
 
 def test_sampler_runs_unmodified_on_host_logits() -> None:
-    got = _run(_SAMPLER)
-    assert got == {
+    checks = (
+        "greedy_matches_v1",
+        "top_k_in_window",
+        "top_p_in_nucleus",
+        "logprobs_match",
+        "seeded_reproducible",
+        "seed_changes_the_draw",
+    )
+    assert _run(_SAMPLER) == {
         "has_triton": "True",
-        "greedy_matches_v1": "True",
-        "top_k_in_window": "True",
-        "top_p_in_nucleus": "True",
-        "logprobs_match": "True",
-        "seeded_reproducible": "True",
+        **{f"{dtype}_{check}": "True" for dtype in ("fp32", "fp16") for check in checks},
     }
 
 

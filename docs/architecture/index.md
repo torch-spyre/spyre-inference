@@ -205,7 +205,7 @@ persistent form. Down's output slices are concatenated, not summed.
 
 ## Compilation Granularity
 
-Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
+Under `CompilationMode.STOCK_TORCH_COMPILE`, `compile_for_spyre` compiles each entry of
 the model's block `ModuleList` in place via `block.compile(backend="inductor",
 fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to the
 `OptimizedModule` that `torch.compile` returns would re-parent the block under an

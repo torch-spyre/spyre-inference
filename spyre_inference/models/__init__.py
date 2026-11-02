@@ -41,9 +41,11 @@ _ADAPTED_MODULES = ("bert", "roberta")
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM builds
-    # its language model through the registry as Gemma4ForCausalLM, which resolves here,
-    # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
+    # Vision tower only: upstream builds its language model through the registry, as
+    # Gemma4ForCausalLM below.
+    "Gemma4ForConditionalGeneration": (
+        "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
+    ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",

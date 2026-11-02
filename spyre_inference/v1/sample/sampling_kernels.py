@@ -30,7 +30,7 @@ except (ImportError, AttributeError) as e:
     _HAS_SAMPLING_KERNELS = False
     init_logger(__name__).warning(
         "Failed to import the sampling kernels extension (spyre_inference._C): %s. "
-        "Falling back to PyTorch sampling, which is slower.",
+        "Ordinary sampling falls back to PyTorch; rejection sampling requires these kernels.",
         e,
     )
 

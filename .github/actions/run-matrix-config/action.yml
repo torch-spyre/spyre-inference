@@ -54,6 +54,10 @@ inputs:
   storage_root:
     description: Repo-scoped uv-cache root on the shared mount, forwarded to the uv-nfs-cache action (e.g. $STORAGE_1_DIR/.cache/uv)
     required: true
+  compile_cache_root:
+    description: Repo-scoped compile-cache root on the shared mount (e.g. $STORAGE_1_DIR/.cache/compile); empty = compile cold, no Spyre kernel cache
+    required: false
+    default: ''
   torch_spyre_ref:
     description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
     required: false
@@ -187,10 +191,28 @@ runs:
         HF_TOKEN: ${{ inputs.hf_token }}
       run: uv run .github/cache_config/manage_cache.py --public
 
-    # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
+    # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool, which raced concurrent jobs' writes (#591). A job-scoped dir keeps writes private; reuse across jobs comes only from the restore below.
     - name: Use a job-scoped torch inductor compile cache dir
       shell: bash
       run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}-${{ github.run_id }}" >> "$GITHUB_ENV"
+
+    # Seeds the job-scoped dir from earlier jobs on the same lockfiles. Off when torch-spyre or the
+    # RPMs are overridden, since the lockfiles then no longer describe the stack.
+    - name: Restore compile cache (NFS)
+      id: compile-cache
+      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        python3 -I .github/scripts/nfs_compile_cache.py restore \
+          --nfs-root "${{ inputs.compile_cache_root }}" \
+          --local-dir "$TORCHINDUCTOR_CACHE_DIR" \
+          --manifest "${RUNNER_TEMP}/compile-cache-manifest.txt" \
+          --key-file uv.lock --key-file spyre-rpms.lock \
+          --event-name "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --pr-number "$PR_NUMBER"
+        echo "SPYRE_KERNEL_CACHE=1" >> "$GITHUB_ENV"
 
     # All shard jobs of a suite must weight the partition from the SAME durations
     # file or they'd compute different partitions and drop/double-run tests, so
@@ -234,7 +256,9 @@ runs:
 
     # Marker expression and coverage wiring both live in the Makefile test_target; COVERAGE=1 drops .coverage.* data files for the fan-in.
     # Bounded so a wedged card acquisition (a blocking open() on a contended /dev/vfio device) cannot hang the job silently -- failing here keeps the step's log and lets the post steps publish JUnit.
-    # Composite action steps don't support the `timeout-minutes` step key, so the same bound is enforced with the shell `timeout` command instead.
+    # The bound lives on the caller's step (`timeout-minutes` in _test_matrix.yaml): composite
+    # action steps don't support that key, and a shell `timeout` here would bound only make,
+    # which vLLM's workers outlive by double-forking and holding the `tee` pipe open.
     - name: Run tests
       shell: bash
       env:
@@ -261,13 +285,27 @@ runs:
         # pipefail preserves test failures; without writable PID 1 stdout, use ordinary step output.
         set -o pipefail
         if [[ -w /proc/1/fd/1 ]]; then
-          timeout --signal=TERM --kill-after=1m 90m \
-            make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml 2>&1 | tee /proc/1/fd/1
+          make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml 2>&1 | tee /proc/1/fd/1
         else
-          timeout --signal=TERM --kill-after=1m 90m \
-            make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
+          make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
         fi
         echo "tests done"
+
+    # Green legs only: a failing leg may be failing because of what it compiled.
+    - name: Save compile cache delta (NFS)
+      if: ${{ steps.compile-cache.outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        python3 -I .github/scripts/nfs_compile_cache.py save \
+          --nfs-root "${{ inputs.compile_cache_root }}" \
+          --local-dir "$TORCHINDUCTOR_CACHE_DIR" \
+          --key "${{ steps.compile-cache.outputs.cache-key }}" \
+          --manifest "${RUNNER_TEMP}/compile-cache-manifest.txt" \
+          --name "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.job_slot }}" \
+          --event-name "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --pr-number "$PR_NUMBER"
 
     # Raw per-process data files; their host/pid suffixes are unique across jobs, so the fan-in's `make coverage` combines them without a per-job step. if-no-files-found=ignore covers configs that measured nothing.
     - name: Upload coverage data

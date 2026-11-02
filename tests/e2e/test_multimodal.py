@@ -37,7 +37,9 @@ GEMMA4_MODEL = "google/gemma-4-26B-A4B-it"
 # Keep in sync with .github/cache_config/hf_models_and_datasets.yaml.
 GEMMA4_REVISION = "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
 
-MAX_MODEL_LEN = 4096
+# Short, so warmup records attention and token buckets only up to it: these prompts carry
+# at most two 176x176 images (Pixtral) or one image of at most 280 tokens (Gemma 4).
+MAX_MODEL_LEN = 512
 MAX_TOKENS = 16
 
 
@@ -98,6 +100,8 @@ def _generate(
         config_format=config_format,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=len(conversations),
+        # One decoding sequence, and a prefill of the whole prompt.
+        compilation_config={"compile_sizes": [1, MAX_MODEL_LEN]},
         dtype=dtype,
         enforce_eager=enforce_eager,
         limit_mm_per_prompt={"image": images_per_prompt},
@@ -112,6 +116,7 @@ def _generate(
 @pytest.mark.multimodal
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
 def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
@@ -137,6 +142,7 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
 def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
     """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
 
@@ -177,13 +183,15 @@ def test_two_image_prompt_produces_output():
 @pytest.mark.gemma4_vision
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
 def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
     rewrite on CPU, this checks that what it rewrites to actually lowers.
 
-    Both modes, as for Pixtral above: compiled is the repo default, and the tower's
-    rewrites (permutation-matmul rope, padded SDPA, the pooling matmul) have to lower
-    inside a graph, not just run eagerly.
+    Both modes, as for Pixtral above: compiled is the repo default, where the tower's
+    rewrites (gathered position embeddings and rope, permutation-matmul rope, the
+    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs,
+    not just run eagerly.
     """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")

@@ -12,71 +12,84 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: scoped bypass of vllm.triton_utils.HAS_TRITON.
-
-vllm.triton_utils binds real triton or placeholders once, at first import, so
-the gate must act before then: register() calls it during platform resolution,
-which runs earlier in every process. A meta-path hook rewrites HAS_TRITON as
-vllm/triton_utils/importing.py executes.
-
-open() (V2) accepts triton-cpu on x86. close() (V1) hides triton from vLLM:
-triton-cpu's CPU driver would otherwise pass vLLM's own check.
+"""MRV2: set vllm.triton_utils.HAS_TRITON per runner by patching the two names
+vllm/triton_utils/importing.py reads. register() can run inside that import (it
+resolves the platform), so each patch is also applied to the half-executed module.
 """
 
 import contextlib
-import importlib.abc
-import importlib.machinery
 import importlib.util
 import platform
 import sys
-from collections.abc import Callable, Iterator
-from types import ModuleType
+from collections.abc import Callable
 from typing import Any
 
+import vllm.platforms
+
 _IMPORTING = "vllm.triton_utils.importing"
-
-_state: str | None = None
-_hooks: dict[str, Callable[[ModuleType], contextlib.AbstractContextManager[None]]] = {}
-
-
-class _HookLoader(importlib.abc.Loader):
-    def __init__(self, loader: importlib.abc.Loader, hook: Callable[..., Any]) -> None:
-        self._loader = loader
-        self._hook = hook
-
-    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
-        return self._loader.create_module(spec)
-
-    def exec_module(self, module: ModuleType) -> None:
-        # Not in find_spec, so a lookup that never executes leaves the hook pending.
-        _hooks.pop(module.__name__, None)
-        try:
-            with self._hook(module):
-                self._loader.exec_module(module)
-        finally:
-            # Not from find_spec: importlib may still be iterating sys.meta_path there.
-            if not _hooks:
-                sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, _HookFinder)]
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._loader, name)
+# Triton-free; V2 runs there on the replacement kernels kernels.py binds (#1238).
+_NO_TRITON_MACHINES = ("ppc64le", "s390x")
+_MARK = "_spyre_triton_gate"
 
 
-class _HookFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
-        hook = _hooks.get(fullname)
-        if hook is None:
-            return None
-        for finder in sys.meta_path[sys.meta_path.index(self) + 1 :]:
-            spec = finder.find_spec(fullname, path, target)
-            if spec is not None:
-                if spec.loader is not None:
-                    spec.loader = _HookLoader(spec.loader, hook)
-                return spec
-        return None
+def _patch(module: Any, name: str, wrap: Callable[[Any], Any]) -> None:
+    # Once: vLLM calls register() on every plugin probe.
+    original = getattr(module, name)
+    if hasattr(original, _MARK):
+        return
+    replacement = wrap(original)
+    setattr(replacement, _MARK, original)
+    setattr(module, name, replacement)
+    importing = sys.modules.get(_IMPORTING)
+    if importing is not None and hasattr(importing, name):
+        setattr(importing, name, replacement)
 
 
-def _has_triton_cpu() -> bool:
+def _unpatch(module: Any, name: str) -> None:
+    replacement = getattr(module, name)
+    original = getattr(replacement, _MARK, None)
+    if original is None:
+        return
+    setattr(module, name, original)
+    importing = sys.modules.get(_IMPORTING)
+    if getattr(importing, name, None) is replacement:
+        setattr(importing, name, original)
+
+
+def _from_importing() -> bool:
+    # Frame 0 is this function, 1 the wrapper, 2 the wrapper's caller.
+    return sys._getframe(2).f_globals.get("__name__") == _IMPORTING
+
+
+def open() -> None:
+    """V2: report a CPU build to importing.py only, so it takes vLLM's own
+    triton-cpu branch while the platform probes still see the real build."""
+
+    def wrap(matches: Callable[[str], bool]) -> Callable[[str], bool]:
+        def cpu_for_importing(substr: str) -> bool:
+            return (substr == "cpu" and _from_importing()) or matches(substr)
+
+        return cpu_for_importing
+
+    _patch(vllm.platforms, "vllm_version_matches_substr", wrap)
+
+
+def close() -> None:
+    """V1: hide triton from importing.py only; torch has already imported it, and
+    triton-cpu's CPU driver would otherwise pass vLLM's check."""
+
+    def wrap(find_spec: Callable[..., Any]) -> Callable[..., Any]:
+        def hidden(name: str, package: str | None = None) -> Any:
+            if name in ("triton", "pytorch-triton-xpu") and _from_importing():
+                return None
+            return find_spec(name, package)
+
+        return hidden
+
+    _patch(importlib.util, "find_spec", wrap)
+
+
+def has_triton_cpu() -> bool:
     if platform.machine() != "x86_64" or importlib.util.find_spec("triton") is None:
         return False
     try:
@@ -85,80 +98,46 @@ def _has_triton_cpu() -> bool:
         return False
 
 
-@contextlib.contextmanager
-def _accept_triton_cpu(module: ModuleType) -> Iterator[None]:
-    yield
-    module.HAS_TRITON = module.HAS_TRITON or _has_triton_cpu()
+def check(runner: str) -> None:
+    """Raise unless HAS_TRITON matches runner. On Power and Z, V2 gets past vLLM's
+    "requires Triton" check; x86 V2 without triton-cpu still fails it."""
+    from vllm.triton_utils import HAS_TRITON
+
+    # importing.py has bound HAS_TRITON, so the patches have done their job.
+    _unpatch(importlib.util, "find_spec")
+    _unpatch(vllm.platforms, "vllm_version_matches_substr")
+    want = runner == "v2" and has_triton_cpu()
+    if want != HAS_TRITON:
+        raise ValueError(
+            f"SPYRE_MODEL_RUNNER={runner} needs HAS_TRITON={want}, but vLLM resolved "
+            f"{HAS_TRITON}: set SPYRE_MODEL_RUNNER before vLLM is imported, and the same "
+            "in every process."
+        )
+    if runner == "v2" and not HAS_TRITON and platform.machine() in _NO_TRITON_MACHINES:
+        _allow_v2_without_triton()
+
+
+def _allow_v2_without_triton() -> None:
+    import vllm.config.vllm as config_module
+
+    validate = config_module.VllmConfig._validate_v2_model_runner
+    if hasattr(validate, _MARK):
+        return
+
+    def without_triton(self: Any) -> None:
+        # Upstream's own check, with its HAS_TRITON read made true.
+        with _has_triton(config_module):
+            validate(self)
+
+    setattr(without_triton, _MARK, validate)
+    config_module.VllmConfig._validate_v2_model_runner = without_triton  # ty: ignore[invalid-assignment]
 
 
 @contextlib.contextmanager
-def _hide_triton(module: ModuleType) -> Iterator[None]:
-    find_spec = importlib.util.find_spec
-
-    # Hidden from importing.py's own frame only.
-    def hidden(name: str, package: str | None = None) -> Any:
-        if (
-            name in ("triton", "pytorch-triton-xpu")
-            and sys._getframe(1).f_globals.get("__name__") == _IMPORTING
-        ):
-            return None
-        return find_spec(name, package)
-
-    importlib.util.find_spec = hidden  # ty: ignore[invalid-assignment]
+def _has_triton(module: Any) -> Any:
+    saved = module.HAS_TRITON
+    module.HAS_TRITON = True
     try:
         yield
     finally:
-        importlib.util.find_spec = find_spec
-        module.find_spec = find_spec
-
-
-def _apply(
-    state: str, hooks: dict[str, Callable[..., Any]], has_triton: Callable[[], bool]
-) -> None:
-    global _state
-    if _state == state:
-        return
-    if _state is not None:
-        raise RuntimeError(f"Triton gate is already {_state}; cannot switch it to {state}")
-    importing = sys.modules.get(_IMPORTING)
-    if importing is not None:
-        if not hasattr(importing, "HAS_TRITON"):
-            raise RuntimeError(
-                f"{_IMPORTING} is mid-import, so the Triton gate cannot be {state} in this process"
-            )
-        if has_triton() != importing.HAS_TRITON:
-            raise RuntimeError(
-                f"{_IMPORTING} was imported before the Spyre plugin loaded, so the Triton "
-                f"gate cannot be {state} in this process"
-            )
-    try:
-        for name, hook in hooks.items():
-            if name in sys.modules:
-                with hook(sys.modules[name]):
-                    pass
-            else:
-                _hooks[name] = hook
-        if _hooks and not any(isinstance(f, _HookFinder) for f in sys.meta_path):
-            sys.meta_path.insert(0, _HookFinder())
-    except BaseException:
-        _hooks.clear()
-        raise
-    _state = state
-
-
-def state() -> str | None:
-    """ "open" or "closed" once applied, else None, including when a hooked module
-    was imported without the hook running."""
-    if any(name in sys.modules for name in _hooks):
-        return None
-    return _state
-
-
-def open() -> None:
-    """Make HAS_TRITON accept triton-cpu on x86."""
-    _apply("open", {_IMPORTING: _accept_triton_cpu}, _has_triton_cpu)
-
-
-def close() -> None:
-    """Keep vLLM Triton-free for the V1 runner, whatever triton is installed."""
-    _apply("closed", {_IMPORTING: _hide_triton}, lambda: False)
+        module.HAS_TRITON = saved

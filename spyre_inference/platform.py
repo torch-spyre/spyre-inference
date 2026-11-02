@@ -38,6 +38,8 @@ from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
@@ -158,8 +160,9 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
-    # Measured throughput argmax across pooling models; they regress above it.
-    _POOLING_MAX_BATCHED_TOKENS = 2048
+    # A `--max-num-batched-tokens` the user passes (recorded by `pre_register_and_update`) wins.
+    _DEFAULT_PREFILL_BUCKET = 512
+    _user_max_num_batched_tokens: int | None = None
 
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
@@ -177,8 +180,6 @@ class TorchSpyrePlatform(CpuPlatform):
     @classmethod
     def _decoder_backend_path(cls) -> str:
         """The decoder attention backend for the requested KV cache layout."""
-        from spyre_inference import envs
-
         layout = envs.SPYRE_ATTN_KV_LAYOUT
         if layout not in cls._KV_LAYOUTS:
             raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
@@ -207,6 +208,7 @@ class TorchSpyrePlatform(CpuPlatform):
         @functools.wraps(original)
         def _spyre_patched(self, usage_context, model_config, parallel_config):
             user_supplied = self.max_num_seqs is not None
+            cls._user_max_num_batched_tokens = self.max_num_batched_tokens
             original(self, usage_context, model_config, parallel_config)
             if not user_supplied and self.max_num_seqs is not None:
                 self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
@@ -232,6 +234,28 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
         # which don't exist with VLLM_TARGET_DEVICE=empty. Override to no-op.
         pass
+
+    @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        from vllm.triton_utils.dispatcher import register_kernels
+
+        from spyre_inference.v1.spec_decode import rejection_sampler
+
+        # Use our vendored C++ kernels; CpuPlatform's wrappers require the absent vllm._C.
+        register_kernels(
+            {
+                "vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel": (
+                    rejection_sampler.greedy_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel": (
+                    rejection_sampler.random_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.expand_kernel": rejection_sampler.expand,
+                "vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel": (
+                    rejection_sampler.recover
+                ),
+            }
+        )
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -337,12 +361,30 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
-                # Largest default bucket: scheduler limit and 512 (Spyre max).
                 # Decode packs one token per running sequence; prefill lands on
-                # the single largest bucket. Denser sizes only cost warmup time.
-                max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
+                # the largest bucket. Denser sizes only cost warmup time. The budget
+                # is the user's only if it still equals what they passed: a config
+                # built without EngineArgs carries vLLM's own default.
+                budget = vllm_config.scheduler_config.max_num_batched_tokens
+                prefill = cls._DEFAULT_PREFILL_BUCKET
+                user_budget = cls._user_max_num_batched_tokens
+                max_capture_size = (
+                    budget
+                    if user_budget is not None and budget == user_budget
+                    else min(budget, prefill)
+                )
+                if max_capture_size > 2 * prefill:
+                    logger.warning(
+                        "max_num_batched_tokens=%d: prefill variants this wide can exceed "
+                        "torch-spyre's backend compile time limit at a long context "
+                        "(torch-spyre#5250).",
+                        max_capture_size,
+                    )
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
                 sizes = {max_capture_size, num_seqs}
+                # Short prefills keep a default-size bucket instead of padding up.
+                if max_capture_size > prefill:
+                    sizes.add(prefill)
                 size = 1
                 while size < num_seqs:
                     sizes.add(size)
@@ -368,15 +410,16 @@ class TorchSpyrePlatform(CpuPlatform):
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
 
-        The token budget ``R`` is the only input. Both other limits are written back
-        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
-        shape every encoder path runs on.
+        ``max_num_seqs`` is lowered to the widest short rectangle. ``compile_sizes`` is
+        one entry when the model fits in the 2048-row body, and one entry per body when
+        ``max_model_len`` is longer — a step pads to the smallest of those.
 
-        The scheduler is left alone -- the ragged path means no batch upstream can form
-        has to be refused.
+        The scheduler token cap stays the largest body, so one max-length sequence can
+        be scheduled. The ragged path still covers a batch no rectangle holds.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
+            POOLING_FAST_BODY_ROWS,
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
@@ -389,18 +432,17 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_num_seqs = scheduler_config.max_num_seqs
 
         # vLLM's verify_max_model_len runs before this hook, so the floor
-        # `encoder_budget_rows` applies is not checked for us.
-        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        # `encoder_budget_rows` applies is not checked for us. The 2048 cap is the
+        # fast body; `encoder_budget_rows` then floors back up to max_model_len when
+        # the model is longer, which is the scheduler cap.
+        scheduler_config.max_num_batched_tokens = min(prev_budget, POOLING_FAST_BODY_ROWS)
+        full_budget = encoder_budget_rows(
+            max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+        )
 
         # The shortest length carries the widest rectangle, so no batch ever needs more
         # width than the ladder offers.
-        widest = max(
-            1,
-            encoder_budget_rows(
-                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
-            )
-            // ENCODER_SEQ_ALIGNMENT,
-        )
+        widest = max(1, full_budget // ENCODER_SEQ_ALIGNMENT)
         if prev_num_seqs > widest:
             logger.warning(
                 "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
@@ -411,24 +453,24 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             scheduler_config.max_num_seqs = widest
 
-        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
-        budget = encoder_shape_tables(vllm_config).budget
-        scheduler_config.max_num_batched_tokens = budget
-
-        # One body shape: every rectangle is exactly `budget` rows and the ragged path
-        # packs into the same buffer, so the attention kernels key on sequence shapes
-        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        # Restore the scheduler cap before the tables are memoised. The worker reads
+        # the same limits, and a table built against the temporary 2048 cap would be a
+        # different cache entry from the one serving uses. That restored cap is the
+        # largest body, so the tables do not change it again.
+        scheduler_config.max_num_batched_tokens = full_budget
+        tables = encoder_shape_tables(vllm_config)
+        # A user-set list still wins, including an empty one to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
-            vllm_config.compilation_config.compile_sizes = [budget]
+            vllm_config.compilation_config.compile_sizes = list(tables.budgets)
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
-            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
-            "(L, B) %s; ragged groups (width, extent) %s.",
+            "max_num_batched_tokens=%d: bodies %s; rectangles (L, B) %s; "
+            "ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
-            budget,
-            budget,
+            tables.budget,
+            list(tables.budgets),
             encoder_rectangles(vllm_config),
             encoder_group_shapes(vllm_config) or "none reachable",
         )
@@ -475,7 +517,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        # Linear layers use SpyreFp8LinearKernel (spyre.scaled_mm).
         return True
 
     @classmethod
@@ -633,7 +675,7 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
-        # The attention KV buckets are powers of two starting at block_size; a
+        # Every KV ladder keeps the powers of two starting at block_size; a
         # non-power-of-two block size makes that ladder start off-grid, so block
         # counts stop being a clean doubling sequence.
         if aligned & (aligned - 1):
@@ -691,8 +733,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
-            # weights included.
+            # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(
@@ -748,6 +789,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
+        # Validate the ladder name now; the bucketer only reads it in the worker, after model load.
+        if not envs.SPYRE_ATTN_KV_BUCKETS:
+            from spyre_inference.v1.attention.spyre_attn_bucketer import kv_ladder
+
+            kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
         from spyre_inference.threading_config import configure_threading
@@ -755,7 +802,7 @@ class TorchSpyrePlatform(CpuPlatform):
         configure_threading(parallel_config.world_size)
 
         # ---- worker ----
-        from spyre_inference import envs, pin_model_runner
+        from spyre_inference import pin_model_runner
         from spyre_inference.v1.worker.spyre import triton_gate
 
         # Read fresh, not from the cache register() filled, so a value changed after
@@ -763,13 +810,7 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        gate = "open" if runner == "v2" else "closed"
-        if triton_gate.state() != gate:
-            raise ValueError(
-                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
-                f"{triton_gate.state() or 'not applied'}: set SPYRE_MODEL_RUNNER before "
-                "vLLM is imported, and the same in every process."
-            )
+        triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 

@@ -37,6 +37,76 @@ These appear in current parametrize IDs. They're for reading collected node IDs;
 - `swa_4` / `swa_16`, `soft_cap(50)`
 - `device_cpu` / `device_spyre`, `compilation_NONE` / `compilation_STOCK`
 
+## Reading LX residency: read the allocation, not the `lx_pinning:` log
+
+When a hypothesis is "this buffer spills to HBM", do not read the answer off the planner's
+debug log. With `SPYRE_INDUCTOR_LOG=1 SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` (note:
+`TORCH_LOGS='+spyre.inductor...'` crashes torch — it rejects the non-module name) the allocator
+prints one `lx_pinning:` line per op, and `→ lx` *reads* like "resident" while being the
+fallback for a missing dict entry. Symbols below, in
+`torch_spyre/_inductor/scratchpad/`; behaviour verified at torch-spyre
+`b9daa0c3aa7ac7624e3ff6897da5893bb1fa54f4`, the rev `pyproject.toml` pins:
+
+- `_log_lx_pinning` (`allocator.py`) prints `reasons.get(op.name, "lx")` and only runs at
+  DEBUG. Anything missing from the dict reads as `lx`.
+- Missing entries are rare, not routine. `cpsat` (the default) and `simulated_annealing` both
+  write `_SOLVER_CHOSE_SPILL` for every spilled buffer (`ilp_solver_ortools.py`,
+  `sa_cooptimizer.py`), and the base `ScratchpadAllocator._get_spill_reasons` synthesizes
+  `no room on scratchpad` for every buffer with `address is None`. The co-opt override
+  (`CoOptimizingAllocator._get_spill_reasons`) drops `None` reasons precisely because its two
+  native solvers leave none.
+- The one solver that does leave gaps is `ExhaustiveSearchSolver`: it copies a placement-only
+  solver's `spill_reasons` (`exhaustive_search.py`), and `record_exclusions`
+  (`plan_solver.py`) records only declared and capacity exclusions, so a buffer that merely
+  did not fit keeps `spill_reason = None` and prints `→ lx`. Reached only with
+  `ALLOW_EXHAUSTIVE_SEARCH=1` (for `greedy`/`bestfit`/`firstfit`, or `cpsat` without ortools);
+  without that flag `select_allocator` raises `ValueError` instead, and
+  `_cpsat_solver_class`'s fallback to greedy logs a `warn_once` rather than degrading quietly.
+- Two buffer kinds are never logged at all, on any path: graph-input clones are keyed by the
+  input name and relayout buffers by a synthetic `__spyre_lx_relayout__:` name, and neither
+  appears in `graph.operations`, which is what `_log_lx_pinning` walks. On the placement-only
+  path `_build_bound_buffers` additionally skips buffers with no lifetime, so those ops have
+  no verdict either; the co-opt builder (`_build_cd_bound_buffers`) has no such skip, so there
+  every op reaches the solver.
+
+So the log is reliable except under `ExhaustiveSearchSolver` and, on the placement-only path,
+for ops with no lifetime — but it is silent about input clones and relayouts either way. Read
+residency off the allocation instead, where `address is None` means HBM:
+
+```python
+from torch_spyre._inductor.scratchpad import allocator as alloc
+
+orig = alloc.ScratchpadAllocator._push_allocation
+
+def push(self, graph, buffers, accepted):
+    for b in buffers:
+        where = "LX " if b.address is not None else "HBM"
+        cd = getattr(b, "chosen_division", None)
+        per_core = b.per_core_size(cd) if cd is not None else b.size
+        print(f"{where} {b.name:50} addr={b.address} {per_core / 1024:.1f} KiB/core")
+    return orig(self, graph, buffers, accepted)
+
+alloc.ScratchpadAllocator._push_allocation = push
+```
+
+`b.size` means different things per path, which is why the snippet does not print it raw: a
+co-opt `CoreDivisionBuffer` is sized by its **total** device footprint, while the placement-only
+path builds `LifetimeBoundBuffer` from `size_per_core` and is already per-core. On co-opt the
+divisor is the chosen division's `output_partition * tiling.output_tile_count` (see
+`CoreDivisionBuffer.min_footprint`) — *not* the core count, since a reduction split retains a
+full output part. `per_core_size(chosen_division)` applies exactly that divisor;
+`b.core_divisions[b.chosen_division].label` prints which division was picked. Address deltas
+between two same-sized buffers confirm the figure.
+
+Take the capacity from `_lx_planning_size()` rather than from the physical LX size or the
+tracker constant: the frontend plans into `1 - DXP_LX_FRAC_AVAIL` of the tracker capacity and
+leaves the rest to the backend, so at the default `DXP_LX_FRAC_AVAIL=0.2` the solver's limit is
+four fifths of the tracker figure.
+
+This mattered concretely: it is what made an experiment aimed at giving the batched decode
+kernel LX-resident page gathers look like it had found the shipped kernel *not* resident, when
+both paths were resident all along, and the whole premise was void.
+
 ## Attention-specific hypotheses to add to the queue
 
 When the failing surface is attention, in addition to the generic starter set, also consider:

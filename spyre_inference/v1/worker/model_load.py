@@ -79,6 +79,10 @@ def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     for module in model.modules():
         if isinstance(module, SpyreConv2d):
             module.process_weights_after_loading()
+        elif getattr(module, "spyre_moe_biases", None) is not None:
+            # On Spyre the move replaces w13_bias/w2_bias, so rebuild the config that holds them.
+            module.quant_method.moe_quant_config = None
+            module._ensure_moe_quant_config_init()
 
 
 def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) -> bool:

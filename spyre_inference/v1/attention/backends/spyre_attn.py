@@ -826,11 +826,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         attention_mask_stacks[s] = tiles_by_block[row][: padded_num_blocks[s]]
                     continue
                 for row, s in enumerate(group):
+                    # contiguous() preserves singleton strides, which can differ between
+                    # warmup and mixed batches and trigger a compile while serving.
                     attention_mask_stacks[s] = (
                         mask_cpu[row]
                         .reshape(aligned_query_len, -1, block_size)
                         .transpose(0, 1)[: padded_num_blocks[s]]
-                        .contiguous()
+                        .clone(memory_format=torch.contiguous_format)
                     )
             # active_block_indices stays None, so forward iterates all blocks.
         else:

@@ -153,6 +153,36 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
     return [v for v in bucketer.variants() if v.num_blocks <= pages]
 
 
+@pytest.mark.parametrize("query_bucket", [16, 64])
+def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
+    from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
+
+    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
+    envs.clear_env_cache()
+    cfg = get_current_vllm_config()
+    monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 128)
+    builder._attn_bucketer = SpyreAttnBucketer(cfg)
+    recorded = builder.build_for_variant(SpyreAttnBucket(1, query_bucket))
+    query_len = recorded.max_query_len
+    mixed = _padded_mask_metadata(
+        [(query_len, BLOCK_SIZE), (query_len, 3 * BLOCK_SIZE + 1)],
+        block_size=BLOCK_SIZE,
+        num_query_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        max_num_blocks=4,
+    )
+    assert mixed.aligned_query_lens == [query_bucket, query_bucket]
+    assert mixed.padded_num_blocks == [1, 4]
+    torch.testing.assert_close(
+        mixed.attention_mask_stacks[0],
+        recorded.attention_mask_stacks[0],
+        rtol=0,
+        atol=0,
+        check_stride=True,
+    )
+
+
 @pytest.mark.parametrize(
     "layout,backend,kernel",
     [

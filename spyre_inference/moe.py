@@ -59,6 +59,7 @@ if TYPE_CHECKING:
         spyre_moe_gate_alias: torch.Tensor
         spyre_moe_up_alias: torch.Tensor
         spyre_moe_down_alias: torch.Tensor
+        spyre_moe_biases: _ExpertBiases | None
         spyre_moe_chunk_scale: torch.Tensor
         spyre_moe_chunk_offsets: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
@@ -129,6 +130,20 @@ class SpyreMoERecipe:
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
+@dataclass(frozen=True)
+class _ExpertBiases:
+    """Per-expert bias stacks, ``[E, 1, F]`` so each tiles and gathers like its weight pool.
+
+    ``down_chunks`` is ``down`` split along the hidden axis into the gathered form's
+    ``[E*chunks, 1, hidden/chunks]`` entries; the persistent forms read ``down`` whole.
+    """
+
+    gate: torch.Tensor
+    up: torch.Tensor
+    down: torch.Tensor
+    down_chunks: torch.Tensor
+
+
 def _validate_recipe(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> None:
     if recipe.routing == "full_softmax" and layer.custom_routing_function is None:
         raise NotImplementedError(
@@ -159,8 +174,6 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
         raise NotImplementedError("Spyre MoE backend does not support quantized experts.")
     if moe.is_lora_enabled:
         raise NotImplementedError("Spyre MoE backend does not support LoRA experts.")
-    if moe.has_bias:
-        raise NotImplementedError("Spyre MoE backend does not support expert biases.")
     parallel = moe.moe_parallel_config
     # TP only narrows each expert's ``M``, and MoERunner all-reduces the partial sums.
     # The other axes would split the expert stacks the regions hold whole.
@@ -185,6 +198,14 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
         raise NotImplementedError("Spyre MoE backend requires normalized top-k routing weights.")
     if layer.apply_router_weight_on_input:
         raise NotImplementedError("Spyre MoE backend does not support input-weighted routing.")
+    # prepare_down_weight scales the down stack (Gemma folds per_expert_scale there) and
+    # does not see w2_bias, so a biased expert would add an unscaled d_e.
+    if moe.has_bias and recipe.prepare_down_weight is not None:
+        raise NotImplementedError(
+            "Spyre MoE backend does not support expert biases together with "
+            "prepare_down_weight; that transform scales the down stack and would "
+            "leave w2_bias unscaled."
+        )
     if layer.activation.value != recipe.activation:
         raise NotImplementedError(
             f"Spyre MoE recipe requires activation={recipe.activation!r}, "
@@ -261,6 +282,7 @@ def _moe_gathered(
     *,
     chunk_scale: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    biases: _ExpertBiases | None = None,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
     if hidden % chunks:
@@ -310,10 +332,18 @@ def _moe_gathered(
     if chunks > 1:
         gate_out = gate_out.reshape(rows, chunks, 1, inter).sum(dim=1)
         up_out = up_out.reshape(rows, chunks, 1, inter).sum(dim=1)
+    if biases is not None:
+        # Gathered per expert, read off the same fp32 lanes as the entry index; a gate/up bias
+        # is the expert's whole row, the down bias its chunk of the hidden axis.
+        expert_index = expert_fp32.amax(-1).to(torch.int32)
+        gate_out = gate_out + biases.gate[expert_index]
+        up_out = up_out + biases.up[expert_index]
     activated = _activation(gate_out, up_out, activation)
     act_rep = activated[:, None].expand(rows, chunks, 1, inter).reshape(rows * chunks, 1, inter)
     # Output chunk c of every row is the c-th hidden slice, so the parts reshape in place.
     parts = torch.bmm(act_rep, down[slice_index].reshape(rows * chunks, inter, slice_rows))
+    if biases is not None:
+        parts = parts + biases.down_chunks[slice_index]
     expert_out = parts.reshape(tokens, top_k, hidden)
     return (expert_out * weights[..., None]).sum(dim=1)
 
@@ -375,6 +405,7 @@ def _moe_persistent(
     up: torch.Tensor,
     down: torch.Tensor,
     activation: str,
+    biases: _ExpertBiases | None = None,
 ) -> torch.Tensor:
     # Process routed experts over token tiles using the persistent weight pools.
     from torch_spyre._inductor.propagate_hints import spyre_hint
@@ -383,19 +414,42 @@ def _moe_persistent(
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = route.permute(1, 0, 2).contiguous().clone()
 
+    operands, dims = _expert_loop_operands(x, route, gate, up, down, biases)
+
     def expert_body(acc, tiles):
-        x, route_tile, gate_tile, up_tile, down_tile = tiles
-        activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
-        return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
+        x, route_tile, gate_tile, up_tile, down_tile, *bias = tiles
+        expert_out = _expert_tile(x, gate_tile, up_tile, down_tile, bias, activation)
+        return acc + (expert_out * route_tile).squeeze(0), None
 
     result, _ = for_each_tile(
         expert_body,
-        (x, route, gate, up, down),
-        dims=(None, 0, 0, 0, 0),
+        operands,
+        dims=dims,
         tile_size=1,
         init=torch.zeros_like(x),
     )
     return result
+
+
+def _expert_loop_operands(x, route, gate, up, down, biases):
+    """The persistent loops' operands: the bias stacks tile on the expert axis with the pools."""
+    operands: tuple[torch.Tensor, ...] = (x, route, gate, up, down)
+    dims: tuple[int | None, ...] = (None, 0, 0, 0, 0)
+    if biases is not None:
+        operands += (biases.gate, biases.up, biases.down)
+        dims += (0, 0, 0)
+    return operands, dims
+
+
+def _expert_tile(x, gate_tile, up_tile, down_tile, bias, activation):
+    """One expert's output for every token; ``bias`` is the tiled gate/up/down biases or empty."""
+    gate_out = torch.matmul(x, gate_tile)
+    up_out = torch.matmul(x, up_tile)
+    if bias:
+        gate_out = gate_out + bias[0]
+        up_out = up_out + bias[1]
+    out = torch.matmul(_activation(gate_out, up_out, activation), down_tile)
+    return out + bias[2] if bias else out
 
 
 def _moe_persistent_in_graph(
@@ -405,6 +459,7 @@ def _moe_persistent_in_graph(
     up: torch.Tensor,
     down: torch.Tensor,
     activation: str,
+    biases: _ExpertBiases | None = None,
 ) -> torch.Tensor:
     """``_moe_persistent`` inside a block graph, where nothing names x's token axis."""
     from torch_spyre._inductor.propagate_hints import spyre_hint
@@ -413,10 +468,12 @@ def _moe_persistent_in_graph(
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = route.permute(1, 0, 2).contiguous().clone()
 
+    operands, dims = _expert_loop_operands(x, route, gate, up, down, biases)
+
     def expert_body(acc, tiles):
-        x, route_tile, gate_tile, up_tile, down_tile = tiles
-        activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
-        return acc + torch.matmul(activated, down_tile) * route_tile, None
+        x, route_tile, gate_tile, up_tile, down_tile, *bias = tiles
+        expert_out = _expert_tile(x, gate_tile, up_tile, down_tile, bias, activation)
+        return acc + expert_out * route_tile, None
 
     # Loop-body ops only receive this scope's hints, so T is named here; every body op stays
     # at [1, T, C] (C is M or H) so one name list fits them all.
@@ -424,8 +481,8 @@ def _moe_persistent_in_graph(
     with spyre_hint(named_dims=["ONE", "T", "C"]):
         result, _ = for_each_tile(
             expert_body,
-            (x, route, gate, up, down),
-            dims=(None, 0, 0, 0, 0),
+            operands,
+            dims=dims,
             tile_size=1,
             init=init,
         )
@@ -454,6 +511,7 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         recipe.activation,
         chunk_scale=layer.spyre_moe_chunk_scale,
         chunk_offsets=layer.spyre_moe_chunk_offsets,
+        biases=layer.spyre_moe_biases,
     )
 
 
@@ -478,11 +536,19 @@ def _rows_are_stick_addressable(x: torch.Tensor, router_logits: torch.Tensor, st
 
 
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Materialize canonical vLLM top-k weights in dense expert order."""
-    topk_weights, topk_ids = _routing_weights(
-        router_logits, top_k, "topk_softmax", router_logits.dtype
+    """Materialize canonical vLLM top-k weights in dense expert order.
+
+    A softmax over the row with the unselected experts at -inf is the softmax over the
+    selected logits. Unlike scattering those weights back, it lowers on Spyre.
+    """
+    _, selected = _topk(router_logits, top_k)
+    masked = torch.ops.spyre.keep_by_index(
+        router_logits,  # ty: ignore[invalid-argument-type]
+        selected,  # ty: ignore[invalid-argument-type]
+        -1,  # ty: ignore[invalid-argument-type]
+        float("-inf"),  # ty: ignore[invalid-argument-type]
     )
-    return torch.zeros_like(router_logits).scatter(-1, topk_ids, topk_weights)
+    return torch.softmax(masked, dim=-1)
 
 
 def _route(layer: RoutedExperts, probs: torch.Tensor) -> torch.Tensor:
@@ -508,6 +574,7 @@ def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torc
         layer.spyre_moe_up,
         layer.spyre_moe_down,
         layer.spyre_moe_recipe.activation,
+        layer.spyre_moe_biases,
     )
 
 
@@ -637,6 +704,35 @@ def _down_chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     return _C.reinterpret_tensor_with_layout(pool, size, stride, 0, layout)
 
 
+def _prepare_biases(
+    layer: RoutedExperts, inter: int, pad: int, chunks: int
+) -> _ExpertBiases | None:
+    """Relayout ``w13_bias`` / ``w2_bias`` next to the pools.
+
+    ``_prepare_layer`` has already checked both shapes against the weights. The host
+    parameters stay. They are tiny next to the weight stacks, and upstream's
+    ``get_fused_moe_quant_config`` still reads them. The kernels read ``spyre_moe_biases``.
+    """
+    # vLLM registers both exactly when ``moe_config.has_bias``.
+    if not hasattr(layer, "w13_bias"):
+        return None
+    w13_bias = layer.get_parameter("w13_bias").data
+    w2_bias = layer.get_parameter("w2_bias").data
+    experts, hidden = w2_bias.shape
+    # Every rank adds this full down bias before MoERunner's all-reduce, as upstream's
+    # kernels do. The model loader must zero ``w2_bias`` off rank 0. gpt-oss's loader
+    # does; vLLM's generic RoutedExperts weight loader copies it onto every rank.
+    biases = _ExpertBiases(
+        gate=_to_spyre_expert_weight(w13_bias[:, :inter].unsqueeze(1), (0, pad)),
+        up=_to_spyre_expert_weight(w13_bias[:, inter:].unsqueeze(1), (0, pad)),
+        down=_to_spyre_expert_weight(w2_bias.unsqueeze(1), ()),
+        down_chunks=_to_spyre_expert_weight(
+            w2_bias.reshape(experts * chunks, 1, hidden // chunks), ()
+        ),
+    )
+    return biases
+
+
 def _prepare_layer(layer: RoutedExperts) -> None:
     from torch_spyre._C import get_elem_in_stick
 
@@ -654,6 +750,17 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         raise ValueError(
             f"unexpected MoE expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
         )
+    # A bias with the wrong expert count matches its sibling and
+    # would otherwise gather out of range.
+    if hasattr(layer, "w13_bias"):
+        w13_bias_shape = tuple(layer.get_parameter("w13_bias").shape)
+        w2_bias_shape = tuple(layer.get_parameter("w2_bias").shape)
+        if w13_bias_shape != (experts, 2 * inter) or w2_bias_shape != (experts, hidden):
+            raise ValueError(
+                f"unexpected MoE expert bias shapes: w13_bias={w13_bias_shape} "
+                f"w2_bias={w2_bias_shape}, expected {(experts, 2 * inter)} and "
+                f"{(experts, hidden)}"
+            )
 
     from torch_spyre._inductor import config as spyre_config
 
@@ -663,7 +770,8 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         hidden, layer.top_k, stick, spyre_config.sencores, envs.SPYRE_MOE_CHUNKS
     )
     # TP can leave intermediate shards mid-stick; zero-padding is inert because those
-    # activation lanes multiply zero rows in the down stack.
+    # activation lanes multiply zero rows in the down stack. A gate/up bias pads with zeros
+    # too, and its padded activation lanes still meet those zero rows.
     pad = -inter % stick
     # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
@@ -689,6 +797,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         spyre_config.sencores,
     )
     del layer.w2_weight, w2
+    layer.spyre_moe_biases = _prepare_biases(layer, inter, pad, chunks)
 
     dtype = layer.spyre_moe_gate.dtype
     layer.spyre_moe_stick = stick
@@ -785,6 +894,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer.spyre_moe_up,
                 layer.spyre_moe_down,
                 recipe.activation,
+                layer.spyre_moe_biases,
             )
         moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.

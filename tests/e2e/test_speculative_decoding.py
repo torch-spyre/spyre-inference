@@ -22,7 +22,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from huggingface_hub import snapshot_download
 from spyre_testing_plugin.pytest_plugin import spyre_hardware_present
 from vllm import LLM, SamplingParams
 
@@ -34,22 +33,6 @@ DRAFT = "UIUC-SSAIL/Qwen3-8B-XPress-b16"
 DRAFT_REVISION = "f098ab5bbe4fce37c4a1093266bcd8ad15df5cb5"
 TARGET_CACHE_NAMES = {f"model.layers.{i}.self_attn.attn" for i in range(36)}
 DRAFT_CACHE_NAMES = {f"model.layers.{i}.self_attn.attn" for i in range(36, 41)}
-
-
-def _cached_model(model, revision):
-    try:
-        path = Path(
-            snapshot_download(
-                model,
-                revision=revision,
-                local_files_only=True,
-                allow_patterns=["config.json", "*.safetensors"],
-            )
-        )
-    except FileNotFoundError:
-        pytest.skip(f"Cache {model}@{revision} before running this hardware test")
-    if not list(path.glob("*.safetensors")):
-        pytest.skip(f"Missing safetensors weights in {path}")
 
 
 def _compare_cache(actual, expected, *, prompt_length=0, exact=False):
@@ -115,8 +98,6 @@ def _check_acceptance_metrics(before, after, steps):
 def xpress_engine(monkeypatch):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
-    _cached_model(TARGET, TARGET_REVISION)
-    _cached_model(DRAFT, DRAFT_REVISION)
     monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64")
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")

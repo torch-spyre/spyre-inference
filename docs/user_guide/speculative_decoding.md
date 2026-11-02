@@ -28,9 +28,10 @@ Requests can use greedy (`temperature=0`) or stochastic target sampling,
 including temperature, top-k and top-p. The drafter remains greedy;
 vLLM treats its proposals as point-mass distributions during CPU rejection
 sampling. The same speculative configuration works with `vllm.LLM`.
-The end-to-end test pins the same model and checkpoint revisions as this example;
-update both together. A full verification round needs at least 31 budgeted tokens because
-vLLM reserves additional drafting slots; the adapter rejects a smaller budget.
+The end-to-end test and CI's public-model cache list pin the same model and
+checkpoint revisions as this example; update all three together. A full
+verification round needs at least 31 budgeted tokens because vLLM reserves
+additional drafting slots; the adapter rejects a smaller budget.
 
 ## Refinement and compatibility
 
@@ -52,12 +53,12 @@ the same seed need not produce identical tokens across these modes.
 The pinned vLLM 0.32 lacks native XPress registration, so this adapter uses its V1
 DFlash classes with a configuration bridge. The merged GPU speculator uses V2.
 Initial selection and per-pass argmax run on CPU; readout and refinement run on
-Spyre. Jagged attention and compiler extensions are optional follow-up work.
+Spyre. Batched XPress and device candidate selection are follow-up work.
 
-Spyre's V2 runner is still a scaffold: model loading, KV-cache setup, compilation
-and warmup are unimplemented. After that runner is operational, XPress needs its
-auxiliary-state, draft-context and CPU-sampling hooks ported to V2's speculator
-interface. See [the V2 migration issue](https://github.com/torch-spyre/spyre-inference/issues/906).
+Spyre's V2 runner still lacks model loading, compilation and warmup. After that
+runner is operational, XPress needs its auxiliary-state, draft-context and
+CPU-sampling hooks ported to V2's speculator interface. See
+[the V2 migration issue](https://github.com/torch-spyre/spyre-inference/issues/906).
 
 ## Validation
 
@@ -66,6 +67,9 @@ uv run --no-sync pytest tests/spec_decode -m 'not upstream'
 SPYRE_XPRESS_TEST_TOPC=128 uv run --no-sync pytest \
   tests/e2e/test_speculative_decoding.py -m model_quality -s
 ```
+
+PR regression jobs prefetch both pinned models before running the quality gate.
+On Spyre, missing checkpoints fail the tests instead of skipping coverage.
 
 CPU recurrence, sampling and lifecycle tests pass. At C128, device validation
 passes seven reference cases and 63 strict greedy token comparisons across

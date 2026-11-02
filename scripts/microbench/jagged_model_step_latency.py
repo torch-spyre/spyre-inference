@@ -356,7 +356,7 @@ def main():
         "--scenarios",
         nargs="+",
         choices=SCENARIOS,
-        default=["decode1", "decode4", "mixed512", "jagged69"],
+        default=["decode1", "decode4", "ragged_prefill", "multi_token", "mixed512", "jagged69"],
     )
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--max-num-seqs", type=int, default=4)

@@ -30,11 +30,16 @@ sample order. `L` denotes the maximum total sequence length, including new token
 | `decode1` | `[1]` | `[L]` |
 | `decode4` | `[1,1,1,1]` | `[L, 7L/8-13, 3L/4+7, 5L/8+17]` |
 | `prefill512` | `[512]` | `[L]` |
+| `ragged_prefill` | `[9,65,33]` | `[L, 3L/4+17, L/2+33]` |
+| `multi_token` | `[2,3,8]` | `[L, 3L/4+17, L/2+33]` |
 | `mixed512` | `[1,511]` | `[L, 3L/4+17]` |
 | `jagged69` | `[1,65,3]` | `[L, 3L/4+17, L/2+33]` |
 
 `--jagged-schedule serving` is the default. It uses the integrated mixed-width
-schedule, 64 parallel decode entries and shared output staging. Compare matching
+schedule for prefill/mixed/multi-token queries, 64 parallel short-query entries
+and shared output staging. Pure `decode1`/`decode4` scenarios use the existing
+grouped/batched decode path in both legs; they are regression controls for the
+experimental flag, not measurements of a new decode kernel. Compare matching
 output-buffer modes: `--output-buffer model` uses model-sized outputs for pure
 decode, while the default uses paired staging. Pre-staged prefill/mixed calls
 require paired staging and cannot use a separate model-sized output.
@@ -170,9 +175,10 @@ bucket lattice is not a second knob: `derive_lattice` builds it from the shape l
 so that every declared length is its own bucket and the real
 `SpyreAttentionMetadataBuilder`'s round-up is the identity. `max_model_len` and
 `max_num_seqs` are the tops of those ladders, so they are derived too.
-`max_num_batched_tokens` is pinned to the platform's 512 cap instead: `staging_rows`
-is it plus one, and those buffers are the kernel's query and output arguments, so
-deriving it from a decode-only shape list would narrow the gather the kernel runs.
+`max_num_batched_tokens` comes from `--max-num-batched-tokens` instead (default 512,
+the platform's default prefill bucket): `staging_rows` is it plus one, and those
+buffers are the kernel's query and output arguments, so deriving it from a
+decode-only shape list would narrow the gather the kernel runs.
 A config that sets any of the three, or the old `attn_*_buckets` keys, is rejected.
 
 Padding has not gone away — it is now something you ask for. The kernel specialises
@@ -194,12 +200,13 @@ which it has to be, since `spyre_inference.envs` caches on first read.
 
 ### Prefill is always chunked
 
-`apply_config_platform_defaults` caps `max_num_batched_tokens` at
-`min(max_num_batched_tokens, 512)` for compiled decoder models (the largest default
-`compile_sizes` bucket), so a query longer than
-that is unschedulable at **any** `max_model_len`: production chunks its prefills.
-A prefill capture is therefore `query_len <= 512` against a growing `seq_len`, not
-`query_len == seq_len`. The cap is checked against the declared batch, since the
+Unless the user passes `--max-num-batched-tokens`, `apply_config_platform_defaults`
+caps it at 512 for compiled decoder models (the largest default `compile_sizes`
+bucket), so a longer query is unschedulable at **any** `max_model_len`: production
+chunks its prefills. A prefill capture is therefore `query_len <= 512` against a
+growing `seq_len`, not `query_len == seq_len`; to measure a deployment that passes a
+larger budget, give the microbench the same `--max-num-batched-tokens`. The budget is
+checked against the declared batch, since the
 derived limits come from the shapes and so can never rule one out; a batch over it
 is reported as a row with `error` set rather than an assertion mid-sweep.
 

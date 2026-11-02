@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre adaptations for vLLM's Gemma-4 model."""
+"""Gemma 4's text decoder (``SpyreGemma4ForCausalLM``, MoE layers) and its startup hooks.
+
+The hooks (``force_text_backbone``, ``repair_head_dim_access``) run for every model, so this
+module must not import the vision model; that lives in ``gemma4_mm.py``.
+"""
 
 from __future__ import annotations
 

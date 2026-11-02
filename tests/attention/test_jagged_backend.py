@@ -63,7 +63,8 @@ def backend_config(monkeypatch):
             mode=CompilationMode.STOCK_TORCH_COMPILE, static_forward_context={}
         ),
     )
-    monkeypatch.setattr(envs, "SPYRE_JAGGED_ATTENTION", True)
+    monkeypatch.setenv("SPYRE_JAGGED_ATTENTION", "1")
+    envs.clear_env_cache()
     monkeypatch.setattr(spyre_attn, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(spyre_head_major_attn, "get_current_vllm_config", lambda: config)
     return config
@@ -72,8 +73,9 @@ def backend_config(monkeypatch):
 @pytest.mark.parametrize("device_type", ["cpu", "spyre"])
 @pytest.mark.parametrize("head_major", [False, True])
 @pytest.mark.parametrize("pre_staged", [False, True])
+@pytest.mark.parametrize("batch", ["mixed", "prefill", "multi_token"])
 def test_jagged_builder_and_packed_dispatch(
-    monkeypatch, backend_config, head_major, pre_staged, device_type
+    monkeypatch, backend_config, head_major, pre_staged, device_type, batch
 ):
     from torch_spyre.ops.fallbacks import FallbackWarning
 
@@ -122,6 +124,9 @@ def test_jagged_builder_and_packed_dispatch(
     ):
         warnings.simplefilter("error", FallbackWarning)
         for q, k, v, starts, lengths, pages in jagged_cases(torch.float16):
+            if batch != "mixed":
+                q_lens = [9, 65, 33] if batch == "prefill" else [2, 3, 8]
+                starts = torch.tensor([0, *q_lens], dtype=torch.int32).cumsum(0).int()
             tokens = int(starts[-1])
             slots = torch.arange(tokens, dtype=torch.int64)
             metadata = builder.build(
@@ -162,11 +167,17 @@ def test_jagged_builder_and_packed_dispatch(
             tables = metadata.jagged_tables_device
             impl.forward(None, query, None, None, cache, metadata, output)
             assert metadata.jagged_tables_device is tables
-            assert all(kernel.call_args.kwargs["head_major"] == head_major for kernel in kernels)
-    assert all(kernel.call_count == 4 for kernel in kernels)
+            assert all(
+                kernel.call_args.kwargs["head_major"] == head_major
+                for kernel in kernels
+                if kernel.called
+            )
+    expected_calls = {"mixed": (4, 4), "prefill": (0, 8), "multi_token": (4, 0)}
+    assert tuple(kernel.call_count for kernel in kernels) == expected_calls[batch]
 
 
-def test_jagged_warmup_covers_scheduled_group_shapes(monkeypatch, backend_config):
+@pytest.mark.parametrize("head_major", [False, True])
+def test_jagged_warmup_covers_scheduled_group_shapes(monkeypatch, backend_config, head_major):
     config = backend_config
     builder = spyre_attn.SpyreAttentionMetadataBuilder(
         AttentionSpec(block_size=64, num_kv_heads=2, head_size=64, dtype=torch.float16),
@@ -174,7 +185,12 @@ def test_jagged_warmup_covers_scheduled_group_shapes(monkeypatch, backend_config
         config,
         torch.device("cpu"),
     )
-    impl = spyre_attn.SpyreAttentionImpl(num_heads=4, num_kv_heads=2, head_size=64, scale=64**-0.5)
+    impl_cls = (
+        spyre_head_major_attn.SpyreHeadMajorAttentionImpl
+        if head_major
+        else spyre_attn.SpyreAttentionImpl
+    )
+    impl = impl_cls(num_heads=4, num_kv_heads=2, head_size=64, scale=64**-0.5)
     recorded = set()
 
     def record(query, k, v, *args, **kwargs):
@@ -183,10 +199,21 @@ def test_jagged_warmup_covers_scheduled_group_shapes(monkeypatch, backend_config
 
     monkeypatch.setattr(spyre_attn, "_jagged_decode_compiled", record)
     monkeypatch.setattr(spyre_attn, "_jagged_tile_compiled", record)
+    record_decode = Mock(return_value=3)
+    monkeypatch.setattr(impl, "_record_all", record_decode)
+    record_batch = Mock(side_effect=lambda variants, *args: len(variants))
+    monkeypatch.setattr(impl, "_record_batched_all", record_batch)
     cache = spyre_attn.SpyrePagedKVCache(torch.zeros(65, 64, 2, 64), torch.zeros(65, 64, 2, 64))
     with torch.inference_mode():
         count = impl.record_graphs(None, cache, builder)
-        assert count == len(recorded) == len(jagged_plan_variants(192, 8, 384, 64, 193))
+        batch_variants = record_batch.call_args.args[0]
+        assert bool(batch_variants) == head_major
+        assert count == len(recorded) + 3 + len(batch_variants)
+        _, staging_out = impl.staging_buffers(torch.device("cpu"))
+        assert impl._group_staging.shape == staging_out.shape
+        assert len(recorded) == len(jagged_plan_variants(192, 8, 384, 64, 193))
+        assert record_decode.call_args.args[0]
+        assert all(v.padded_query_len == 1 for v in record_decode.call_args.args[0])
         generator = torch.Generator().manual_seed(72)
         for _ in range(80):
             requests = int(torch.randint(1, 9, (), generator=generator))
@@ -209,8 +236,11 @@ def test_jagged_warmup_covers_scheduled_group_shapes(monkeypatch, backend_config
                     slot_mapping=torch.zeros(int(starts[-1]), dtype=torch.int64),
                 ),
             )
-            for group in metadata.jagged_plan.groups:
-                assert tuple(tuple(t.shape) for t in group.tensors) in recorded
+            if int(q_lens.max()) == 1:
+                assert metadata.jagged_plan is None
+            else:
+                for group in metadata.jagged_plan.groups:
+                    assert tuple(tuple(t.shape) for t in group.tensors) in recorded
 
 
 @pytest.mark.parametrize("device_type", ["cpu", "spyre"])

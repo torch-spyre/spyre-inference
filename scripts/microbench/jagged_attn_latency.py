@@ -32,7 +32,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-SCENARIOS = ("decode1", "decode4", "prefill512", "mixed512", "jagged69", "spread4")
+SCENARIOS = (
+    "decode1",
+    "decode4",
+    "prefill512",
+    "ragged_prefill",
+    "multi_token",
+    "mixed512",
+    "jagged69",
+    "spread4",
+)
 
 
 def request_lengths(scenario, context):
@@ -47,6 +56,10 @@ def request_lengths(scenario, context):
         ]
     if scenario == "prefill512":
         return [512], [context]
+    if scenario == "ragged_prefill":
+        return [9, 65, 33], [context, 3 * context // 4 + 17, context // 2 + 33]
+    if scenario == "multi_token":
+        return [2, 3, 8], [context, 3 * context // 4 + 17, context // 2 + 33]
     if scenario == "mixed512":
         return [1, 511], [context, 3 * context // 4 + 17]
     if scenario == "jagged69":
@@ -399,6 +412,8 @@ def main():
                 return plan_builder(
                     *inputs, **kwargs, max_parallel_entries=args.jagged_parallel_entries
                 )
+            if args.jagged_schedule not in ("serving", "mixed"):
+                kwargs.pop("page_buckets", None)
             if args.jagged_schedule == "flat":
                 kwargs.pop("workspace", None)
             width = args.jagged_query_tile_size
@@ -620,10 +635,25 @@ def main():
                     }
                     report["rows"].append(row)
                     before = time.perf_counter()
-                    with patch.object(envs, "SPYRE_JAGGED_ATTENTION", name == "jagged"):
+                    with patch.object(
+                        envs,
+                        "SPYRE_JAGGED_ATTENTION",
+                        name == "jagged" and args.jagged_schedule == "serving",
+                    ):
                         metadata = builder.build(0, common)
+                    if name == "jagged" and args.jagged_schedule != "serving":
+                        metadata.jagged_plan = build_plan(
+                            starts,
+                            lengths,
+                            common.block_table_tensor,
+                            args.block_size,
+                            query_capacity=impl.staging_rows,
+                        )
                     row["metadata_build_ms"] = (time.perf_counter() - before) * 1000
-                    if name == "jagged" and args.jagged_schedule in ("mixed", "serving"):
+                    if metadata.jagged_plan is not None and args.jagged_schedule in (
+                        "mixed",
+                        "serving",
+                    ):
                         plan = metadata.jagged_plan
                         group_details = []
                         for group in plan.groups:
@@ -654,7 +684,7 @@ def main():
                             work_items=sum(group.num_work_items for group in plan.groups),
                             work_capacity=sum(group["work_capacity"] for group in group_details),
                         )
-                    elif name == "jagged":
+                    elif metadata.jagged_plan is not None:
                         plan = metadata.jagged_plan
                         row["dispatch"] = {
                             "flat": "jagged_page_attn_kernel",
@@ -702,11 +732,15 @@ def main():
                             row["page_capacity"] = plan.page_indices.shape[1]
                             row["work_capacity"] *= row["page_capacity"]
                     else:
-                        batched = impl._batched_decode_preconditions_met(metadata, num_pages)
+                        grouped = impl._grouped_decode_preconditions_met(metadata, num_pages)
+                        batched = grouped or impl._batched_decode_preconditions_met(
+                            metadata, num_pages
+                        )
                         remaining_queries = metadata.aligned_query_lens[
                             metadata.num_decode_seqs if batched else 0 :
                         ]
-                        dispatch = ["batched_decode_head_major_kernel"] if batched else []
+                        decode_calls = len(metadata.decode_groups) if grouped else int(batched)
+                        dispatch = ["batched_decode_head_major_kernel"] * decode_calls
                         dispatch.extend(
                             "page_attn_head_major_prefill_kernel"
                             if ql > 1

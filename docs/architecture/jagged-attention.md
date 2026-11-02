@@ -1,14 +1,33 @@
 # Jagged paged attention
 
-`SPYRE_JAGGED_ATTENTION=1` enables experimental decoder attention over packed
-queries and paged KV. It is off by default. The target is 128K tokens per sequence
-with 128-token pages. Set `SPYRE_BACKEND_LOOP_UNROLL=0` to preserve counted device loops.
+`SPYRE_JAGGED_ATTENTION=1` enables experimental packed prefill, mixed
+prefill/decode batches, and multi-token queries over paged KV. It is off by default.
+Set `SPYRE_BACKEND_LOOP_UNROLL=0` to preserve counted device loops.
 
-The [companion torch-spyre PR](https://github.com/torch-spyre/torch-spyre/pull/5157)
-provides the remaining scatter/carry lowering. Its branch includes the merged
-pytree output support, consecutive host correction steps, loop-unroll control,
-and one-sided clamps that preserve DL16's range. ALiBi is unsupported.
-Pooling and encoder attention use their existing paths.
+[PR #1429](https://github.com/torch-spyre/spyre-inference/pull/1429) already groups
+single-token decode requests by context bucket using the existing batched kernel.
+That path remains controlled by `SPYRE_JAGGED_DECODE` (on by default).
+This extension covers the query-length cases beyond that decode prefix:
+
+| Scheduled batch | Path with `SPYRE_JAGGED_ATTENTION=1` |
+| --- | --- |
+| All queries have one token | Existing grouped/batched decode, with its existing fallbacks |
+| Variable-length prefill, including chunked prefill | Packed query tiles |
+| Mixed prefill and single-token decode | Packed query-width groups sharing output staging |
+| Multiple new tokens per request | Packed short-query groups or prefill tiles |
+| Encoder or pooling | Existing encoder/pooling path |
+
+Both head-major and token-major caches support the packed path. Ordinary
+token-major decode retains its existing per-sequence fallback under the tiled
+walk. Mixed queries need not place their single-token requests first.
+Multi-token attention coverage does not by itself enable speculative decoding
+in the worker or scheduler. ALiBi and FP8 KV caches are unsupported when the
+experimental flag is enabled.
+
+The required [scatter/carry compiler support](https://github.com/torch-spyre/torch-spyre/pull/5157)
+has merged and is included in the compiler pinned by main; no companion pin is
+needed. The attention-input target remains 128K tokens per sequence with
+128-token pages, subject to the validation limits below.
 
 ## vLLM contract
 
@@ -31,8 +50,9 @@ positions. Attention reads the cache after the existing KV insertion operation.
 
 ## Serving schedule
 
-The host groups requests by query width. Requests with up to eight new tokens
-use grouped decode. Longer requests use 64/128/256/512-row prefill tiles. Tiles
+Within a packed batch, the host groups requests by query width. Requests with
+up to eight new tokens use the page-parallel short-query kernel. Longer requests
+use 64/128/256/512-row prefill tiles. Tiles
 retain indices into the original packed Q and output buffers.
 
 Prefill uses an outer `for_each_tile` over query tiles and an inner loop over KV
@@ -90,14 +110,18 @@ tokens in model-size buckets. Their bucket padding is unchanged. Metadata saving
 occur once per attention group per step; attention work repeats in every layer.
 
 Startup recording enumerates independent query/page group shapes and registers
-both serving kernels with the compile guard. `SPYRE_ATTN_RECORD=0` permits lazy
-compilation or explicit shape warmup. Attention still compiles when the rest of
+both packed kernels with the compile guard. It also records the existing
+single-token per-sequence, batched-decode and grouped-output variants, so a
+prefill-to-decode transition does not introduce an unrecorded attention path.
+`SPYRE_ATTN_RECORD=0` permits lazy compilation or explicit shape warmup. Attention still compiles when the rest of
 the model runs eagerly.
 
-## Performance status and when to enable it
+## Historical performance and when to enable it
 
-Jagged attention is off by default because it is **not** currently a net win on
-most end-to-end serving benchmarks, even though its kernels are faster.
+Packed attention remains off by default. The measurements below predate #1429
+and the dispatch split above; they describe the original all-jagged experiment,
+not a comparison against today's default grouped decode. They do not establish
+an end-to-end speedup for this extension.
 
 Profiled against the default backend through the real worker path, the jagged
 attention span is roughly twice as fast on both decode-heavy and ragged batches.
@@ -116,10 +140,9 @@ capacities above `max_model_len / block_size` are dropped at startup as
 unreachable, so a ladder quoted for a long context may be mostly inert at a
 shorter one.
 
-`SPYRE_JAGGED_CONTEXT_GROUPS` keys decode groups by context as well as query
-width. It costs one extra dispatch per occupied bucket, which at low
-`max_num_seqs` outweighs the padding it removes; its measured win comes from
-deliberately wide context spreads.
+The experimental serving path no longer exposes a separate context-grouping
+policy. Ordinary decode uses #1429's grouping and dispatch-cost model. The packed
+path groups by query width.
 
 ### Warmup cost
 

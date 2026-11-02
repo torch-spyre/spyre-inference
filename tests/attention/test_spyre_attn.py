@@ -1142,6 +1142,7 @@ def test_attention_sinks_are_rejected(default_vllm_config):
     [
         "spyre_inference.v1.attention.backends.spyre_attn:SpyreAttentionImpl",
         "spyre_inference.v1.attention.backends.spyre_head_major_attn:SpyreHeadMajorAttentionImpl",
+        "spyre_inference.v1.attention.backends.spyre_encoder_attn:SpyreEncoderAttentionImpl",
     ],
 )
 def test_alibi_is_rejected(default_vllm_config, impl_path):

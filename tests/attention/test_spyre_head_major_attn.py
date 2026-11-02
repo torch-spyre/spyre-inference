@@ -456,38 +456,30 @@ def _fp8_layer(k_scale, v_scale, **attrs):
     return layer
 
 
-def _runner_over(monkeypatch, layers, static_forward_context=None):
-    """A runner whose model is just ``layers``."""
-    from types import SimpleNamespace
+def _resolve(layers, static_forward_context=None):
+    from spyre_inference.v1.worker.model_load import resolve_kv_scales
 
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    runner = object.__new__(TorchSpyreModelRunner)
-    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=layers)))
-    runner.compilation_config = SimpleNamespace(static_forward_context=static_forward_context or {})
-    return runner
+    model = Mock(modules=Mock(return_value=layers))
+    return resolve_kv_scales(model, static_forward_context or {})
 
 
 def _warnings(monkeypatch):
-    from spyre_inference.v1.worker import spyre_model_runner
+    from spyre_inference.v1.worker import model_load
 
     warnings = []
-    monkeypatch.setattr(
-        spyre_model_runner.logger, "warning_once", lambda msg, *args: warnings.append(msg)
-    )
+    monkeypatch.setattr(model_load.logger, "warning_once", lambda msg, *args: warnings.append(msg))
     return warnings
 
 
 def test_distinct_kv_scales_warn_about_warmup(default_vllm_config, monkeypatch):
     """Each distinct (k_scale, v_scale) pair is its own compile, so startup says so."""
     first, other = _fp8_layer(0.25, 0.5), _fp8_layer(0.25, 0.5)
-    runner = _runner_over(monkeypatch, [first, other])
     warnings = _warnings(monkeypatch)
 
-    runner._resolve_kv_scales()
+    _resolve([first, other])
     assert warnings == [], "one shared pair compiles once"
     other._k_scale_float = 0.125
-    runner._resolve_kv_scales()
+    _resolve([first, other])
     assert len(warnings) == 1 and "distinct" in warnings[0]
 
 
@@ -496,7 +488,7 @@ def test_per_head_kv_scales_warn(default_vllm_config, monkeypatch):
     layer = _fp8_layer(0.25, 0.5, _k_scale=torch.tensor([0.25, 0.025]))
     warnings = _warnings(monkeypatch)
 
-    _runner_over(monkeypatch, [layer])._resolve_kv_scales()
+    _resolve([layer])
 
     assert layer.impl._kernel_kv_scales() == (0.25, 0.5)
     assert len(warnings) == 1 and "per-head" in warnings[0]
@@ -507,9 +499,7 @@ def test_kv_sharing_layer_reads_with_its_target_scales(default_vllm_config, monk
     target = _fp8_layer(0.05, 0.02)
     # A sharing layer stores nothing, so a calibrated checkpoint leaves its own at 1.0.
     reader = _fp8_layer(1.0, 1.0, kv_sharing_target_layer_name="layers.0.attn")
-    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
-
-    runner._resolve_kv_scales()
+    _resolve([reader, target], {"layers.0.attn": target})
 
     assert reader.impl._kernel_kv_scales() == (0.05, 0.02)
 
@@ -522,24 +512,26 @@ def test_kv_sharing_layer_and_target_must_agree_on_fp8(default_vllm_config, monk
     reader = _fp8_layer(
         1.0, 1.0, layer_name="layers.1.attn", kv_sharing_target_layer_name="layers.0.attn"
     )
-    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
-
     with pytest.raises(ValueError, match="kv_cache_dtype_skip_layers"):
-        runner._resolve_kv_scales()
+        _resolve([reader, target], {"layers.0.attn": target})
 
 
 def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch):
     """A reload passes its arguments through, re-reads the scales, and re-warms only on a
     change, so an armed compile guard never sees the new scales mid-request."""
     import contextlib
+    from types import SimpleNamespace
 
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     from spyre_inference.v1.worker import compile_guard
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
     layer = _fp8_layer(0.25, 0.5)
-    runner = _runner_over(monkeypatch, [layer])
-    runner._resolve_kv_scales()
+    runner = object.__new__(TorchSpyreModelRunner)
+    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=[layer])))
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    _resolve([layer])
     calls, warmups, allowed = [], [], []
     new_k_scale = 0.25
 

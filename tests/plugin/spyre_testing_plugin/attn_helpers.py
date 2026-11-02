@@ -44,6 +44,22 @@ def _fused_qkv_kv_views(
     )
 
 
+def random_block_tables(
+    kv_lens: list[int], width: int, block_size: int, num_blocks: int
+) -> torch.Tensor:
+    """Random block tables whose real blocks are distinct across all sequences."""
+    real = [(kv_len + block_size - 1) // block_size for kv_len in kv_lens]
+    assert sum(real) <= num_blocks, f"{sum(real)} real blocks do not fit in {num_blocks} pages"
+    # Padding entries are fully masked, so they may point anywhere.
+    block_tables = torch.randint(0, num_blocks, (len(kv_lens), width), dtype=torch.int32)
+    pages = torch.randperm(num_blocks).to(torch.int32)
+    offset = 0
+    for seq_idx, n in enumerate(real):
+        block_tables[seq_idx, :n] = pages[offset : offset + n]
+        offset += n
+    return block_tables
+
+
 def _build_metadata(
     num_query_heads: int,
     num_kv_heads: int,

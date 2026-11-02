@@ -22,6 +22,7 @@ from spyre_testing_plugin.attn_helpers import (
     _fused_qkv_kv_views,
     _padded_mask_metadata,
     assert_close_outliers,
+    random_block_tables,
     ref_attn,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -174,9 +175,7 @@ def _run_spyre_attn_test(
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-    )
+    block_tables = random_block_tables(kv_lens, max_num_blocks_per_seq, block_size, num_blocks)
 
     slot_mapping = []
     q_offset = 0
@@ -586,6 +585,17 @@ def test_spyre_attn_sliding_window(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
     )
+
+
+def test_random_block_tables_never_share_a_real_page():
+    # A page shared across sequences is written differently for the kernel and the
+    # reference, so the test would compare the two against different KV caches.
+    set_random_seed(0)
+    kv_lens, block_size = [64, 128, 192, 256, 320, 384, 448, 512], 64
+    block_tables = random_block_tables(kv_lens, 16, block_size, num_blocks=40)
+    real = [block_tables[i, : -(-kv // block_size)] for i, kv in enumerate(kv_lens)]
+    pages = torch.cat(real)
+    assert pages.unique().numel() == pages.numel() == 36
 
 
 @pytest.mark.parametrize(

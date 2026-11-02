@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import os
+
 import pytest
+from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 from vllm import LLM, RequestOutput, SamplingParams
 from vllm.config import AttentionConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -93,3 +97,43 @@ def test_padded_head_dim_and_intermediate_size_generate(enforce_eager: bool) -> 
     outputs = llm.generate({"prompt_token_ids": _PADDED_PROMPT_TOKEN_IDS}, sp, use_tqdm=False)
 
     assert list(outputs[0].outputs[0].token_ids) == _PADDED_REFERENCE_TOKEN_IDS
+
+
+def _seeded_generations(max_num_batched_tokens: int) -> list[list[int]]:
+    llm = LLM(
+        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        max_model_len=512,
+        max_num_seqs=2,
+        max_num_batched_tokens=max_num_batched_tokens,
+        # Cached blocks would let later seeds prefill the prompt in one chunk.
+        enable_prefix_caching=False,
+    )
+    try:
+        # 376 prompt tokens: three prefill chunks at a 128-token budget, one at 512.
+        prompt = {"prompt_token_ids": list(range(1000, 1376))}
+        return [
+            list(
+                llm.generate(
+                    prompt,
+                    SamplingParams(max_tokens=8, temperature=1.0, seed=seed, ignore_eos=True),
+                    use_tqdm=False,
+                )[0]
+                .outputs[0]
+                .token_ids
+            )
+            for seed in (0, 1, 2)
+        ]
+    finally:
+        llm.llm_engine.engine_core.shutdown(timeout=60)
+        del llm
+        gc.collect()
+        wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
+
+
+@pytest.mark.uses_subprocess
+def test_seeded_sampling_does_not_depend_on_prefill_chunking(monkeypatch) -> None:
+    """A seeded request longer than one prefill chunk must not crash the engine (#1420)."""
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    chunked = _seeded_generations(128)
+    assert len({tuple(tokens) for tokens in chunked}) == 3
+    assert chunked == _seeded_generations(512)

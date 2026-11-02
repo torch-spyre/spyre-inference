@@ -1303,6 +1303,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # upstream checks supports_sink() on CUDA/ROCm only.
         if sinks is not None:
             raise NotImplementedError("Spyre attention does not support attention sinks")
+        # Backstop for the platform's `uses_alibi` check, which is a heuristic over HF config.
+        if alibi_slopes is not None:
+            raise NotImplementedError("ALiBi is not supported by the Spyre attention backends.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1355,9 +1358,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
         self._kv_scales: tuple[float, float] | None = None
-
-        if alibi_slopes is not None:
-            raise NotImplementedError("ALiBi is not supported by the Spyre attention backends.")
 
         # Normalise the API's Optional[float] into a plain float so the kernel
         # can bake it as a closure constant. logits_soft_cap == 0.0 disables

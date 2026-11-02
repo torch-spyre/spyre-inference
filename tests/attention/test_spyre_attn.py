@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import warnings
 from unittest.mock import Mock
 
@@ -38,6 +37,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
+from spyre_inference.v1.attention.backends.spyre_head_major_attn import SpyreHeadMajorAttentionImpl
 from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
@@ -1138,19 +1139,11 @@ def test_attention_sinks_are_rejected(default_vllm_config):
 
 
 @pytest.mark.parametrize(
-    "impl_path",
-    [
-        "spyre_inference.v1.attention.backends.spyre_attn:SpyreAttentionImpl",
-        "spyre_inference.v1.attention.backends.spyre_head_major_attn:SpyreHeadMajorAttentionImpl",
-        "spyre_inference.v1.attention.backends.spyre_encoder_attn:SpyreEncoderAttentionImpl",
-    ],
+    "impl_cls", [SpyreAttentionImpl, SpyreHeadMajorAttentionImpl, SpyreEncoderAttentionImpl]
 )
-def test_alibi_is_rejected(default_vllm_config, impl_path):
-    """Nothing upstream screens ALiBi models out before this constructor; without the raise
-    they would silently run without their positional bias."""
-    module, name = impl_path.split(":")
-    impl_cls = getattr(importlib.import_module(module), name)
-
+def test_alibi_is_rejected(default_vllm_config, impl_cls):
+    """The backstop behind the platform's `uses_alibi` check, which is a heuristic over HF
+    config fields; without the raise a model it misses would run without its positional bias."""
     with pytest.raises(NotImplementedError, match="ALiBi is not supported"):
         impl_cls(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8, alibi_slopes=[0.5] * 8)
 

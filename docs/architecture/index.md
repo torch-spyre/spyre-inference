@@ -443,7 +443,7 @@ cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
 device dim 0, which is where an indexed axis has to sit for the gather to cost one page
 rather than the whole tensor.
 
-Three things follow from those choices. The gather is a 2-D subscript, which lowers to
+Two things follow from those choices. The gather is a 2-D subscript, which lowers to
 `aten.index` and fails eager by upcasting its int32 index, so this backend always compiles
 attention even under `--enforce-eager` — attention compiles in its own domain, so the rest
 of the model still runs eager. Because the bmm's output axes

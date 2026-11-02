@@ -67,7 +67,7 @@ class SpyreDFlashProposer(DFlashProposer):
         self.spyre_device = runner._spyre_device
         self.draft_block_size = self.num_speculative_tokens + 1
         self._context_warmed_rows: set[int] = set()
-        self._draft_warmed = False
+        self._warmed_draft_batches: set[int] = set()
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None):
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
@@ -93,19 +93,22 @@ class SpyreDFlashProposer(DFlashProposer):
                 torch.zeros(num_tokens, dtype=torch.int64),
             )
             self._context_warmed_rows.add(num_tokens)
-        if self._draft_warmed:
-            return
         block = self.draft_block_size
-        attn_layer.publish_null_slots(block)
-        ids = torch.full((block,), self.parallel_drafting_token_id, dtype=torch.int64)
-        ids[0] = 0
-        with set_forward_context(None, self.vllm_config, num_tokens=block, slot_mapping={}):
-            hidden = self.model(
-                input_ids=convert(ids, self.spyre_device),
-                positions=convert(torch.arange(block), self.spyre_device),
-            )
-        self.model.propose_block(hidden, ids[:1])
-        self._draft_warmed = True
+        largest_batch = 1 << (self.max_batch_size - 1).bit_length()
+        for batch in (4, 2, 1):
+            if batch > largest_batch or batch in self._warmed_draft_batches:
+                continue
+            rows = batch * block
+            attn_layer.publish_null_slots(rows)
+            ids = torch.full((rows,), self.parallel_drafting_token_id, dtype=torch.int64)
+            ids[::block] = 0
+            with set_forward_context(None, self.vllm_config, num_tokens=rows, slot_mapping={}):
+                hidden = self.model(
+                    input_ids=convert(ids, self.spyre_device),
+                    positions=convert(torch.arange(block).repeat(batch), self.spyre_device),
+                )
+            self.model.propose_block(hidden, ids[::block])
+            self._warmed_draft_batches.add(batch)
 
     def propose_spyre(
         self,
@@ -119,54 +122,77 @@ class SpyreDFlashProposer(DFlashProposer):
         max_model_len: int | None = None,
     ):
         """Commit accepted context even when no further draft is needed."""
-        assert len(sampled_token_ids) == 1, "Spyre DFlash requires one active request"
+        num_reqs = len(sampled_token_ids)
+        assert 1 <= num_reqs <= 4, "Spyre DFlash requires one to four active requests"
         assert aux_hidden_states is not None, "Spyre DFlash requires auxiliary hidden states"
+        starts = common_attn_metadata.query_start_loc_cpu.tolist()
         scheduled = target_positions.shape[0]
-        if scheduled <= 0 or common_attn_metadata.query_start_loc_cpu.tolist() != [0, scheduled]:
-            raise ValueError("DFlash request boundaries must cover the scheduled target rows")
-        skip = [skip_proposal] if isinstance(skip_proposal, bool) else skip_proposal
-        if len(skip) != 1:
+        if (
+            len(starts) != num_reqs + 1
+            or starts[0] != 0
+            or starts[-1] != scheduled
+            or any(end <= start for start, end in zip(starts, starts[1:]))
+        ):
+            raise ValueError("DFlash request boundaries must partition the scheduled target rows")
+        skip = [skip_proposal] * num_reqs if isinstance(skip_proposal, bool) else skip_proposal
+        if len(skip) != num_reqs:
             raise ValueError("DFlash proposal mask must have one entry per request")
-        drafts = spec_decode_metadata.num_draft_tokens if spec_decode_metadata else [0]
-        if len(drafts) != 1:
+        drafts = spec_decode_metadata.num_draft_tokens if spec_decode_metadata else [0] * num_reqs
+        if len(drafts) != num_reqs:
             raise ValueError("DFlash draft counts must have one entry per request")
-        sampled = sampled_token_ids[0]
-        valid = accepted_context_length(scheduled, drafts[0], len(sampled))
+        block = self.draft_block_size
+        limit = self.max_model_len if max_model_len is None else max_model_len
+
+        # Rejected and padded rows write the reserved null page.
         features = torch.cat(aux_hidden_states, dim=-1)
         rows = features.shape[0]
         positions = F.pad(target_positions, (0, rows - scheduled))
-        # Rejected and padded rows write the reserved null page.
         slots = torch.zeros(rows, dtype=torch.int64)
-        slots[:valid] = common_attn_metadata.slot_mapping[:valid]
+        active, context_ends, anchors = [], [], []
+        for request, sampled in enumerate(sampled_token_ids):
+            start, end = starts[request : request + 2]
+            valid = accepted_context_length(end - start, drafts[request], len(sampled))
+            slots[start : start + valid] = common_attn_metadata.slot_mapping[start : start + valid]
+            if sampled and not skip[request]:
+                context_end = int(target_positions[start + valid - 1]) + 1
+                if context_end + block <= limit:
+                    active.append(request)
+                    context_ends.append(context_end)
+                    anchors.append(sampled[-1])
         context = self.model.combine_hidden_states(features)
         self.model.precompute_and_store_context_kv(
             context, convert(positions, self.spyre_device), slots
         )
-        if not sampled or skip[0]:
-            return [[]]
-        block = self.draft_block_size
-        limit = self.max_model_len if max_model_len is None else max_model_len
-        context_end = int(target_positions[valid - 1]) + 1
-        if context_end + block > limit:
-            return [[]]
+        result: list[list[int]] = [[] for _ in range(num_reqs)]
+        if not active:
+            return result
 
-        positions = torch.arange(context_end, context_end + block, dtype=torch.int64)
-        block_table = common_attn_metadata.block_table_tensor
-        slots = block_table[0, positions // self.block_size].long() * self.block_size
-        slots += positions % self.block_size
-        ids = torch.full((block,), self.parallel_drafting_token_id, dtype=torch.int64)
-        ids[0] = sampled[-1]
-        query_start = torch.tensor([0, block], dtype=torch.int32)
-        seq_lens = torch.tensor([context_end + block], dtype=torch.int32)
+        padded_batch = 1 << (len(active) - 1).bit_length()
+        num_tokens = padded_batch * block
+        actual_tokens = len(active) * block
+        positions = torch.zeros(num_tokens, dtype=torch.int64)
+        slots = torch.zeros(num_tokens, dtype=torch.int64)
+        ids = torch.full((num_tokens,), self.parallel_drafting_token_id, dtype=torch.int64)
+        ids[::block] = 0
+        block_table = common_attn_metadata.block_table_tensor[active]
+        for index, (context_end, anchor) in enumerate(zip(context_ends, anchors, strict=True)):
+            rows = slice(index * block, (index + 1) * block)
+            pos = torch.arange(context_end, context_end + block, dtype=torch.int64)
+            positions[rows] = pos
+            slots[rows] = block_table[index, pos // self.block_size].long() * self.block_size
+            slots[rows] += pos % self.block_size
+            ids[index * block] = anchor
+        query_start = torch.arange(0, actual_tokens + 1, block, dtype=torch.int32)
+        seq_lens = torch.tensor(context_ends, dtype=torch.int32) + block
         metadata = CommonAttentionMetadata(
             query_start_loc=query_start,
             query_start_loc_cpu=query_start,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens,
-            num_reqs=1,
-            num_actual_tokens=block,
+            num_reqs=len(active),
+            num_actual_tokens=actual_tokens,
             max_query_len=block,
-            max_seq_len=context_end + block,
+            max_seq_len=int(seq_lens.max()),
             block_table_tensor=block_table,
             slot_mapping=slots,
             causal=False,
@@ -175,11 +201,14 @@ class SpyreDFlashProposer(DFlashProposer):
         with set_forward_context(
             per_layer,
             self.vllm_config,
-            num_tokens=block,
+            num_tokens=num_tokens,
             slot_mapping={name: slots for name in self._draft_attn_layer_names},
         ):
             hidden = self.model(
                 input_ids=convert(ids, self.spyre_device),
                 positions=convert(positions, self.spyre_device),
             )
-        return self.model.propose_block(hidden, ids[:1])
+        proposals = self.model.propose_block(hidden, ids[::block])
+        for request, proposal in zip(active, proposals[: len(active)], strict=True):
+            result[request] = proposal
+        return result

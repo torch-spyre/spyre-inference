@@ -186,7 +186,7 @@ def proposer(monkeypatch):
         hidden_size=128,
         dflash_config={"target_layer_ids": [0]},
         _context_warmed_rows=set(),
-        _draft_warmed=False,
+        _warmed_draft_batches=set(),
         parallel_drafting_token_id=42,
         build_per_group_and_layer_attn_metadata=build,
         vllm_config=None,

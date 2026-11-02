@@ -26,7 +26,7 @@ from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead
     "topc,vocab", [(0, 73), (1, 73), (7, 73), (73, 73), (128, 1031), (512, 1031)]
 )
 @pytest.mark.parametrize("passes", [0, 2, 6])
-@pytest.mark.parametrize("batch", [1])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4])
 def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_scores(
     topc, vocab, passes, batch
 ):

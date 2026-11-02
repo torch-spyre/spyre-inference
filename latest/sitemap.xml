@@ -56,4 +56,8 @@
          <loc>https://torch-spyre.github.io/spyre-inference/latest/user_guide/kineto_profiling.html</loc>
          <lastmod>2026-11-02</lastmod>
     </url>
+    <url>
+         <loc>https://torch-spyre.github.io/spyre-inference/latest/user_guide/speculative_decoding.html</loc>
+         <lastmod>2026-11-02</lastmod>
+    </url>
 </urlset>

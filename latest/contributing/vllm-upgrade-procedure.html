@@ -1039,6 +1039,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/speculative_decoding.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Speculative Decoding
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1712,6 +1740,34 @@
     
   
     Kineto Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/speculative_decoding.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Speculative Decoding
   
 
     
@@ -2399,9 +2455,9 @@ are missing.</p>
 <td>Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors.</td>
 </tr>
 <tr>
-<td><code>spyre_inference/v1/spec_decode/{xpress_head,checkpoint}.py</code></td>
+<td><code>spyre_inference/v1/spec_decode/{xpress_head,checkpoint,config}.py</code>, <code>spyre_inference/models/qwen3_dflash.py</code> and its registrations</td>
 <td><code>vllm/model_executor/models/{qwen3_xpress,qwen3_dflash}.py</code></td>
-<td>Temporary compatibility for vllm#54448 (<code>ce9467b757</code>), which postdates 0.32.0. Replace with upstream XPress model/head subclasses when available, retaining the Spyre overrides.</td>
+<td>Temporary compatibility for vllm#54448 (<code>ce9467b757</code>), which postdates 0.32.0. Replace the DFlash bridge and configuration aliases with upstream XPress model/head subclasses when available; retain Spyre context-KV, layout and serving overrides.</td>
 </tr>
 <tr>
 <td><code>csrc/cpu/spec_decode_utils.cpp</code>, <code>spyre_inference/v1/spec_decode/rejection_sampler.py</code> and the platform kernel hook</td>
@@ -2417,6 +2473,11 @@ are missing.</p>
 <td>The sampler patch in <code>TorchSpyreModelRunner.__init__</code></td>
 <td><code>Sampler</code> (<code>vllm/v1/sample/sampler.py</code>), its construction and <code>RejectionSampler(self.sampler)</code> (<code>vllm/v1/worker/gpu_model_runner.py</code>)</td>
 <td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>
+</tr>
+<tr>
+<td><code>use_spyre_dflash_proposer()</code> (<code>spyre_inference/v1/spec_decode/dflash.py</code>)</td>
+<td>The <code>DFlashProposer</code> import, construction and <code>isinstance</code> checks in <code>vllm/v1/worker/gpu_model_runner.py</code></td>
+<td>Temporarily replaces the module's constructor during runner initialization. The replacement remains an upstream <code>DFlashProposer</code> subclass so later checks in <code>_prepare_inputs</code> and <code>sample_tokens</code> still pass after restoration.</td>
 </tr>
 </tbody>
 </table>

@@ -15,6 +15,7 @@
 """Real Qwen3 batched verification, request isolation and changing active batches."""
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -128,6 +129,7 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property):
                                 temperature=0.0,
                                 max_tokens=case["max_tokens"],
                                 ignore_eos=True,
+                                logprobs=5,
                             )
                             | case.get("sampling", {})
                             | (overrides or {})
@@ -149,12 +151,27 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property):
             )
             result = [finished[request_id] for request_id in requested]
             for output, case in zip(result, selected):
+                completion = output.outputs[0]
                 if not overrides:
-                    assert len(output.outputs[0].token_ids) == case["max_tokens"]
+                    assert len(completion.token_ids) == case["max_tokens"]
+                assert len(completion.logprobs) == len(completion.token_ids)
+                temperature = (case.get("sampling", {}) | (overrides or {})).get("temperature", 0)
+                for token, row in zip(completion.token_ids, completion.logprobs, strict=True):
+                    assert token in row and len(row) >= 5
+                    assert all(math.isfinite(value.logprob) for value in row.values())
+                    if temperature == 0:
+                        assert row[token].logprob == max(value.logprob for value in row.values())
                 if capture:
                     assert internal_ids[output.request_id] in state["snapshots"]
             report[label] = dict(
                 outputs=[list(output.outputs[0].token_ids) for output in result],
+                logprobs=[
+                    [
+                        {token: value.logprob for token, value in row.items()}
+                        for row in output.outputs[0].logprobs
+                    ]
+                    for output in result
+                ],
                 state=state,
                 acceptance=metrics,
             )
@@ -315,6 +332,7 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property):
             replay, replay_state = run(
                 f"{label}_replay", stochastic, mode, capture=True, passes=passes
             )
+            assert report[f"{label}_seeded"]["logprobs"] == report[f"{label}_replay"]["logprobs"]
             for first, second in zip(original, replay, strict=True):
                 assert first.outputs[0].token_ids == second.outputs[0].token_ids
                 caches = [

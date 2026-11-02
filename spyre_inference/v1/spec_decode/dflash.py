@@ -86,8 +86,11 @@ class SpyreDFlashProposer(DFlashProposer):
             features = torch.zeros(num_tokens, taps * self.hidden_size, dtype=self.dtype)
             positions = torch.zeros(num_tokens, dtype=torch.int64)
             context = self.model.combine_hidden_states(convert(features, self.spyre_device))
+            # Context stores compile separately; warm them against the reserved null page.
             self.model.precompute_and_store_context_kv(
-                context, convert(positions, self.spyre_device)
+                context,
+                convert(positions, self.spyre_device),
+                torch.zeros(num_tokens, dtype=torch.int64),
             )
             self._context_warmed_rows.add(num_tokens)
         if self._draft_warmed:

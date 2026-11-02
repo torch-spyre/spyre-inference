@@ -278,9 +278,14 @@ def test_context_limit_replaces_previous_host_drafts_with_empty_rows(proposer):
 
 def test_context_warms_once_per_row_bucket_and_draft_warms_once(proposer, monkeypatch):
     monkeypatch.setattr(dflash.attn_layer, "publish_null_slots", lambda _: None)
-    for count in (16, 16, 64, 16, 64):
+    for count in (1, 16, 16, 64, 1, 16, 64):
         SpyreDFlashProposer.dummy_run(proposer, count)
-    assert len(proposer.model.context) == 2
+    assert len(proposer.model.context) == 3
+    for (context, positions, slots), count in zip(proposer.model.context, (1, 16, 64), strict=True):
+        assert context.shape[0] == count
+        assert positions.shape == slots.shape == (count,)
+        assert slots.dtype == torch.int64
+        assert slots.tolist() == [0] * count
     assert len(proposer.model.forwards) == 1
     assert proposer.model.anchors == [[0]]
 

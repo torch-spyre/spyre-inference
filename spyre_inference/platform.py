@@ -735,6 +735,14 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
+            # Neither attention layout implements ALiBi; reject before the worker builds the
+            # model. The attention impl constructor keeps a backstop, since this is a heuristic.
+            if vllm_config.model_config.uses_alibi:
+                raise ValueError(
+                    f"Spyre does not support ALiBi attention, which "
+                    f"{vllm_config.model_config.model} uses."
+                )
+
             # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:

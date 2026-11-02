@@ -28,18 +28,27 @@ OOT registrations pick up on their own. Two things are left to HF's module code:
 from __future__ import annotations
 
 import functools
+import re
 import sys
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.auto.auto_factory import _get_model_class
 from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import TransformersForCausalLM
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
+from spyre_inference.hf_adapters import (
+    PagedAdapterAttention,
+    PreparedBody,
+    prepare_body,
+    uses_hf_adapters,
+    validate_hf_adapters_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -194,15 +203,142 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
     """Transformers backend with the Spyre RoPE replacement wired in."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        validate_hf_adapters_config(vllm_config)
+        self._hf_adapters = uses_hf_adapters(vllm_config)
+        self._prepared_body: PreparedBody | None = None
         self._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         logger.debug("SpyreTransformersForCausalLM ready: %s", type(self.model).__name__)
 
+    def _patch_config(self):
+        super()._patch_config()
+        if self._hf_adapters and type(self.config) in AutoModel._model_mapping:
+            model_class = _get_model_class(self.config, AutoModel._model_mapping)
+            # Match vLLM's HF capability check; preserve its attention selection
+            # unless the backbone needs standard HF attention for construction.
+            if not (
+                model_class.is_backend_compatible() or model_class._can_set_attn_implementation()
+            ):
+                self.text_config._attn_implementation = "eager"
+
+    def _create_hf_to_vllm_mapper(self):
+        super()._create_hf_to_vllm_mapper()
+        if self._hf_adapters and self.config.model_type == "gpt2":
+            # HF's legacy "attn.bias" mask pattern also matches real c_attn.bias
+            # under vLLM's regex search. Match complete module path components.
+            self.hf_to_vllm_mapper.orig_to_new_regex = {
+                re.compile(rf"(?:^|\.){pattern.pattern}$") if target is None else pattern: target
+                for pattern, target in self.hf_to_vllm_mapper.orig_to_new_regex.items()
+            }
+        if self._hf_adapters and self.config.model_type == "gpt_neo":
+            # Old checkpoints persist causal-mask buffers absent from current HF.
+            self.hf_to_vllm_mapper.orig_to_new_regex = {
+                **self.hf_to_vllm_mapper.orig_to_new_regex,
+                re.compile(r"(?:^|\.)attn\.attention\.(?:bias|masked_bias)$"): None,
+            }
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._hf_adapters and self._prepared_body is not None:
+            raise NotImplementedError("Reloading a prepared HF-adapters body is not supported")
         result = super().load_weights(weights)
-        self._patch_rope()
+        if self._hf_adapters:
+            # CausalMixin only ties VocabParallelEmbedding; the preserved HF embedding
+            # needs copying through the LM head's loader before its packing pass.
+            if self._get_tie_word_embeddings():
+                embedding = self.model.get_input_embeddings().weight
+                loader = getattr(self.lm_head.weight, "weight_loader", None)
+                if not callable(loader):
+                    raise TypeError("The retained vLLM LM head must provide a weight loader")
+                loader(self.lm_head.weight, embedding)
+                result.add("lm_head.weight")
+        else:
+            self._patch_rope()
         return result
+
+    def recursive_replace(self):
+        if not self._hf_adapters:
+            super().recursive_replace()
+
+    def _create_attention_instances(self, prefix: str = ""):
+        if self._hf_adapters:
+            self._attention_prefix = prefix
+        else:
+            super()._create_attention_instances(prefix)
+
+    def prepare_hf_adapters(self) -> None:
+        """Prepare loaded CPU weights, then register attention at the final geometry."""
+        if not self._hf_adapters or self._prepared_body is not None:
+            raise RuntimeError("HF-adapters preparation must run exactly once in adapter mode")
+        cfg = self.text_config
+        dimensions = (
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+            cfg.hidden_size,
+            cfg.vocab_size,
+        )
+        prepared = prepare_body(self.model, self.vllm_config)
+        if dimensions != (
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+            cfg.hidden_size,
+            cfg.vocab_size,
+        ):
+            raise ValueError(
+                "Preparation may pad head_size but must preserve layer/head counts, "
+                "hidden_size and vocab_size"
+            )
+        if self.model.config is not self.config:
+            raise ValueError("Preparation must retain the HF config object")
+        self._bind_adapter_execution(prepared)
+        self._prepared_body = prepared
+
+    def _bind_adapter_execution(self, prepared: PreparedBody) -> None:
+        from vllm.model_executor.layers.attention import Attention
+
+        self.text_config.head_dim = prepared.head_size
+        self.model_config.model_arch_config.head_size = prepared.head_size
+        if prepared.logits_scale is not None:
+            self.logits_processor.scale = prepared.logits_scale
+        self.adapter_attentions = nn.ModuleList()
+        attention_cls = cast(type[Attention], self._get_attn_cls())
+        for binding in prepared.attention_bindings:
+            path = f"adapter_attentions.{binding.layer_idx}.attn"
+            prefix = f"{self._attention_prefix}.{path}" if self._attention_prefix else path
+            attention = attention_cls(
+                num_heads=binding.num_heads,
+                num_kv_heads=binding.num_kv_heads,
+                head_size=binding.head_size,
+                scale=binding.scale,
+                cache_config=self.cache_config,
+                quant_config=self.quant_config,
+                prefix=prefix,
+            )
+            executor = PagedAdapterAttention(attention)
+            self.adapter_attentions.append(executor)
+            binding.bind(executor)
+            attention.process_weights_after_loading(cast(torch.dtype, self.model_config.dtype))
+
+    def forward(
+        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs
+    ):
+        if not self._hf_adapters:
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            )
+        prepared = self._prepared_body
+        if prepared is None:
+            raise RuntimeError("HF-adapters body has not been prepared")
+        if input_ids is None or inputs_embeds is not None or intermediate_tensors is not None:
+            raise ValueError("Adapter execution currently requires token IDs and TP=PP=1")
+        return prepared.forward_backbone(input_ids.unsqueeze(0), positions.unsqueeze(0))[0]
+
+    def compile_hf_adapters(self) -> None:
+        if self._prepared_body is None:
+            raise RuntimeError("HF-adapters body has not been prepared")
+        self._prepared_body.compile_body(self.model)
 
     @staticmethod
     def _fix_generic_config(vllm_config: VllmConfig) -> None:

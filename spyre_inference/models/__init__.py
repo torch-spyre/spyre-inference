@@ -145,8 +145,11 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     plugin leaves that to the worker, too late for an in-process engine, which by then
     has cached the upstream class of a multimodal architecture such as CLIP.
     """
+    from spyre_inference.hf_adapters import uses_hf_adapters
     from spyre_inference.models import clip, gemma4
 
     register_models()
+    if uses_hf_adapters(engine_args):
+        return
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)

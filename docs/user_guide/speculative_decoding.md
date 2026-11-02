@@ -71,10 +71,10 @@ Replaying a seeded request with the same configuration is deterministic.
 Changing between ordinary decoding, DFlash and XPress changes RNG consumption;
 the same seed need not produce identical tokens across these modes.
 
-The pinned vLLM 0.32 lacks native XPress registration, so this adapter uses its V1
-DFlash classes with a configuration bridge. The merged GPU speculator uses V2.
-Initial selection and per-pass argmax run on CPU; readout and refinement run on
-Spyre. Device candidate selection is follow-up work.
+Upstream serves XPress only on the V2 runner, so Spyre subclasses its XPress model
+and drives refinement from the V1 DFlash proposer. Initial selection and per-pass
+argmax run on CPU; readout and refinement run on Spyre. Device candidate selection
+is follow-up work.
 
 Spyre's V2 runner still lacks model loading, compilation and warmup. After that
 runner is operational, XPress needs its auxiliary-state, draft-context and

@@ -67,3 +67,29 @@ def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_s
         actual = SpyreDFlashQwen3ForCausalLM.propose_block(model, hidden, anchor)
     assert actual == expected
     assert sum(transferred_bytes) == batch * (16 * vocab + passes * 15 * (topc or vocab)) * 4
+
+
+def test_xpress_model_builds_the_spyre_head_from_the_checkpoint_config(monkeypatch):
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+
+    from spyre_inference.models.qwen3_dflash import SpyreQwen3XPressForCausalLM
+
+    config = SimpleNamespace(
+        vocab_size=73,
+        hidden_size=128,
+        xpress_block_size=16,
+        xpress_rank=64,
+        xpress_mlp_hidden=128,
+        xpress_topc=7,
+        xpress_num_passes=2,
+    )
+
+    def dflash_init(self, *, vllm_config, prefix=""):
+        torch.nn.Module.__init__(self)
+        self.config = config
+
+    monkeypatch.setattr(DFlashQwen3ForCausalLM, "__init__", dflash_init)
+    model = SpyreQwen3XPressForCausalLM(vllm_config=None)
+    assert type(model.xpress_head) is XPressRefinerHead
+    assert (model.xpress_head.rank, model.xpress_head.topc) == (64, 7)
+    assert (model.xpress_topc, model.xpress_num_passes) == (7, 2)

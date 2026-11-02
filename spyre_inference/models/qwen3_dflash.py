@@ -15,9 +15,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM 0.32 lacks XPress (vllm#54448); test_xpress_vendored.py flags migration to its subclasses.
-# Retain Spyre context-KV, layout and refinement overrides when resolving #1417.
-
 from typing import cast
 
 import torch
@@ -27,6 +24,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
+from vllm.model_executor.models.qwen3_xpress import Qwen3XPressForCausalLM
 
 from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from spyre_inference.custom_ops.utils import convert
@@ -92,21 +90,11 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model: SpyreDFlashQwen3Model
 
     def __init__(self, *, vllm_config, prefix=""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.xpress_head = None
+        # Explicit base: in the XPress subclass's MRO, super() is upstream's XPress model.
+        DFlashQwen3ForCausalLM.__init__(self, vllm_config=vllm_config, prefix=prefix)
+        self.xpress_head: XPressRefinerHead | None = None
         self.xpress_num_passes = 0
         self.xpress_topc = 0
-        if hasattr(self.config, "xpress_rank"):
-            self.xpress_topc = getattr(self.config, "xpress_topc", 128)
-            self.xpress_head = XPressRefinerHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                self.config.xpress_block_size,
-                self.config.xpress_rank,
-                self.config.xpress_mlp_hidden,
-                topc=self.xpress_topc,
-            )
-            self.xpress_num_passes = getattr(self.config, "xpress_num_passes", 6)
 
     def load_weights(self, weights):
         weights = dict(weights)
@@ -119,8 +107,8 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 if not name.startswith("xpress_head.")
             }
         elif any(name.startswith("xpress_head.") for name in weights):
-            raise ValueError("XPress weights require an XPress head in the checkpoint config")
-        super().load_weights(weights.items())
+            raise ValueError("XPress weights require an XPress checkpoint architecture")
+        DFlashQwen3ForCausalLM.load_weights(self, weights.items())
 
     def prepare_for_spyre(self) -> None:
         self.model.prepare_for_spyre()
@@ -188,3 +176,21 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 )
                 draft = self._argmax_on_cpu(self._copy_logits_to_cpu(logits), candidates)
         return draft.tolist()
+
+
+class SpyreQwen3XPressForCausalLM(SpyreDFlashQwen3ForCausalLM, Qwen3XPressForCausalLM):
+    """Upstream's XPress model on the Spyre DFlash path; its own head is Triton-only."""
+
+    def __init__(self, *, vllm_config, prefix=""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        config = self.config
+        self.xpress_topc = config.xpress_topc
+        self.xpress_num_passes = config.xpress_num_passes
+        self.xpress_head = XPressRefinerHead(
+            config.vocab_size,
+            config.hidden_size,
+            config.xpress_block_size,
+            config.xpress_rank,
+            config.xpress_mlp_hidden,
+            topc=self.xpress_topc,
+        )

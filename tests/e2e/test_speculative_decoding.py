@@ -122,7 +122,6 @@ def xpress_engine(monkeypatch):
             model=DRAFT,
             revision=DRAFT_REVISION,
             num_speculative_tokens=15,
-            xpress_num_passes=6,
             xpress_topc=int(os.environ.get("SPYRE_XPRESS_TEST_TOPC", "128")),
         ),
     )

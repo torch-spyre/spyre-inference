@@ -899,6 +899,10 @@ class TorchSpyrePlatform(CpuPlatform):
             and vllm_config.speculative_config.use_dflash()
         ):
             raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
+        # Every process, ahead of the V1 validation that follows this hook in __post_init__.
+        from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
+
+        allow_xpress_on_v1()
         triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)

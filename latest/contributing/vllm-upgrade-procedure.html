@@ -2409,6 +2409,11 @@ are missing.</p>
 <td>Native kernels in <code>_spyre_C</code>, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels; #1417 tracks their independent cleanup condition.</td>
 </tr>
 <tr>
+<td><code>TorchSpyreModelRunner._sample</code> / <code>_bookkeeping_sync</code> (<code>spyre_inference/v1/worker/spyre_model_runner.py</code>)</td>
+<td>The same methods in <code>vllm/v1/worker/gpu_model_runner.py</code>, as patched by vllm#62688 (unmerged)</td>
+<td>Temporary port for #1420: restores the full state of CPU generators around sampling and hides them from upstream's <code>set_offset</code> rewind, which CPU generators lack. Delete both overrides once the pin includes vllm#62688; <code>tests/runtime/test_sampling_fallback.py::test_upstream_rewind_still_needs_the_cpu_generator_port</code> fails once upstream restores CPU generators itself. V1 only: MRV2 samples from <code>(seed, position)</code> and keeps no generator state.</td>
+</tr>
+<tr>
 <td>The sampler patch in <code>TorchSpyreModelRunner.__init__</code></td>
 <td><code>Sampler</code> (<code>vllm/v1/sample/sampler.py</code>), its construction and <code>RejectionSampler(self.sampler)</code> (<code>vllm/v1/worker/gpu_model_runner.py</code>)</td>
 <td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>

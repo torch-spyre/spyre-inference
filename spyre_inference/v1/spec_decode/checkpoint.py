@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Upstream's DFlash loader accepts any subset of these weights; Spyre checks the
-# published layout up front, before the layouts are built on device.
+# Upstream's DFlash loader accepts any subset of these weights.
 
 """Validate the published Qwen3 DFlash/XPress backbone weights."""
 

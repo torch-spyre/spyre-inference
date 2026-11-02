@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Spyre overrides of upstream's XPress head. Upstream's Jacobi loop runs Triton kernels;
-# serving here compiles the step helpers below instead, and test_xpress_upstream.py
-# checks them against upstream's own torch path.
+# Upstream's Jacobi loop is Triton-only; Spyre compiles these step helpers instead.
 
 from collections.abc import Mapping
 

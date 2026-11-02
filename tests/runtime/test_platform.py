@@ -595,8 +595,7 @@ def test_v1_model_runner_is_pinned(monkeypatch, requested):
     upstream's HAS_TRITON fallback, so the override is what prevents V2 here."""
     from spyre_inference.platform import TorchSpyrePlatform
 
-    # Set after construction: VllmConfig.__post_init__ reads the env var, and
-    # register() has already pinned it by then in a real run.
+    # After construction: register() pins the env var before VllmConfig reads it.
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
     if requested is None:
         monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
@@ -633,8 +632,7 @@ def test_v2_only_features_are_rejected(monkeypatch, feature):
 
 
 def test_fly_rejection_sampling_is_rejected(monkeypatch):
-    """vLLM 0.33's FLy acceptance is Triton-only, and its CPU guard checks the runner's
-    device, which is spyre, so without this it fails at the first verify step."""
+    """FLy is Triton-only, and upstream's CPU guard misses the spyre runner device."""
     from types import SimpleNamespace
 
     from spyre_inference.platform import TorchSpyrePlatform

@@ -100,8 +100,7 @@ def has_triton_cpu() -> bool:
 
 def check(runner: str) -> None:
     """Raise unless HAS_TRITON matches runner. On Power and Z, V2 gets past vLLM's
-    "requires Triton" check in Worker.__init__; x86 V2 without triton-cpu is refused
-    here, at config time, rather than when the worker is built."""
+    "requires Triton" check in Worker.__init__; x86 V2 without triton-cpu fails here."""
     from vllm.triton_utils import HAS_TRITON
 
     # importing.py has bound HAS_TRITON, so the patches have done their job.

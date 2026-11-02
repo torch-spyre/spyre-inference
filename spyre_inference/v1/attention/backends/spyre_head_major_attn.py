@@ -214,6 +214,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         if not self.kv_cache_fp8:
             return self.scale, None
         k_scale, v_scale = self._kernel_kv_scales()
+        assert k_scale is not None
         return self.scale * k_scale, v_scale
 
     def kv_write_index(
@@ -429,7 +430,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         )
         k_rows, v_rows = self.kv_slot_views(kv_cache)
         k_scale, v_scale = self._kernel_kv_scales()
-        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, k_scale=k_scale, v_scale=v_scale)
+        # The base class types _reshape_fn as the token-major store, which has no scales.
+        self._reshape_fn(  # ty: ignore[unknown-argument]
+            key, value, k_rows, v_rows, slot_mapping, k_scale=k_scale, v_scale=v_scale
+        )
         # Only k_rows is returned; Inductor fuses the stores into one kernel, so
         # ordering the read after it covers the V write too.
         return k_rows

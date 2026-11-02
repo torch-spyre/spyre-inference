@@ -27,7 +27,6 @@ import contextlib
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-import torch
 import torch.nn as nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
@@ -51,6 +50,7 @@ from spyre_inference.v1.worker.spyre.model_states import resolve_spyre_model_sta
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _SpyreModelWrapper,
+    model_dtype,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -105,14 +105,13 @@ class _SpyreModelLoader:
                 # Prompt logprobs project the prompt rows in chunks of up to CHUNK_SIZE.
                 chunk = min(PROMPT_LOGPROBS_CHUNK_SIZE, runner.max_num_tokens)
                 row_buckets = sorted({*row_buckets, chunk})
-        dtype = model_config.dtype
         return _SpyreModelWrapper(  # ty: ignore[invalid-return-type]
             compiled,
             runner.spyre_device,
             keep_outputs_on_device=runner.pooling_on_spyre,
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
-            model_dtype=dtype if isinstance(dtype, torch.dtype) else torch.float16,
+            model_dtype=model_dtype(model_config),
         )
 
 
@@ -153,6 +152,9 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
         raise NotImplementedError("Loading a caller-built model is not supported on Spyre V2.")
     if runner.lora_config:
         raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
+    if runner.parallel_config.enable_batch_sharded_sampling:
+        # Upstream calls model.compute_logits_local, past the wrapper's H2D and row buckets.
+        raise NotImplementedError("Batch-sharded sampling is not supported on the Spyre V2 runner.")
     if runner.speculator is not None:
         # Upstream loads a draft model through its own loader, outside the swap.
         raise NotImplementedError("Speculative decoding is not supported on the Spyre V2 runner.")
@@ -168,10 +170,3 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
         pooling_runner.pooling_on_spyre = runner.pooling_on_spyre
         pooling_runner.spyre_device = runner.spyre_device
         pooling_runner.encoder_plan_source = lambda: getattr(model_state, "encoder_plan", None)
-
-
-def unwrap(model: Any) -> nn.Module:
-    """The bare model under the wrapper and any whole-model OptimizedModule."""
-    if isinstance(model, _SpyreModelWrapper):
-        model = model._model
-    return getattr(model, "_orig_mod", model)

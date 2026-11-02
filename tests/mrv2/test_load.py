@@ -32,7 +32,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from spyre_inference.v1.worker.spyre import compile, load
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
-from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper, unwrap_model
 
 from .fakes import FakeModel
 
@@ -50,6 +50,7 @@ def _runner(**attrs) -> SimpleNamespace:
         "max_num_tokens": 2048,
         "lora_config": None,
         "speculator": None,
+        "parallel_config": SimpleNamespace(enable_batch_sharded_sampling=False),
     }
     return SimpleNamespace(**{**defaults, **attrs})
 
@@ -190,6 +191,10 @@ def test_upstreams_stock_compile_is_a_no_op_inside(monkeypatch: pytest.MonkeyPat
 def test_load_refuses_lora_spec_decode_and_caller_built_models() -> None:
     with pytest.raises(NotImplementedError, match="LoRA"):
         load.load_and_wrap(_runner(lora_config=object()))
+    with pytest.raises(NotImplementedError, match="Batch-sharded sampling"):
+        load.load_and_wrap(
+            _runner(parallel_config=SimpleNamespace(enable_batch_sharded_sampling=True))
+        )
     with pytest.raises(NotImplementedError, match="Speculative decoding"):
         load.load_and_wrap(_runner(speculator=object()))
     with pytest.raises(NotImplementedError, match="caller-built"):
@@ -220,8 +225,8 @@ def test_unwrap_reaches_the_bare_model() -> None:
     model = FakeModel()
     compiled = SimpleNamespace(_orig_mod=model)
     wrapper = _SpyreModelWrapper(compiled, torch.device("cpu"), model_dtype=torch.float16)  # ty: ignore[invalid-argument-type]
-    assert load.unwrap(wrapper) is model
-    assert load.unwrap(model) is model
+    assert unwrap_model(wrapper) is model
+    assert unwrap_model(model) is model
 
 
 def test_generation_tasks_are_read_off_the_bare_model() -> None:
@@ -262,13 +267,17 @@ def test_load_model_through_upstreams_body() -> None:
         from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
         from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 
+        from spyre_inference.v1.worker.spyre import load
+
         stock = []
         upstream.compile_model_with_stock_torch = lambda model, config: stock.append(model)
+        # Not enforce_eager: that resets the mode to NONE and upstream's stock branch
+        # would never run. The block compile itself is stubbed to keep the model on CPU.
+        load.compile_for_spyre = lambda model, config: (model, 0)
         device_shims.install()
         config = VllmConfig(
             model_config=ModelConfig(
                 model="ibm-ai-platform/micro-g3.3-8b-instruct-1b", max_model_len=256,
-                enforce_eager=True,
             ),
             cache_config=CacheConfig(block_size=64),
             load_config=LoadConfig(load_format="dummy"),
@@ -279,6 +288,7 @@ def test_load_model_through_upstreams_body() -> None:
             ensure_model_parallel_initialized(1, 1)
             runner = SpyreModelRunnerV2(config, torch.device("cpu"))
             runner.load_model()
+            print("MODE", config.compilation_config.mode.name)
             print("WRAPPER", isinstance(runner.model, _SpyreModelWrapper))
             print("STATE", isinstance(runner.model_state, SpyreModelStateMixin))
             print("STATE_HOLDS_WRAPPER", runner.model_state.model is runner.model)
@@ -301,6 +311,7 @@ def test_load_model_through_upstreams_body() -> None:
         line.split(" ", 1) for line in result.stdout.splitlines() if line.split(" ")[0].isupper()
     )
     assert got == {
+        "MODE": "STOCK_TORCH_COMPILE",
         "WRAPPER": "True",
         "STATE": "True",
         "STATE_HOLDS_WRAPPER": "True",

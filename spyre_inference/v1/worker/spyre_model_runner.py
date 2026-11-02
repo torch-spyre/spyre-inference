@@ -298,6 +298,20 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
         raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
 
 
+def model_dtype(model_config) -> torch.dtype:
+    """The activation dtype the platform settled on (float16 for every engine run;
+    see ``TorchSpyrePlatform.apply_config_platform_defaults``)."""
+    dtype = model_config.dtype
+    return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
+
+def unwrap_model(model: Any) -> nn.Module:
+    """The bare model under the wrapper and any whole-model OptimizedModule."""
+    if isinstance(model, _SpyreModelWrapper):
+        model = model._model
+    return getattr(model, "_orig_mod", model)
+
+
 class _SpyreModelWrapper:
     """Transparent wrapper that converts model inputs/outputs at the boundary.
 
@@ -1459,10 +1473,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def _model_dtype(self) -> torch.dtype:
-        """The activation dtype the platform settled on (float16 for every engine run;
-        see ``TorchSpyrePlatform.apply_config_platform_defaults``)."""
-        dtype = self.model_config.dtype
-        return dtype if isinstance(dtype, torch.dtype) else torch.float16
+        return model_dtype(self.model_config)
 
     def initialize_kv_cache_tensors(
         self,
@@ -1511,12 +1522,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def get_model(self) -> nn.Module:
         # Return the unwrapped model for isinstance checks
         # (e.g. is_text_generation_model in get_supported_tasks).
-        model = self.model
-        if isinstance(model, _SpyreModelWrapper):
-            model = model._model
-        # Unwrap torch.compile's OptimizedModule (has _orig_mod attribute)
-        if hasattr(model, "_orig_mod"):
-            model = model._orig_mod
+        model = unwrap_model(self.model)
         assert isinstance(model, nn.Module)
         return model
 

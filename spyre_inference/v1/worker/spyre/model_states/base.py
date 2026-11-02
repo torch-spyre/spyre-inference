@@ -30,6 +30,8 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
+from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
+
 
 class SpyreModelStateMixin:
     """MRV2: ModelState, aware of the Spyre device beside the host one."""
@@ -49,8 +51,7 @@ class SpyreModelStateMixin:
         # Upstream's interface checks (is_text_generation_model, supports_transcription)
         # fail on load.py's _SpyreModelWrapper, whose __init__ takes no vllm_config.
         model = self.model
-        bare = getattr(model, "_model", model)
-        self.model = getattr(bare, "_orig_mod", bare)
+        self.model = unwrap_model(model)
         try:
             return super().get_supported_generation_tasks()
         finally:

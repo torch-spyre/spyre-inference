@@ -14,9 +14,13 @@
 
 """SpyreModelRunnerV2's own overrides."""
 
+import contextlib
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from spyre_inference.v1.worker.spyre import model_runner
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
 from .fakes import make_fake_scheduler_output
@@ -44,3 +48,26 @@ def test_a_step_without_block_copies_reaches_upstream(monkeypatch: pytest.Monkey
     runner.update_requests(output)
 
     assert upstream == [output]
+
+
+@pytest.mark.parametrize("scales_changed", [True, False])
+def test_reload_rewarms_only_when_the_kv_scales_change(
+    monkeypatch: pytest.MonkeyPatch, scales_changed: bool
+) -> None:
+    """The block graphs guard on the KV scales a reload rewrites, as in V1."""
+    events = []
+    monkeypatch.setattr(GPUModelRunner, "reload_weights", lambda self: events.append("reload"))
+    monkeypatch.setattr(model_runner, "resolve_kv_scales", lambda model, ctx: scales_changed)
+    monkeypatch.setattr(
+        model_runner.compile_guard,
+        "allow_compile",
+        lambda reason: contextlib.nullcontext(events.append("allow")),
+    )
+    runner = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
+    runner.model = object()
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    monkeypatch.setattr(runner, "warming_up_model", lambda: events.append("warm"))
+
+    runner.reload_weights()
+
+    assert events == (["reload", "allow", "warm"] if scales_changed else ["reload"])

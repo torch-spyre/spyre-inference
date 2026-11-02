@@ -109,7 +109,7 @@ def _lx_max_cores(output_units: int) -> int:
     return 0 if output_units >= _SPYRE_CORES else _LX_ATTN_CORES
 
 
-def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], *args, **kwargs) -> _T:
+def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], /, *args, **kwargs) -> _T:
     # work_division reads config.sencores per compile, which is what keeps the rest of
     # the model uncapped.
     max_cores = _lx_max_cores(output_units)
@@ -200,10 +200,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             p.view(torch.uint8).zero_()
         return SpyrePagedKVCache(*pages)
 
-    def _kernel_kv_scales(self) -> tuple[float, ...]:
-        """Trailing (k_scale, v_scale) store arguments; none for a model-dtype cache."""
+    def _kernel_kv_scales(self) -> tuple[float | None, float | None]:
+        """The (k_scale, v_scale) store arguments; both None for a model-dtype cache."""
         if not self.kv_cache_fp8:
-            return ()
+            return None, None
         assert self._kv_scales is not None, (
             "KV scales unresolved: the runner reads them at load (resolve_kv_scales)"
         )
@@ -428,7 +428,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
         k_rows, v_rows = self.kv_slot_views(kv_cache)
-        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, *self._kernel_kv_scales())
+        k_scale, v_scale = self._kernel_kv_scales()
+        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, k_scale=k_scale, v_scale=v_scale)
         # Only k_rows is returned; Inductor fuses the stores into one kernel, so
         # ordering the read after it covers the V write too.
         return k_rows

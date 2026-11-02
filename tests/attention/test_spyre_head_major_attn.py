@@ -417,7 +417,7 @@ def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
     # A model-dtype cache passes v_scale=None, so its kernels trace as before.
     plain = SpyreHeadMajorAttentionImpl(num_heads=8, head_size=128, scale=1.0, num_kv_heads=2)
     plain.prepare_kv_scales(layer)
-    assert plain._kernel_kv_scales() == ()
+    assert plain._kernel_kv_scales() == (None, None)
     assert plain._read_scales() == (1.0, None)
 
 

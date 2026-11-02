@@ -103,7 +103,7 @@ def test_one_chunk_keeps_chunk_reduction(monkeypatch):
     query, rep = _meta(b, bpc, kv, q)
     k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
 
-    def unexpected_merge(*args):
+    def unexpected_merge(**kwargs):
         pytest.fail("A single chunk must not build and merge per-slot state")
 
     monkeypatch.setattr(bdhm, "_merge_entry_local", unexpected_merge)
@@ -170,7 +170,16 @@ def test_body_matches_reference_with_init_state():
         scores = torch.matmul(q_flat, k_page.transpose(-2, -1)) * SCALE
         sc = scores.reshape(bpc, b, kv, q, BLOCK) + tile_mask
         carry = bdhm._entry_local_update(carry, sc, v_page, entries, bpc, b, kv, q, BLOCK, HEAD)
-    got = bdhm._merge_entry_local(*carry, b, kv, q, HEAD)
+    tile_max, tile_sum, tile_output = carry
+    got = bdhm._merge_entry_local(
+        tile_max=tile_max,
+        tile_sum=tile_sum,
+        tile_output=tile_output,
+        num_seqs=b,
+        num_kv_heads=kv,
+        num_queries_per_kv=q,
+        head_size=HEAD,
+    )
     torch.testing.assert_close(
         got,
         _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0),

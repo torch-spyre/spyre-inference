@@ -678,6 +678,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
             inputs_embeds_buffer=self.inputs_embeds.gpu,
         )
 
+    # TEMPORARY port of vllm#62688 (#1420): upstream rewinds discarded prefill samples
+    # with set_offset, which CPU generators lack. Delete once the vLLM pin includes it.
+    def _discarded_generators(self) -> dict[int, torch.Generator]:
+        discard = self.discard_request_mask.np[: self.input_batch.num_reqs]
+        return {i: gen for i, gen in self.input_batch.generators.items() if discard[i]}
+
+    def _sample(self, logits, spec_decode_metadata):
+        states = [(gen, gen.get_state()) for gen in self._discarded_generators().values()]
+        try:
+            return super()._sample(logits, spec_decode_metadata)
+        finally:
+            for gen, state in states:
+                gen.set_state(state)
+
+    def _bookkeeping_sync(
+        self, scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+    ):
+        generators = self.input_batch.generators
+        discarded = self._discarded_generators()
+        # A new dict, not an in-place edit: sampling_metadata aliases this one.
+        self.input_batch.generators = {
+            i: gen for i, gen in generators.items() if i not in discarded
+        }
+        try:
+            return super()._bookkeeping_sync(
+                scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+            )
+        finally:
+            self.input_batch.generators = generators
+
     def _copy_draft_token_ids_to_cpu(self, scheduler_output, zeros_only=False):
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported for Spyre draft-token bookkeeping"

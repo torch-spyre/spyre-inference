@@ -84,6 +84,10 @@ def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     for module in model.modules():
         if isinstance(module, SpyreConv2d):
             module.process_weights_after_loading()
+        elif getattr(module, "spyre_moe_biases", None) is not None:
+            # On Spyre the move replaces w13_bias/w2_bias, so rebuild the config that holds them.
+            module.quant_method.moe_quant_config = None  # ty: ignore[invalid-assignment]
+            module._ensure_moe_quant_config_init()  # ty: ignore[call-non-callable]
 
 
 def _sink_owners(model: nn.Module) -> list[tuple[SpyreAttentionImpl, nn.Module, str]]:

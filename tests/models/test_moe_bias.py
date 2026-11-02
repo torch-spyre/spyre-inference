@@ -185,6 +185,37 @@ def test_relayout_without_biases_keeps_none(monkeypatch):
     assert layer.spyre_moe_biases is None
 
 
+def test_quant_config_follows_the_biases_moved_to_spyre(monkeypatch):
+    """On Spyre, ``model.to`` replaces ``w13_bias``/``w2_bias`` with new Parameters."""
+    from types import MethodType
+
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+    from spyre_inference.v1.worker.model_load import move_model_to_spyre
+
+    layer, _ = _prepared(720, monkeypatch)
+    method = object.__new__(SpyreUnquantizedFusedMoEMethod)
+    torch.nn.Module.__init__(method)
+    method.moe, method.moe_quant_config = SimpleNamespace(has_bias=True), None
+    method.get_fused_moe_quant_config = MethodType(
+        UnquantizedFusedMoEMethod.get_fused_moe_quant_config, method
+    )
+    layer.quant_method = method
+    layer._ensure_moe_quant_config_init = MethodType(
+        RoutedExperts._ensure_moe_quant_config_init, layer
+    )
+    layer._ensure_moe_quant_config_init()
+
+    move_model_to_spyre(torch.nn.Sequential(layer), torch.device("spyre"))
+    quant_config = method.moe_quant_config
+    assert quant_config.w1_bias is layer.w13_bias and quant_config.w2_bias is layer.w2_bias
+    assert layer.w13_bias.device.type == "spyre"
+
+
 @pytest.mark.parametrize("kind", ["hidden", "experts"])
 def test_bad_bias_shape_is_rejected_before_relayout(kind, monkeypatch):
     """The check uses the weight shapes, and it runs before any pool is copied to the device.

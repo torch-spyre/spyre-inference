@@ -56,19 +56,19 @@ def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap):
 
 def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0):
     return bdhm.batched_decode_head_major_kernel(
-        query,
-        rep,
-        k_pages,
-        v_pages,
-        page_ids,
-        mask,
-        SCALE,
-        b,
-        bpc,
-        kv,
-        q,
-        BLOCK,
-        HEAD,
+        query=query,
+        rep_row_ids=rep,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        chunk_page_ids=page_ids,
+        mask_by_chunk=mask,
+        scale=SCALE,
+        num_seqs=b,
+        blocks_per_chunk=bpc,
+        num_kv_heads=kv,
+        num_queries_per_kv=q,
+        block_size=BLOCK,
+        head_size=HEAD,
         logits_soft_cap=cap,
     )
 

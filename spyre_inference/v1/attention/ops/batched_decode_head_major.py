@@ -87,6 +87,7 @@ def _merge_entry_local(
 
 
 def batched_decode_head_major_kernel(
+    *,
     query,
     rep_row_ids,
     k_pages,

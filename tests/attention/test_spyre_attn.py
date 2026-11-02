@@ -249,10 +249,10 @@ def _run_spyre_attn_test(
     if expect_fused_store is not None or expect_query_widths is not None:
         _real_attn_fn = attn_impl._attn_fn
 
-        def _spy_attn_fn(*a, **kw):
-            fused_calls.append(a[-1] is not None)
-            dispatched_widths.add(a[8])  # padded_query_len
-            return _real_attn_fn(*a, **kw)
+        def _spy_attn_fn(**kw):
+            fused_calls.append(kw["out"] is not None)
+            dispatched_widths.add(kw["padded_query_len"])
+            return _real_attn_fn(**kw)
 
         attn_impl._attn_fn = _spy_attn_fn
 
@@ -1904,19 +1904,19 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
 
     def run(cap: float):
         return batched_decode_kernel(
-            query,
-            rep_row_ids,
-            k_pages,
-            v_pages,
-            block_ids,
-            mask_by_chunk,
-            1.0,
-            num_seqs,
-            bpc,
-            num_kv_heads,
-            qpk,
-            block_size,
-            head_size,
+            query=query,
+            rep_row_ids=rep_row_ids,
+            k_pages=k_pages,
+            v_pages=v_pages,
+            chunk_page_ids=block_ids,
+            mask_by_chunk=mask_by_chunk,
+            scale=1.0,
+            num_seqs=num_seqs,
+            blocks_per_chunk=bpc,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=qpk,
+            block_size=block_size,
+            head_size=head_size,
             logits_soft_cap=cap,
         )
 
@@ -2190,19 +2190,19 @@ def test_batched_decode_matches_fp32_reference(
     query_padded[:num_seqs] = query
 
     actual = batched_decode_kernel(
-        query_padded,
-        rep_row_ids,
-        k_pages,
-        v_pages,
-        chunk_page_ids,
-        mask_by_chunk,
-        scale,
-        b_seqs,
-        bpc,
-        num_kv_heads,
-        qpk,
-        block_size,
-        head_size,
+        query=query_padded,
+        rep_row_ids=rep_row_ids,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        chunk_page_ids=chunk_page_ids,
+        mask_by_chunk=mask_by_chunk,
+        scale=scale,
+        num_seqs=b_seqs,
+        blocks_per_chunk=bpc,
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=qpk,
+        block_size=block_size,
+        head_size=head_size,
     )
 
     expected = _decode_reference_fp32(
@@ -2285,18 +2285,18 @@ def test_page_attn_matches_fp32_reference(
         alibi = alibi_stack.permute(1, 2, 3, 0, 4).reshape(num_kv_heads, qpk, 1, kv_len)
 
     actual = page_attn_kernel(
-        query,
-        query_row_index,
-        k_pages,
-        v_pages,
-        page_index_table,
-        mask_tiles,
-        scale,
-        num_blocks,
-        padded_query_len,
-        num_heads,
-        num_kv_heads,
-        head_size,
+        query=query,
+        query_row_index=query_row_index,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        page_index_table=page_index_table,
+        mask_stack=mask_tiles,
+        scale=scale,
+        num_blocks=num_blocks,
+        padded_query_len=padded_query_len,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
         alibi_stack=alibi_stack,
     )
 

@@ -21,6 +21,7 @@ from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
 def page_attn_kernel(
+    *,
     query,
     query_row_index,
     k_pages,

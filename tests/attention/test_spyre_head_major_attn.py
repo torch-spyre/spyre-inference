@@ -413,12 +413,12 @@ def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
     layer = Mock(_k_scale_float=0.25, _v_scale_float=0.5)
     impl.prepare_kv_scales(layer)
     assert impl._kernel_kv_scales() == (0.25, 0.5)
-    assert impl._read_scales() == (0.25, (0.5,))
-    # A model-dtype cache passes no scales, so its kernels trace as before.
+    assert impl._read_scales() == (0.25, 0.5)
+    # A model-dtype cache passes v_scale=None, so its kernels trace as before.
     plain = SpyreHeadMajorAttentionImpl(num_heads=8, head_size=128, scale=1.0, num_kv_heads=2)
     plain.prepare_kv_scales(layer)
     assert plain._kernel_kv_scales() == ()
-    assert plain._read_scales() == (1.0, ())
+    assert plain._read_scales() == (1.0, None)
 
 
 def test_fp8_quantize_saturates():
@@ -576,15 +576,23 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     index_table[:, 0] = torch.tensor([4, 1, 3])
     mask = torch.zeros(num_blocks, padded_q, block_size, dtype=DTYPE)
     mask[-1, :, 40:] = float("-inf")
-    args = (num_blocks, padded_q, num_heads, num_kv_heads, head_size)
+    common = dict(
+        query=query,
+        query_row_index=rows,
+        page_index_table=index_table,
+        mask_stack=mask,
+        num_blocks=num_blocks,
+        padded_query_len=padded_q,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+    )
     scale = head_size**-0.5
 
     got = page_attn_head_major_prefill_kernel(
-        query, rows, k8, v8, index_table, mask, scale * k_scale, *args, 0.0, None, v_scale
+        **common, k_pages=k8, v_pages=v8, scale=scale * k_scale, v_scale=v_scale
     )
-    want = page_attn_head_major_prefill_kernel(
-        query, rows, k_dq, v_dq, index_table, mask, scale, *args
-    )
+    want = page_attn_head_major_prefill_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
@@ -606,14 +614,23 @@ def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
     mask = torch.zeros(num_chunks * bpc, num_seqs, 1, 1, block_size, dtype=DTYPE)
     mask[-1, ..., 32:] = float("-inf")
     scale = head_size**-0.5
-    args = (num_seqs, bpc, num_kv_heads, qpk, block_size, head_size)
+    common = dict(
+        query=query,
+        rep_row_ids=rep_row_ids,
+        chunk_page_ids=page_ids,
+        mask_by_chunk=mask,
+        num_seqs=num_seqs,
+        blocks_per_chunk=bpc,
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=qpk,
+        block_size=block_size,
+        head_size=head_size,
+    )
 
     got = batched_decode_head_major_kernel(
-        query, rep_row_ids, k8, v8, page_ids, mask, scale * k_scale, *args, 0.0, None, v_scale
+        **common, k_pages=k8, v_pages=v8, scale=scale * k_scale, v_scale=v_scale
     )
-    want = batched_decode_head_major_kernel(
-        query, rep_row_ids, k_dq, v_dq, page_ids, mask, scale, *args
-    )
+    want = batched_decode_head_major_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
@@ -1319,22 +1336,21 @@ def test_page_attn_head_major_matches_fp32_reference():
 
     for soft_cap in (0.0, 30.0):
         got = page_attn_head_major_decode_kernel(
-            query,
-            rows,
-            k,
-            v,
-            page_table,
-            kv_row_pool,
-            masks,
-            d**-0.5,
-            blocks,
-            query_len,
-            heads,
-            kv,
-            d,
-            block,
-            soft_cap,
-            None,
+            query=query,
+            query_row_index=rows,
+            k_pages=k,
+            v_pages=v,
+            page_index_table=page_table,
+            kv_row_pool=kv_row_pool,
+            mask_stack=masks,
+            scale=d**-0.5,
+            num_blocks=blocks,
+            padded_query_len=query_len,
+            num_heads=heads,
+            num_kv_heads=kv,
+            head_size=d,
+            block_size=block,
+            logits_soft_cap=soft_cap,
         )
         expected = ref_attn(
             query=query.index_select(0, rows.to(torch.int64)),
@@ -1431,19 +1447,19 @@ def test_head_major_decode_body_matches_fp32_reference(
     k_hm = k_pages.permute(0, 2, 1, 3).contiguous()
     v_hm = v_pages.permute(0, 2, 1, 3).contiguous()
     actual = batched_decode_head_major_kernel(
-        query_padded,
-        rep_row_ids,
-        k_hm,
-        v_hm,
-        chunk_page_ids,
-        mask_by_chunk,
-        scale,
-        b_seqs,
-        bpc,
-        num_kv_heads,
-        qpk,
-        block_size,
-        head_size,
+        query=query_padded,
+        rep_row_ids=rep_row_ids,
+        k_pages=k_hm,
+        v_pages=v_hm,
+        chunk_page_ids=chunk_page_ids,
+        mask_by_chunk=mask_by_chunk,
+        scale=scale,
+        num_seqs=b_seqs,
+        blocks_per_chunk=bpc,
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=qpk,
+        block_size=block_size,
+        head_size=head_size,
     )
     expected = _decode_reference_fp32(
         query_padded,

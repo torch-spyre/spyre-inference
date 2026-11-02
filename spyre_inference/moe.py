@@ -344,13 +344,6 @@ def _moe_persistent_selected_routing(
     return (packed @ route_identity)[..., :1]
 
 
-def _token_cores(tokens: int) -> int:
-    from torch_spyre._inductor import config as spyre_config
-
-    limit = min(tokens, spyre_config.sencores)
-    return max(split for split in range(1, limit + 1) if tokens % split == 0)
-
-
 def _name_persistent_dims(
     x: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor
 ) -> None:
@@ -395,14 +388,13 @@ def _moe_persistent(
         activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
         return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
 
-    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}):
-        result, _ = for_each_tile(
-            expert_body,
-            (x, route, gate, up, down),
-            dims=(None, 0, 0, 0, 0),
-            tile_size=1,
-            init=torch.zeros_like(x),
-        )
+    result, _ = for_each_tile(
+        expert_body,
+        (x, route, gate, up, down),
+        dims=(None, 0, 0, 0, 0),
+        tile_size=1,
+        init=torch.zeros_like(x),
+    )
     return result
 
 
@@ -429,7 +421,7 @@ def _moe_persistent_in_graph(
     # Loop-body ops only receive this scope's hints, so T is named here; every body op stays
     # at [1, T, C] (C is M or H) so one name list fits them all.
     init = torch.zeros_like(x).unsqueeze(0)
-    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}, named_dims=["ONE", "T", "C"]):
+    with spyre_hint(named_dims=["ONE", "T", "C"]):
         result, _ = for_each_tile(
             expert_body,
             (x, route, gate, up, down),

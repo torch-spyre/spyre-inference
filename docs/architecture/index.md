@@ -205,7 +205,7 @@ persistent form. Down's output slices are concatenated, not summed.
 
 ## Compilation Granularity
 
-Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
+Under `CompilationMode.STOCK_TORCH_COMPILE`, `compile_for_spyre` compiles each entry of
 the model's block `ModuleList` in place via `block.compile(backend="inductor",
 fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to the
 `OptimizedModule` that `torch.compile` returns would re-parent the block under an
@@ -456,10 +456,18 @@ what the tiled walk needs, so the batched kernel is reached on this layout and d
 token-major until that port lands.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
-planner's own verdicts. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
+planner's own verdicts. Read those from the allocation — `LifetimeBoundBuffer.address`, where
+`None` means HBM — and not from the allocator's `lx_pinning:` debug log, whose `→ lx` is the
+default for any buffer the spill-reason dict does not mention, and which never reports a
+graph-input clone at all. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
 transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
+
+Batched decode needs none of this. Its whole-page gather is LX-resident as it stands, so the
+per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding anyway divides
+`blocks_per_chunk` by `num_kv_heads` and multiplies the chunk trips, which measured roughly
+1.5–2x more kernel time across the decode batches and contexts tried.
 
 #### FP8 KV cache
 
@@ -487,7 +495,8 @@ calibrated one.
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
-  to `max_model_len` (avoids per-step recompilation on Spyre)
+  to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
+  selects a denser preset
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the

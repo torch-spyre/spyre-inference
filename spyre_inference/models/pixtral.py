@@ -53,6 +53,7 @@ from spyre_inference.models._vision_encoder import (
 )
 from spyre_inference.multimodal.utils import (
     align_up,
+    linear_weight,
     padded_sdpa,
     rope_perm_matrix,
     rope_rotate_matmul,
@@ -148,16 +149,6 @@ def offset_major_merge_weight(weight: torch.Tensor, merge: int) -> torch.Tensor:
     return weight.reshape(out_dim, in_dim // merge**2, merge**2).permute(2, 1, 0).contiguous()
 
 
-def _linear_weight(layer: nn.Module) -> torch.Tensor:
-    """``[out, in]``, undoing the Spyre linear's post-load transpose and row padding."""
-    weight = cast(torch.Tensor, layer.weight).detach()
-    padding = getattr(layer, "spyre_row_padding", None)
-    if padding is None:
-        return weight
-    weight = weight.t()
-    return weight[: weight.shape[0] - padding]
-
-
 def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
     """The ``[C, H, W]`` images in ``mm_kwargs``, whether batched in one tensor or a list."""
     images = mm_kwargs.get("images")
@@ -223,7 +214,7 @@ class SpyrePixtralForConditionalGeneration(
         tower.patch_conv.weight = nn.Parameter(weight_t, requires_grad=False)
         if self.patch_merger is not None:
             layer = self.patch_merger.merging_layer
-            merge_weight = offset_major_merge_weight(_linear_weight(layer), self._merge)
+            merge_weight = offset_major_merge_weight(linear_weight(layer), self._merge)
             layer.weight = nn.Parameter(merge_weight, requires_grad=False)
 
     # --- protocol methods upstream Pixtral does not provide ---

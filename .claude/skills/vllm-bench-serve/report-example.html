@@ -362,7 +362,7 @@ cd spyre-inference &amp;&amp; make perf-tests BENCH_TYPES=serve \
     <pre>python -m vllm.entrypoints.cli.main bench serve \
   --dataset-name custom --num-prompts 100 --custom-output-len -1 --ignore-eos --disable-shuffle \
   --endpoint /v1/completions --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 99,100 \
-  --max-concurrency 4 --dataset-path /models/online_benchmarking_data_reordered/cics_results_2025.11.03_e2ee1b0_correct_order.jsonl \
+  --max-concurrency 4 --dataset-path cics_results_2025.11.03_e2ee1b0_correct_order.jsonl \
   --model ibm-granite/granite-3.3-8b-instruct --skip-chat-template \
   --save-result --result-dir bench-prXXX/&lt;leg&gt;/results --result-filename serve_granite33-8b_tp4_cics8k_bs4.json</pre>
   </section>

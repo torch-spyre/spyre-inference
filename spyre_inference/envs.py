@@ -35,11 +35,13 @@ if TYPE_CHECKING:
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
+    SPYRE_ATTN_KV_LADDER: str = "pow2"
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
+    SPYRE_JAGGED_DECODE: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
@@ -89,9 +91,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
-    # Comma-separated kv_len buckets to record, unset uses the default buckets of
-    # powers of two from block_size up to max_model_len.
+    # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
+    # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.
+    "SPYRE_ATTN_KV_LADDER": lambda: os.getenv("SPYRE_ATTN_KV_LADDER") or "pow2",
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
@@ -114,6 +117,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
+    # When "1" (default), a decode batch spanning several KV buckets runs one batched
+    # dispatch per bucket group instead of padding every sequence to the longest.
+    "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
     # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.

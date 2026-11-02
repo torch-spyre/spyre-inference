@@ -24,6 +24,7 @@ guards it trips.
 
 import logging
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,15 +36,25 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference import envs
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
 )
+from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+    SpyreHeadMajorAttentionBackend,
+)
+from spyre_inference.v1.attention.ops import tile_loop
+from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+    page_attn_head_major_prefill_kernel,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
 )
+from spyre_inference.v1.attention.warmup import record_attention_graphs
 
 pytestmark = pytest.mark.attention
 
@@ -86,12 +97,12 @@ def kv_cache():
     )
 
 
-def _make_builder(kv_cache_spec) -> SpyreAttentionMetadataBuilder:
+def _make_builder(kv_cache_spec, backend=SpyreAttentionBackend) -> SpyreAttentionMetadataBuilder:
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = MagicMock(return_value=NUM_HEADS)
     vllm_config.model_config.get_num_kv_heads = MagicMock(return_value=NUM_KV_HEADS)
     vllm_config.cache_config.block_size = BLOCK_SIZE
-    return SpyreAttentionMetadataBuilder(
+    return backend.get_builder_cls()(
         kv_cache_spec=kv_cache_spec,
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,
@@ -140,6 +151,118 @@ def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
     return [v for v in bucketer.variants() if v.num_blocks <= pages]
+
+
+@pytest.mark.parametrize(
+    "layout,backend,kernel",
+    [
+        ("token_major", SpyreAttentionBackend, page_attn_kernel),
+        ("head_major", SpyreHeadMajorAttentionBackend, page_attn_head_major_prefill_kernel),
+    ],
+)
+def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
+    default_vllm_config, monkeypatch, layout, backend, kernel
+):
+    monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", layout)
+    assert backend.supports_non_causal()
+    builder = _make_builder(
+        AttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            dtype=torch.float16,
+        ),
+        backend=backend,
+    )
+    bucket = SpyreAttnBucket(1, 16)
+    bidirectional = builder.build_for_variant(bucket, causal=False)
+    causal = builder.build_for_variant(bucket, causal=True)
+    assert bidirectional.causal is False
+    assert not bidirectional.apply_causal_mask
+    assert causal.apply_causal_mask
+    visible = bidirectional.attention_mask_stacks[0][0, : bidirectional.max_query_len]
+    assert torch.all(visible == 0)
+    mask = causal.attention_mask_stacks[0]
+    assert mask[0, 0, -1] == torch.finfo(mask.dtype).min
+
+    # Exercise the kernel bodies on CPU without the Spyre tiled-loop lowering.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    shape = backend.get_kv_cache_shape(1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    k_pages, v_pages = (torch.zeros(shape, dtype=torch.float16) for _ in range(2))
+    if layout == "head_major":
+        v_pages[0, :, -1] = 1
+    else:
+        v_pages[0, -1] = 1
+    for metadata, expected in ((bidirectional, 1 / BLOCK_SIZE), (causal, 0.0)):
+        padded_query_len = metadata.aligned_query_lens[0]
+        result = kernel(
+            torch.zeros(padded_query_len, NUM_HEADS, HEAD_SIZE, dtype=torch.float16),
+            torch.arange(padded_query_len, dtype=torch.int32),
+            k_pages,
+            v_pages,
+            torch.zeros(1, 32, dtype=torch.int32),
+            metadata.attention_mask_stacks[0],
+            1 / HEAD_SIZE**0.5,
+            1,
+            padded_query_len,
+            NUM_HEADS,
+            NUM_KV_HEADS,
+            HEAD_SIZE,
+        )
+        torch.testing.assert_close(result[0], torch.full_like(result[0], expected), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "causal,expected",
+    [
+        ([True, False], [True, False]),
+        ([False, True], [False, True]),
+        ([True, True], [True]),
+        ([False, False], [False]),
+    ],
+)
+def test_attention_recording_shares_only_layers_with_matching_causality(
+    impl, kv_cache, builder, monkeypatch, causal, expected
+):
+    layers = {str(i): SimpleNamespace(impl=impl) for i in range(len(causal))}
+    record = MagicMock(return_value=1)
+    monkeypatch.setattr(impl, "record_graphs", record)
+    count = record_attention_graphs(
+        layers,
+        dict.fromkeys(layers, kv_cache),
+        dict.fromkeys(layers, builder),
+        causal_by_layer=dict(zip(layers, causal, strict=True)),
+    )
+    assert count == len(expected)
+    assert [call.kwargs["causal"] for call in record.call_args_list] == expected
+
+
+def test_attention_recording_requires_causality_for_every_layer(impl, kv_cache, builder):
+    with pytest.raises(KeyError, match="draft"):
+        record_attention_graphs(
+            {"draft": SimpleNamespace(impl=impl)},
+            {"draft": kv_cache},
+            {"draft": builder},
+            causal_by_layer={},
+        )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_recorder_passes_explicit_causality_to_metadata(
+    impl, kv_cache, builder, monkeypatch, causal
+):
+    builder._attn_bucketer = make_bucketer()
+    forward = MagicMock()
+    monkeypatch.setattr(impl, "forward", forward)
+    monkeypatch.setattr(impl, "_batched_decode_supported", lambda: False)
+    impl.record_graphs(SimpleNamespace(), kv_cache, builder, causal=causal)
+    assert forward.call_count > 0
+    assert all(call.args[5].causal is causal for call in forward.call_args_list)
+
+
+def test_attention_sinks_are_rejected(default_vllm_config):
+    with pytest.raises(NotImplementedError, match="attention sinks"):
+        SpyreAttentionImpl(NUM_HEADS, HEAD_SIZE, 1.0, NUM_KV_HEADS, sinks=torch.zeros(NUM_HEADS))
 
 
 def _record(impl, kv_cache, builder) -> int:
@@ -215,6 +338,30 @@ class TestRecordGraphs:
         snapshot = compiles()
         assert _record(impl, kv_cache, builder) == first
         assert compiles() == snapshot
+
+    def test_layer_with_equal_graph_key_shares_the_recorded_graphs(self, impl, kv_cache, builder):
+        """Another layer's impl and pages, with an equal key, compile nothing new."""
+        bucketer = builder._attn_bucketer = make_bucketer()
+        _record(impl, kv_cache, builder)
+        other = SpyreAttentionImpl(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=impl.scale,
+            num_kv_heads=NUM_KV_HEADS,
+        )
+        other_cache = SpyrePagedKVCache(*(torch.zeros_like(t) for t in kv_cache))
+        assert other.graph_key() == impl.graph_key()
+
+        snapshot = compiles()
+        for bucket in _recordable(bucketer):
+            _dispatch(other, builder, other_cache, bucket.num_blocks, bucket.padded_query_len)
+        assert compiles() == snapshot
+
+    @pytest.mark.parametrize("attr", ["num_heads", "scale"])
+    def test_graph_key_tells_apart_per_layer_kernel_scalars(self, impl, attr):
+        base = impl.graph_key()
+        setattr(impl, attr, getattr(impl, attr) * 2)
+        assert impl.graph_key() != base
 
     def test_buckets_collapsing_onto_one_kernel_record_once(
         self, impl, kv_cache, sliding_window_builder

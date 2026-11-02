@@ -91,8 +91,10 @@ required-environments = [
 ]
 
 override-dependencies = [
-    # No triton support yet, don't allow any dependencies to pull it in
-    "triton; sys_platform == 'never'",
+    # triton-cpu on x86 only, for MRV2's Triton kernels until upstream's non-Triton ones
+    # exist (#906). Power/Z stay Triton-free; triton_gate hides it from V1.
+    "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version == '3.11'",
+    "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version >= '3.12'",
 
     # Declared in [project.dependencies] too; this entry exists to neutralise any
     # version constraint a transitive dep (e.g. transformers) puts on torchvision,
@@ -150,7 +152,7 @@ PYTORCH_VERSION = "2.13.0"
 [tool.uv.extra-build-variables.torch-spyre]
 USE_SPYRE_PROFILER = "0"
 # Must equal [tool.spyre-rpms] bundle: a change makes uv rebuild a cached torch-spyre wheel against the new RPMs.
-SPYRE_RPM_BUNDLE = "main_nightly_2026_10_15"
+SPYRE_RPM_BUNDLE = "main_nightly_2026_10_27"
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
@@ -159,7 +161,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "b9daa0c3aa7ac7624e3ff6897da5893bb1fa54f4" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "64870622fc39cda7e344a271decb901e7088c6c6" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -230,7 +232,7 @@ provides-extras = ["gdown", "scipy"]
 # spyre-rpms.lock is generated from this; after editing, re-run
 # `python3 scripts/lock_spyre_rpms.py`. Bump SPYRE_RPM_BUNDLE above with `bundle`.
 [tool.spyre-rpms]
-bundle = "main_nightly_2026_10_15"
+bundle = "main_nightly_2026_10_27"
 packages = [
   "ibm-aiu-toolbox-e2e",
   "ibm-deeptools",
@@ -350,7 +352,8 @@ filterwarnings = [
 
 # --8<-- [start:test-markers-definition]
 markers = [
-    "distributed: Tests requiring multiple spyre cards",
+    "distributed: Tests requiring multiple spyre cards (TP=2, runs on spyre_pf_x2)",
+    "distributed_tp4: Tests requiring 4 Spyre cards (TP=4, runs on spyre_pf_x4)",
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
@@ -369,7 +372,7 @@ markers = [
     "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
     "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
-    "gemma4_vision: Gemma-4 vision-tower tests (tests/models/test_gemma4_mm.py, tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "gemma4_vision: Gemma-4 vision-tower tests (tests/models/test_gemma4_mm.py, plus the on-card row in tests/e2e/test_multimodal.py)",
     "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
     "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
@@ -404,4 +407,6 @@ plugins.md007.indent = 4
 dev = [
     "spyre-testing-plugin",
     "coverage",
+    # pandas 3.1.0 fails to build from source on s390x (pandas-dev/pandas#71548)
+    "pandas!=3.1.0; platform_machine == 's390x'",
 ]

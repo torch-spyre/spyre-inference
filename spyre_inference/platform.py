@@ -38,6 +38,8 @@ from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
@@ -158,6 +160,10 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
+    # A `--max-num-batched-tokens` the user passes (recorded by `pre_register_and_update`) wins.
+    _DEFAULT_PREFILL_BUCKET = 512
+    _user_max_num_batched_tokens: int | None = None
+
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
@@ -174,8 +180,6 @@ class TorchSpyrePlatform(CpuPlatform):
     @classmethod
     def _decoder_backend_path(cls) -> str:
         """The decoder attention backend for the requested KV cache layout."""
-        from spyre_inference import envs
-
         layout = envs.SPYRE_ATTN_KV_LAYOUT
         if layout not in cls._KV_LAYOUTS:
             raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
@@ -204,6 +208,7 @@ class TorchSpyrePlatform(CpuPlatform):
         @functools.wraps(original)
         def _spyre_patched(self, usage_context, model_config, parallel_config):
             user_supplied = self.max_num_seqs is not None
+            cls._user_max_num_batched_tokens = self.max_num_batched_tokens
             original(self, usage_context, model_config, parallel_config)
             if not user_supplied and self.max_num_seqs is not None:
                 self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
@@ -229,6 +234,28 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
         # which don't exist with VLLM_TARGET_DEVICE=empty. Override to no-op.
         pass
+
+    @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        from vllm.triton_utils.dispatcher import register_kernels
+
+        from spyre_inference.v1.spec_decode import rejection_sampler
+
+        # Use our vendored C++ kernels; CpuPlatform's wrappers require the absent vllm._C.
+        register_kernels(
+            {
+                "vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel": (
+                    rejection_sampler.greedy_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel": (
+                    rejection_sampler.random_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.expand_kernel": rejection_sampler.expand,
+                "vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel": (
+                    rejection_sampler.recover
+                ),
+            }
+        )
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -334,12 +361,30 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
-                # Largest default bucket: scheduler limit and 512 (Spyre max).
                 # Decode packs one token per running sequence; prefill lands on
-                # the single largest bucket. Denser sizes only cost warmup time.
-                max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
+                # the largest bucket. Denser sizes only cost warmup time. The budget
+                # is the user's only if it still equals what they passed: a config
+                # built without EngineArgs carries vLLM's own default.
+                budget = vllm_config.scheduler_config.max_num_batched_tokens
+                prefill = cls._DEFAULT_PREFILL_BUCKET
+                user_budget = cls._user_max_num_batched_tokens
+                max_capture_size = (
+                    budget
+                    if user_budget is not None and budget == user_budget
+                    else min(budget, prefill)
+                )
+                if max_capture_size > 2 * prefill:
+                    logger.warning(
+                        "max_num_batched_tokens=%d: prefill variants this wide can exceed "
+                        "torch-spyre's backend compile time limit at a long context "
+                        "(torch-spyre#5250).",
+                        max_capture_size,
+                    )
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
                 sizes = {max_capture_size, num_seqs}
+                # Short prefills keep a default-size bucket instead of padding up.
+                if max_capture_size > prefill:
+                    sizes.add(prefill)
                 size = 1
                 while size < num_seqs:
                     sizes.add(size)
@@ -630,7 +675,7 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
-        # The attention KV buckets are powers of two starting at block_size; a
+        # Every KV ladder keeps the powers of two starting at block_size; a
         # non-power-of-two block size makes that ladder start off-grid, so block
         # counts stop being a clean doubling sequence.
         if aligned & (aligned - 1):
@@ -739,6 +784,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
+        # Validate the ladder name now; the bucketer only reads it in the worker, after model load.
+        if not envs.SPYRE_ATTN_KV_BUCKETS:
+            from spyre_inference.v1.attention.spyre_attn_bucketer import kv_ladder
+
+            kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
         from spyre_inference.threading_config import configure_threading
@@ -746,7 +797,7 @@ class TorchSpyrePlatform(CpuPlatform):
         configure_threading(parallel_config.world_size)
 
         # ---- worker ----
-        from spyre_inference import envs, pin_model_runner
+        from spyre_inference import pin_model_runner
         from spyre_inference.v1.worker.spyre import triton_gate
 
         # Read fresh, not from the cache register() filled, so a value changed after
@@ -754,13 +805,7 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        gate = "open" if runner == "v2" else "closed"
-        if triton_gate.state() != gate:
-            raise ValueError(
-                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
-                f"{triton_gate.state() or 'not applied'}: set SPYRE_MODEL_RUNNER before "
-                "vLLM is imported, and the same in every process."
-            )
+        triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 

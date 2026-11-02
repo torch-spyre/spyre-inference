@@ -930,6 +930,14 @@ class TorchSpyrePlatform(CpuPlatform):
                     "runner."
                 )
 
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.rejection_sample_method == "fly":
+            # Upstream's CPU guard keys on the runner device, which is spyre here.
+            raise ValueError(
+                "Spyre does not support rejection_sample_method='fly': its acceptance "
+                "kernels are Triton-only and have no host implementation."
+            )
+
         # The pin holds only if the resolved property agrees; anything new that outranks
         # the env var must fail here rather than at the first runner-specific code path.
         # A raise, not an assert: -O would strip the tripwire.

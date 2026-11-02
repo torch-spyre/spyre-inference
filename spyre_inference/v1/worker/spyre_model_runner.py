@@ -1076,7 +1076,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        if self.speculative_config is not None:
+        if self.speculative_config is not None and hasattr(self.drafter, "model"):
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(

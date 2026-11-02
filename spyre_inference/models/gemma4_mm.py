@@ -488,6 +488,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         del embedder.position_embedding_table
 
         standardize = getattr(config, "standardize", False)
+        assert self.embed_vision is not None, "a vision tower always has its embedder"
         projection = self.embed_vision.embedding_projection
         self._spyre_vision_tail = _VisionTail(
             # vision_project sums the k*k patches; the pooler averages and scales them.

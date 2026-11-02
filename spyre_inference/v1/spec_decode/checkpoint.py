@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TEMPORARY compatibility for the vendored vllm-project/vllm#54448 XPress adaptation.
-# Published weight contract: vllm/model_executor/models/qwen3_dflash.py at ce9467b757.
-# Replace with upstream XPress loading on upgrade; retain the Spyre model overrides.
-# Cleanup: https://github.com/torch-spyre/spyre-inference/issues/1417
-# test_xpress_vendored.py flags native support.
+# Upstream's DFlash loader accepts any subset of these weights; Spyre checks the
+# published layout up front, before the layouts are built on device.
 
 """Validate the published Qwen3 DFlash/XPress backbone weights."""
 

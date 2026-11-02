@@ -26,8 +26,8 @@ def head_and_weights():
     head = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128, topc=0).double()
     state = head.state_dict()
     weights = {
-        "xpress_head." + source: torch.randn_like(state[dest]) * 0.05
-        for source, dest in head._PUBLISHED_KEYS.items()
+        "xpress_head." + source: torch.randn_like(state.get(dest, head.mix_L)) * 0.05
+        for source, dest in head.HYBRID_KEY_MAP.items()
     }
     head.load_checkpoint_weights(weights)
     return head, weights

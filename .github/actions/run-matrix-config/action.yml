@@ -140,10 +140,11 @@ runs:
     # here rather than falling back.
     - name: Download kernels wheel
       if: ${{ inputs.use_prebaked_image != 'true' }}
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: sampling-kernels-wheel
         path: ${{ runner.temp }}/kernels-wheel
+        digest-mismatch: warn
 
     # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
     - name: Build spyre-inference
@@ -228,13 +229,14 @@ runs:
     # back; the no-pin case is handled by the `if` above, not by swallowing errors.
     - name: Download pinned test durations
       if: ${{ inputs.durations_run_id != '' }}
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: test-durations
         path: ${{ runner.temp }}/test-durations
         run-id: ${{ inputs.durations_run_id }}
         repository: ${{ github.repository }}
         github-token: ${{ github.token }}
+        digest-mismatch: warn
 
     - name: Point the sharder at the pinned durations
       if: ${{ inputs.durations_run_id != '' }}
@@ -310,7 +312,7 @@ runs:
     # Raw per-process data files; their host/pid suffixes are unique across jobs, so the fan-in's `make coverage` combines them without a per-job step. if-no-files-found=ignore covers configs that measured nothing.
     - name: Upload coverage data
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: coverage-${{ inputs.job_slot }}
         path: .coverage.*
@@ -321,7 +323,7 @@ runs:
     # This leg's {nodeid: seconds} slice, merged by the durations fan-in job into the next run's pinned partition weights. if-no-files-found=ignore: a leg that ran nothing (all skipped) writes no file.
     - name: Upload test durations
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: durations-data-${{ inputs.job_slot }}
         path: ${{ runner.temp }}/durations-${{ inputs.job_slot }}.json
@@ -344,10 +346,11 @@ runs:
     - name: Download the first attempt's JUnit results
       if: ${{ always() && inputs.retry == 'true' }}
       continue-on-error: true
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: junit-${{ inputs.test_target }}
         path: ${{ runner.temp }}/replaced-junit
+        digest-mismatch: warn
 
     - name: Mark the retry's JUnit results
       if: ${{ always() && inputs.retry == 'true' }}
@@ -388,7 +391,7 @@ runs:
     # attempt's file.
     - name: Upload JUnit results
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: junit-${{ inputs.test_target }}
         path: |

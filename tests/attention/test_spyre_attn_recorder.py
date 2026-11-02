@@ -153,6 +153,7 @@ def make_bucketer(
             parallel_drafting=False,
         )
     )
+    config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens

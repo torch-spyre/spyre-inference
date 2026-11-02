@@ -39,7 +39,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import max_decode_query_len
 
@@ -88,10 +88,15 @@ def batched_decode_query_len(vllm_config: VllmConfig) -> int:
 
     1 + k only where every verification is that wide once the scheduler pads its
     drafts, so not for a per-batch-size k, nor for V1 parallel drafting, whose decode
-    width is not 1 + k.
+    width is not 1 + k. Nor where ``SpyreAttentionImpl._batched_decode_supported`` keeps
+    the per-seq loop for every batch: padding would only add rows without the kernel.
     """
     spec = vllm_config.speculative_config
     if not envs.SPYRE_BATCHED_DECODE or spec is None or not spec.num_speculative_tokens:
+        return 1
+    if envs.SPYRE_ATTN_FOR_EACH_TILE and envs.SPYRE_ATTN_KV_LAYOUT != "head_major":
+        return 1
+    if vllm_config.compilation_config.mode != CompilationMode.STOCK_TORCH_COMPILE:
         return 1
     width = 1 + spec.num_speculative_tokens
     if spec.num_speculative_tokens_per_batch_size or max_decode_query_len(vllm_config) != width:
@@ -276,6 +281,7 @@ class SpyreAttnBucketer:
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        self._max_num_batched_tokens = max_batched
 
         # A pooling request's query_len is its own context_len, so it can't
         # exceed max_model_len even when max_num_batched_tokens is larger (unlike
@@ -440,6 +446,9 @@ class SpyreAttnBucketer:
         out: list[SpyreAttnBatchedDecodeBucket] = []
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
             for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
+                # Wider than a step can schedule, so dispatch never reaches it.
+                if num_seqs * self._batched_decode_query_len > self._max_num_batched_tokens:
+                    continue
                 chunking = batched_decode_chunking(
                     num_seqs, num_blocks, self._batched_decode_query_len
                 )

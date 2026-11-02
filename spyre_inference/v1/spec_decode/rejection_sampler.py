@@ -218,7 +218,7 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_logits.shape == (num_tokens, vocab_size)
 
-    output_token_ids = torch.full(
+    output_token_ids = torch.full(  # ty: ignore[no-matching-overload]
         (batch_size, max_spec_len + 1),
         upstream.PLACEHOLDER_TOKEN_ID,
         dtype=torch.int32,
@@ -247,7 +247,7 @@ def rejection_sample(
             draft_token_ids,
             sampler.greedy_sample(target_logits),
             bonus_token_ids,
-            is_greedy,
+            is_greedy,  # ty: ignore[invalid-argument-type]
             max_spec_len,
             uniform_probs,
             synthetic_conditional_rates,
@@ -280,7 +280,7 @@ def rejection_sample(
         bonus_token_ids,
         recovered_token_ids,
         uniform_probs,
-        is_greedy,
+        is_greedy,  # ty: ignore[invalid-argument-type]
         max_spec_len,
         synthetic_conditional_rates,
     )

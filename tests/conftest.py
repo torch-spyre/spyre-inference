@@ -39,6 +39,9 @@ def pytest_collection_modifyitems(items):
         # Match only the test id/class/parameter portion, not the file path: the
         # global skip must not exclude the card-free entry-local CPU tests by filename.
         nodeid = item.nodeid.partition("::")[2].lower()
+        # Head-major runs batched decode under the tiled walk; verified on device.
+        if getattr(item, "originalname", None) == "test_head_major_batched_verify_correctness":
+            continue
         if (
             "batched_decode" in nodeid
             or "batcheddecode" in nodeid

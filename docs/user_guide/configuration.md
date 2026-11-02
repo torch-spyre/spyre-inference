@@ -164,6 +164,7 @@ the number of image-batch widths the vision tower is warmed at, which can run ou
 device memory (#1302). At a long `--max-model-len`, a 2048-token bucket can push the
 largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
 they are left to compile on first use (torch-spyre#5250 makes that limit configurable).
+
 **Speculative decoding.** A verification step packs up to `1 + num_speculative_tokens`
 tokens per running sequence, so the one-token decode ladder above would pad it all the way
 up to the prefill bucket. When `speculative_config` is set and `compile_sizes` is left

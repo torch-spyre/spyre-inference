@@ -16,7 +16,8 @@
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from spyre_inference import envs
@@ -101,6 +102,28 @@ class TorchSpyreScheduler(Scheduler):
             num_invalid_spec_tokens,
             request_id,
         )
+
+    def update_from_output(
+        self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput
+    ) -> dict[int, EngineCoreOutputs]:
+        # The per-request twin of make_spec_decoding_stats: upstream observes every
+        # verification into the request's metrics, so undo the padding-only ones. The
+        # outputs hold the same metrics object and are serialized after this returns.
+        invalid = scheduler_output.num_invalid_spec_tokens or {}
+        padding_only = []
+        for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items():
+            request = self.requests.get(req_id)
+            metrics = None if request is None else request.spec_decode_metrics
+            if metrics is not None and tokens and invalid.get(req_id) == len(tokens):
+                padding_only.append((metrics, metrics.histogram[0], len(metrics.per_step_drafted)))
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        for metrics, rejected_steps, detailed_steps in padding_only:
+            if metrics.histogram[0] > rejected_steps:
+                metrics.histogram[0] -= 1
+            if len(metrics.per_step_drafted) > detailed_steps:
+                metrics.per_step_drafted.pop()
+                metrics.per_step_accepted.pop()
+        return outputs
 
     def _schedule(self, *args, **kwargs) -> SchedulerOutput:
         if self.max_num_partial_prefills <= 0:

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.config import CompilationMode
 
 from spyre_inference import envs
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
@@ -49,6 +50,7 @@ def make_config(
         config.speculative_config.num_speculative_tokens = num_speculative_tokens
         config.speculative_config.num_speculative_tokens_per_batch_size = None
         config.speculative_config.parallel_drafting = False
+    config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
     config.model_config.runner_type = runner_type
@@ -727,6 +729,25 @@ class TestSpeculativeVerifyWidth:
         config.speculative_config.parallel_drafting = True
         config.use_v2_model_runner = False
         assert batched_decode_query_len(config) == 1
+
+    def test_token_major_under_tiled_walk_keeps_plain_decode(self, monkeypatch):
+        """Only head-major runs batched decode there, so padding would buy nothing."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
+        envs.clear_env_cache()
+        assert batched_decode_query_len(make_config(num_speculative_tokens=3)) == 1
+
+    def test_eager_keeps_plain_decode(self):
+        config = make_config(num_speculative_tokens=3)
+        config.compilation_config.mode = CompilationMode.NONE
+        assert batched_decode_query_len(config) == 1
+
+    def test_variants_wider_than_a_step_are_dropped(self):
+        """128 seqs x 8 rows can never be scheduled under a 512-token budget."""
+        b = SpyreAttnBucketer(
+            make_config(max_num_seqs=128, max_num_batched_tokens=512, num_speculative_tokens=7)
+        )
+        widths = {v.num_seqs * v.verify_len for v in b.batched_decode_variants()}
+        assert widths and max(widths) <= 512
 
     def test_variants_carry_the_one_verification_width(self):
         plain = SpyreAttnBucketer(make_config())

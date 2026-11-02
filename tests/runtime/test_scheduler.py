@@ -29,7 +29,8 @@ from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
-from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.metrics.stats import RequestSpecDecodeMetrics
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -253,3 +254,25 @@ def test_padding_only_step_is_not_counted_as_a_draft():
     assert stats.num_drafts == 2
     assert stats.num_draft_tokens == 3 + 1
     assert stats.num_accepted_tokens == 2 + 1
+
+
+@pytest.mark.parametrize(
+    "drafts,histogram",
+    [([], [0, 0, 0, 0]), ([7], [1, 0, 0, 0])],
+    ids=["padding_only", "real_draft"],
+)
+def test_padding_only_step_kept_out_of_request_metrics(drafts, histogram):
+    scheduler = _speculative(_scheduler())
+    request = _decoding(scheduler)
+    request.spec_decode_metrics = RequestSpecDecodeMetrics.new(NUM_SPEC_TOKENS)
+    rid = request.request_id
+    scheduler.update_draft_token_ids(DraftTokenIds([rid], [drafts]))
+    output = scheduler.schedule()
+
+    # Every draft rejected: only the target's own token comes back.
+    runner_output = ModelRunnerOutput(
+        req_ids=[rid], req_id_to_index={rid: 0}, sampled_token_ids=[[11]]
+    )
+    scheduler.update_from_output(output, runner_output)
+
+    assert request.spec_decode_metrics.histogram == histogram

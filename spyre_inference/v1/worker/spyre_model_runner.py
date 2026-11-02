@@ -89,8 +89,17 @@ from spyre_inference.v1.pool.encoder_grid import (
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+from spyre_inference.v1.spec_decode.gemma4_proposer import (
+    SpyreGemma4Proposer,
+    create_spyre_drafter,
+)
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
+from spyre_inference.v1.worker.compile_granularity import (
+    compile_blocks,
+    compile_for_spyre,
+    compile_granularity,
+    repeated_block_lists,
+)
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
     encoder_pad_token_id,
@@ -524,6 +533,53 @@ class _SpyreModelWrapper:
             setattr(self._model, name, value)
 
 
+class _SpyreDraftModelWrapper(_SpyreModelWrapper):
+    """The MTP drafter's boundary, which also takes a float input: the target's hidden state.
+
+    The proposer, unlike the runner, never pads its batch, so every input is padded here
+    onto a compiled body bucket. Outputs come back to the host before the trim, avoiding
+    a dim-0 slice on device. With ``on_device`` they stay on the card, padded, and a
+    float input already there is taken as such: the previous pass's padded output.
+    """
+
+    def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds=None, on_device=False):
+        num_tokens = positions.shape[-1]
+        bucketer = self._shape_bucketer
+        padded = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        pad = 0 if padded is None else padded - num_tokens
+
+        def to_spyre(t: torch.Tensor | None, rows_last: bool) -> torch.Tensor | None:
+            if t is None:
+                return None
+            if t.device.type != "cpu":
+                assert t.shape[0] == num_tokens + pad, "an on-card input is already padded"
+                return t
+            if pad:
+                t = convert(t, device="cpu")
+                t = F.pad(t, (0, pad) if rows_last else (0, 0, 0, pad))
+            if t.is_floating_point():
+                return convert(t, device=self._spyre_device, dtype=self._model_dtype)
+            return convert(t, device=self._spyre_device, dtype=torch.int64)
+
+        result = self._model(
+            input_ids=to_spyre(input_ids, rows_last=True),
+            positions=to_spyre(positions, rows_last=True),
+            hidden_states=to_spyre(hidden_states, rows_last=False),
+            inputs_embeds=to_spyre(inputs_embeds, rows_last=False),
+        )
+        if on_device:
+            return result
+        return tuple(convert(t, device="cpu")[:num_tokens] for t in result)
+
+    def lm_head_takes_padded_rows(self, num_tokens: int) -> bool:
+        """Whether ``num_tokens``'s padded body bucket is a width the lm_head compiled at."""
+        bucketer = self._shape_bucketer
+        if bucketer is None:
+            return False
+        padded = bucketer.find_bucket(num_tokens)
+        return padded is not None and padded in self._logits_row_buckets
+
+
 class TorchSpyreModelRunner(GPUModelRunner):
     """Model runner for Spyre.
 
@@ -573,6 +629,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # via self._spyre_device regardless of self.device.
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, torch.device("cpu"))
+            # Upstream built its own Gemma4Proposer; replace it before anything uses it.
+            if hasattr(self, "drafter"):
+                self.drafter = create_spyre_drafter(vllm_config, self)
         # Patch upstream's Sampler in place, so every holder of it (e.g. the
         # RejectionSampler) takes the host-side draws.
         self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
@@ -626,11 +685,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.lora_config:
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
-        if hasattr(self, "drafter"):
-            raise NotImplementedError(
-                "Models with a drafter model are not yet implemented and tested for Spyre."
-            )
-
         fix_padded_model(self.model, self.model_config)
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
@@ -676,6 +730,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
+        )
+
+        if hasattr(self, "drafter"):
+            self._load_drafter()
+
+    def _load_drafter(self) -> None:
+        """Load the MTP assistant onto Spyre, compiled per block like the target."""
+        drafter = cast(SpyreGemma4Proposer, self.drafter)
+        logger.info("Loading drafter %s...", drafter.draft_model_config.model)
+        drafter.load_model(self.get_model())
+        attn_layer.install_kv_readers(drafter.attention_layers())
+        draft_model = drafter.model
+        draft_model.to(device=self._spyre_device)
+        if not (
+            self.vllm_config.model_config.enforce_eager
+            or self.compilation_config.mode is CompilationMode.NONE
+        ):
+            num_blocks, _ = compile_blocks(repeated_block_lists(draft_model))
+            logger.info("Wrapped %d drafter blocks for per-block compile on Spyre.", num_blocks)
+        bucketer = self.spyre_shape_bucketer
+        drafter.model = _SpyreDraftModelWrapper(
+            draft_model,
+            self._spyre_device,
+            logits_row_buckets=(
+                []
+                if bucketer is None
+                else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
+            ),
+            shape_bucketer=bucketer,
+            model_dtype=self._model_dtype(),
         )
 
     def _copy_draft_token_ids_to_cpu(self, scheduler_output, zeros_only=False):
@@ -960,7 +1044,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        if self.speculative_config is not None:
+        # A KV-sharing drafter (gemma-4 MTP) has no KV layers of its own: its layers
+        # are already in the target's attention groups above, and causal.
+        if self.speculative_config is not None and hasattr(
+            self.drafter.model, "get_draft_kv_cache_layer_names"
+        ):
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(
@@ -1498,6 +1586,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._spyre_kv_caches = dict(kv_caches)
         return kv_caches
+
+    def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
+        """Also register each KV-sharing layer in its group's per-layer spec dict.
+
+        With the hybrid manager disabled, layers of differing head shapes share one group
+        under a UniformTypeKVCacheSpecs, and ``initialize_attn_backend`` looks every group
+        member up in its per-layer dict. Upstream appends a sharing layer (an MTP drafter's)
+        to the group but not to that dict, so the lookup raises.
+        """
+        super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        for group in kv_cache_config.kv_cache_groups:
+            per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            if per_layer is None:
+                continue
+            for layer_name, target in self.shared_kv_cache_layers.items():
+                if target in per_layer:
+                    per_layer.setdefault(layer_name, per_layer[target])
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.

@@ -284,6 +284,13 @@ class SpyreAttnBucketer:
             "SPYRE_ATTN_QUERY_BUCKETS",
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
+        # A speculative verify step queries the drafts plus one per sequence; without its
+        # own bucket it would pad onto the prefill step. Added to an override too: a run
+        # with a drafter verifies every step.
+        spec = vllm_config.speculative_config
+        verify_len = 1 + spec.num_speculative_tokens if spec is not None else 1
+        if 1 < verify_len <= max_batched:
+            self._query_buckets = sorted({*self._query_buckets, verify_len})
 
         # Default: the SPYRE_ATTN_KV_LADDER preset. Sparse because the recorded set is a
         # product of both axes; the extra padding each bucket costs is absorbed by the mask.

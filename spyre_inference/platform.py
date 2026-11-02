@@ -389,6 +389,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 while size < num_seqs:
                     sizes.add(size)
                     size *= 2
+                # A speculative verify step packs each decode batch's drafts beside it.
+                spec = vllm_config.speculative_config
+                if spec is not None and spec.num_speculative_tokens:
+                    per_seq = 1 + spec.num_speculative_tokens
+                    decode_sizes = [n for n in sizes if n <= num_seqs]
+                    sizes |= {min(n * per_seq, max_capture_size) for n in decode_sizes}
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
@@ -405,6 +411,36 @@ class TorchSpyrePlatform(CpuPlatform):
         # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
+        # The drafter's config was built beside the target's, with the checkpoint dtype.
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.draft_model_config is not None:
+            spec.draft_model_config.dtype = torch.float16
+
+    @staticmethod
+    def _extend_drafter_context(spec, target_max_model_len: int) -> None:
+        """Let the MTP assistant draft over the target's whole context.
+
+        Its config says 2048, and upstream zeroes the drafts of any step whose sequence is
+        longer than the drafter's max_model_len, so past that every draft is rejected. The
+        assistant has no KV of its own: it reads the target's cache at the target's
+        positions, which is the shared positional space upstream already grants EAGLE drafts
+        (#48894). Its rotary cache is sized from max_position_embeddings, so that goes up too.
+        """
+        draft_model_config = spec.draft_model_config
+        if draft_model_config.max_model_len >= target_max_model_len:
+            return
+        hf_config = draft_model_config.hf_config
+        # The draft layers build their rope from the text config.
+        for config in (hf_config, getattr(hf_config, "text_config", hf_config)):
+            positions = getattr(config, "max_position_embeddings", None)
+            if positions is not None and positions < target_max_model_len:
+                config.max_position_embeddings = target_max_model_len
+        logger.info(
+            "Extending the MTP drafter's max_model_len from %d to the target's %d.",
+            draft_model_config.max_model_len,
+            target_max_model_len,
+        )
+        draft_model_config.max_model_len = target_max_model_len
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
@@ -769,6 +805,26 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
 
+        spec = vllm_config.speculative_config
+        if spec is not None:
+            if not spec.use_gemma4_mtp():
+                raise ValueError(
+                    f"Spyre supports speculative decoding only with a Gemma-4 MTP assistant "
+                    f"checkpoint (got method={spec.method!r})."
+                )
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            draft_hf_config = spec.draft_model_config.hf_config
+            draft_text_config = getattr(draft_hf_config, "text_config", draft_hf_config)
+            repair_head_dim_access(draft_text_config)
+            cls._extend_drafter_context(spec, vllm_config.model_config.max_model_len)
+            # Async spec decode overlaps its bookkeeping on CUDA copy streams and events.
+            if vllm_config.scheduler_config.async_scheduling:
+                logger.info(
+                    "Disabling async scheduling: Spyre runs speculative decoding synchronously."
+                )
+                vllm_config.scheduler_config.async_scheduling = False
+
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
         # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
@@ -906,6 +962,9 @@ class TorchSpyrePlatform(CpuPlatform):
             else:
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
                 max_model_len = vllm_config.model_config.max_model_len
+                # The scheduler reserves slots for the next step's drafts too.
+                if vllm_config.speculative_config is not None:
+                    max_model_len += vllm_config.speculative_config.num_speculative_tokens
                 blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
                 # +1 for BlockPool's reserved null block, which is never allocatable.
                 cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1

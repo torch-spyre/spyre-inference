@@ -110,3 +110,15 @@ def test_attention_warmup_rejects_misaligned_draft_causality(recording_runner):
     with pytest.raises(ValueError, match="zip"):
         TorchSpyreModelRunner._record_attention_graphs(runner)
     record.assert_not_called()
+
+
+def test_attention_warmup_takes_a_kv_sharing_drafter_from_the_attention_groups(
+    recording_runner,
+):
+    """Gemma-4 MTP's layers read the target's KV and sit in its groups, as causal layers."""
+    runner, record = recording_runner
+    runner.attn_groups = [[SimpleNamespace(layer_names=["target", "draft.0"])]]
+    runner._spyre_kv_caches = {"target": object(), "draft.0": object()}
+    runner.drafter = SimpleNamespace(model=SimpleNamespace())
+    TorchSpyreModelRunner._record_attention_graphs(runner)
+    assert record.call_args.kwargs["causal_by_layer"] == {"target": True, "draft.0": True}

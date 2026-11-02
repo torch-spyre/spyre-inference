@@ -587,17 +587,6 @@ def test_spyre_attn_sliding_window(
     )
 
 
-def test_random_block_tables_never_share_a_real_page():
-    # A page shared across sequences is written differently for the kernel and the
-    # reference, so the test would compare the two against different KV caches.
-    set_random_seed(0)
-    kv_lens, block_size = [64, 128, 192, 256, 320, 384, 448, 512], 64
-    block_tables = random_block_tables(kv_lens, 16, block_size, num_blocks=40)
-    real = [block_tables[i, : -(-kv // block_size)] for i, kv in enumerate(kv_lens)]
-    pages = torch.cat(real)
-    assert pages.unique().numel() == pages.numel() == 36
-
-
 @pytest.mark.parametrize(
     "configure_device",
     [

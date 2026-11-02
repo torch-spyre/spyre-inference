@@ -20,6 +20,7 @@
 from unittest.mock import Mock
 
 import torch
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
@@ -47,16 +48,27 @@ def _fused_qkv_kv_views(
 def random_block_tables(
     kv_lens: list[int], width: int, block_size: int, num_blocks: int
 ) -> torch.Tensor:
-    """Random block tables whose real blocks are distinct across all sequences."""
-    real = [(kv_len + block_size - 1) // block_size for kv_len in kv_lens]
-    assert sum(real) <= num_blocks, f"{sum(real)} real blocks do not fit in {num_blocks} pages"
-    # Padding entries are fully masked, so they may point anywhere.
-    block_tables = torch.randint(0, num_blocks, (len(kv_lens), width), dtype=torch.int32)
-    pages = torch.randperm(num_blocks).to(torch.int32)
-    offset = 0
-    for seq_idx, n in enumerate(real):
-        block_tables[seq_idx, :n] = pages[offset : offset + n]
-        offset += n
+    """Random block tables whose real blocks are distinct across all sequences.
+
+    Padding points only at pages no sequence owns, so it stays inert even if a mask
+    regresses. The global stream sees only the plain ``randint`` table the tests drew
+    before, so the K/V data drawn after this call is unchanged.
+    """
+    real = [cdiv(kv_len, block_size) for kv_len in kv_lens]
+    num_real = sum(real)
+    needs_spare = any(n < width for n in real)
+    assert num_real + needs_spare <= num_blocks, (
+        f"{num_real} real blocks{' plus a padding page' if needs_spare else ''} "
+        f"do not fit in {num_blocks} pages"
+    )
+    draw = torch.randint(0, num_blocks, (len(kv_lens), width), dtype=torch.int32)
+    pages = torch.randperm(
+        num_blocks, generator=torch.Generator().manual_seed(0), dtype=torch.int32
+    )
+    spare = pages[num_real:] if needs_spare else pages
+    block_tables = spare[draw % spare.numel()]
+    for row, own in zip(block_tables, torch.split(pages[:num_real], real)):
+        row[: own.numel()] = own
     return block_tables
 
 

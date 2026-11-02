@@ -33,6 +33,7 @@ Only neox-style full rotary is supported; other configs raise ``NotImplementedEr
 """
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
@@ -122,6 +123,12 @@ class _SpyreRotaryMixin:
                 f"head_size); got is_neox_style={self.is_neox_style}, "
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
+        # A model may request its cache at a wider dtype than it runs in.
+        # For example gpt-oss models ask for fp32.
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = vllm_config.model_config if vllm_config is not None else None
+        if model_config is not None and self.cos_sin_cache.dtype != model_config.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(model_config.dtype)
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None

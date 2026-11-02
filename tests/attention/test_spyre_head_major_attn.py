@@ -185,7 +185,10 @@ def _run_head_major_attn_test(
     from vllm.config import get_current_vllm_config
 
     max_num_blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
-    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    # The bucketer must see this test's block_size, not the fixture default.
+    bucketer_config = get_current_vllm_config()
+    bucketer_config.cache_config.block_size = block_size
+    buckets = SpyreAttnBucketer(bucketer_config).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
@@ -453,38 +456,30 @@ def _fp8_layer(k_scale, v_scale, **attrs):
     return layer
 
 
-def _runner_over(monkeypatch, layers, static_forward_context=None):
-    """A runner whose model is just ``layers``."""
-    from types import SimpleNamespace
+def _resolve(layers, static_forward_context=None):
+    from spyre_inference.v1.worker.model_load import resolve_kv_scales
 
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    runner = object.__new__(TorchSpyreModelRunner)
-    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=layers)))
-    runner.compilation_config = SimpleNamespace(static_forward_context=static_forward_context or {})
-    return runner
+    model = Mock(modules=Mock(return_value=layers))
+    return resolve_kv_scales(model, static_forward_context or {})
 
 
 def _warnings(monkeypatch):
-    from spyre_inference.v1.worker import spyre_model_runner
+    from spyre_inference.v1.worker import model_load
 
     warnings = []
-    monkeypatch.setattr(
-        spyre_model_runner.logger, "warning_once", lambda msg, *args: warnings.append(msg)
-    )
+    monkeypatch.setattr(model_load.logger, "warning_once", lambda msg, *args: warnings.append(msg))
     return warnings
 
 
 def test_distinct_kv_scales_warn_about_warmup(default_vllm_config, monkeypatch):
     """Each distinct (k_scale, v_scale) pair is its own compile, so startup says so."""
     first, other = _fp8_layer(0.25, 0.5), _fp8_layer(0.25, 0.5)
-    runner = _runner_over(monkeypatch, [first, other])
     warnings = _warnings(monkeypatch)
 
-    runner._resolve_kv_scales()
+    _resolve([first, other])
     assert warnings == [], "one shared pair compiles once"
     other._k_scale_float = 0.125
-    runner._resolve_kv_scales()
+    _resolve([first, other])
     assert len(warnings) == 1 and "distinct" in warnings[0]
 
 
@@ -493,7 +488,7 @@ def test_per_head_kv_scales_warn(default_vllm_config, monkeypatch):
     layer = _fp8_layer(0.25, 0.5, _k_scale=torch.tensor([0.25, 0.025]))
     warnings = _warnings(monkeypatch)
 
-    _runner_over(monkeypatch, [layer])._resolve_kv_scales()
+    _resolve([layer])
 
     assert layer.impl._kernel_kv_scales() == (0.25, 0.5)
     assert len(warnings) == 1 and "per-head" in warnings[0]
@@ -504,9 +499,7 @@ def test_kv_sharing_layer_reads_with_its_target_scales(default_vllm_config, monk
     target = _fp8_layer(0.05, 0.02)
     # A sharing layer stores nothing, so a calibrated checkpoint leaves its own at 1.0.
     reader = _fp8_layer(1.0, 1.0, kv_sharing_target_layer_name="layers.0.attn")
-    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
-
-    runner._resolve_kv_scales()
+    _resolve([reader, target], {"layers.0.attn": target})
 
     assert reader.impl._kernel_kv_scales() == (0.05, 0.02)
 
@@ -519,24 +512,26 @@ def test_kv_sharing_layer_and_target_must_agree_on_fp8(default_vllm_config, monk
     reader = _fp8_layer(
         1.0, 1.0, layer_name="layers.1.attn", kv_sharing_target_layer_name="layers.0.attn"
     )
-    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
-
     with pytest.raises(ValueError, match="kv_cache_dtype_skip_layers"):
-        runner._resolve_kv_scales()
+        _resolve([reader, target], {"layers.0.attn": target})
 
 
 def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch):
     """A reload passes its arguments through, re-reads the scales, and re-warms only on a
     change, so an armed compile guard never sees the new scales mid-request."""
     import contextlib
+    from types import SimpleNamespace
 
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     from spyre_inference.v1.worker import compile_guard
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
     layer = _fp8_layer(0.25, 0.5)
-    runner = _runner_over(monkeypatch, [layer])
-    runner._resolve_kv_scales()
+    runner = object.__new__(TorchSpyreModelRunner)
+    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=[layer])))
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    _resolve([layer])
     calls, warmups, allowed = [], [], []
     new_k_scale = 0.25
 
@@ -883,6 +878,55 @@ def test_head_major_dispatches_by_query_width(
     assert sorted(called) == ["decode", "prefill"], called
 
 
+# Not named "batched_decode": tests/conftest.py skips those under the tiled walk.
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], id="long_and_shorts"),
+        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], id="graded"),
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], id="with_prefill"),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_grouped_decode_matches_reference(
+    default_vllm_config, monkeypatch, seq_lens, configure_compilation, configure_device
+):
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    envs.clear_env_cache()
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.model_config.max_model_len = 8192
+
+    groups_run = []
+    run_grouped = SpyreAttentionImpl._run_grouped_decode
+
+    def spy(self, query_dev, k_pages, v_pages, attn_metadata, output, device):
+        groups_run.append(len(attn_metadata.decode_groups))
+        return run_grouped(self, query_dev, k_pages, v_pages, attn_metadata, output, device)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_grouped_decode", spy)
+
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+
+
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -1015,7 +1059,10 @@ def test_head_major_matches_token_major(
     from vllm.config import get_current_vllm_config
 
     blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
-    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    # The bucketer must see this test's block_size, not the fixture default.
+    bucketer_config = get_current_vllm_config()
+    bucketer_config.cache_config.block_size = block_size
+    buckets = SpyreAttnBucketer(bucketer_config).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(blocks_per_seq, buckets)
     if padded_width is not None:
         blocks_per_seq = max(blocks_per_seq, padded_width)

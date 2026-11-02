@@ -49,14 +49,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers.models.llava_next.modeling_llava_next import image_size_to_num_patches
-from vllm.model_executor.models import blip2, granite4_vision
+from vllm.model_executor.models import granite4_vision
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import StageMissingLayer
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
+from spyre_inference.models.blip2 import use_spyre_qformer_attention
 from spyre_inference.multimodal.utils import STICK, align_up
 from spyre_inference.v1.worker import compile_guard
 
@@ -169,7 +169,7 @@ def pad_siglip_heads(tower: nn.Module) -> None:
     before the slice-assignments (a strided slice-assign is silently wrong on Spyre) and moved
     back. A no-op for a head_dim that is already stick-aligned, and for a tower padded before.
     """
-    for layer in tower.encoder.layers:
+    for layer in tower.encoder.layers:  # ty: ignore[not-iterable]
         attn = layer.self_attn
         if getattr(attn, "_spyre_head_dim_padded", False):
             continue
@@ -200,57 +200,6 @@ def pad_siglip_heads(tower: nn.Module) -> None:
         # out_proj bias is [hidden], the output dim, unchanged.
         attn.attn.head_size = pad
         attn._spyre_head_dim_padded = True
-
-
-class SpyreBlip2QFormerMultiHeadAttention(blip2.Blip2QFormerMultiHeadAttention):
-    """Q-Former attention that runs fully on Spyre.
-
-    Upstream's ``transpose_for_scores`` is a ``permute(0, 2, 1, 3)`` with no ``.contiguous()``,
-    which leaves non-contiguous stick layouts that Spyre's restickify and bmm_padding passes
-    cannot reconcile: the fused transpose -> SDPA lowering reads them with the wrong stick
-    layout and returns garbage. As in hf-adapters' ``make_encoder_block``, each head-shape
-    transpose is followed by ``.contiguous()``, so Spyre materialises a canonically tiled
-    buffer before the SDPA decomposition.
-
-    It adds no state, so ``use_spyre_qformer_attention`` can swap it onto a built module.
-    """
-
-    def forward(  # ty: ignore[invalid-method-override]
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        bsz, q_len, _ = hidden_states.shape
-
-        def project(proj: nn.Module, x: torch.Tensor) -> torch.Tensor:
-            return (
-                proj(x)
-                .view(bsz, x.shape[1], self.num_attention_heads, self.attention_head_size)
-                .transpose(1, 2)
-                .contiguous()
-            )
-
-        q = project(self.query, hidden_states)
-        kv_src = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        k = project(self.key, kv_src)
-        v = project(self.value, kv_src)
-        out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, is_causal=False, scale=self.scaling
-        )
-        # [B, H, Lq, D] -> [B, Lq, H*D]
-        return out.transpose(1, 2).reshape(bsz, q_len, self.all_head_size)
-
-
-def use_spyre_qformer_attention(root: nn.Module) -> int:
-    """Swap ``SpyreBlip2QFormerMultiHeadAttention`` onto every upstream Q-Former attention
-    under ``root``, in place and before weights load. Only this model's own modules change,
-    not the upstream class other models share. Returns how many it swapped."""
-    swapped = 0
-    for module in root.modules():
-        if type(module) is blip2.Blip2QFormerMultiHeadAttention:
-            module.__class__ = SpyreBlip2QFormerMultiHeadAttention
-            swapped += 1
-    return swapped
 
 
 class SpyreGranite4VisionForConditionalGeneration(
@@ -342,7 +291,9 @@ class SpyreGranite4VisionForConditionalGeneration(
         position.weight = nn.Parameter(position.weight.detach()[self._tile_order])
 
         for proj in (*self.layerwise_projectors, *self.spatial_projectors):
-            proj.image_positions.data = proj.image_positions.data[:, self._window_order]
+            proj.image_positions.data = (
+                proj.image_positions.data[:, self._window_order]  # ty: ignore[not-subscriptable]
+            )
         # Plain tensor, so it stays on the host: the packing in postprocess runs there.
         self._image_newline_host = convert(self.image_newline.detach(), device="cpu").clone()
 
@@ -387,7 +338,7 @@ class SpyreGranite4VisionForConditionalGeneration(
         return self._tile_patches
 
     @property
-    def vision_taps(self) -> tuple[int, ...]:  # ty: ignore[invalid-method-override]
+    def vision_taps(self) -> tuple[int, ...]:
         """The deepstack layers, then the one layer the spatial projectors read."""
         cfg = self.config
         return (*(vision for vision, _ in cfg.deepstack_layer_map), cfg.spatial_vision_layer)
@@ -458,11 +409,15 @@ class SpyreGranite4VisionForConditionalGeneration(
         (its spatial offset).
         """
         merge2, queries = self.patches_per_token, self._query**2
-        enc = proj.norm(tap).reshape(-1, self._window**2, tap.shape[-1])
+        enc = proj.norm(tap).reshape(  # ty: ignore[call-non-callable]
+            -1, self._window**2, tap.shape[-1]
+        )
         groups = enc.reshape(enc.shape[0], merge2, queries, -1)
         query = proj.query + (groups * down).sum(dim=1)
         out = _qformer(proj.qformer, query, enc + proj.image_positions)
-        return proj.out_linear(out).reshape(-1, proj.out_linear.out_features)
+        return proj.out_linear(out).reshape(  # ty: ignore[call-non-callable]
+            -1, proj.out_linear.out_features
+        )
 
     def postprocess_encoder_output(
         self,
@@ -496,7 +451,10 @@ class SpyreGranite4VisionForConditionalGeneration(
             _downsample_rate=Fraction(self.config.downsample_rate),
             image_newline=self._image_newline_host,
         )
-        packed = [_Upstream._pack_and_unpad_image_features(packer, f, sizes) for f in per_level]
+        packed = [
+            _Upstream._pack_and_unpad_image_features(packer, f, sizes)  # ty: ignore[invalid-argument-type]
+            for f in per_level
+        ]
         for position, idx in enumerate(indices):
             dest[idx] = torch.cat([level[position] for level in packed], dim=-1)
 

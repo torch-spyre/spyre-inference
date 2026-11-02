@@ -449,8 +449,7 @@ attention even under `--enforce-eager` — attention compiles in its own domain,
 of the model still runs eager. Because the bmm's output axes
 (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
 mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
-at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries no ALiBi (which
-needs a bias tile per query group), so an ALiBi model needs `token_major`. Batched decode
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. Batched decode
 runs the other way round: its page index is uploaded one entry per stick here, which is
 what the tiled walk needs, so the batched kernel is reached on this layout and declined on
 token-major until that port lands.
@@ -512,7 +511,8 @@ Key constraints:
   are all exercised, on both layouts (`tests/attention/test_spyre_attn.py`,
   `tests/attention/test_spyre_head_major_attn.py`)
 - **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
-  layers stay unwindowed) and logits soft-capping on both layouts; ALiBi on token-major only
+  layers stay unwindowed) and logits soft-capping on both layouts
+- **Not supported**: ALiBi, on either layout
 
 ### Encoder-only attention
 

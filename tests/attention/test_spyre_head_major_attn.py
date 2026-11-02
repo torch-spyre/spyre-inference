@@ -163,8 +163,6 @@ def _run_head_major_attn_test(
     torch.set_default_device("cpu")
     set_random_seed(0)
 
-    # This layout does not carry ALiBi; the impl rejects slopes at construction.
-    alibi_slopes = None
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -242,7 +240,6 @@ def _run_head_major_attn_test(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
         kv_cache_dtype=kv_cache_dtype,
         logits_soft_cap=soft_cap,
@@ -316,7 +313,6 @@ def _run_head_major_attn_test(
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
-        alibi_slopes=alibi_slopes,
     )
 
     atol, rtol = (0.3, 0.2) if max(query_lens) >= 32 else (0.2, 0.2)

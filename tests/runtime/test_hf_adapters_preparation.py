@@ -31,7 +31,10 @@ from spyre_inference.hf_adapters import (
     uses_hf_adapters,
 )
 from spyre_inference.platform import TorchSpyrePlatform
-from spyre_inference.transformers_backend import SpyreTransformersForCausalLM
+from spyre_inference.transformers_backend import (
+    SpyreTransformersEmbeddingModel,
+    SpyreTransformersForCausalLM,
+)
 
 
 def execution_result(head_size=64, **overrides):
@@ -81,7 +84,16 @@ class RecordedLMHead(nn.Module):
 
 @pytest.fixture
 def config_factory(tmp_path):
-    def create(*, adapter=True, tied=False, hf_config=None, hf_overrides=None, **kwargs):
+    def create(
+        *,
+        adapter=True,
+        tied=False,
+        hf_config=None,
+        hf_overrides=None,
+        runner="auto",
+        pooler_config=None,
+        **kwargs,
+    ):
         hf = hf_config or GraniteConfig(
             architectures=["GraniteForCausalLM"],
             hidden_size=128,
@@ -99,6 +111,8 @@ def config_factory(tmp_path):
         hf.save_pretrained(tmp_path)
         additional = {"spyre_model_preparation": "hf_adapters"} if adapter else {}
         engine_args = EngineArgs(
+            runner=runner,
+            pooler_config=pooler_config,
             model=str(tmp_path),
             model_impl="transformers",
             dtype="float16",
@@ -280,7 +294,7 @@ def test_native_forward_still_delegates_to_transformers(backend_factory, monkeyp
     [
         ("model_impl", "vllm", "model_impl"),
         ("quantization", "fp8", "unquantized"),
-        ("runner_type", "pooling", "text generation"),
+        ("runner_type", "invalid", "text generation"),
     ],
 )
 def test_unsupported_model_options(config_factory, field, value, error):
@@ -416,9 +430,11 @@ def test_prelaunch_preserves_registration_but_skips_model_overrides(monkeypatch)
     monkeypatch.setattr(clip, "force_disable_chunked_prefill", clip_override)
     models.apply_prelaunch_overrides(
         SimpleNamespace(
+            runner="auto",
+            convert="none",
             additional_config={
                 "spyre_model_preparation": "hf_adapters",
-            }
+            },
         )
     )
     register.assert_called_once()
@@ -611,7 +627,7 @@ def test_adapter_sliding_layers_require_covering_context(config_factory, window,
     if accepted:
         validate_hf_adapters_config(config)
     else:
-        with pytest.raises(ValueError, match="dense full-attention decoder"):
+        with pytest.raises(ValueError, match="dense full-attention backbone"):
             validate_hf_adapters_config(config)
 
 
@@ -624,7 +640,7 @@ def test_adapter_non_attention_layer_rejected_with_covering_window(config_factor
         "full_attention",
     ]
     config.model_config.hf_text_config.sliding_window = 64
-    with pytest.raises(ValueError, match="dense full-attention decoder"):
+    with pytest.raises(ValueError, match="dense full-attention backbone"):
         validate_hf_adapters_config(config)
 
 
@@ -782,7 +798,7 @@ def test_generic_wrapper_cannot_hide_nested_multimodal_config(config_factory):
     config = config_factory()
     assert not config.model_config.is_multimodal_model
     config.model_config.hf_config = SimpleNamespace(text_config=config.model_config.hf_text_config)
-    with pytest.raises(ValueError, match="text generation only"):
+    with pytest.raises(ValueError, match="text generation and embedding only"):
         validate_hf_adapters_config(config)
 
 
@@ -799,5 +815,262 @@ def test_generic_wrapper_does_not_enable_unsupported_adapter(config_factory):
         max_position_embeddings=64,
     )
     config = config_factory(hf_config=hf)
-    with pytest.raises(ValueError, match="does not support BertModel"):
+    with pytest.raises(ValueError, match="requires task='embed'"):
         prepare_execution(BertModel(hf).eval(), vllm_config=config)
+
+
+@pytest.mark.parametrize(
+    "family,head_dim,pooling",
+    [
+        ("qwen3", 128, "LAST"),
+        ("bert", 32, "MEAN"),
+        ("bert", 64, "CLS"),
+        ("roberta", 32, "CLS"),
+        ("xlm-roberta", 64, "MEAN"),
+    ],
+)
+def test_embedding_wrapper_loads_and_runs_shared_backbone(
+    config_factory, backend_factory, monkeypatch, family, head_dim, pooling
+):
+    import copy
+
+    import torch.nn.functional as F
+    from transformers import AutoConfig, AutoModel
+    from vllm.config import PoolerConfig
+    from vllm.model_executor.layers.attention import EncoderOnlyAttention
+
+    from spyre_inference.models.clip import CausalEncoderOnlyAttention
+
+    monkeypatch.setattr(
+        SpyreTransformersEmbeddingModel, "_decorate_for_torch_compile", lambda self: None
+    )
+    hf = AutoConfig.for_model(
+        family,
+        hidden_size=2 * head_dim,
+        head_dim=head_dim,
+        num_attention_heads=2,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        vocab_size=101,
+        max_position_embeddings=66,
+        pad_token_id=0,
+        **({"num_key_value_heads": 1} if family == "qwen3" else {}),
+    )
+    config = config_factory(
+        hf_config=hf, runner="pooling", pooler_config=PoolerConfig(seq_pooling_type=pooling)
+    )
+    assert config.model_config.architectures == ["TransformersEmbeddingModel"]
+    assert config.model_config.runner_type == "pooling"
+    assert config.model_config.pooler_config.seq_pooling_type == pooling
+    with set_current_vllm_config(config), torch.device("cpu"):
+        backend = SpyreTransformersEmbeddingModel(vllm_config=config).eval()
+    assert not hasattr(backend, "lm_head")
+    assert not backend.attention_fusers
+    assert type(backend.model.get_input_embeddings()) is nn.Embedding
+    reference_config = copy.deepcopy(backend.model.config)
+    reference_config._attn_implementation = "sdpa"
+    reference = AutoModel.from_config(reference_config).eval().to(torch.float16)
+    # Bare AutoModel state dict names, as shipped by embedding checkpoints.
+    backend.load_weights(iter(reference.state_dict().items()))
+    for name, parameter in backend.model.named_parameters():
+        torch.testing.assert_close(parameter, reference.get_parameter(name))
+    lengths = [3, 5]
+    ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
+    from spyre_inference.models.roberta import roberta_position_delta
+
+    offset = roberta_position_delta(backend.model_config.hf_config)
+    assert offset == (1 if family in ("roberta", "xlm-roberta") else 0)
+    positions = torch.cat([torch.arange(n) + offset for n in lengths])
+    token_types = torch.arange(8).remainder(2) if family != "qwen3" else None
+    expected = []
+    start = 0
+    with torch.inference_mode():
+        for n in lengths:
+            kw = (
+                {}
+                if token_types is None
+                else {"token_type_ids": token_types[start : start + n].unsqueeze(0)}
+            )
+            expected.append(
+                reference(
+                    ids[start : start + n].unsqueeze(0),
+                    position_ids=positions[start : start + n].unsqueeze(0),
+                    **kw,
+                ).last_hidden_state[0]
+            )
+            start += n
+
+    original_selector = backend._adapter_attention_cls
+
+    def select(binding):
+        assert not binding.uses_cache
+        assert binding.is_causal is (family == "qwen3")
+        assert original_selector(binding) is (
+            CausalEncoderOnlyAttention if binding.is_causal else EncoderOnlyAttention
+        )
+
+        class NumericalAttention(RecordedAttention):
+            def forward(self, query, key, value):
+                heads, kv_heads, dim = binding.num_heads, binding.num_kv_heads, binding.head_size
+                q = query.view(1, -1, heads, dim).transpose(1, 2)
+                k = key.view(1, -1, kv_heads, dim).transpose(1, 2)
+                v = value.view(1, -1, kv_heads, dim).transpose(1, 2)
+                outputs = []
+                start = 0
+                for n in lengths:
+                    end = start + n
+                    outputs.append(
+                        F.scaled_dot_product_attention(
+                            q[:, :, start:end],
+                            k[:, :, start:end],
+                            v[:, :, start:end],
+                            scale=binding.scale,
+                            is_causal=binding.is_causal,
+                            enable_gqa=True,
+                        )
+                    )
+                    start = end
+                return torch.cat(outputs, dim=2).transpose(1, 2).reshape(-1, heads * dim)
+
+        return NumericalAttention
+
+    monkeypatch.setattr(backend, "_adapter_attention_cls", select)
+    backend.prepare_hf_adapters()
+    assert backend.model_config.get_head_size() == max(head_dim, 64)
+    kw = {} if token_types is None else {"token_type_ids": token_types}
+    with torch.inference_mode():
+        actual = backend(ids, positions, **kw)
+    torch.testing.assert_close(actual, torch.cat(expected), atol=6e-3, rtol=6e-3)
+
+
+def test_embedding_rejects_unsupported_sentence_transformer_tail(config_factory, monkeypatch):
+    config = config_factory(runner="pooling")
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda *args: [
+            {"type": "sentence_transformers.models.Transformer"},
+            {"type": "sentence_transformers.models.Pooling"},
+            {"type": "sentence_transformers.models.Dense"},
+        ],
+    )
+    with pytest.raises(ValueError, match="Transformer/Pooling/Normalize"):
+        SpyreTransformersEmbeddingModel(vllm_config=config)
+
+
+@pytest.mark.parametrize("chunked", [None, False, True])
+def test_embedding_prelaunch_requires_whole_requests(monkeypatch, chunked):
+    from spyre_inference import models
+
+    monkeypatch.setattr(models, "register_models", lambda: None)
+    args = SimpleNamespace(
+        runner="pooling",
+        convert="none",
+        enable_chunked_prefill=chunked,
+        additional_config={"spyre_model_preparation": "hf_adapters"},
+    )
+    if chunked:
+        with pytest.raises(ValueError, match="complete requests"):
+            models.apply_prelaunch_overrides(args)
+    else:
+        models.apply_prelaunch_overrides(args)
+        assert args.enable_chunked_prefill is False
+
+
+@pytest.mark.parametrize("mode", ["cls_token", "mean_tokens", "lasttoken"])
+def test_embedding_reads_checkpoint_pooling_metadata(config_factory, tmp_path, mode):
+    import json
+
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"type": "sentence_transformers.models.Transformer", "path": ""},
+                {"type": "sentence_transformers.models.Pooling", "path": "1_Pooling"},
+                {"type": "sentence_transformers.models.Normalize", "path": "2_Normalize"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({f"pooling_mode_{mode}": True}))
+    config = config_factory(runner="pooling")
+    assert (
+        config.model_config.pooler_config.seq_pooling_type
+        == {
+            "cls_token": "CLS",
+            "mean_tokens": "MEAN",
+            "lasttoken": "LAST",
+        }[mode]
+    )
+    assert config.model_config.pooler_config.use_activation is True
+
+
+@pytest.mark.parametrize(
+    "pooling",
+    [
+        {},
+        {"pooling_mode_mean_tokens": True, "pooling_mode_cls_token": True},
+        {"pooling_mode_mean_sqrt_len_tokens": True},
+        {"pooling_mode_mean_tokens": True, "include_prompt": False},
+    ],
+)
+def test_embedding_rejects_unsupported_pooling_semantics(config_factory, monkeypatch, pooling):
+    config = config_factory(runner="pooling")
+    modules = [
+        {"type": "sentence_transformers.models.Transformer", "path": ""},
+        {"type": "sentence_transformers.models.Pooling", "path": "1_Pooling"},
+    ]
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda filename, *args: modules if filename == "modules.json" else pooling,
+    )
+    with pytest.raises(ValueError, match="one CLS/MEAN/LAST"):
+        SpyreTransformersEmbeddingModel(vllm_config=config)
+
+
+@pytest.mark.parametrize(
+    "runner,causal,cached,valid",
+    [
+        ("generate", True, True, True),
+        ("generate", False, True, False),
+        ("pooling", True, False, True),
+        ("pooling", False, False, True),
+        ("pooling", True, True, False),
+        ("pooling", 1, False, False),
+    ],
+)
+def test_attention_semantics_agree_with_runner(
+    config_factory, monkeypatch, runner, causal, cached, valid
+):
+    from dataclasses import replace
+
+    from spyre_inference.hf_adapters import prepare_body
+
+    config = config_factory(runner=runner)
+    result = execution_result()
+    result = replace(
+        result,
+        attention_bindings=tuple(
+            replace(binding, is_causal=causal, uses_cache=cached)
+            for binding in result.attention_bindings
+        ),
+    )
+    monkeypatch.setattr(
+        "spyre_inference.hf_adapters.prepare_execution", lambda *args, **kwargs: result
+    )
+    if valid:
+        assert prepare_body(nn.Module(), config) is result
+    else:
+        with pytest.raises(ValueError, match="semantics disagree"):
+            prepare_body(nn.Module(), config)
+
+
+def test_ordinary_embedding_forward_delegates_to_transformers(monkeypatch):
+    from vllm.model_executor.models.transformers import TransformersEmbeddingModel
+
+    backend = SpyreTransformersEmbeddingModel.__new__(SpyreTransformersEmbeddingModel)
+    nn.Module.__init__(backend)
+    backend._hf_adapters = False
+    native = Mock(return_value=torch.zeros(1, 128))
+    monkeypatch.setattr(TransformersEmbeddingModel, "forward", native)
+    ids, positions = torch.tensor([1]), torch.tensor([0])
+    assert backend(ids, positions) is native.return_value
+    native.assert_called_once_with(ids, positions, None, None)

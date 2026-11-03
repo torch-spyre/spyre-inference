@@ -658,10 +658,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.drafter.load_model(self.model)
 
         if use_hf_adapters:
-            from spyre_inference.transformers_backend import SpyreTransformersForCausalLM
+            from spyre_inference.transformers_backend import SpyreTransformersMixin
 
             with set_current_vllm_config(self.vllm_config):
-                cast(SpyreTransformersForCausalLM, self.model).prepare_hf_adapters()
+                cast(SpyreTransformersMixin, self.model).prepare_hf_adapters()
         else:
             fix_padded_model(self.model, self.model_config)
 

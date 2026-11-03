@@ -240,18 +240,23 @@ class TorchSpyrePlatform(CpuPlatform):
             # Adapter execution supplies forward/attention independently of HF's
             # backend hooks. Select the wrapper before vLLM checks those hooks.
             original_overrides = self.hf_overrides
+            architecture = (
+                "TransformersEmbeddingModel"
+                if self.runner == "pooling" or self.convert == "embed"
+                else "TransformersForCausalLM"
+            )
             if callable(original_overrides):
 
                 def adapter_overrides(config):
                     config = original_overrides(config)
-                    config.architectures = ["TransformersForCausalLM"]
+                    config.architectures = [architecture]
                     return config
 
                 self.hf_overrides = adapter_overrides
             else:
                 self.hf_overrides = {
                     **original_overrides,
-                    "architectures": ["TransformersForCausalLM"],
+                    "architectures": [architecture],
                 }
             try:
                 return create_model_config(self)

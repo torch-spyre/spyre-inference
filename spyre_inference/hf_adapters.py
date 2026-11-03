@@ -41,6 +41,8 @@ class AttentionBinding:
     head_size: int
     scale: float
     bind: Callable[[nn.Module], None]
+    is_causal: bool = True
+    uses_cache: bool = True
 
 
 class PagedAdapterAttention(nn.Module):
@@ -68,7 +70,7 @@ class PreparedBody:
     """
 
     head_size: int
-    forward_backbone: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    forward_backbone: Callable[..., torch.Tensor]
     attention_bindings: tuple[AttentionBinding, ...]
     compile_body: Callable[[nn.Module], None]
     # Absolute output scale for the retained LM head; None keeps the vLLM default.
@@ -99,11 +101,11 @@ def validate_hf_adapters_config(config: VllmConfig) -> None:
     if model is None or model.model_impl != "transformers":
         raise ValueError("hf_adapters preparation requires model_impl='transformers'")
     if (
-        model.runner_type != "generate"
+        model.runner_type not in ("generate", "pooling")
         or model.is_multimodal_model
         or model.hf_config is not model.hf_text_config
     ):
-        raise ValueError("hf_adapters preparation currently supports text generation only")
+        raise ValueError("hf_adapters preparation supports text generation and embedding only")
     parallel = config.parallel_config
     if (
         parallel.tensor_parallel_size,
@@ -136,7 +138,7 @@ def validate_hf_adapters_config(config: VllmConfig) -> None:
         or (layer_types and any(kind not in full_attention_types for kind in layer_types))
     ):
         raise ValueError(
-            "hf_adapters preparation currently requires a dense full-attention decoder"
+            "hf_adapters preparation currently requires a dense full-attention backbone"
         )
 
 
@@ -147,7 +149,9 @@ def prepare_execution(model: nn.Module, *, vllm_config: VllmConfig) -> PreparedB
 
     validate_hf_adapters_config(vllm_config)
     prepared = prepare_adapter_execution(
-        model, max_model_len=vllm_config.model_config.max_model_len
+        model,
+        max_model_len=vllm_config.model_config.max_model_len,
+        task="embed" if vllm_config.model_config.runner_type == "pooling" else "generate",
     )
     bindings = tuple(
         AttentionBinding(
@@ -157,6 +161,8 @@ def prepare_execution(model: nn.Module, *, vllm_config: VllmConfig) -> PreparedB
             head_size=attention.spec.head_size,
             scale=attention.spec.scale,
             bind=attention.bind,
+            is_causal=attention.spec.is_causal,
+            uses_cache=attention.spec.uses_cache,
         )
         for attention in prepared.runtime.attentions
     )
@@ -196,6 +202,13 @@ def prepare_body(model: nn.Module, config: VllmConfig) -> PreparedBody:
     ):
         raise ValueError("Attention bindings must cover each layer exactly once, in order")
     for binding in result.attention_bindings:
+        if (
+            type(binding.is_causal) is not bool
+            or type(binding.uses_cache) is not bool
+            or binding.uses_cache != (config.model_config.runner_type == "generate")
+            or (binding.uses_cache and not binding.is_causal)
+        ):
+            raise ValueError("Attention causality/cache semantics disagree with the runner")
         if (
             type(binding.layer_idx) is not int
             or type(binding.head_size) is not int

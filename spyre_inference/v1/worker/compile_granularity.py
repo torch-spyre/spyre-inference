@@ -173,10 +173,10 @@ def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Mod
         return model, 0
 
     if uses_hf_adapters(vllm_config):
-        from spyre_inference.transformers_backend import SpyreTransformersForCausalLM
+        from spyre_inference.transformers_backend import SpyreTransformersMixin
 
         with set_current_vllm_config(vllm_config):
-            cast(SpyreTransformersForCausalLM, model).compile_hf_adapters()
+            cast(SpyreTransformersMixin, model).compile_hf_adapters()
         logger.info("HF-adapters installed model body compilation")
         return model, 0
 

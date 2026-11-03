@@ -39,7 +39,10 @@ from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.auto_factory import _get_model_class
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 from spyre_inference.hf_adapters import (
@@ -199,8 +202,8 @@ def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.M
         cfg.head_dim = padded
 
 
-class SpyreTransformersForCausalLM(TransformersForCausalLM):
-    """Transformers backend with the Spyre RoPE replacement wired in."""
+class SpyreTransformersMixin:
+    """Shared adapter preparation, attention binding and backbone execution."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         validate_hf_adapters_config(vllm_config)
@@ -209,7 +212,7 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         self._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        logger.debug("SpyreTransformersForCausalLM ready: %s", type(self.model).__name__)
+        logger.debug("Spyre Transformers backend ready: %s", type(self.model).__name__)
 
     def _patch_config(self):
         super()._patch_config()
@@ -245,14 +248,14 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         if self._hf_adapters:
             # CausalMixin only ties VocabParallelEmbedding; the preserved HF embedding
             # needs copying through the LM head's loader before its packing pass.
-            if self._get_tie_word_embeddings():
+            if self.model_config.runner_type == "generate" and self._get_tie_word_embeddings():
                 embedding = self.model.get_input_embeddings().weight
                 loader = getattr(self.lm_head.weight, "weight_loader", None)
                 if not callable(loader):
                     raise TypeError("The retained vLLM LM head must provide a weight loader")
                 loader(self.lm_head.weight, embedding)
                 result.add("lm_head.weight")
-        else:
+        elif isinstance(self, TransformersForCausalLM):
             self._patch_rope()
         return result
 
@@ -296,15 +299,13 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         self._prepared_body = prepared
 
     def _bind_adapter_execution(self, prepared: PreparedBody) -> None:
-        from vllm.model_executor.layers.attention import Attention
-
         self.text_config.head_dim = prepared.head_size
         self.model_config.model_arch_config.head_size = prepared.head_size
-        if prepared.logits_scale is not None:
+        if self.model_config.runner_type == "generate" and prepared.logits_scale is not None:
             self.logits_processor.scale = prepared.logits_scale
         self.adapter_attentions = nn.ModuleList()
-        attention_cls = cast(type[Attention], self._get_attn_cls())
         for binding in prepared.attention_bindings:
+            attention_cls = self._adapter_attention_cls(binding)
             path = f"adapter_attentions.{binding.layer_idx}.attn"
             prefix = f"{self._attention_prefix}.{path}" if self._attention_prefix else path
             attention = attention_cls(
@@ -321,6 +322,15 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
             binding.bind(executor)
             attention.process_weights_after_loading(cast(torch.dtype, self.model_config.dtype))
 
+    def _adapter_attention_cls(self, binding):
+        if binding.uses_cache:
+            return self._get_attn_cls()
+        from vllm.model_executor.layers.attention import EncoderOnlyAttention
+
+        from spyre_inference.encoder_attention import CausalEncoderOnlyAttention
+
+        return CausalEncoderOnlyAttention if binding.is_causal else EncoderOnlyAttention
+
     def forward(
         self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs
     ):
@@ -333,6 +343,13 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
             raise RuntimeError("HF-adapters body has not been prepared")
         if input_ids is None or inputs_embeds is not None or intermediate_tensors is not None:
             raise ValueError("Adapter execution currently requires token IDs and TP=PP=1")
+        token_type_ids = kwargs.get("token_type_ids")
+        if token_type_ids is not None:
+            return prepared.forward_backbone(
+                input_ids.unsqueeze(0),
+                positions.unsqueeze(0),
+                token_type_ids=token_type_ids.unsqueeze(0),
+            )[0]
         return prepared.forward_backbone(input_ids.unsqueeze(0), positions.unsqueeze(0))[0]
 
     def compile_hf_adapters(self) -> None:
@@ -438,6 +455,58 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
             patched_mods.add(id(mod))
 
 
-# using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
-# against "TransformersForCausalLM", so the subclass has to keep answering to that name.
+class SpyreTransformersForCausalLM(SpyreTransformersMixin, TransformersForCausalLM):
+    pass
+
+
+class SpyreTransformersEmbeddingModel(SpyreTransformersMixin, TransformersEmbeddingModel):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        if uses_hf_adapters(vllm_config):
+            from vllm.transformers_utils.config import get_hf_file_to_dict
+
+            config = vllm_config.model_config
+            if config.pooler_config.seq_pooling_type not in ("CLS", "MEAN", "LAST"):
+                raise ValueError("HF-adapters embedding supports CLS, MEAN or LAST pooling")
+            modules = get_hf_file_to_dict("modules.json", config.model, config.revision)
+            if modules is not None:
+                kinds = [module["type"] for module in modules]
+                expected = [
+                    "sentence_transformers.models.Transformer",
+                    "sentence_transformers.models.Pooling",
+                ]
+                if kinds not in (expected, [*expected, "sentence_transformers.models.Normalize"]):
+                    raise ValueError(
+                        "HF-adapters embedding supports "
+                        "Transformer/Pooling/Normalize pipelines only"
+                    )
+                pooling = (
+                    get_hf_file_to_dict(
+                        f"{modules[1]['path']}/config.json", config.model, config.revision
+                    )
+                    or {}
+                )
+                modes = [
+                    key
+                    for key, value in pooling.items()
+                    if key.startswith("pooling_mode_") and value is True
+                ]
+                if (
+                    len(modes) != 1
+                    or modes[0]
+                    not in (
+                        "pooling_mode_cls_token",
+                        "pooling_mode_mean_tokens",
+                        "pooling_mode_lasttoken",
+                    )
+                    or pooling.get("include_prompt", True) is not True
+                ):
+                    raise ValueError(
+                        "HF-adapters requires one CLS/MEAN/LAST pooling mode "
+                        "with include_prompt=True"
+                    )
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+
+# vLLM's Transformers-backend detection compares these registered class names.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
+SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"

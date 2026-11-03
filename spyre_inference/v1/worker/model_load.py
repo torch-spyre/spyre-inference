@@ -75,10 +75,39 @@ def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
     # an nn.Module, but just the attention implementation.
     Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+    sink_owners = _sink_owners(model)
     model.to(device=device)
+    # On Spyre the move registers a new Parameter for each sink tensor, and a reload
+    # writes that one, so the impl must read it rather than the host original.
+    for impl, owner, name in sink_owners:
+        impl._sinks_source = getattr(owner, name)
     for module in model.modules():
         if isinstance(module, SpyreConv2d):
             module.process_weights_after_loading()
+        elif getattr(module, "spyre_moe_biases", None) is not None:
+            # On Spyre the move replaces w13_bias/w2_bias, so rebuild the config that holds them.
+            module.quant_method.moe_quant_config = None  # ty: ignore[invalid-assignment]
+            module._ensure_moe_quant_config_init()  # ty: ignore[call-non-callable]
+
+
+def _sink_owners(model: nn.Module) -> list[tuple[SpyreAttentionImpl, nn.Module, str]]:
+    """Each sink impl, with the module and name its sink parameter is registered under.
+
+    The model's attention module owns that parameter, not the Attention layer whose
+    ``_apply`` is a no-op, so ``model.to`` moves it.
+    """
+    owners = {
+        id(param): (owner, name)
+        for owner in model.modules()
+        for name, param in owner.named_parameters(recurse=False)
+    }
+    found = []
+    for module in model.modules():
+        impl = getattr(module, "impl", None)
+        if isinstance(impl, SpyreAttentionImpl) and id(impl._sinks_source) in owners:
+            owner, name = owners[id(impl._sinks_source)]
+            found.append((impl, owner, name))
+    return found
 
 
 def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) -> bool:

@@ -278,8 +278,8 @@ def _generate_greedy(model: str, model_impl: str) -> list[list[int]]:
 @pytest.mark.parametrize(
     "model",
     [
-        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        # head_dim=64 -> padded; micro-g3.3 is 128 -> unpadded. Covers both branches.
+        # head_dim=64 takes the padded branch. The unpadded one (micro-g3.3, 128) is
+        # covered by upstream's test_backend.py::test_models in upstream_tests.yaml.
         "meta-llama/Llama-3.2-1B-Instruct",
     ],
 )

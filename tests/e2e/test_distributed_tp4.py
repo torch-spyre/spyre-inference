@@ -59,32 +59,9 @@ def _assert_matches_tp1(tp1: list[list[int]], tp4: list[list[int]]) -> None:
     spyre_device_count() < 4,
     reason="needs >=4 Spyre cards; skipping TP=4 distributed test",
 )
-def test_tp4_llm_construction() -> None:
-    """Construct `vllm.LLM(tensor_parallel_size=4)` end-to-end.
-
-    Goes through the real `MultiprocExecutor` worker-spawn path that
-    `vllm serve --tensor-parallel-size 4` uses.
-    """
-    from vllm import LLM
-
-    LLM(
-        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        tensor_parallel_size=4,
-        dtype="float16",
-        enforce_eager=True,
-        max_model_len=128,
-        max_num_seqs=2,
-    )
-
-
-@pytest.mark.uses_subprocess
-@pytest.mark.distributed_tp4
-@pytest.mark.skipif(
-    spyre_device_count() < 4,
-    reason="needs >=4 Spyre cards; skipping TP=4 distributed test",
-)
 def test_tp4_llm_generate_matches_tp1() -> None:
-    """TP=1 vs TP=4 greedy-decode prefix-match test on ibm-ai-platform/micro-g3.3-8b-instruct-1b.
+    """TP=1 vs TP=4 greedy-decode prefix-match test on ibm-ai-platform/micro-g3.3-8b-instruct-1b,
+    through the `MultiprocExecutor` worker-spawn path `vllm serve` uses.
 
     Runs identical prompts at TP=1 and TP=4 with `temperature=0` and
     asserts the first 2 output tokens match per prompt. Later divergence

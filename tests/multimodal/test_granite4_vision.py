@@ -608,5 +608,34 @@ def test_patch_embed_input_ids_ds_buffers_migrated_to_correct_device():
         )
 
 
+@pytest.mark.granite4_vision
+@pytest.mark.parametrize(("side", "tiles", "image_tokens"), [(336, 2, 300), (672, 5, 744)])
+def test_multi_tile_image_preprocessing(side, tiles, image_tokens):
+    """The processor's tiling and placeholder count for a one- and a multi-tile image.
+
+    CPU stand-in for the on-card multi-tile e2e test: 672px picks the 768x768 grid
+    pinpoint, i.e. the base image plus four 384px tiles.
+    """
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    try:
+        processor = AutoProcessor.from_pretrained(
+            "ibm-granite/granite-vision-4.1-4b", trust_remote_code=True
+        )
+    except OSError:
+        pytest.skip("granite-vision-4.1-4b processor not in the local HF cache")
+
+    out = processor(
+        images=Image.new("RGB", (side, side)),
+        text=f"{processor.image_token}Describe.",
+        return_tensors="pt",
+    )
+    image_token_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
+
+    assert out["pixel_values"].shape[1] == tiles
+    assert int((out["input_ids"] == image_token_id).sum()) == image_tokens
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

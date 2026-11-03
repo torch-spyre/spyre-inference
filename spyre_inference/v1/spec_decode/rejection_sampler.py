@@ -21,8 +21,8 @@ Adapted from vllm/utils/cpu_triton_utils.py at 5df63a7203. The native kernels
 accept the caller's dtypes directly and implement synthetic acceptance.
 
 ``install`` additionally swaps upstream's ``rejection_sample`` for a copy that takes the
-target argmax with ``greedy_argmax`` and draws recovered tokens' noise in-kernel; vLLM's
-RejectionSampler.forward runs unchanged.
+target argmax with ``greedy_argmax`` and, for drafts without probabilities, draws recovered
+tokens with ``fused_gumbel_argmax``; vLLM's RejectionSampler.forward runs unchanged.
 """
 
 import torch
@@ -39,7 +39,6 @@ _HAS_REJECTION_KERNELS = has_sampling_kernels() and all(
         "rejection_random_sample_kernel_impl",
         "expand_kernel_impl",
         "sample_recovered_tokens_kernel_impl",
-        "sample_recovered_tokens_seeded_kernel_impl",
     )
 )
 
@@ -141,52 +140,58 @@ def recover(
     )
 
 
-_upstream_sample_recovered_tokens = upstream.sample_recovered_tokens
-
-
-def sample_recovered_tokens(
-    max_spec_len: int,
-    num_draft_tokens: list[int],
-    cu_num_draft_tokens: torch.Tensor,
+def recover_without_draft_probs(
+    target_logits: torch.Tensor,
     draft_token_ids: torch.Tensor,
-    draft_probs: torch.Tensor | None,
-    target_probs: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-    device: torch.device,
-    use_fp64_gumbel: bool = False,
+    num_draft_tokens: list[int],
+    generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """Upstream's ``sample_recovered_tokens`` without its [batch, vocab] exponential_ draw."""
-    if use_fp64_gumbel:
-        # The kernel's noise is fixed; keep upstream's fp64 q, as SpyreTopKTopPSampler does.
-        return _upstream_sample_recovered_tokens(
-            max_spec_len,
-            num_draft_tokens,
-            cu_num_draft_tokens,
-            draft_token_ids,
-            draft_probs,
-            target_probs,
-            sampling_metadata,
-            device,
-            use_fp64_gumbel,
-        )
-    # Like upstream, a request without drafts leaves its generator untouched.
-    generators = {
-        i: generator
-        for i, generator in sampling_metadata.generators.items()
-        if num_draft_tokens[i] > 0
-    }
-    recovered_token_ids = torch.empty_like(draft_token_ids)
-    _kernels().sample_recovered_tokens_seeded_kernel_impl(
-        recovered_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        draw_seeds(len(num_draft_tokens), generators),
-        target_probs.shape[-1],
-        draft_probs is None,
+    """Recovered tokens for drafts without probabilities (ngram, suffix): one
+    ``fused_gumbel_argmax`` draw per position over the target logits with the draft masked.
+
+    That samples the target distribution with the draft removed and renormalized, upstream's
+    residual for ``draft_probs=None``; a padded draft (-1) masks nothing. Every position of
+    a request shares that request's seed, as upstream's one noise row per request does, and
+    a request without drafts leaves its generator untouched.
+    """
+    masked = target_logits.float().clone()
+    real = (draft_token_ids >= 0).nonzero().squeeze(1)
+    masked[real, draft_token_ids[real].long()] = float("-inf")
+    drafted = {i: g for i, g in generators.items() if num_draft_tokens[i] > 0}
+    seeds = draw_seeds(len(num_draft_tokens), drafted).repeat_interleave(
+        torch.tensor(num_draft_tokens, dtype=torch.long)
     )
-    return recovered_token_ids
+    return torch.ops._spyre_C.fused_gumbel_argmax(masked, seeds)  # ty: ignore[invalid-argument-type]
+
+
+def accept_without_draft_probs(
+    output_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    draft_token_ids: torch.Tensor,
+    target_draft_probs: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    uniform_probs: torch.Tensor,
+    is_greedy: torch.Tensor | None,
+) -> None:
+    """``_rejection_random_sample`` for ``draft_probs=None``, from each draft's target
+    probability alone rather than the [num_tokens, vocab] target probabilities."""
+    counts = torch.tensor(num_draft_tokens, dtype=torch.long)
+    batch_size = counts.numel()
+    req = torch.repeat_interleave(torch.arange(batch_size), counts)
+    pos = torch.arange(req.numel()) - (torch.cumsum(counts, 0) - counts)[req]
+    # A draft without probabilities has q = 1: accepted iff p >= u. Pads never are.
+    accepted = (draft_token_ids >= 0) & (target_draft_probs.double() >= uniform_probs)
+    num_accepted = counts.clone().scatter_reduce_(0, req[~accepted], pos[~accepted], "amin")
+    is_random = torch.ones(batch_size, dtype=torch.bool) if is_greedy is None else ~is_greedy
+    # The accepted prefix keeps its drafts; the first rejection takes the recovered token.
+    keep = is_random[req] & (pos <= num_accepted[req])
+    tokens = torch.where(accepted, draft_token_ids.long(), recovered_token_ids.long())
+    output_token_ids[req[keep], pos[keep]] = tokens[keep].to(output_token_ids.dtype)
+    done = is_random & (num_accepted == counts)
+    output_token_ids[done, counts[done]] = bonus_token_ids.reshape(-1)[done].to(
+        output_token_ids.dtype
+    )
 
 
 def rejection_sample(
@@ -202,8 +207,13 @@ def rejection_sample(
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64_gumbel: bool = False,
 ) -> torch.Tensor:
-    """vLLM 0.32.0's ``rejection_sample`` with two calls swapped: ``greedy_argmax`` for the
-    target argmax and ``sample_recovered_tokens`` above for the recovered tokens."""
+    """vLLM 0.32.0's ``rejection_sample``, taking the target argmax with ``greedy_argmax``.
+
+    Random requests whose drafts carry no probabilities skip the full-vocabulary softmax:
+    acceptance needs only each draft's target probability, and the recovered token is a
+    ``fused_gumbel_argmax`` draw. Draft probabilities, synthetic acceptance and
+    ``use_fp64_gumbel`` keep upstream's path.
+    """
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -255,10 +265,31 @@ def rejection_sample(
         if sampling_metadata.all_greedy:
             return output_token_ids
 
+    assert uniform_probs is not None
+    if draft_probs is None and not synthetic_mode and not use_fp64_gumbel:
+        logits = target_logits.float()
+        rows = torch.arange(num_tokens)
+        target_draft_probs = (
+            logits[rows, draft_token_ids.long().clamp(min=0)] - logits.logsumexp(dim=-1)
+        ).exp()
+        recovered_token_ids = recover_without_draft_probs(
+            logits, draft_token_ids, num_draft_tokens, sampling_metadata.generators
+        )
+        accept_without_draft_probs(
+            output_token_ids,
+            num_draft_tokens,
+            draft_token_ids,
+            target_draft_probs,
+            bonus_token_ids,
+            recovered_token_ids,
+            uniform_probs,
+            is_greedy,  # ty: ignore[invalid-argument-type]
+        )
+        return output_token_ids
+
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     assert target_probs.is_contiguous()
-
-    recovered_token_ids = sample_recovered_tokens(
+    recovered_token_ids = upstream.sample_recovered_tokens(
         max_spec_len,
         num_draft_tokens,
         cu_num_draft_tokens,
@@ -269,8 +300,6 @@ def rejection_sample(
         device,
         use_fp64_gumbel,
     )
-
-    assert uniform_probs is not None
     upstream._rejection_random_sample(
         output_token_ids,
         cu_num_draft_tokens,

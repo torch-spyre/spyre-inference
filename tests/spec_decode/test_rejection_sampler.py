@@ -391,108 +391,132 @@ def test_recovery_preserves_zero_times_infinite_noise(dtype, no_draft):
     assert output.tolist() == [1, 1]
 
 
-# Seeded recovery: native.sample_recovered_tokens replaces upstream's, drawing the noise
-# in-kernel from one seed per request.
+# Drafts without probabilities (ngram, suffix): recovery is a fused_gumbel_argmax draw over
+# the masked target logits, and acceptance reads only each draft's target probability.
 
 
-def _residual(target, draft_ids, draft_probs):
-    if draft_probs is not None:
-        return (target - draft_probs).clamp(min=0.0)
-    residual = target.clone()
+def _random_metadata(batch_size, generators=None):
+    return SimpleNamespace(
+        all_greedy=False,
+        all_random=True,
+        temperature=torch.ones(batch_size),
+        generators=generators or {},
+    )
+
+
+def test_recovery_matches_fused_gumbel_argmax_over_masked_logits():
+    torch.manual_seed(7)
+    logits = torch.randn(6, 1000).mul(3)
+    draft_ids = torch.tensor([3, -1, 17, 999, 0, 42])
+    generators = {i: torch.Generator().manual_seed(10 + i) for i in range(4)}
+    counts = [2, 0, 3, 1]
+    seeds = [
+        torch.randint(0, 2**62, (1,), generator=torch.Generator().manual_seed(10 + i)).item()
+        for i in (0, 2, 3)
+    ]
+    masked = logits.clone()
     for row, draft_id in enumerate(draft_ids.tolist()):
         if draft_id >= 0:
-            residual[row, draft_id] = 0.0
-    return residual
-
-
-def _seeded_recover(cumulative, draft_ids, target, seeds, draft_probs=None):
-    output = torch.empty_like(draft_ids)
-    torch.ops._spyre_C.sample_recovered_tokens_seeded_kernel_impl(
-        output,
-        cumulative,
-        draft_ids,
-        draft_probs,
-        target,
-        seeds,
-        target.shape[1],
-        draft_probs is None,
-    )
-    return output.tolist()
-
-
-@pytest.mark.parametrize("no_draft", [True, False])
-def test_seeded_recovery_matches_fused_gumbel_argmax(no_draft):
-    """The same SplitMix64 noise as fused_gumbel_argmax over log(residual), one key per request."""
-    torch.manual_seed(7)
-    vocab = 1000
-    cumulative = torch.tensor([2, 2, 5, 6])
-    target = torch.randn(6, vocab).mul(3).softmax(dim=-1)
-    draft_probs = None if no_draft else torch.randn(6, vocab).mul(3).softmax(dim=-1)
-    draft_ids = torch.tensor([3, -1, 17, 999, 0, 42])
-    seeds = torch.tensor([11, 22, 33, 2**62 - 1])
-    per_token_seeds = seeds.repeat_interleave(torch.tensor([2, 0, 3, 1]))
+            masked[row, draft_id] = float("-inf")
     expected = torch.ops._spyre_C.fused_gumbel_argmax(
-        _residual(target, draft_ids, draft_probs).log(), per_token_seeds
+        masked, torch.tensor(seeds).repeat_interleave(torch.tensor([2, 3, 1]))
     )
-    assert _seeded_recover(cumulative, draft_ids, target, seeds, draft_probs) == expected.tolist()
+    result = native.recover_without_draft_probs(logits, draft_ids, counts, generators)
+    assert result.tolist() == expected.tolist()
 
 
-def test_seeded_recovery_draws_only_from_the_residual():
-    target = torch.zeros(3, 8)
-    target[0, 7] = 1.0  # a pad (-1) excludes nothing, not the last id
-    target[1, [2, 6]] = torch.tensor([0.9, 0.1])  # the real draft 2 is excluded
-    target[2, 4] = 1.0  # the draft takes all the mass: nothing to draw from
-    result = _seeded_recover(torch.tensor([3]), torch.tensor([-1, 2, 4]), target, torch.tensor([5]))
-    assert result == [7, 6, 0]
+def test_recovery_draws_only_from_the_residual():
+    logits = torch.full((3, 8), float("-inf"))
+    logits[0, 7] = 0.0  # a pad (-1) excludes nothing, not the last id
+    logits[1, [2, 6]] = torch.tensor([5.0, 0.0])  # the real draft 2 is excluded
+    logits[2, 4] = 0.0  # the draft takes all the mass: nothing to draw from
+    result = native.recover_without_draft_probs(logits, torch.tensor([-1, 2, 4]), [3], {})
+    assert result.tolist() == [7, 6, 0]
 
 
-def test_seeded_recovery_shares_noise_across_a_requests_positions():
-    torch.manual_seed(3)
-    row = torch.randn(1, 500).softmax(dim=-1)
-    target = row.expand(4, -1).contiguous()
-    result = _seeded_recover(torch.tensor([4]), torch.full((4,), -1), target, torch.tensor([1234]))
-    assert len(set(result)) == 1
-
-
-def test_seeded_recovery_reproduces_seeded_requests_and_skips_empty_ones():
-    target = torch.randn(2, 64).softmax(dim=-1)
+def test_recovery_reproduces_seeded_requests_and_skips_empty_ones():
+    logits = torch.randn(2, 64)
     idle = torch.Generator().manual_seed(1)
     idle_state = idle.get_state()
 
     def draw():
-        metadata = SimpleNamespace(generators={0: idle, 1: torch.Generator().manual_seed(99)})
-        return native.sample_recovered_tokens(
-            2, [0, 2], torch.tensor([0, 2]), torch.tensor([-1, -1]), None, target, metadata, "cpu"
+        generators = {0: idle, 1: torch.Generator().manual_seed(99)}
+        return native.recover_without_draft_probs(
+            logits, torch.tensor([-1, -1]), [0, 2], generators
         ).tolist()
 
     assert draw() == draw()
     torch.testing.assert_close(idle.get_state(), idle_state, rtol=0, atol=0)
 
 
-def test_seeded_recovery_draws_no_exponential_noise():
-    target = torch.randn(3, 64).softmax(dim=-1)
-    metadata = SimpleNamespace(generators={})
-    with patch.object(torch.Tensor, "exponential_", wraps=torch.Tensor.exponential_) as exp:
-        native.sample_recovered_tokens(
-            2, [1, 2], torch.tensor([1, 3]), torch.tensor([0, 1, -1]), None, target, metadata, "cpu"
-        )
+def test_acceptance_matches_the_random_kernel():
+    """Same decisions as _rejection_random_sample given the same uniforms and recovery."""
+    torch.manual_seed(11)
+    vocab, counts = 16, [3, 0, 2, 3]
+    num_tokens = sum(counts)
+    # Peaked rows so both accepts and rejects occur.
+    target_probs = torch.randn(num_tokens, vocab).mul(4).softmax(dim=-1)
+    draft_ids = torch.cat([target_probs[:4].argmax(-1), torch.tensor([5, -1, 2, 9])])
+    recovered = torch.randint(0, vocab, (num_tokens,))
+    uniform = torch.rand(num_tokens, dtype=torch.float64)
+    bonus = torch.tensor([[100], [101], [102], [103]])
+    is_greedy = torch.tensor([False, False, True, False])
+    cumulative = torch.tensor(counts).cumsum(0)
+
+    expected = torch.full((4, 4), -1, dtype=torch.int32)
+    native.random_sample(
+        expected, cumulative, draft_ids, None, target_probs, bonus, recovered, uniform,
+        is_greedy, 3, vocab, None, True, False,
+    )  # fmt: skip
+    result = torch.full((4, 4), -1, dtype=torch.int32)
+    target_draft = target_probs[torch.arange(num_tokens), draft_ids.clamp(min=0)]
+    native.accept_without_draft_probs(
+        result, counts, draft_ids, target_draft, bonus, recovered, uniform, is_greedy
+    )
+    assert result.tolist() == expected.tolist()
+
+
+def test_acceptance_rejects_padded_draft_even_at_zero_uniform():
+    output = torch.full((1, 3), -1, dtype=torch.int32)
+    native.accept_without_draft_probs(
+        output,
+        [2],
+        torch.tensor([3, PAD]),
+        torch.ones(2),
+        torch.tensor([[7]]),
+        torch.tensor([0, 5]),
+        torch.zeros(2, dtype=torch.float64),
+        torch.tensor([False]),
+    )
+    assert output.tolist() == [[3, 5, -1]]
+
+
+def test_rejection_sample_without_draft_probs_skips_softmax_and_exponential_noise():
+    logits = torch.randn(3, 64)
+    with (
+        patch.object(torch.Tensor, "softmax", wraps=torch.Tensor.softmax) as softmax,
+        patch.object(torch.Tensor, "exponential_", wraps=torch.Tensor.exponential_) as exp,
+    ):
+        native.rejection_sample(
+            torch.tensor([0, 1, -1]), [1, 2], 2, torch.tensor([1, 3]), None, logits,
+            torch.tensor([[7], [8]]), _random_metadata(2),
+        )  # fmt: skip
+    softmax.assert_not_called()
     exp.assert_not_called()
 
 
-def test_fp64_gumbel_keeps_upstream_recovery(monkeypatch):
+@pytest.mark.parametrize("case", ["draft_probs", "fp64_gumbel"])
+def test_upstream_recovery_for_draft_probs_and_fp64_gumbel(case, monkeypatch):
     calls = []
-    monkeypatch.setattr(native, "_upstream_sample_recovered_tokens", lambda *a: calls.append(a))
-    native.sample_recovered_tokens(
-        1,
-        [1],
-        torch.tensor([1]),
-        torch.tensor([0]),
-        None,
-        torch.ones(1, 4) / 4,
-        SimpleNamespace(generators={}),
-        "cpu",
-        True,
+    original = upstream.sample_recovered_tokens
+    monkeypatch.setattr(
+        upstream, "sample_recovered_tokens", lambda *a: calls.append(a) or original(*a)
     )
+    native.rejection_sample(
+        torch.tensor([0]), [1], 1, torch.tensor([1]),
+        torch.ones(1, 4) / 4 if case == "draft_probs" else None, torch.zeros(1, 4),
+        torch.tensor([[7]]), _random_metadata(1), use_fp64_gumbel=case == "fp64_gumbel",
+    )  # fmt: skip
     assert len(calls) == 1
 
 

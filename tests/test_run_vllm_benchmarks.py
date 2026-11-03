@@ -731,3 +731,35 @@ def test_run_benchmark_writes_records_without_a_card(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("*.json")) or all(
         p.name.endswith(".host_resources.json") for p in tmp_path.glob("*.json")
     )
+
+
+def test_compile_summary_merges_per_pid_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {})
+    rec = bench_support.Recorder(tmp_path, "t", {})
+    env = {}
+    rec.child_env(env)
+    assert env["TORCH_SPYRE_COMPILE_SUMMARY_DIR"] == str(rec.compile_dir)
+    rec.compile_dir.mkdir(parents=True)
+    for pid in (1, 2):
+        (rec.compile_dir / f"compile_summary.{pid}.json").write_text(
+            json.dumps(
+                {
+                    "total_s": 1.5,
+                    "passes": {"A:p": 1.0},
+                    "cache": {"entries": 2, "hits": 1, "misses": 1},
+                }
+            )
+        )
+    rec.write()
+    got = json.loads((tmp_path / "t" / "compile_summary.json").read_text())
+    assert got == {
+        "total_s": 3.0,
+        "passes": {"A:p": 2.0},
+        "cache": {"entries": 4, "hits": 2, "misses": 2},
+    }
+
+
+def test_no_compile_summary_without_sidecar_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {})
+    bench_support.Recorder(tmp_path, "t", {}).write()
+    assert not (tmp_path / "t" / "compile_summary.json").exists()

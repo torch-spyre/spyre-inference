@@ -194,6 +194,29 @@ class Recorder:
         self._env = {**env_fingerprint(), "runtime_config": runtime_config}
         self._phases: list[dict] = []
         self._samplers: list = []
+        # torch-spyre writes compile_summary.<pid>.json here when the image supports it.
+        self.compile_dir = self.dir / "compile"
+
+    def child_env(self, env: dict) -> None:
+        """Point the benchmarked process at this test's compile-summary directory, in place."""
+        env.setdefault("TORCH_SPYRE_COMPILE_SUMMARY_DIR", str(self.compile_dir))
+
+    def _write_compile_summary(self) -> None:
+        """Merge per-pid summaries (one per TP worker) into compile_summary.json, if any."""
+        merged = {"total_s": 0.0, "passes": {}, "cache": {"entries": 0, "hits": 0, "misses": 0}}
+        files = sorted(self.compile_dir.glob("compile_summary.*.json"))
+        for f in files:
+            try:
+                d = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            merged["total_s"] += d.get("total_s", 0.0)
+            for k, v in d.get("passes", {}).items():
+                merged["passes"][k] = merged["passes"].get(k, 0.0) + v
+            for k in merged["cache"]:
+                merged["cache"][k] += d.get("cache", {}).get(k, 0)
+        if files:
+            _write_json(self.dir / "compile_summary.json", merged)
 
     def mark(self, name: str | None) -> None:
         """End the open phase and start `name` (None just ends it)."""
@@ -220,6 +243,7 @@ class Recorder:
                 },
             )
             self._write_host_resources()
+            self._write_compile_summary()
         except Exception as e:
             log.warning("Could not write bench records: %s", e)
 

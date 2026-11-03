@@ -387,6 +387,7 @@ def run_benchmark(
 
     log_file = results_dir / f"{test_name}.log"
     rec = Recorder(results_dir, test_name, {"bench_type": bench_type, "parameters": parameters})
+    rec.child_env(env)
     sampler = _make_sampler()
     rec.add_sampler(sampler)
     rec.mark("run")
@@ -529,6 +530,7 @@ def run_serve_benchmark(
     rec = Recorder(
         results_dir, test_name, {"bench_type": "serve", "server_parameters": server_parameters}
     )
+    rec.child_env(env)
     with open(server_log, "w") as server_lf:
         server_lf.write(f"# {server_cmd_line}\n")
         server_lf.flush()

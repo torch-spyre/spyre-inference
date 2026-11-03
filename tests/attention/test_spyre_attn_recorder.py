@@ -71,7 +71,9 @@ def compiles() -> int:
 
 
 @pytest.fixture()
-def impl(default_vllm_config):
+def impl(default_vllm_config, monkeypatch):
+    # CPU graph-reuse tests use the Python walk; Spyre e2e tests cover tiled lowering.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()

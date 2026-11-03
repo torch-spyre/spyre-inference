@@ -14,6 +14,7 @@
 
 """``SpyreGemma4ForConditionalGeneration``'s vision pipeline against the stock tower."""
 
+import copy
 import inspect
 from types import SimpleNamespace
 
@@ -265,7 +266,7 @@ def test_gqa_tower_is_rejected():
 
 def test_tower_classes_stay_stock_and_weight_names_are_kept():
     """Only instances switch; names are checked as constructed, when the checkpoint loads."""
-    from spyre_inference.multimodal.gemma4_vision import (
+    from spyre_inference.models.gemma4_mm import (
         SpyreGemma4RMSNorm,
         SpyreGemma4VisionAttention,
     )
@@ -309,6 +310,19 @@ def test_spyre_layers_are_constructed_and_keep_upstreams_linears():
         assert [getattr(attn, n) for n in ("q_proj", "k_proj", "v_proj", "o_proj")] == kept
         assert attn.spyre_rope_swap.shape == (PADDED_HEAD_DIM, PADDED_HEAD_DIM)
         assert "spyre_rope_swap" not in attn.state_dict()
+
+
+def test_rope_swap_takes_the_construction_dtype():
+    """vLLM constructs the model at its dtype; an fp32 swap buffer would promote every rope
+    matmul to an fp32 result Spyre cannot lay out."""
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    with set_default_torch_dtype(torch.float16):
+        model = _built_model(_tower_config(num_layers=1))
+
+    attn = model.vision_tower.encoder.layers[0].self_attn
+    assert attn.spyre_rope_swap.dtype == torch.float16
+    assert attn.spyre_rope_swap.dtype == attn.q_proj.linear.weight.dtype
 
 
 def test_process_weights_after_loading_pads_every_layer():
@@ -420,25 +434,308 @@ def test_construction_reaches_upstream_init_and_protocol():
     assert supports_encoder_cudagraph(SpyreGemma4ForConditionalGeneration)
 
 
-def test_multimodal_patches_leave_the_spyre_model_alone():
-    """The old class-name dispatch to ``multimodal/gemma4_vision.py`` must not reach it."""
+def test_only_the_spyre_model_may_carry_the_tower():
+    """Other architectures that build the stock tower fail at load, not inside it."""
     from spyre_inference import multimodal
 
-    patched = (
-        modeling_gemma4.Gemma4VisionEncoder,
-        modeling_gemma4.Gemma4VisionPooler,
-        modeling_gemma4.Gemma4VisionPatchEmbedder,
+    config = _tower_config(num_layers=1)
+    multimodal.apply_multimodal_patches(_spyre_model(config), torch.device("cpu"))
+
+    other = nn.Module()
+    other.vision_tower = _stock_modules(config)[0]
+    with pytest.raises(NotImplementedError, match="Gemma4ForConditionalGeneration"):
+        multimodal.apply_multimodal_patches(other, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("padded_to", [None, PADDED_HEAD_DIM + 128])
+def test_spyre_attention_refuses_an_unpadded_instance(padded_to):
+    """An instance ``process_weights_after_loading`` never touched, or padded for another
+    head dim, says so rather than failing on a missing attribute or a bad view."""
+    from spyre_inference.models.gemma4_mm import SpyreGemma4VisionAttention
+
+    attn = SpyreGemma4VisionAttention(_vision_config(), layer_idx=0)
+    if padded_to is not None:
+        attn._spyre_padded_head_dim = padded_to
+
+    with pytest.raises(RuntimeError, match="not padded"):
+        attn(
+            torch.zeros(1, 4, attn.config.hidden_size),
+            position_embeddings=(None, None),
+            attention_mask=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("orig", "expected"),
+    [(64, 128), (72, 128), (128, 128), (129, 256), (256, 256)],
+)
+def test_padded_head_dim_rounds_to_a_double_stick(orig, expected):
+    """Rope needs each half on a whole stick, so head_dim pads to 2*64, not 64."""
+    from spyre_inference.models.gemma4_mm import _padded_head_dim
+
+    assert _padded_head_dim(orig) == expected
+
+
+def test_pad_qk_linear_preserves_every_original_channel():
+    """The quarter-interleave must be a permutation of the real channels into the
+    padded layout -- no value dropped, no value duplicated."""
+    from spyre_inference.models.gemma4_mm import _pad_qk_linear
+
+    torch.manual_seed(0)
+    in_features = 32
+    linear = torch.nn.Linear(in_features, NUM_HEADS * ORIG_HEAD_DIM, bias=False)
+    linear.weight.data.normal_()
+    proj = type("_Proj", (), {"linear": linear})()
+
+    padded = _pad_qk_linear(proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    assert padded.weight.shape == (NUM_HEADS * PADDED_HEAD_DIM, in_features)
+    orig_w = linear.weight.detach().view(NUM_HEADS, ORIG_HEAD_DIM, in_features)
+    new_w = padded.weight.detach().view(NUM_HEADS, PADDED_HEAD_DIM, in_features)
+    quarter = ORIG_HEAD_DIM // 4
+    half = PADDED_HEAD_DIM // 2
+    # X-axis quarters land in the first slot of each half, Y-axis in the second.
+    torch.testing.assert_close(new_w[:, :quarter], orig_w[:, :quarter])
+    torch.testing.assert_close(
+        new_w[:, quarter : 2 * quarter], orig_w[:, 2 * quarter : 3 * quarter]
     )
-    stock = {cls: dict(vars(cls)) for cls in patched}
-    model = _spyre_model(_tower_config(num_layers=1))
-    multimodal.apply_multimodal_patches(model, torch.device("cpu"))
-    assert {cls: dict(vars(cls)) for cls in patched} == stock
+    torch.testing.assert_close(new_w[:, half : half + quarter], orig_w[:, quarter : 2 * quarter])
+    torch.testing.assert_close(
+        new_w[:, half + quarter : half + 2 * quarter], orig_w[:, 3 * quarter :]
+    )
+    # Everything else is the zero padding.
+    assert torch.all(new_w[:, 2 * quarter : half] == 0)
+    assert torch.all(new_w[:, half + 2 * quarter :] == 0)
+
+
+def test_pad_norm_weight_fills_padding_lanes_with_ones():
+    """A norm weight is multiplicative, so padding lanes must be 1.0 (not 0.0) --
+    a zero there would be harmless today but wrong if the lane ever carried data."""
+    from spyre_inference.models.gemma4_mm import _pad_norm_weight
+
+    norm = modeling_gemma4.Gemma4RMSNorm(dim=ORIG_HEAD_DIM, eps=1e-6, with_scale=True)
+    norm.weight.data.normal_()
+
+    padded = _pad_norm_weight(norm, PADDED_HEAD_DIM)
+
+    assert padded.shape == (PADDED_HEAD_DIM,)
+    quarter = ORIG_HEAD_DIM // 4
+    half = PADDED_HEAD_DIM // 2
+    assert torch.all(padded[2 * quarter : half] == 1.0)
+    assert torch.all(padded[half + 2 * quarter :] == 1.0)
+
+
+def test_pad_mlp_is_numerically_transparent():
+    """26B-A4B's vision MLP is 4304 wide (not a 64-multiple), so it is zero-extended
+    onto the stick. The zero lanes must contribute nothing: `gelu(0) * 0 == 0`, and
+    the matching zero down-projection columns ignore whatever lands there."""
+    from spyre_inference.models.gemma4_mm import _pad_mlp
+
+    torch.manual_seed(0)
+    orig, padded = 200, 256
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=128,
+        intermediate_size=orig,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_hidden_layers=1,
+        use_clipped_linears=False,
+    )
+    layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0).to(torch.float32)
+    x = torch.randn(1, 5, 128)
+
+    want = layer.mlp(x)
+    _pad_mlp(layer, orig, padded)
+    got = layer.mlp(x)
+
+    assert layer.mlp.gate_proj.linear.out_features == padded
+    assert layer.mlp.up_proj.linear.out_features == padded
+    assert layer.mlp.down_proj.linear.in_features == padded
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+    # Idempotent: re-padding would double the width.
+    _pad_mlp(layer, orig, padded)
+    assert layer.mlp.gate_proj.linear.out_features == padded
+
+
+def test_pad_mlp_is_a_noop_when_already_stick_aligned():
+    """E2B's 3072-wide MLP needs no padding; don't rebuild its linears."""
+    from spyre_inference.models.gemma4_mm import _pad_mlp
+
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_hidden_layers=1,
+        use_clipped_linears=False,
+    )
+    layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0)
+    before = layer.mlp.gate_proj.linear
+
+    _pad_mlp(layer, 256, 256)
+
+    assert layer.mlp.gate_proj.linear is before
+
+
+def test_padded_rms_norm_does_not_promote_via_an_fp32_weight():
+    """These weights are fp32, so an unguarded `x * weight` promotes the activation --
+    which torch-spyre cannot lower. Stock hid it behind a trailing `.type_as`."""
+    from spyre_inference.models.gemma4_mm import _padded_rms_norm
+
+    x = torch.randn(1, 4, NUM_HEADS, PADDED_HEAD_DIM, dtype=torch.float16)
+    fp32_weight = torch.randn(PADDED_HEAD_DIM, dtype=torch.float32)
+    out = _padded_rms_norm(x, fp32_weight, 1e-6, ORIG_HEAD_DIM)
+    assert out.dtype == torch.float16
+
+
+def test_spyre_rms_norm_does_not_promote_via_its_fp32_weight():
+    """Same hazard through the module: transformers builds these weights at the default
+    (fp32) dtype, and the vision tower feeds fp16 activations."""
+    from spyre_inference.models.gemma4_mm import SpyreGemma4RMSNorm
+
+    norm = SpyreGemma4RMSNorm(dim=16, eps=1e-6, with_scale=True)
+    assert norm.weight.dtype == torch.float32, "premise of this test changed upstream"
+
+    out = norm(torch.randn(2, 3, 16, dtype=torch.float16))
+    assert out.dtype == torch.float16
+
+
+def test_padded_rms_norm_ignores_zero_padding_lanes():
+    """Normalizing the padded activation must match normalizing the real channels
+    alone -- that is what the `padded/orig` variance rescale buys."""
+    from spyre_inference.models.gemma4_mm import _padded_rms_norm
+
+    torch.manual_seed(0)
+    real = torch.randn(1, 4, NUM_HEADS, ORIG_HEAD_DIM, dtype=torch.float32)
+    padded = _pad_activation_quarters(real, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    got = _padded_rms_norm(padded, None, 1e-6, ORIG_HEAD_DIM)
+    got_real_channels = _unpad_activation_quarters(got, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    variance = (real * real).mean(-1, keepdim=True)
+    want = real * torch.rsqrt(variance + 1e-6)
+
+    torch.testing.assert_close(got_real_channels, want, rtol=1e-5, atol=1e-5)
+
+
+def test_spyre_rms_norm_stays_in_input_dtype_and_matches_reference():
+    """`SpyreGemma4RMSNorm` drops stock's fp32 round trip; in fp32 (where the
+    promotion is a no-op) it must still agree with stock to tight tolerance."""
+    from spyre_inference.models.gemma4_mm import SpyreGemma4RMSNorm
+
+    torch.manual_seed(0)
+    dim = 16
+    norm = SpyreGemma4RMSNorm(dim=dim, eps=1e-6, with_scale=True)
+    norm.weight.data.normal_()
+    x = torch.randn(2, 3, dim, dtype=torch.float32)
+
+    mean_squared = x.pow(2).mean(-1, keepdim=True) + norm.eps
+    want = x * torch.pow(mean_squared, -0.5) * norm.weight
+
+    got = norm(x)
+
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+def _clipped_proj(output_min: float, output_max: float):
+    """A `Gemma4ClippableLinear` with real (finite) output clipping bounds."""
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=NUM_HEADS * ORIG_HEAD_DIM,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_HEADS,
+        head_dim=ORIG_HEAD_DIM,
+        use_clipped_linears=True,
+    )
+    proj = modeling_gemma4.Gemma4ClippableLinear(config, 32, NUM_HEADS * ORIG_HEAD_DIM)
+    proj.output_min = torch.nn.Buffer(torch.tensor(output_min))
+    proj.output_max = torch.nn.Buffer(torch.tensor(output_max))
+    return proj
+
+
+@pytest.mark.parametrize(
+    ("lo", "hi"),
+    [(-6.0, 6.0), (0.0, 6.0), (-6.0, 0.0), (-float("inf"), float("inf"))],
+)
+def test_clipping_that_includes_zero_is_accepted(lo, hi):
+    """A range containing zero keeps the padding lanes at zero; a zero bound is fine,
+    since clamp(0) is still 0."""
+    from spyre_inference.models.gemma4_mm import _assert_clipping_preserves_zero
+
+    _assert_clipping_preserves_zero(_clipped_proj(lo, hi), "test proj")
+
+
+@pytest.mark.parametrize(("lo", "hi"), [(0.5, 6.0), (-6.0, -0.5)])
+def test_clipping_that_excludes_zero_is_rejected(lo, hi):
+    """A range excluding zero maps the padding lanes to a nonzero bound, invalidating
+    `_padded_rms_norm`'s variance correction."""
+    from spyre_inference.models.gemma4_mm import _assert_clipping_preserves_zero
+
+    with pytest.raises(NotImplementedError, match="must include zero"):
+        _assert_clipping_preserves_zero(_clipped_proj(lo, hi), "test proj")
+
+
+def test_unclipped_projection_skips_the_clipping_check():
+    """Unclipped is the common case, so the check must be inert and must not touch
+    bounds buffers that do not exist."""
+    from spyre_inference.models.gemma4_mm import _assert_clipping_preserves_zero
+
+    config = _vision_config()
+    assert not config.use_clipped_linears, "premise: this config is unclipped"
+    proj = modeling_gemma4.Gemma4ClippableLinear(config, 32, NUM_HEADS * ORIG_HEAD_DIM)
+    assert not hasattr(proj, "output_min")
+
+    _assert_clipping_preserves_zero(proj, "test proj")  # must not raise
+
+
+def test_quantized_projection_is_rejected_rather_than_dequantized():
+    """Rebuilding as a plain nn.Linear drops the quantization method, so a quantized
+    projection must fail rather than be silently dequantized."""
+    from spyre_inference.models.gemma4_mm import _as_plain_linear
+
+    class _FakeQuantMethod:
+        pass
+
+    class _FakeQuantLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(32, 8))
+            self.bias = None
+            self.quant_method = _FakeQuantMethod()
+
+    with pytest.raises(NotImplementedError, match="quantization method"):
+        _as_plain_linear(_FakeQuantLinear())
+
+
+def test_unquantized_vllm_linear_is_bounced_to_a_plain_linear():
+    """A vLLM linear stores `Wᵀ`, so the bounce must transpose back to `[out, in]`."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from spyre_inference.models.gemma4_mm import _as_plain_linear
+
+    class _FakeReplicatedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(0)
+            self.weight = torch.nn.Parameter(torch.randn(8, 32))  # [in, out]
+            self.bias = None
+            self.quant_method = UnquantizedLinearMethod()
+
+    src = _FakeReplicatedLinear()
+    plain = _as_plain_linear(src)
+
+    assert isinstance(plain, torch.nn.Linear)
+    assert plain.weight.shape == (32, 8)  # [out, in]
+    torch.testing.assert_close(plain.weight, src.weight.t().contiguous())
 
 
 @pytest.mark.rotary
 def test_rope_tables_match_transformers_reference():
     """Catches an off-by-a-quarter interleave, a swapped axis or a sin sign error."""
-    from spyre_inference.multimodal.gemma4_vision import gemma4_rope_tables
+    from spyre_inference.models.gemma4_mm import gemma4_rope_tables
     from spyre_inference.multimodal.utils import rope_perm_matrix, rope_rotate_matmul
 
     torch.manual_seed(0)
@@ -465,7 +762,7 @@ def test_rope_tables_match_transformers_reference():
 @pytest.mark.rotary
 def test_rope_tables_padding_lanes_are_the_identity_rotation():
     """cos=1, sin=0 after both axes sum, so a nonzero padded channel cannot leak."""
-    from spyre_inference.multimodal.gemma4_vision import gemma4_rope_tables
+    from spyre_inference.models.gemma4_mm import gemma4_rope_tables
 
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(_vision_config())
     cos_t, sin_t = gemma4_rope_tables(rope.inv_freq, 8, PADDED_HEAD_DIM)
@@ -479,7 +776,7 @@ def test_rope_tables_padding_lanes_are_the_identity_rotation():
 
 
 def test_rope_tables_apply_attention_scaling_to_the_real_lanes_only():
-    from spyre_inference.multimodal.gemma4_vision import gemma4_rope_tables
+    from spyre_inference.models.gemma4_mm import gemma4_rope_tables
 
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(_vision_config())
     cos, sin = gemma4_rope_tables(rope.inv_freq, 8, PADDED_HEAD_DIM)
@@ -495,6 +792,113 @@ def test_rope_tables_apply_attention_scaling_to_the_real_lanes_only():
     for lanes in pad:
         assert torch.all(cos_scaled[0, :, lanes] == 1.0)
         assert torch.all(sin_scaled[..., lanes] == 0.0)
+
+
+def test_fp32_inv_freq_is_recomputed_not_read_off_a_downcast_buffer():
+    """`model.to(...)` downcasts `inv_freq` to the model dtype, and these frequencies
+    span a range where 16 bits cost real precision. Recomputing must recover full fp32."""
+    from spyre_inference.models.gemma4_mm import _fp32_inv_freq
+
+    config = _vision_config()
+    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
+    exact = rope.inv_freq.float().clone()
+
+    # Simulate the fp16 cast the real model applies to the whole tower.
+    rope.inv_freq = rope.inv_freq.to(torch.float16)
+    assert not torch.allclose(rope.inv_freq.float(), exact), "premise: fp16 loses bits"
+
+    recovered, attention_scaling = _fp32_inv_freq(rope, config)
+    assert recovered.dtype == torch.float32
+    assert attention_scaling == 1.0
+    torch.testing.assert_close(recovered, exact, rtol=1e-6, atol=1e-9)
+
+
+def test_fp32_inv_freq_resolves_the_rope_type_off_the_module_not_the_registry():
+    """transformers renames this tower's rope type from `default` to `axial` after the
+    pinned 5.16.1, and its axial initializer is a class-local staticmethod that
+    `ROPE_INIT_FUNCTIONS` does not carry -- resolving through the registry raises KeyError.
+    """
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from spyre_inference.models.gemma4_mm import _fp32_inv_freq
+
+    assert "axial" not in ROPE_INIT_FUNCTIONS, "premise: the registry has no axial entry"
+
+    config = _vision_config()
+    config.rope_parameters = dict(config.rope_parameters, rope_type="axial")
+
+    class AxialRotary(torch.nn.Module):
+        @staticmethod
+        def compute_axial_rope_parameters(cfg, device=None, **kwargs):
+            spatial_dim = cfg.head_dim // 2
+            base = cfg.rope_parameters["rope_theta"]
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim)
+            )
+            return inv_freq, 2.0
+
+    inv_freq, attention_scaling = _fp32_inv_freq(AxialRotary(), config)
+    assert inv_freq.shape == (ORIG_HEAD_DIM // 4,)
+    assert attention_scaling == 2.0
+
+
+def test_padding_on_device_weights_matches_padding_on_host():
+    """Padding a layer already on Spyre must give the same weights as padding it on the
+    host and moving afterwards.
+
+    The regression the host round trip exists for: composed on device-resident weights, the
+    helpers' strided slice-assignments lower silently wrong.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.models import gemma4_mm as gm
+
+    # Real 26B-A4B vision proportions: head_dim 72 -> 128, intermediate 4304 -> 4352.
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=NUM_HEADS * 72,
+        intermediate_size=4304,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_HEADS,
+        head_dim=72,
+        num_hidden_layers=1,
+        use_clipped_linears=False,
+    )
+    orig_hd = config.head_dim
+    padded_hd = gm._padded_head_dim(orig_hd)
+    padded_inter = 4352
+
+    torch.manual_seed(0)
+    layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0)
+    layer = layer.to(torch.float16).eval()
+
+    # Reference: pad on the host, then move.
+    on_host = copy.deepcopy(layer)
+    gm._prepare_attention(on_host.self_attn, NUM_HEADS, orig_hd, padded_hd)
+    gm._pad_mlp(on_host, config.intermediate_size, padded_inter)
+    on_host = on_host.to(torch.device("spyre"))
+
+    # Move first, then pad.
+    on_device = copy.deepcopy(layer).to(torch.device("spyre"))
+    gm._prepare_attention(on_device.self_attn, NUM_HEADS, orig_hd, padded_hd)
+    gm._pad_mlp(on_device, config.intermediate_size, padded_inter)
+
+    # Every host<->device convert halves an fp16 subnormal (normals round-trip exactly),
+    # and padding on device round-trips through the host, so its subnormals come back one
+    # halving further down -- an error bounded by half the largest subnormal. A wrongly
+    # composed slice-assign moves whole weights, so `smallest_normal` still catches it.
+    checked = 0
+    for name, want in on_host.named_parameters():
+        got = dict(on_device.named_parameters())[name]
+        torch.testing.assert_close(
+            got.detach().to("cpu").float(),
+            want.detach().to("cpu").float(),
+            rtol=0,
+            atol=torch.finfo(torch.float16).smallest_normal,
+            msg=lambda m, name=name: f"{name} differs when padded on device:\n{m}",
+        )
+        checked += 1
+    assert checked, "no parameters compared -- the layer walk found nothing"
 
 
 def test_pipeline_matches_stock_on_spyre():

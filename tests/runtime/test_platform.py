@@ -265,6 +265,19 @@ def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     assert vllm_config.compilation_config.compile_sizes == [512]
 
 
+def test_apply_config_keeps_a_fast_body_when_the_model_is_longer_than_2k():
+    """bge-reranker-v2-m3 at 8K. The scheduler can still accept one 8K sequence,
+    but compile sizes include the 2K and 4K bodies so shorter steps do not pad to 8K."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(
+        max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [2048, 4096, 8192]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 8192
+
+
 def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
     from spyre_inference.platform import TorchSpyrePlatform
 
@@ -644,6 +657,18 @@ def test_quantization_is_rejected_with_bfloat16():
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def test_alibi_model_is_rejected(monkeypatch):
+    """Neither attention layout implements ALiBi; fail in the front end, not in the worker."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    # The Falcon spelling of the flag `ModelConfig.uses_alibi` reads.
+    monkeypatch.setattr(vllm_config.model_config.hf_text_config, "alibi", True, raising=False)
+
+    with pytest.raises(ValueError, match="does not support ALiBi"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_accepted_at_tp1():
     """The guard above must not reject the single-card bf16 path."""
     from spyre_inference.platform import TorchSpyrePlatform
@@ -652,6 +677,25 @@ def test_bfloat16_is_accepted_at_tp1():
     vllm_config.model_config.dtype = torch.bfloat16
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(("kv_buckets", "raises"), [(None, True), ("256,1024", False)])
+def test_an_unknown_kv_ladder_fails_at_startup(monkeypatch, kv_buckets, raises):
+    from spyre_inference import envs
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Built first: VllmConfig runs this hook on construction too.
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "7_4")
+    if kv_buckets:
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", kv_buckets)
+    envs.clear_env_cache()
+
+    if raises:
+        with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER='7_4'"):
+            TorchSpyrePlatform.check_and_update_config(vllm_config)
+    else:
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
 def test_raise_dynamo_recompile_limits_survives_a_clobber():
@@ -752,6 +796,69 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
 
     assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 32
+
+
+@pytest.mark.parametrize(
+    ("budget", "user_budget", "sizes"),
+    [
+        pytest.param(2048, None, [1, 2, 4, 512], id="unset_default_is_capped"),
+        pytest.param(1024, 1024, [1, 2, 4, 512, 1024], id="user_budget_keeps_512"),
+        pytest.param(2048, 1024, [1, 2, 4, 512], id="budget_not_from_user_is_capped"),
+        pytest.param(256, 256, [1, 2, 4, 256], id="user_budget_below_default"),
+    ],
+)
+def test_compile_sizes_default_honors_a_user_budget(monkeypatch, budget, user_budget, sizes):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", user_budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == sizes
+    assert vllm_config.scheduler_config.max_num_batched_tokens == sizes[-1]
+
+
+@pytest.mark.parametrize(("budget", "expect_warn"), [(1024, False), (2048, True)])
+def test_compile_sizes_warns_above_twice_the_default(monkeypatch, caplog, budget, expect_warn):
+    import logging
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
+        TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512, budget]
+    warned = any("torch-spyre#5250" in r.message for r in caplog.records)
+    assert warned == expect_warn
+
+
+@pytest.mark.parametrize(
+    ("flag", "budget", "sizes"), [(None, 512, [512]), (1024, 1024, [512, 1024])]
+)
+def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, sizes):
+    """Through EngineArgs: an omitted flag keeps the default, a passed one is honored."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", None)
+    vllm_config = EngineArgs(
+        model="Qwen/Qwen3-0.6B", max_model_len=4096, max_num_batched_tokens=flag
+    ).create_engine_config()
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == budget
+    assert vllm_config.compilation_config.compile_sizes[-len(sizes) :] == sizes
 
 
 def test_compile_sizes_empty_list_opts_out():

@@ -65,7 +65,7 @@ sub-stick half) run directly in the compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice on Spyre, compiled as its own graph (`maybe_compile`, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)) unless compilation is off; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
-| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is dequanted to CPU fp16 at load so `model.to("spyre")` is a legal H2D. First Spyre forward eager-quantizes each SuperDSC N-tile to `qfp8wt` and caches it; later forwards compile `quantscalepertokenfp8` + `qfp8ch` + `aten._scaled_mm`. LM head stays FP16 |
+| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. LM head stays FP16 |
 
 ### Transposed linear weights
 
@@ -89,8 +89,8 @@ linear subclasses install it in `__init__`, but only when `quant_method` is an
 pure-PyTorch equivalent of torch-spyre's `[1,0]` weight layout, which only fires
 for `nn.Linear` and so misses every vLLM parallel-linear. FP8 checkpoints use
 `SpyreFp8LinearKernel` (`custom_ops/fp8_linear_kernel.py`) rather than `F.linear`:
-load dequants to fp16, the first Spyre forward caches `qfp8wt` per N-tile, and
-the compiled GEMM is `qfp8ch` + `aten._scaled_mm`.
+load DMAs the checkpoint FP8 weight into `qfp8wt`, and the GEMM is `qfp8ch` +
+`spyre.scaled_mm`.
 `SpyreUnquantizedLMHeadMethod` reuses the same base with `WEIGHT_T_ATTR="padded_weight_t"` and
 `ROW_ALIGN=64*32`, so the fast path and the padding/un-pad logic are defined once.
 
@@ -205,10 +205,9 @@ persistent form. Down's output slices are concatenated, not summed.
 
 ## Compilation Granularity
 
-Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
+Under `CompilationMode.STOCK_TORCH_COMPILE`, `compile_for_spyre` compiles each entry of
 the model's block `ModuleList` in place via `block.compile(backend="inductor",
-fullgraph=not uses_fp8, dynamic=False)`. FP8 linears need graph breaks, so their blocks
-use `fullgraph=False`. In place matters: rebinding the list entry to the
+fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to the
 `OptimizedModule` that `torch.compile` returns would re-parent the block under an
 `_orig_mod` child and rename every parameter, breaking weight save/reload.
 
@@ -444,23 +443,30 @@ cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
 device dim 0, which is where an indexed axis has to sit for the gather to cost one page
 rather than the whole tensor.
 
-Three things follow from those choices. The gather is a 2-D subscript, which lowers to
+Two things follow from those choices. The gather is a 2-D subscript, which lowers to
 `aten.index` and fails eager by upcasting its int32 index, so this backend always compiles
 attention even under `--enforce-eager` — attention compiles in its own domain, so the rest
 of the model still runs eager. Because the bmm's output axes
 (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
 mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
-at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries no ALiBi (which
-needs a bias tile per query group), so an ALiBi model needs `token_major`. Batched decode
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. Batched decode
 runs the other way round: its page index is uploaded one entry per stick here, which is
 what the tiled walk needs, so the batched kernel is reached on this layout and declined on
 token-major until that port lands.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
-planner's own verdicts. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
+planner's own verdicts. Read those from the allocation — `LifetimeBoundBuffer.address`, where
+`None` means HBM — and not from the allocator's `lx_pinning:` debug log, whose `→ lx` is the
+default for any buffer the spill-reason dict does not mention, and which never reports a
+graph-input clone at all. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
 transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
+
+Batched decode needs none of this. Its whole-page gather is LX-resident as it stands, so the
+per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding anyway divides
+`blocks_per_chunk` by `num_kv_heads` and multiplies the chunk trips, which measured roughly
+1.5–2x more kernel time across the decode batches and contexts tried.
 
 #### FP8 KV cache
 
@@ -488,7 +494,8 @@ calibrated one.
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
-  to `max_model_len` (avoids per-step recompilation on Spyre)
+  to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
+  selects a denser preset
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
@@ -504,7 +511,8 @@ Key constraints:
   are all exercised, on both layouts (`tests/attention/test_spyre_attn.py`,
   `tests/attention/test_spyre_head_major_attn.py`)
 - **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
-  layers stay unwindowed) and logits soft-capping on both layouts; ALiBi on token-major only
+  layers stay unwindowed) and logits soft-capping on both layouts
+- **Not supported**: ALiBi, on either layout
 
 ### Encoder-only attention
 
@@ -716,12 +724,13 @@ platform widens `head_dim` to the next 128-multiple, not the native path's 64-mu
 weight passes in `head_pad.py` are shared with the native path and pad Q/K interleaved, so
 this backend only has to rebuild the rotation cache at the pre-pad frequencies.
 
-`RMSNorm` registers no OOT op: upstream `forward_native` lowers its fp16→fp32 upcast
-into the compiled graph. `GemmaRMSNorm` still needs one, because its trailing fp32
-`weight` multiply hits a torch-spyre gap — a STANDARD `[hidden]` operand that can
-neither broadcast against nor de-stagger the staggered-EA activation. Because the
-fusers key on class names, the OOT registry covers the fused Gemma norm
-(`SpyreTPAwareGemmaRMSNorm`) too.
+`RMSNorm` and `GemmaRMSNorm` both run upstream `forward_native`, compiled as their own
+graph wherever no block graph encloses them, which is the final norm after the last
+block; eagerly that norm launches one Spyre program per op. `GemmaRMSNorm` also compiles
+under `--enforce-eager`, because its trailing fp32 `weight` multiply hits a torch-spyre
+gap eagerly: a STANDARD `[hidden]` operand that can neither broadcast against nor
+de-stagger the staggered-EA activation. Because the fusers key on class names, the OOT
+registry covers the fused norms (`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`) too.
 
 ## Distributed (TP)
 

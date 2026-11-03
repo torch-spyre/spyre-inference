@@ -54,6 +54,7 @@ find_isa(${CPUINFO} "S390" S390_FOUND)
 
 set(SPYRE_EXT_SRC
   "csrc/cpu/sampling_kernels.cpp"
+  "csrc/cpu/spec_decode_utils.cpp"
   "csrc/cpu/torch_bindings.cpp")
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from functools import cache
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -36,6 +37,16 @@ _BLOCK_COMPILABLE_ATTR = "_spyre_block_compilable"
 
 def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
+
+
+def linear_weight(layer: nn.Module) -> torch.Tensor:
+    """``[out, in]``, undoing the Spyre linear's post-load transpose and row padding."""
+    weight = cast(torch.Tensor, layer.weight).detach()
+    padding = getattr(layer, "spyre_row_padding", None)
+    if padding is None:
+        return weight
+    weight = weight.t()
+    return weight[: weight.shape[0] - padding]
 
 
 @cache
@@ -163,7 +174,7 @@ def _key_pad_mask_key(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.
     and the tail write cannot lower on Spyre. The key, not the row, is the constant: a
     tensor constant becomes a graph attribute torch-spyre cannot lay out, while the dict
     read in `padded_sdpa` makes the row a guarded graph input. Needs `dynamic=False`,
-    which `_compile_blocks` passes because Spyre rejects SymInt shapes.
+    which `compile_blocks` passes because Spyre rejects SymInt shapes.
     """
     key = (seq, seq_pad, dtype, device)
     if key not in _KEY_PAD_MASKS:

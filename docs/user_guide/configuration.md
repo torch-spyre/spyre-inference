@@ -145,19 +145,76 @@ llm = LLM(
 `1` and `8` cover decode steps (one token per running sequence, up to 8); `512` is the
 prefill bucket.
 
+The default prefill bucket is 512 tokens, but larger ones compile. For prompts of many
+thousands of tokens, a 1024-token prefill chunk shortens time to first token, on dense
+models such as granite-3.3-8b as well as on MoE models such as gemma-4, where each
+prefill step reads every expert's weights however many tokens it carries. Pass a larger
+`--max-num-batched-tokens` to get one; the default buckets then keep `512` too, so short
+prefills don't pad up to the larger one:
+
+```bash
+vllm serve google/gemma-4-26B-A4B -tp 4 --max-model-len 32768 \
+    --max-num-batched-tokens 1024 \
+    --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'
+```
+
+Warmup takes longer, and for prompts under a few thousand tokens it gains little; decode
+can get slightly slower. The example serves text only: a larger token budget also raises
+the number of image-batch widths the vision tower is warmed at, which can run out of
+device memory (#1302). At a long `--max-model-len`, a 2048-token bucket can push the
+largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
+they are left to compile on first use (torch-spyre#5250 makes that limit configurable).
+
 **Attention (KV length × query length).** Set the buckets directly as comma-separated
 lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
 `--max-num-batched-tokens` (query) are dropped, and the limit is appended if missing, so
 every schedulable length keeps a bucket.
 
 ```bash
-export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from block_size
+export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: the SPYRE_ATTN_KV_LADDER preset (pow2)
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) because the recorded set grows
-with both axes, even after filtering. If your context never exceeds 2048, dropping the
-higher powers removes variants from warmup at no serving cost.
+The default KV buckets are the powers of two from `block_size`; the denser presets below
+union them with a further series. The ladder stays geometric rather than uniform because the
+recorded set grows with both the KV and num-sequences axes, even after filtering, so each
+extra entry costs warmup time. If your context never exceeds 2048,
+dropping the higher entries removes variants from warmup at no serving cost.
+
+### Choosing a KV ladder
+
+`SPYRE_ATTN_KV_LADDER` picks how finely the KV ladder subdivides, without having to write the
+buckets out. The default is `pow2`. Every preset keeps the powers of two, so a KV length's bucket
+can only move down relative to `pow2`, never up. The denser presets do not contain each other,
+though: at block_size 128, 2600 rounds to 2688 under `8_5` but to 2944 under `4_3`. Counts and
+overpay below are for block_size 128, at the `--max-model-len` each column names:
+
+| preset | spacing | buckets at 4096 / 16384 / 32768 | mean overpay at 4096 / 32768 |
+|---|---|---|---|
+| `pow2` (default) | powers of two only | 6 / 8 / 9 | 39% / 39% |
+| `8_5` | 8/5 ratio | 10 / 15 / 18 | 21% / 19% |
+| `4_3` | 4/3 ratio | 14 / 20 / 24 | 15% / 13% |
+| `9_8` | 9/8 ratio | 20 / 34 / 41 | 8% / 6% |
+| `uniform` | odd sixteenths of `--max-model-len` | 13 / 15 / 16 | 14% / 14% |
+
+Overpay is the bucket over the real KV length, averaged over every KV length above `block_size`,
+so it describes a workload whose lengths are spread out. Warmup cost tracks the number of distinct
+recorded kernels, which rises with the bucket count. The ratio presets put their buckets at fixed
+token counts; `uniform` places them as fractions of `--max-model-len`, so its buckets move up with
+the context while its count stays roughly flat. Short contexts that are not a power of two are the
+exception: there the step rounds down to a whole block and adds a few buckets (16 at 2047 against
+12 at 2048). Match `--max-model-len` to your real lengths before choosing it.
+
+As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
+saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
+it buys little for its warmup. Once the block count exceeds one chunk of `32 // num_seqs` blocks,
+the batched-decode kernel also pads it up to whole chunks, which takes back part of a denser
+preset's saving below 32 sequences. `8_5` is the recommended compromise, `9_8` the fastest when
+warmup time does not matter, and `pow2` the default because it has the shortest warmup.
+
+If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every preset: put the
+buckets where the lengths actually are. A workload that sits on one power of two gains nothing
+from any preset.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
@@ -175,7 +232,8 @@ vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
 It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. It does not raise capacity: the platform pins the block count
+that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+...) are rejected at startup. It does not raise capacity: the platform pins the block count
 to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
 same number of tokens in half the device memory. Attention still computes in the model
 dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
@@ -187,6 +245,19 @@ The scales are compiled into the graphs as constants. A checkpoint whose layers 
 different KV scales therefore compiles the transformer block and each recorded attention
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.
+
+## Offline engine in the calling process
+
+At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline
+`LLM` engine in the calling process instead of a spawned EngineCore, which skips the
+spawn and the second round of imports at startup. `vllm serve` always spawns EngineCore.
+
+The engine then changes the calling process: vLLM freezes the garbage collector's heap,
+caches its environment variables, seeds the global RNGs and leaves `RANK`/`WORLD_SIZE`
+set, the worker sets torch's thread count, and the card stays open until the process
+exits. Build an engine with `tensor_parallel_size > 1` in a new process. Set
+`OMP_WAIT_POLICY=PASSIVE` before Python starts: OpenMP reads it when it loads, so the
+default the plugin sets only reaches spawned processes.
 
 ## pyproject.toml Reference
 

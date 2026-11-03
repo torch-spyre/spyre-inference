@@ -94,7 +94,7 @@ def _pad_qk_interleaved(w: torch.Tensor, n_heads: int, orig: int, padded: int) -
     return new.reshape(n_heads * padded, *w.shape[2:])
 
 
-def _pad_output_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> torch.Tensor:
+def pad_output_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> torch.Tensor:
     """End-pad each head on the output dim (dim 0). Used for V (no RoPE)."""
     w = w.view(n_heads, orig, *w.shape[1:])
     new = w.new_zeros(n_heads, padded, *w.shape[2:])
@@ -102,7 +102,7 @@ def _pad_output_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> to
     return new.reshape(n_heads * padded, *w.shape[2:])
 
 
-def _pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> torch.Tensor:
+def pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> torch.Tensor:
     """End-pad each head on the input dim (dim 1). Used for O."""
     hidden = w.shape[0]
     w = w.view(hidden, n_heads, orig)
@@ -134,7 +134,7 @@ def _pad_fused_qkv(
         [
             _pad_qk_interleaved(q, n_heads, orig, padded),
             _pad_qk_interleaved(k, n_kv_heads, orig, padded),
-            _pad_output_end(v, n_kv_heads, orig, padded),
+            pad_output_end(v, n_kv_heads, orig, padded),
         ]
     )
 
@@ -159,22 +159,22 @@ def _pad_weight(
     if name.endswith(("k_proj.weight", "k_proj.bias")):
         return _pad_qk_interleaved(w, n_kv_heads, orig, padded)
     if name.endswith(("v_proj.weight", "v_proj.bias")):
-        return _pad_output_end(w, n_kv_heads, orig, padded)
+        return pad_output_end(w, n_kv_heads, orig, padded)
     if name.endswith("o_proj.weight"):
-        return _pad_input_end(w, n_heads, orig, padded)
+        return pad_input_end(w, n_heads, orig, padded)
     # QK-norm (Qwen3): pad only a norm taken over head_dim; other widths are untouched.
     if name.endswith(("q_norm.weight", "k_norm.weight")) and w.numel() == orig:
         return _pad_qk_norm_weight(w, orig, padded)
     # Raw HF names (pre-WeightsMapper): three separate Q/K/V tensors, no RoPE.
     # "attention.output.dense" (not bare "output.dense") excludes BertOutput's FFN.
     if name.endswith(("attention.self.query.weight", "attention.self.query.bias")):
-        return _pad_output_end(w, n_heads, orig, padded)
+        return pad_output_end(w, n_heads, orig, padded)
     if name.endswith(("attention.self.key.weight", "attention.self.key.bias")):
-        return _pad_output_end(w, n_kv_heads, orig, padded)
+        return pad_output_end(w, n_kv_heads, orig, padded)
     if name.endswith(("attention.self.value.weight", "attention.self.value.bias")):
-        return _pad_output_end(w, n_kv_heads, orig, padded)
+        return pad_output_end(w, n_kv_heads, orig, padded)
     if name.endswith("attention.output.dense.weight"):
-        return _pad_input_end(w, n_heads, orig, padded)
+        return pad_input_end(w, n_heads, orig, padded)
     return w
 
 

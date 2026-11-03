@@ -65,9 +65,8 @@ MEMORY_OP_MARKERS = ("memcpy", "memset", "restickify", "stickif", "copy_from_d2d
 # Spyre requires float16 (platform.py raises otherwise).
 DTYPE = torch.float16
 
-# check_and_update_config caps max_num_batched_tokens here for decoder models, so a
-# longer batch is unschedulable at any max_model_len.
-_MAX_BATCHED_TOKENS = 512
+# Mirrors TorchSpyrePlatform._DEFAULT_PREFILL_BUCKET, the budget when the user passes none.
+_DEFAULT_MAX_BATCHED_TOKENS = 512
 
 
 VARIANT_REGISTRY: dict[str, dict] = {}
@@ -635,16 +634,16 @@ def measure(run, iterations, span=SPANS["layer"]):
     return dev_us, mem_us, cpu_us, n_kernels, per_op[median_at] if per_op else {}
 
 
-def unreachable_reason(query_lens) -> str:
+def unreachable_reason(query_lens, max_batched_tokens) -> str:
     """Why the engine could never schedule this shape, or "" if it could.
 
-    Against the platform cap, not the derived limits: those come from the shapes, so
+    Against the token budget, not the derived limits: those come from the shapes, so
     they can never rule one out.
     """
-    if sum(query_lens) > _MAX_BATCHED_TOKENS:
+    if sum(query_lens) > max_batched_tokens:
         return (
-            f"batch of {sum(query_lens)} tokens above the platform's "
-            f"max_num_batched_tokens cap of {_MAX_BATCHED_TOKENS}; the scheduler "
+            f"batch of {sum(query_lens)} tokens above the "
+            f"max_num_batched_tokens budget of {max_batched_tokens}; the scheduler "
             "cannot pack this many into one step, so production chunks it"
         )
     return ""
@@ -802,7 +801,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
 
     inputs = None
     try:
-        unreachable = unreachable_reason(query_lens)
+        unreachable = unreachable_reason(query_lens, cfg["max_num_batched_tokens"])
         if unreachable:
             row["error"] = unreachable
             print(f"    -> skipped ({unreachable})", flush=True)
@@ -1046,7 +1045,7 @@ def _infer_type(query_lens):
     return "mixed"
 
 
-def derive_lattice(entries):
+def derive_lattice(entries, max_batched_tokens):
     """The bucket lattice that makes the builder's padding the identity.
 
     One bucket per declared length, so ``find_*_bucket`` returns it unchanged. The kv
@@ -1060,11 +1059,11 @@ def derive_lattice(entries):
     # list would otherwise measure a narrower gather than production's. It joins the
     # ladder because _resolve_buckets appends a limit its ladder tops out below.
     # 1 is the decode rung, reached by a config that declares no wider query at all.
-    query = sorted({q for e in entries for q in e["query_lens"]} | {1, _MAX_BATCHED_TOKENS})
+    query = sorted({q for e in entries for q in e["query_lens"]} | {1, max_batched_tokens})
     num_seqs = sorted({len(e["query_lens"]) for e in entries})
     return {
         "max_model_len": kv[-1],
-        "max_num_batched_tokens": _MAX_BATCHED_TOKENS,
+        "max_num_batched_tokens": max_batched_tokens,
         "max_num_seqs": num_seqs[-1],
         "SPYRE_ATTN_KV_BUCKETS": ",".join(map(str, kv)),
         "SPYRE_ATTN_QUERY_BUCKETS": ",".join(map(str, query)),
@@ -1157,6 +1156,12 @@ def main():
         help="print the N device ops holding the most time in the measured span, and "
         "write the full per-op breakdown of that window beside the CSV",
     )
+    ap.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=_DEFAULT_MAX_BATCHED_TOKENS,
+        help="the engine's token budget; a batch above it is reported as unschedulable",
+    )
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
@@ -1196,6 +1201,7 @@ def main():
         )
     if args.variants:
         cfg["variants"] = args.variants
+    cfg["max_num_batched_tokens"] = args.max_num_batched_tokens
     cfg["stop_on_failure"] = args.stop_on_failure
     cfg["top_ops"] = args.top_ops
     cfg.setdefault("device", "spyre")
@@ -1236,7 +1242,7 @@ def main():
         )
 
     entries = entries_from_config(cfg)
-    limits = derive_lattice(entries)
+    limits = derive_lattice(entries, cfg["max_num_batched_tokens"])
     # envs caches on first read, so this has to land before any bucketer is built.
     for key, value in limits.items():
         if key.startswith("SPYRE_"):

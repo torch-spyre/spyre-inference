@@ -32,7 +32,8 @@ class XPressRefinerHead(_UpstreamHead):
         block_size: int,
         rank: int = 256,
         mlp_hidden: int = 512,
-        topc: int = 128,
+        *,
+        topc: int,
     ) -> None:
         if min(vocab_size, hidden_size, rank, mlp_hidden) <= 0 or block_size < 2:
             raise ValueError(

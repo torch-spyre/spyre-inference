@@ -164,7 +164,7 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
                 readout = self._gather_readout(candidate_ids)
             for _ in range(self.xpress_num_passes):
-                # The verified anchor is also its own predecessor in merged XPress.
+                # The anchor is its own predecessor, as in upstream's XPressSpeculator.
                 previous = torch.cat(
                     (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
                 )

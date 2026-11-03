@@ -136,9 +136,9 @@ def test_hoisted_projection_and_candidate_readout_match_unfolded_bias(head_and_w
 
 def test_published_and_serving_checkpoint_roundtrip(head_and_weights):
     original, published = head_and_weights
-    loaded = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128).double()
+    loaded = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128, topc=0).double()
     loaded.load_checkpoint_weights(published)
-    restored = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128).double()
+    restored = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128, topc=0).double()
     restored.load_state_dict(loaded.state_dict())
     for name, expected in original.state_dict().items():
         torch.testing.assert_close(loaded.state_dict()[name], expected, atol=0, rtol=0)

@@ -53,6 +53,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
+    "MuseGlimmerForConditionalGeneration": (
+        "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM"
+    ),
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (
         "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"
@@ -163,7 +167,7 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     has cached the upstream class of a multimodal architecture such as CLIP.
     """
     from spyre_inference.hf_adapters import uses_hf_adapters
-    from spyre_inference.models import clip, gemma4
+    from spyre_inference.models import clip, gemma4, muse_glimmer
 
     register_models()
     if uses_hf_adapters(engine_args):
@@ -176,3 +180,4 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
         return
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
+    muse_glimmer.force_language_model_only(engine_args)

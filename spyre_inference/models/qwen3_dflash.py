@@ -15,6 +15,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from typing import cast
 
 import torch
@@ -24,7 +25,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
-from vllm.model_executor.models.qwen3_xpress import Qwen3XPressForCausalLM
+from vllm.model_executor.models.qwen3_xpress import Qwen3XPressForCausalLM, Qwen3XPressModel
 
 from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from spyre_inference.custom_ops.utils import convert
@@ -88,27 +89,23 @@ class SpyreDFlashQwen3Model(DFlashQwen3Model):
 class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = SpyreDFlashQwen3Model
     model: SpyreDFlashQwen3Model
+    xpress_num_passes = 0
 
-    def __init__(self, *, vllm_config, prefix=""):
-        # Explicit base: in the XPress subclass's MRO, super() is upstream's XPress model.
-        DFlashQwen3ForCausalLM.__init__(self, vllm_config=vllm_config, prefix=prefix)
-        self.xpress_head: XPressRefinerHead | None = None
-        self.xpress_num_passes = 0
-        self.xpress_topc = 0
+    @property
+    def xpress_head(self) -> XPressRefinerHead | None:
+        return getattr(self.model, "xpress_head", None)
+
+    @property
+    def xpress_topc(self) -> int:
+        head = self.xpress_head
+        return 0 if head is None else head.topc
 
     def load_weights(self, weights):
         weights = dict(weights)
         validate_dflash_weights(self.config, weights)
-        if self.xpress_head is not None:
-            self.xpress_head.load_checkpoint_weights(weights)
-            weights = {
-                name: weight
-                for name, weight in weights.items()
-                if not name.startswith("xpress_head.")
-            }
-        elif any(name.startswith("xpress_head.") for name in weights):
+        if self.xpress_head is None and any(name.startswith("xpress_head.") for name in weights):
             raise ValueError("XPress weights require an XPress checkpoint architecture")
-        DFlashQwen3ForCausalLM.load_weights(self, weights.items())
+        super().load_weights(weights.items())
 
     def prepare_for_spyre(self) -> None:
         self.model.prepare_for_spyre()
@@ -178,19 +175,30 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         return draft.tolist()
 
 
+class SpyreQwen3XPressModel(SpyreDFlashQwen3Model, Qwen3XPressModel):
+    pass
+
+
 class SpyreQwen3XPressForCausalLM(SpyreDFlashQwen3ForCausalLM, Qwen3XPressForCausalLM):
-    """Upstream's XPress model on the Spyre DFlash path; its own head is Triton-only."""
+    """Upstream's XPress model and loader, built with the Spyre head and context path."""
 
     def __init__(self, *, vllm_config, prefix=""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        config = self.config
-        self.xpress_topc = config.xpress_topc
-        self.xpress_num_passes = config.xpress_num_passes
-        self.xpress_head = XPressRefinerHead(
-            config.vocab_size,
-            config.hidden_size,
-            config.xpress_block_size,
-            config.xpress_rank,
-            config.xpress_mlp_hidden,
-            topc=self.xpress_topc,
-        )
+        with _spyre_xpress_classes():
+            Qwen3XPressForCausalLM.__init__(self, vllm_config=vllm_config, prefix=prefix)
+        # Upstream wraps refine_bias in torch.compile; Spyre compiles its own helpers.
+        self.model.xpress_head.__dict__.pop("refine_bias", None)
+        self.xpress_num_passes = self.config.xpress_num_passes
+
+
+@contextmanager
+def _spyre_xpress_classes():
+    # Upstream constructs both by module-global name, with no class hook.
+    from vllm.model_executor.models import qwen3_xpress
+
+    saved = qwen3_xpress.Qwen3XPressModel, qwen3_xpress.XPressRefinerHead
+    qwen3_xpress.Qwen3XPressModel = SpyreQwen3XPressModel  # ty: ignore[invalid-assignment]
+    qwen3_xpress.XPressRefinerHead = XPressRefinerHead  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        qwen3_xpress.Qwen3XPressModel, qwen3_xpress.XPressRefinerHead = saved

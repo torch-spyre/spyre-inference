@@ -35,7 +35,7 @@ def allow_xpress_on_v1() -> None:
     def without_xpress(self) -> list[str]:
         return [f for f in original(self) if f != _XPRESS_ON_V1]
 
-    without_xpress._spyre_patched = True  # ty: ignore[unresolved-attribute]
+    without_xpress._spyre_patched = True
     VllmConfig._get_v1_model_runner_unsupported_features = without_xpress  # ty: ignore[invalid-assignment]
 
 

@@ -69,10 +69,14 @@ def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_s
     assert sum(transferred_bytes) == batch * (16 * vocab + passes * 15 * (topc or vocab)) * 4
 
 
-def test_xpress_model_builds_the_spyre_head_from_the_checkpoint_config(monkeypatch):
-    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+def test_upstream_xpress_construction_builds_the_spyre_classes(monkeypatch):
+    from vllm.model_executor.models import qwen3_xpress
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
-    from spyre_inference.models.qwen3_dflash import SpyreQwen3XPressForCausalLM
+    from spyre_inference.models.qwen3_dflash import (
+        SpyreQwen3XPressForCausalLM,
+        SpyreQwen3XPressModel,
+    )
 
     config = SimpleNamespace(
         vocab_size=73,
@@ -82,14 +86,27 @@ def test_xpress_model_builds_the_spyre_head_from_the_checkpoint_config(monkeypat
         xpress_mlp_hidden=128,
         xpress_topc=7,
         xpress_num_passes=2,
+        draft_vocab_size=73,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=config)),
+        model_config=SimpleNamespace(get_num_layers=lambda _: 4, get_vocab_size=lambda: 73),
+        parallel_config=None,
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
     )
 
-    def dflash_init(self, *, vllm_config, prefix=""):
+    def backbone_init(self, *, vllm_config, start_layer_id=0, prefix=""):
         torch.nn.Module.__init__(self)
         self.config = config
 
-    monkeypatch.setattr(DFlashQwen3ForCausalLM, "__init__", dflash_init)
-    model = SpyreQwen3XPressForCausalLM(vllm_config=None)
-    assert type(model.xpress_head) is XPressRefinerHead
-    assert (model.xpress_head.rank, model.xpress_head.topc) == (64, 7)
-    assert (model.xpress_topc, model.xpress_num_passes) == (7, 2)
+    monkeypatch.setattr(DFlashQwen3Model, "__init__", backbone_init)
+    monkeypatch.setattr(qwen3_xpress, "ParallelLMHead", lambda *a, **k: torch.nn.Identity())
+    monkeypatch.setattr(qwen3_xpress, "LogitsProcessor", lambda *a, **k: torch.nn.Identity())
+    model = SpyreQwen3XPressForCausalLM(vllm_config=vllm_config)
+
+    assert type(model.model) is SpyreQwen3XPressModel
+    head = model.xpress_head
+    assert head is model.model.xpress_head and type(head) is XPressRefinerHead
+    assert (head.rank, head.topc, model.xpress_num_passes) == (64, 7, 2)
+    assert "refine_bias" not in head.__dict__, "upstream's compiled refine_bias was left bound"
+    assert qwen3_xpress.XPressRefinerHead is not XPressRefinerHead, "class swap leaked"

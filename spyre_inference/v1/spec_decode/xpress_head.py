@@ -14,8 +14,6 @@
 
 # Upstream's Jacobi loop is Triton-only; Spyre compiles these step helpers instead.
 
-from collections.abc import Mapping
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -23,29 +21,16 @@ from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead as _Upstre
 
 
 class XPressRefinerHead(_UpstreamHead):
-    """Causal block refiner, with the raw checkpoint mixer folded at load time."""
+    """Upstream's head, construction and loading included, with Spyre step helpers."""
 
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        block_size: int,
-        rank: int = 256,
-        mlp_hidden: int = 512,
-        *,
-        topc: int,
-    ) -> None:
-        if min(vocab_size, hidden_size, rank, mlp_hidden) <= 0 or block_size < 2:
-            raise ValueError(
-                "XPress requires positive dimensions and a block of at least two tokens"
-            )
-        if type(topc) is not int or topc < 0:
-            raise ValueError("topc must be a nonnegative integer")
-        super().__init__(vocab_size, hidden_size, block_size, rank, mlp_hidden, topc=topc)
-        self.register_buffer("_mix_kjc", None, persistent=False)
-        self.register_buffer("_readout_t", None, persistent=False)
-        self.register_buffer("_hidden_proj_t", None, persistent=False)
-        self.register_buffer("_token_proj_t", None, persistent=False)
+    _mix_kjc: torch.Tensor | None = None
+    _readout_t: torch.Tensor | None = None
+    _hidden_proj_t: torch.Tensor | None = None
+    _token_proj_t: torch.Tensor | None = None
+
+    def build_fused_buffers(self) -> None:
+        # Only the Triton kernels read these; prepare_for_spyre builds the device layouts.
+        pass
 
     def prepare_for_spyre(self) -> None:
         """Build device layouts after the checkpoint is loaded in its serving dtype."""
@@ -69,20 +54,6 @@ class XPressRefinerHead(_UpstreamHead):
         # Match the target LM head's output tiling; trim only full sticks.
         padded = F.pad(weight, (0, 0, 0, (-weight.shape[0]) % 2048))
         self._readout_t = padded.t().contiguous().to(device)
-
-    def load_checkpoint_weights(self, weights: Mapping[str, torch.Tensor]) -> None:
-        """Load raw checkpoint weights; use load_state_dict for an already folded mixer."""
-        prefix, mapping = "xpress_head.", self.HYBRID_KEY_MAP
-        names = {name[len(prefix) :] for name in weights if name.startswith(prefix)}
-        if names != mapping.keys():
-            raise ValueError(
-                f"Invalid XPress head weights: missing={sorted(mapping.keys() - names)}, "
-                f"unexpected={sorted(names - mapping.keys())}"
-            )
-        state = {mapping[name]: weights[prefix + name] for name in names - {"mix.L"}}
-        state["mix_L"] = self.mix_L.detach()
-        self.load_state_dict(state, strict=True)
-        self.fold_from_raw_(weights[prefix + "mix.L"].to(self.mix_L.dtype))
 
     def _mix_and_mlp(self, x):
         # Keep rank as the contiguous dimension for Spyre's stick layout.

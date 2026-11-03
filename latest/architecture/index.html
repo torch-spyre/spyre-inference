@@ -2827,9 +2827,13 @@ warmup is a shape warmup missed. A tower whose per-image shape varies beyond the
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
 marked. Gemma 4's tower is not marked: <code>SpyreGemma4ForConditionalGeneration</code>
 (<code>models/gemma4_mm.py</code>) runs it on the vision encoder mixin below, compiled per token
-budget, and rejects video. The budgets stop at the largest image the engine's
-<code>max_soft_tokens</code> allows, so a request passing a larger <code>max_soft_tokens</code> compiles on first
-use: the guard reports it at its default <code>warn</code> level and refuses it at <code>error</code>.</p>
+budget, and rejects video. Upstream's doubling covers the engine's <code>max_soft_tokens</code>. Larger
+per-request sizes get budgets only when listed in <code>encoder_cudagraph_token_budgets</code> (see
+<a href="../user_guide/configuration.html#gemma-4-per-request-image-sizes">per-request image sizes</a>);
+<code>TorchSpyrePlatform.validate_request</code> rejects an image above the largest budget at the
+frontend, and the platform raises the encoder cache and compute budget to hold one. Several
+images pack into one call only up to the budget covering the engine's own largest image,
+since attention spans the whole packed sequence; a larger image runs alone at its own budget.</p>
 <p>Blocks of one class share one <code>forward</code> code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
 backend compile count is independent of depth, but it is not 1: layer 0 specializes
@@ -2858,8 +2862,9 @@ grows with layer count.</p>
 <p>A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
 class with <code>SpyreVisionEncoderMixin</code> (<code>models/_vision_encoder.py</code>) ahead of it. The mixin implements
 upstream's <code>SupportsEncoderCudaGraph</code> protocol, so the bucketing is upstream's:
-<code>EncoderCudaGraphManager</code> picks power-of-two token budgets, packs a step's images into them,
-pads the inputs and splits the output per image. <code>SpyreEncoderGraphManager</code>
+<code>EncoderCudaGraphManager</code> picks power-of-two token budgets (or takes
+<code>encoder_cudagraph_token_budgets</code>), packs a step's images into them, pads the inputs and splits
+the output per image. <code>SpyreEncoderGraphManager</code>
 (<code>v1/worker/spyre_encoder_graph.py</code>) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
@@ -2955,6 +2960,13 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>63 (one-hot width)</td>
 </tr>
 <tr>
+<td><code>vision_pack_tokens</code></td>
+<td>no</td>
+<td>packing stops at the budget covering this; larger items run alone (default <code>None</code>: up to the largest budget)</td>
+<td>default</td>
+<td>the engine's largest image</td>
+</tr>
+<tr>
 <td><code>vision_modalities</code></td>
 <td>no</td>
 <td>modalities run through the graphs; others go to upstream's <code>embed_multimodal</code></td>
@@ -2978,10 +2990,11 @@ the pooler's <code>sqrt(hidden_size)</code> scale can leave the fp16 range, so t
 placeholders and <code>embed_input_ids</code> are inherited unchanged.</p>
 <p>Constraints the layout follows:</p>
 <ul>
-<li>The largest budget is the largest item the model's upstream processor can produce
+<li>The doubling's largest budget is the largest item the model's upstream processor can produce
   (<code>MultiModalBudget.mm_max_toks_per_item</code>, the same number the scheduler's encoder budget
   uses, or the model's <code>get_encoder_cudagraph_budget_range</code>), so no item needs a shape
-  warmup skipped. Each budget's patch count is a whole multiple of <code>vision_patch_multiple</code>.</li>
+  warmup skipped; user budgets may go above it, and the platform rejects a request image
+  above the largest. Each budget's patch count is a whole multiple of <code>vision_patch_multiple</code>.</li>
 <li>Patches are <strong>offset-major</strong>: one group per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to <code>[M², tokens, D]</code>, a batched matmul
   and a sum. Upstream's <code>unfold</code> regroup has no lowering, and a <code>[L, D] → [L/M², M²·D]</code>

@@ -15,8 +15,8 @@
 # make perf-tests resolves SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET /
 # SPYRE_ALL_SEQUENCES_DATASET from cache, fetching missing/corrupt traces and
 # preserving existing-file overrides. FETCH_BENCH_DATA=0 bypasses resolution.
-# Unset vars fall back to benchmark-host paths; a selected entry whose file is
-# absent fails rather than being skipped.
+# Unset vars default to their location under SPYRE_BENCH_DATA_DIR; a selected
+# entry whose file is absent fails rather than being skipped.
 #
 # The trailing suffix names the trace an entry replays. Each one needs a
 # max-model-len that fits its requests, since longer ones are rejected: the

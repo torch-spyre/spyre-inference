@@ -114,6 +114,22 @@ def test_pair_matrix_equals_pair_swap(head_dim):
 
 
 @pytest.mark.rotary
+@pytest.mark.parametrize(
+    ("head_dim", "dtype"), [(8, torch.float32), (64, torch.float16)], ids=["small", "stick"]
+)
+def test_half_rope_permutation_swaps_halves(head_dim, dtype):
+    """cos=0, sin=1 isolates the swap term, so this pins the half-swap itself. The
+    `cat`/slice form it replaces returns uncorrelated data on device at head_dim=64."""
+    x = torch.arange(head_dim, dtype=dtype).view(1, 1, 1, head_dim)
+    cos = torch.zeros(1, 1, 1, head_dim, dtype=dtype)
+    sin = torch.ones(1, 1, 1, head_dim, dtype=dtype)
+    swap = utils.rope_perm_matrix("half", head_dim, x.device, dtype)
+    got = utils.rope_rotate_matmul(x, cos, sin, swap)
+    want = torch.cat([x[..., head_dim // 2 :], x[..., : head_dim // 2]], dim=-1)
+    torch.testing.assert_close(got, want)
+
+
+@pytest.mark.rotary
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_rope_rotate_matmul_matches_rotation_formula(head_dim):
     torch.manual_seed(2)

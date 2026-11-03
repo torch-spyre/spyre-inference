@@ -219,6 +219,7 @@ def cmd_restore(args):
     # Always hand uv a usable local cache dir, hit or miss.
     local.mkdir(parents=True, exist_ok=True)
     _write_kv(args.github_env, {"UV_CACHE_DIR": str(local)})
+    _write_kv(args.github_state, {"key": key})
     _write_kv(
         args.github_output,
         {"cache-hit": "true" if hit else "false", "cache-key": key, "restored-from": restored_from},
@@ -293,7 +294,7 @@ def cmd_save(args):
     local = Path(args.local_dir)
 
     try:
-        key = compute_key(args.key_file, uv_version=args.uv_version)
+        key = args.key or compute_key(args.key_file, uv_version=args.uv_version)
         arch_dir = _scope_dir(args.nfs_root, scope, args.arch)
         target = arch_dir / f"{key}{ext}"
         # Skip if the key is already readable here, so an ordinary PR (key in
@@ -365,11 +366,14 @@ def main(argv=None):
     add_common(r)
     r.add_argument("--github-env", default=os.getenv("GITHUB_ENV", ""))
     r.add_argument("--github-output", default=os.getenv("GITHUB_OUTPUT", ""))
+    r.add_argument("--github-state", default=os.getenv("GITHUB_STATE", ""))
     r.set_defaults(func=cmd_restore)
 
     s = sub.add_parser("save")
     add_common(s)
     s.add_argument("--compress", choices=sorted(COMPRESS), default="none")
+    # The job may rewrite its lockfile (e.g. `uv add`), so save under the restore-time key.
+    s.add_argument("--key", default="", help="key computed at restore; recomputed if empty")
     s.add_argument("--keep", type=int, default=5, help="tars to retain per scope/arch")
     s.add_argument(
         "--pr-ttl-days", type=int, default=14, help="evict PR-scope tars older than this"

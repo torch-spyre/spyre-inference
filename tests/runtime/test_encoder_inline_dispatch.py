@@ -437,7 +437,7 @@ class TestBuildAttentionMetadata:
         runner.model_config = SimpleNamespace(runner_type="pooling", dtype=torch.float16)
         runner.compilation_config = SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE)
         runner._encoder_rectangles = encoder_rectangles(config)
-        runner._encoder_width_caps = {}
+        runner._encoder_width_caps_by_rows = {}
         runner._encoder_budget = encoder_shape_tables(config).budget
         runner._encoder_buffer_rows = 0
         runner._encoder_grid = None

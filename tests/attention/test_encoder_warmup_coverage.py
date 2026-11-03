@@ -35,9 +35,9 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_group_shapes,
-    encoder_group_width_caps,
     encoder_rectangles,
     encoder_shape_tables,
+    group_width_caps,
 )
 
 # (max_model_len, max_num_seqs, max_num_batched_tokens). The first is the plan's
@@ -256,7 +256,7 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         rectangles = encoder_rectangles(config)
         declared_rects = set(rectangles)
         declared_groups = set(encoder_group_shapes(config))
-        caps = encoder_group_width_caps(config)
+        caps = group_width_caps(encoder_shape_tables(config).groups)
 
         checked = 0
         for num_seqs in range(1, max_num_seqs + 1):
@@ -304,3 +304,10 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         )
         assert [p.group for p in plan] == [16, 1]
         assert set(encoder_group_shapes(config)) >= {(16, 64), (1, 64)}
+
+
+def test_fallback_width_caps_follow_the_query_body():
+    """A buffer's group cap is that body's, not the largest body's."""
+    impl = _make_impl(_config(8192, 128, 8192))
+    assert impl._width_caps_by_rows[2048][64] == 32
+    assert impl._width_caps_by_rows[8192][64] == 128

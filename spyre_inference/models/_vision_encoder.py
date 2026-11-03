@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -90,6 +91,11 @@ class GatherTable(nn.Module):
         return self.table.index_select(0, index)
 
 
+def unbind_items(value: Any) -> list[torch.Tensor]:
+    """An ``mm_kwargs`` field as one tensor per item, whether batched in one tensor or a list."""
+    return list(value.unbind(0)) if isinstance(value, torch.Tensor) else list(value)
+
+
 def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
     """``[hp, wp, ...]`` -> ``[merge**2, tokens, ...]``: one group per offset in a merge window.
 
@@ -100,6 +106,28 @@ def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
     t = t.reshape(hp // merge, merge, wp // merge, merge, *t.shape[2:])
     t = t.permute(1, 3, 0, 2, *range(4, t.dim()))
     return t.reshape(merge * merge, (hp // merge) * (wp // merge), *t.shape[4:])
+
+
+# Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
+_MASK_MIN = torch.finfo(torch.float16).min / 2
+# Most items per call with `segment_buffer`: the one-hot is a stick wide, its last column padding.
+SEGMENT_ITEMS = STICK - 1
+
+
+def segment_buffer() -> VisionBuffer:
+    """Each patch's item as a one-hot row; padding slots take the last column."""
+    return VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half())
+
+
+def one_hot_segments(item_ids: torch.Tensor) -> torch.Tensor:
+    return F.one_hot(item_ids, STICK).to(torch.float16)
+
+
+def segment_mask(segments: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Additive `[1, 1, P, P]` mask keeping each patch to its own item."""
+    # A matmul: Spyre cannot lay out a column-minus-row broadcast.
+    segments = segments.to(dtype)
+    return ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
 
 
 class SpyreVisionEncoderMixin:

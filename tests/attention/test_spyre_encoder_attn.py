@@ -885,7 +885,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     attn_metadata.encoder_plan = build_encoder_plan(
         attn_metadata,
         rectangles=(),
-        width_cap_for=impl._width_caps,
+        width_cap_for=impl._width_caps_by_rows[max(impl._width_caps_by_rows)],
         device=output.device,
         dtype=dtype,
         batched=batched,

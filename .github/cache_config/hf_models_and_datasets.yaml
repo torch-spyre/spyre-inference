@@ -46,6 +46,7 @@ public_models:
   - repo: openai/clip-vit-base-patch32
     revision: 3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
+  - repo: ibm-ai-platform/micro-g3.3-8b-instruct-1b-FP8
   - ibm-granite/granite-4.1-3b
   - ibm-granite/granite-vision-4.1-4b
   - repo: ibm-granite/granite-3.3-8b-instruct

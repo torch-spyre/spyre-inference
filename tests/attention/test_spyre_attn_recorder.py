@@ -195,18 +195,18 @@ def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
     for metadata, expected in ((bidirectional, 1 / BLOCK_SIZE), (causal, 0.0)):
         padded_query_len = metadata.aligned_query_lens[0]
         result = kernel(
-            torch.zeros(padded_query_len, NUM_HEADS, HEAD_SIZE, dtype=torch.float16),
-            torch.arange(padded_query_len, dtype=torch.int32),
-            k_pages,
-            v_pages,
-            torch.zeros(1, 32, dtype=torch.int32),
-            metadata.attention_mask_stacks[0],
-            1 / HEAD_SIZE**0.5,
-            1,
-            padded_query_len,
-            NUM_HEADS,
-            NUM_KV_HEADS,
-            HEAD_SIZE,
+            query=torch.zeros(padded_query_len, NUM_HEADS, HEAD_SIZE, dtype=torch.float16),
+            query_row_index=torch.arange(padded_query_len, dtype=torch.int32),
+            k_pages=k_pages,
+            v_pages=v_pages,
+            page_index_table=torch.zeros(1, 32, dtype=torch.int32),
+            mask_stack=metadata.attention_mask_stacks[0],
+            scale=1 / HEAD_SIZE**0.5,
+            num_blocks=1,
+            padded_query_len=padded_query_len,
+            num_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
         )
         torch.testing.assert_close(result[0], torch.full_like(result[0], expected), rtol=0, atol=0)
 

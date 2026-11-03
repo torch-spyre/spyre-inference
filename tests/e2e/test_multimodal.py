@@ -163,12 +163,11 @@ def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
 def test_two_image_prompt_produces_output():
-    """Two images make the vision mask non-trivial: the `cu_seqlens`-derived
-    block-diagonal mask must actually block cross-image attention, not collapse to a
-    single full-range block.
+    """Two images per prompt: the encoder runs once per image, and both images' tokens
+    reach the decoder.
 
-    Eager only: the mask is built on CPU either way, so a compiled twin would cost a
-    graph build for no new coverage.
+    Eager only: the compiled one-call-per-image path is covered on the card by
+    `test_compiled_manager_runs_one_call_per_image_on_spyre`.
     """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")

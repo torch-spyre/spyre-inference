@@ -19,12 +19,12 @@ decoder, and adds the ``SpyreVisionEncoderMixin`` hooks:
 
 - blocks: ``SpyrePixtralTransformerBlock``, whose attention does RoPE as a matmul and the
   stick-aligned SDPA;
-- inputs: patches laid out offset-major on the host, with each patch's image and position;
+- inputs: one image's patches laid out offset-major on the host, with each patch's position;
 - RoPE: cos and sin gathered on the card by position, from a ``GatherTable``;
 - patch embedding: the conv folded into a linear at load time;
 - patch merge: a batched matmul over the offset groups, in place of upstream's ``unfold``.
 
-The encoder is permutation-equivariant while RoPE and the image mask follow the patches, so
+The encoder is permutation-equivariant while RoPE and the padding mask follow the patches, so
 the offset-major order changes how the merge lowers, not the result.
 """
 
@@ -102,7 +102,7 @@ class SpyrePixtralTransformerBlock(pixtral.TransformerBlock):
     """Upstream's block with ``SpyrePixtralAttention``, called as ``(x, mask, freqs_cis)``.
 
     Its own forward, since upstream's passes packed sequence lengths where these blocks take
-    the same-image mask built once per encoder call in ``vision_embed``.
+    the key-padding mask built once per encoder call in ``vision_embed``.
     """
 
     # Upstream's support_torch_compile __call__ runs forward directly, skipping the graph
@@ -242,7 +242,8 @@ class SpyrePixtralForConditionalGeneration(
         """Offset-major patches of one image, each flattened as ``(c, py, px)`` like the conv
         weight, with its RoPE position."""
         images = _images(mm_kwargs)
-        assert len(images) == 1, f"one image per encoder call, got {len(images)}"
+        if len(images) != 1:
+            raise ValueError(f"one image per encoder call, got {len(images)}")
         (img,) = images
         p, m = self.vision_args.patch_size, self._merge
         c, h, w = img.shape

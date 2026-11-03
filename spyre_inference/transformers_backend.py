@@ -43,6 +43,7 @@ from vllm.model_executor.models.transformers import (
     TransformersEmbeddingModel,
     TransformersForCausalLM,
 )
+from vllm.model_executor.models.transformers.base import Base as TransformersBase
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 from spyre_inference.hf_adapters import (
@@ -202,7 +203,7 @@ def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.M
         cfg.head_dim = padded
 
 
-class SpyreTransformersMixin:
+class SpyreTransformersMixin(TransformersBase):
     """Shared adapter preparation, attention binding and backbone execution."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -248,12 +249,13 @@ class SpyreTransformersMixin:
         if self._hf_adapters:
             # CausalMixin only ties VocabParallelEmbedding; the preserved HF embedding
             # needs copying through the LM head's loader before its packing pass.
-            if self.model_config.runner_type == "generate" and self._get_tie_word_embeddings():
+            if isinstance(self, TransformersForCausalLM) and self._get_tie_word_embeddings():
                 embedding = self.model.get_input_embeddings().weight
-                loader = getattr(self.lm_head.weight, "weight_loader", None)
+                lm_head = self.lm_head
+                loader = getattr(lm_head.weight, "weight_loader", None)
                 if not callable(loader):
                     raise TypeError("The retained vLLM LM head must provide a weight loader")
-                loader(self.lm_head.weight, embedding)
+                loader(lm_head.weight, embedding)
                 result.add("lm_head.weight")
         elif isinstance(self, TransformersForCausalLM):
             self._patch_rope()
@@ -301,7 +303,7 @@ class SpyreTransformersMixin:
     def _bind_adapter_execution(self, prepared: PreparedBody) -> None:
         self.text_config.head_dim = prepared.head_size
         self.model_config.model_arch_config.head_size = prepared.head_size
-        if self.model_config.runner_type == "generate" and prepared.logits_scale is not None:
+        if isinstance(self, TransformersForCausalLM) and prepared.logits_scale is not None:
             self.logits_processor.scale = prepared.logits_scale
         self.adapter_attentions = nn.ModuleList()
         for binding in prepared.attention_bindings:
@@ -468,7 +470,11 @@ class SpyreTransformersEmbeddingModel(SpyreTransformersMixin, TransformersEmbedd
             from vllm.transformers_utils.config import get_hf_file_to_dict
 
             config = vllm_config.model_config
-            if config.pooler_config.seq_pooling_type not in ("CLS", "MEAN", "LAST"):
+            if config.pooler_config is None or config.pooler_config.seq_pooling_type not in (
+                "CLS",
+                "MEAN",
+                "LAST",
+            ):
                 raise ValueError("HF-adapters embedding supports CLS, MEAN or LAST pooling")
             modules = get_hf_file_to_dict("modules.json", config.model, config.revision)
             if modules is not None:

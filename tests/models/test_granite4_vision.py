@@ -139,6 +139,49 @@ def test_every_projector_shares_one_compiled_graph():
     assert len(graphs) == 1
 
 
+def test_init_fails_clearly_without_spatial_sampling():
+    """Upstream leaves ``spatial_projectors`` None when spatial sampling is off; the encoder
+    iterates it, so construction refuses instead of failing later with a TypeError."""
+    from spyre_inference.models.granite4_vision import (
+        SpyreGranite4VisionForConditionalGeneration as Spyre,
+    )
+
+    config = _config()
+    config.vision_config.num_channels = 3
+    model = SimpleNamespace(config=config, spatial_projectors=None)
+    with pytest.raises(NotImplementedError, match="spatial sampling"):
+        Spyre._init_spyre_vision(model)
+
+
+def test_compile_vision_graphs_leaves_vision_project_uncompiled(monkeypatch):
+    """``vision_project`` stays Python and calls the shared ``_project`` graph, so it is
+    neither compiled nor registered with the compile guard."""
+    from spyre_inference.models.granite4_vision import (
+        SpyreGranite4VisionForConditionalGeneration as Spyre,
+    )
+    from spyre_inference.v1.worker import compile_guard
+
+    labels = []
+    monkeypatch.setattr(compile_guard, "watch", lambda target, label: labels.append(label))
+    model = SimpleNamespace(
+        vision_embed=lambda values: values,
+        vision_merge=lambda text, image, mask: text,
+        vision_project=lambda x, taps: x,
+        _project=lambda proj, tap, down: tap,
+        vision_blocks=lambda: nn.ModuleList([nn.Linear(1, 1)]),
+    )
+
+    Spyre.compile_vision_graphs(model)
+
+    assert model._spyre_vision_project is model.vision_project
+    assert sorted(labels) == [
+        "Linear (vision block)",
+        "SimpleNamespace._project",
+        "SimpleNamespace.vision_embed",
+        "SimpleNamespace.vision_merge",
+    ]
+
+
 def _postprocess_model(levels: int = 5) -> SimpleNamespace:
     """The attributes ``postprocess_encoder_output`` reads, without a full model."""
     config = _config()

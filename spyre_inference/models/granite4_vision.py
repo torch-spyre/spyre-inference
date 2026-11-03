@@ -383,15 +383,25 @@ class SpyreGranite4VisionForConditionalGeneration(
 
     def compile_vision_graphs(self) -> None:
         """The mixin's graphs, except that ``vision_project`` stays Python: it calls one
-        compiled projector graph per level, which every projector shares."""
+        compiled projector graph per level, which every projector shares. Not calling
+        ``super()`` keeps the mixin from wrapping ``vision_project`` and registering it with the
+        compile guard, so this mirrors the mixin for the other graphs."""
         if hasattr(self, "_spyre_vision_embed"):
             return
-        super().compile_vision_graphs()
+        compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
+        self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
+        self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
         self._spyre_vision_project = self.vision_project
-        self._spyre_project = torch.compile(
-            self._project, backend="inductor", fullgraph=True, dynamic=False
-        )
-        compile_guard.watch(self._spyre_project, f"{type(self).__name__}._project")
+        self._spyre_project = torch.compile(self._project, **compile_kwargs)
+        for name, graph in (
+            ("vision_embed", self._spyre_vision_embed),
+            ("vision_merge", self._spyre_vision_merge),
+            ("_project", self._spyre_project),
+        ):
+            compile_guard.watch(graph, f"{type(self).__name__}.{name}")
+        for block in self.vision_blocks():
+            block.compile(**compile_kwargs)
+            compile_guard.watch(block, f"{type(block).__name__} (vision block)")
 
     def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
         """Each level's projector over its tap, packed on the last dimension: the deepstack

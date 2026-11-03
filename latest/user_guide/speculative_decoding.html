@@ -1937,8 +1937,10 @@ the target model verify the proposals. The experimental Spyre integration loads
 the published <code>UIUC-SSAIL/Qwen3-8B-XPress-b16</code> checkpoint directly with
 <code>Qwen/Qwen3-8B</code>; checkpoint conversion is not required.</p>
 <p>Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
-the V1 runner, one active request, and prefix caching
-disabled. The checkpoint fixes the block at one anchor plus 15 proposals.</p>
+the V1 runner, up to four active requests, and prefix caching
+disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+The four-request cap reflects the batches validated on Spyre so far. Larger
+batches require additional device validation before raising this limit.</p>
 <h2 id="run-qwen3-8b">Run Qwen3-8B<a class="headerlink" href="#run-qwen3-8b" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_MODEL_RUNNER</span><span class="o">=</span>v1
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,16,64
@@ -1959,6 +1961,42 @@ The end-to-end test and CI's public-model cache list pin the same model and
 checkpoint revisions as this example; update all three together. A full
 verification round needs at least 31 budgeted tokens because vLLM reserves
 additional drafting slots; the adapter rejects a smaller budget.</p>
+<p>For four concurrent requests, set <code>--max-num-seqs 4</code>,
+<code>--max-num-batched-tokens 128</code>, and
+<code>--compilation-config '{"compile_sizes": [1, 16, 32, 64, 128]}'</code>.
+Set <code>SPYRE_ATTN_QUERY_BUCKETS=1,16,64,128</code> for this token budget.
+Set <code>SPYRE_MAX_NUM_PARTIAL_PREFILLS=4</code> to allow four partial prefills.
+The draft body uses batches of 1, 2, or 4; three active requests pad to four.
+Each request retains its own accepted context, page table, and output limit.</p>
+<p>The batch-four test also covers default attention buckets, compilation sizes
+and the default single partial prefill. The settings above reduce query padding
+and allow more concurrent partial prefills.</p>
+<table>
+<thead>
+<tr>
+<th>Maximum requests</th>
+<th>Minimum token budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>31</td>
+</tr>
+<tr>
+<td>2</td>
+<td>62</td>
+</tr>
+<tr>
+<td>3</td>
+<td>93</td>
+</tr>
+<tr>
+<td>4</td>
+<td>124</td>
+</tr>
+</tbody>
+</table>
 <h2 id="refinement-and-compatibility">Refinement and compatibility<a class="headerlink" href="#refinement-and-compatibility" title="Permanent link">&para;</a></h2>
 <p>The refiner follows <a href="https://github.com/vllm-project/vllm/pull/54448">merged vLLM XPress</a>:
 a fixed anchor, causal Jacobi updates, a block-wide hidden summary, and candidate
@@ -1975,7 +2013,7 @@ the same seed need not produce identical tokens across these modes.</p>
 <p>The pinned vLLM 0.32 lacks native XPress registration, so this adapter uses its V1
 DFlash classes with a configuration bridge. The merged GPU speculator uses V2.
 Initial selection and per-pass argmax run on CPU; readout and refinement run on
-Spyre. Batched XPress and device candidate selection are follow-up work.</p>
+Spyre. Device candidate selection is follow-up work.</p>
 <p>Spyre's V2 runner still lacks model loading, compilation and warmup. After that
 runner is operational, XPress needs its auxiliary-state, draft-context and
 CPU-sampling hooks ported to V2's speculator interface. See
@@ -1983,7 +2021,7 @@ CPU-sampling hooks ported to V2's speculator interface. See
 <h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/spec_decode<span class="w"> </span>-m<span class="w"> </span><span class="s1">'not upstream'</span>
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">SPYRE_XPRESS_TEST_TOPC</span><span class="o">=</span><span class="m">128</span><span class="w"> </span>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>tests/e2e/test_speculative_decoding.py<span class="w"> </span>-m<span class="w"> </span>model_quality<span class="w"> </span>-s
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>tests/e2e/test_speculative_decoding.py<span class="w"> </span>tests/e2e/test_xpress_batch.py<span class="w"> </span>-m<span class="w"> </span>model_quality<span class="w"> </span>-s
 </span></code></pre></div>
 <p>PR regression jobs prefetch both pinned models before running the quality gate.
 On Spyre, missing checkpoints fail the tests instead of skipping coverage.</p>
@@ -2004,6 +2042,9 @@ filtering near the context limit, each repeated with exact token and cache repla
 495-token case verifies that a previously nonempty draft is cleared at the limit
 and that the next target step has no scheduled draft tokens. Validation timings
 are collected by the test worker; the serving loop has no timing counters.</p>
+<p>The batch-four test enables <code>SPYRE_COMPILE_GUARD=error</code>, including for partial
+prefill and shrinking batches. Warmup compiles the draft context KV stores at
+each target row bucket using the reserved null page.</p>
 
 
 

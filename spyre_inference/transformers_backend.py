@@ -28,7 +28,6 @@ OOT registrations pick up on their own. Two things are left to HF's module code:
 from __future__ import annotations
 
 import functools
-import inspect
 import sys
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, cast
@@ -38,11 +37,7 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import (
-    TransformersEmbeddingModel,
-    TransformersForCausalLM,
-    TransformersForSequenceClassification,
-)
+from vllm.model_executor.models.transformers import TransformersForCausalLM
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -310,75 +305,3 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
 # against "TransformersForCausalLM", so the subclass has to keep answering to that name.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
-
-
-def _patch_encoder_gather(model: nn.Module) -> None:
-    """Replace gather-based token_type_ids in HF encoder embeddings with explicit zeros."""
-    patched = 0
-    for module in model.modules():
-        buf = getattr(module, "token_type_ids", None)
-        if isinstance(buf, torch.Tensor) and hasattr(module, "word_embeddings"):
-            original_forward = module.forward
-            sig = inspect.signature(original_forward)
-
-            def _patched_forward(
-                *args,
-                _orig=original_forward,
-                _sig=sig,
-                **kwargs,
-            ) -> torch.Tensor:
-                try:
-                    bound = _sig.bind_partial(*args, **kwargs)
-                except TypeError:
-                    return _orig(*args, **kwargs)
-
-                if bound.arguments.get("token_type_ids") is None:
-                    ref = bound.arguments.get("input_ids")
-                    if ref is None:
-                        ref = bound.arguments.get("inputs_embeds")
-                    if ref is not None:
-                        bound.arguments["token_type_ids"] = torch.zeros(
-                            ref.shape[:2], dtype=torch.int32, device=ref.device
-                        )
-                return _orig(*bound.args, **bound.kwargs)
-
-            module.forward = _patched_forward
-            patched += 1
-
-    if patched:
-        logger.debug(
-            "Patched %d HF embedding module(s) to skip aten::gather on token_type_ids.",
-            patched,
-        )
-
-
-class _SpyreTransformersEncoderMixin:
-    """Mixin for Transformers-backend encoder models with Spyre-specific fixes."""
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # The Spyre model runner already applies the RoBERTa position offset on the host
-        # (roberta_position_delta = padding_idx + 1). Disable LegacyMixin's second offset
-        # to avoid double-shifting position IDs (pos + 4 instead of pos + 2).
-        self.is_roberta = False
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
-        _patch_encoder_gather(self.model)
-        return result
-
-
-class SpyreTransformersEmbeddingModel(_SpyreTransformersEncoderMixin, TransformersEmbeddingModel):
-    """Transformers-backend embedding model with Spyre-specific fixes."""
-
-
-SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
-
-
-class SpyreTransformersForSequenceClassification(
-    _SpyreTransformersEncoderMixin, TransformersForSequenceClassification
-):
-    """Transformers-backend sequence-classification model with Spyre-specific fixes."""
-
-
-SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"

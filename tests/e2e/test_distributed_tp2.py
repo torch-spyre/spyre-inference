@@ -151,10 +151,11 @@ def test_tp2_llm_generate_matches_tp1() -> None:
         ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", None),
         # gemma-4 vision checkpoints resolve the multimodal architecture, so this row
         # pins the text-only backbone -- the decoder is what TP splits anyway, and the
-        # tower's weights and warmup would be paid for nothing.
-        ("google/gemma-4-26B-A4B", GEMMA4_TEXT_BACKBONE_OVERRIDE),
+        # tower's weights and warmup would be paid for nothing. The nano model keeps
+        # the 26B-A4B layout (MoE, sliding + full attention) at 6 layers.
+        ("joerunde/gemma-4-moe-nano", GEMMA4_TEXT_BACKBONE_OVERRIDE),
     ],
-    ids=["micro-g3.3", "gemma-4-26B-A4B-text"],
+    ids=["micro-g3.3", "gemma-4-moe-nano-text"],
 )
 def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_property) -> None:
     """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.

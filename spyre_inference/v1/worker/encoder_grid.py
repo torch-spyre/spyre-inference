@@ -110,9 +110,10 @@ class EncoderDispatchStats:
     """Path counts and body occupancy of the encoder steps, logged periodically.
 
     The counters live in the worker process, so a log line is the only way they reach
-    whoever is running a benchmark. Occupancy is the number worth watching: the body is
-    one fixed shape, so a step that is narrow or short pays for rows it does not use,
-    and that is the cost the rectangular path trades away per-layer data movement for.
+    whoever is running a benchmark. Occupancy is the number worth watching: each step
+    pads to one body, so a step that is narrow or short pays for rows of that body it
+    does not use. That is the cost the rectangular path trades away per-layer data
+    movement for.
     """
 
     rect_steps: int = 0

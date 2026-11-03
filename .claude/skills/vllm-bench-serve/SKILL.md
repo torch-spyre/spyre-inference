@@ -111,7 +111,7 @@ List the targets in run order and the baseline last. A leg that did not run is r
     - **init and compile times** from `_server.log`, as the max across TP workers (each one logs its own, as vLLM does for `compilation`):
         - `init engine (...) took <s> s (compilation: <s> s)`, from vLLM `core.py`. Compilation is the wall time of the whole Spyre warmup (`SpyreWorker.compile_or_warm_up_model`), covering the two below;
         - `Warmup complete in <s>s for <n> buckets.`, from `SpyreModelRunner.warming_up_model`;
-        - `Attention graph recording complete: <n> graphs in <s>s.`, from `SpyreModelRunner._record_attention_graphs`, with the per-layer `<p> per-seq + <d> batched-decode` split;
+        - `Attention graph recording complete: <n> graphs in <s>s.`, from `attention.warmup.record_attention_graphs`, with the per-layer `<p> per-seq + <d> batched-decode` split;
     - whether any compile cache was on (`compile_cache`: false only with `SPYRE_KERNEL_CACHE=0`, `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` and `VLLM_DISABLE_COMPILE_CACHE=1`), the server env (`env`: `env.txt` overridden by the config's `environment_variables`), the validity errors, the ITL mean/median ratio (`compile_leak` when it is above 1.1, which points to compilation or a stall inside the measured window), and on failure the first `Error` / `Traceback` lines and the last 50 log lines;
     - the Δ of every row, target vs baseline, with its colour class.
 - `<bench>/results-table.html`: the results table of step 6, with the rules applied: one column group per config, baseline then each target with its Δ, rows missing from every log left out, and timing rows marked `unreliable` when any compile cache is on.

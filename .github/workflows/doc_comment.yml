@@ -16,11 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download pr-number artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pr-number
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          digest-mismatch: warn
       - name: Download preview-docs artifact URL
         id: artifact-url
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1

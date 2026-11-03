@@ -265,6 +265,19 @@ def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     assert vllm_config.compilation_config.compile_sizes == [512]
 
 
+def test_apply_config_keeps_a_fast_body_when_the_model_is_longer_than_2k():
+    """bge-reranker-v2-m3 at 8K. The scheduler can still accept one 8K sequence,
+    but compile sizes include the 2K and 4K bodies so shorter steps do not pad to 8K."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(
+        max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [2048, 4096, 8192]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 8192
+
+
 def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
     from spyre_inference.platform import TorchSpyrePlatform
 
@@ -644,6 +657,18 @@ def test_quantization_is_rejected_with_bfloat16():
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def test_alibi_model_is_rejected(monkeypatch):
+    """Neither attention layout implements ALiBi; fail in the front end, not in the worker."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    # The Falcon spelling of the flag `ModelConfig.uses_alibi` reads.
+    monkeypatch.setattr(vllm_config.model_config.hf_text_config, "alibi", True, raising=False)
+
+    with pytest.raises(ValueError, match="does not support ALiBi"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_accepted_at_tp1():
     """The guard above must not reject the single-card bf16 path."""
     from spyre_inference.platform import TorchSpyrePlatform
@@ -652,6 +677,25 @@ def test_bfloat16_is_accepted_at_tp1():
     vllm_config.model_config.dtype = torch.bfloat16
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(("kv_buckets", "raises"), [(None, True), ("256,1024", False)])
+def test_an_unknown_kv_ladder_fails_at_startup(monkeypatch, kv_buckets, raises):
+    from spyre_inference import envs
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Built first: VllmConfig runs this hook on construction too.
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "7_4")
+    if kv_buckets:
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", kv_buckets)
+    envs.clear_env_cache()
+
+    if raises:
+        with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER='7_4'"):
+            TorchSpyrePlatform.check_and_update_config(vllm_config)
+    else:
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
 def test_raise_dynamo_recompile_limits_survives_a_clobber():
@@ -752,6 +796,69 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
 
     assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 32
+
+
+@pytest.mark.parametrize(
+    ("budget", "user_budget", "sizes"),
+    [
+        pytest.param(2048, None, [1, 2, 4, 512], id="unset_default_is_capped"),
+        pytest.param(1024, 1024, [1, 2, 4, 512, 1024], id="user_budget_keeps_512"),
+        pytest.param(2048, 1024, [1, 2, 4, 512], id="budget_not_from_user_is_capped"),
+        pytest.param(256, 256, [1, 2, 4, 256], id="user_budget_below_default"),
+    ],
+)
+def test_compile_sizes_default_honors_a_user_budget(monkeypatch, budget, user_budget, sizes):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", user_budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == sizes
+    assert vllm_config.scheduler_config.max_num_batched_tokens == sizes[-1]
+
+
+@pytest.mark.parametrize(("budget", "expect_warn"), [(1024, False), (2048, True)])
+def test_compile_sizes_warns_above_twice_the_default(monkeypatch, caplog, budget, expect_warn):
+    import logging
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
+        TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512, budget]
+    warned = any("torch-spyre#5250" in r.message for r in caplog.records)
+    assert warned == expect_warn
+
+
+@pytest.mark.parametrize(
+    ("flag", "budget", "sizes"), [(None, 512, [512]), (1024, 1024, [512, 1024])]
+)
+def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, sizes):
+    """Through EngineArgs: an omitted flag keeps the default, a passed one is honored."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", None)
+    vllm_config = EngineArgs(
+        model="Qwen/Qwen3-0.6B", max_model_len=4096, max_num_batched_tokens=flag
+    ).create_engine_config()
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == budget
+    assert vllm_config.compilation_config.compile_sizes[-len(sizes) :] == sizes
 
 
 def test_compile_sizes_empty_list_opts_out():
@@ -911,3 +1018,137 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
         assert model in registry_warnings[0].message
     else:
         assert len(registry_warnings) == 0
+
+
+def _vision_config(
+    *, eager=False, budgets=(), multimodal=True, batched_tokens=2048, chunked_mm=True
+):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Gemma4ForConditionalGeneration",
+            is_multimodal_model=multimodal,
+            max_model_len=4096,
+            enforce_eager=eager,
+        ),
+        compilation_config=SimpleNamespace(encoder_cudagraph_token_budgets=list(budgets)),
+        scheduler_config=SimpleNamespace(
+            max_num_encoder_input_tokens=batched_tokens,
+            encoder_cache_size=batched_tokens,
+            max_num_batched_tokens=batched_tokens,
+            disable_chunked_mm_input=not chunked_mm,
+        ),
+    )
+
+
+@pytest.fixture
+def vision_limit(monkeypatch):
+    """The platform's image limit for gemma 4 at the engine's default 280 soft tokens."""
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    import spyre_inference.models as models
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(models, "spyre_model_cls", lambda arch: SpyreGemma4ForConditionalGeneration)
+    info = SimpleNamespace(get_mm_max_tokens_per_item=lambda seq_len, counts: {"image": 280})
+    monkeypatch.setattr(MULTIMODAL_REGISTRY, "get_processing_info", lambda model_config: info)
+    monkeypatch.setattr(TorchSpyrePlatform, "_vision_token_limits", {})
+
+    def limit(config=None, **kwargs):
+        TorchSpyrePlatform._set_vision_token_limit(config or _vision_config(**kwargs))
+        return TorchSpyrePlatform._vision_token_limits.get("image")
+
+    return limit
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, 280),
+        ({"budgets": (64, 128, 256, 280, 576, 1152)}, 1152),
+        ({"budgets": (64, 512)}, 512),
+        ({"budgets": (576,), "eager": True}, None),
+        ({"multimodal": False}, None),
+    ],
+)
+def test_vision_token_limit_is_the_largest_budget_the_worker_compiles(
+    vision_limit, kwargs, expected
+):
+    assert vision_limit(**kwargs) == expected
+
+
+def test_vision_token_limit_is_off_for_a_model_without_the_vision_mixin(vision_limit, monkeypatch):
+    import spyre_inference.models as models
+
+    monkeypatch.setattr(models, "spyre_model_cls", lambda arch: object)
+    assert vision_limit() is None
+
+
+def test_the_encoder_cache_holds_the_largest_image_a_request_may_carry(vision_limit):
+    config = _vision_config(budgets=(64, 128, 256, 280, 576, 1152), batched_tokens=512)
+    vision_limit(config)
+    scheduler_config = config.scheduler_config
+    assert scheduler_config.max_num_encoder_input_tokens == 1152
+    assert scheduler_config.encoder_cache_size == 1152
+
+
+def test_unchunked_mm_input_rejects_a_budget_above_the_batched_tokens(vision_limit):
+    config = _vision_config(budgets=(64, 512), batched_tokens=512, chunked_mm=False)
+    assert vision_limit(config) == 512
+    with pytest.raises(ValueError, match="encoder_cudagraph_token_budgets.*disable-chunked"):
+        vision_limit(_vision_config(budgets=(64, 1152), batched_tokens=512, chunked_mm=False))
+
+
+def test_a_bare_config_keeps_the_vision_token_limit(vision_limit):
+    from vllm.config import VllmConfig
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vision_limit()
+    TorchSpyrePlatform.check_and_update_config(VllmConfig())
+    assert TorchSpyrePlatform._vision_token_limits == {"image": 280}
+
+
+def _image_input(*embeds, length=None, modality="image"):
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    ranges = [
+        PlaceholderRange(
+            offset=0,
+            length=length or n,
+            is_embed=None if length is None else torch.arange(length) < n,
+        )
+        for n in embeds
+    ]
+    return {"type": "multimodal", "mm_placeholders": {modality: ranges}}
+
+
+@pytest.mark.parametrize(
+    ("limit", "inputs"),
+    [
+        (280, _image_input(256, 280)),
+        # Counts the soft tokens, not the begin/end-of-image tokens around them.
+        (280, _image_input(280, length=290)),
+        (None, _image_input(1120)),
+        (280, _image_input(750, modality="audio")),
+        (280, {"type": "token", "prompt_token_ids": [1, 2]}),
+    ],
+)
+def test_validate_request_accepts_what_the_encoder_compiled_for(monkeypatch, limit, inputs):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    limits = {} if limit is None else {"image": limit}
+    monkeypatch.setattr(TorchSpyrePlatform, "_vision_token_limits", limits)
+    TorchSpyrePlatform.validate_request(inputs, None)
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, modality):
+    from vllm.exceptions import VLLMValidationError
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_vision_token_limits", {"image": 280, "video": 280})
+    with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets") as err:
+        TorchSpyrePlatform.validate_request(_image_input(256, 281, modality=modality), None)
+    assert (err.value.parameter, err.value.value) == ("mm_processor_kwargs", 281)

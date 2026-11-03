@@ -44,6 +44,16 @@ _COSINE_MIN = 0.99
             "\n\nIBMs main businesses are the companies that provide the services of the",
             None,
         ),
+        # FP8 checkpoint of the same model: QFP8WT weights and FP8 linears traced into the
+        # block graph.
+        pytest.param(
+            (
+                "ibm-ai-platform/micro-g3.3-8b-instruct-1b-FP8",
+                "\n\nIBMs are a set of standards that are used to measure the performance",
+                None,
+            ),
+            marks=pytest.mark.fp8,
+        ),
         (
             "google/gemma-3-1b-it",
             "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
@@ -52,7 +62,7 @@ _COSINE_MIN = 0.99
         # Both gemma-4 checkpoints carry a vision_config, so an unpinned run resolves
         # Gemma4ForConditionalGeneration and builds the tower. This test is about the
         # compiled decoder -- pin the backbone rather than pay for the tower; the vision
-        # path is covered by tests/multimodal/test_gemma4_vision.py.
+        # path is covered by tests/models/test_gemma4_mm.py.
         (
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
@@ -64,7 +74,13 @@ _COSINE_MIN = 0.99
             GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
     ],
-    ids=["micro-g3.3", "gemma-3-1b-it", "gemma-4-31B-text", "gemma-4-26B-A4B-text"],
+    ids=[
+        "micro-g3.3",
+        "micro-g3.3-fp8",
+        "gemma-3-1b-it",
+        "gemma-4-31B-text",
+        "gemma-4-26B-A4B-text",
+    ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.

@@ -15,7 +15,10 @@
 """Batched multi-sequence decode over a head-major KV cache.
 
 Each index selects a whole page containing all KV heads. The page is already
-head-major, so the token-major kernel's per-chunk permutation is unnecessary.
+head-major, so the token-major kernel's per-chunk permutation is unnecessary, and the
+gathered page is LX-resident as it stands. The per-sequence kernel's ``(page, kv_head)``
+fold exists to win that residency, so there is nothing for it to buy here: folding anyway
+measured roughly 1.5-2x slower.
 
 With multiple chunks, each block slot keeps its own running softmax across
 chunks; the slots merge once afterward. For two slots, slot 0 processes
@@ -67,6 +70,7 @@ def _entry_local_update(
 
 
 def _merge_entry_local(
+    *,
     tile_max,
     tile_sum,
     tile_output,
@@ -84,6 +88,7 @@ def _merge_entry_local(
 
 
 def batched_decode_head_major_kernel(
+    *,
     query,
     rep_row_ids,
     k_pages,
@@ -227,7 +232,13 @@ def batched_decode_head_major_kernel(
     if use_entry_local:
         tile_max, tile_sum, tile_output = carry
         attn = _merge_entry_local(
-            tile_max, tile_sum, tile_output, num_seqs, num_kv_heads, num_queries_per_kv, head_size
+            tile_max=tile_max,
+            tile_sum=tile_sum,
+            tile_output=tile_output,
+            num_seqs=num_seqs,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            head_size=head_size,
         )
     else:
         _, tile_sum, tile_output = carry

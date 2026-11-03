@@ -644,3 +644,74 @@ def test_rotary_matches_native_at_high_positions(default_vllm_config):
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+# gpt-oss: get_rope(head_dim=64, dtype=torch.float32) with this YaRN config.
+GPT_OSS_ROPE_PARAMS = {
+    "rope_type": "yarn",
+    "rope_theta": 150000,
+    "factor": 32.0,
+    "original_max_position_embeddings": 4096,
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "truncate": False,
+}
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", [64, 128])
+def test_fp32_requested_cache_follows_model_dtype(default_vllm_config, head_size):
+    """A rope built with dtype=torch.float32 keeps its cache and rotate_half matrix in the
+    model dtype, so the baked rotation cannot promote fp16 q/k to fp32 in the graph.
+    64 takes the split-free path, 128 the 2x2 path."""
+    rope = _fresh_rope(
+        head_size=head_size,
+        max_position=4096,
+        is_neox_style=True,
+        rope_parameters=GPT_OSS_ROPE_PARAMS,
+        dtype=torch.float32,
+    )
+
+    assert rope.cos_sin_cache.dtype == torch.float16
+    assert (rope._rotate_half is not None) == (head_size == 64)
+    if rope._rotate_half is not None:
+        assert rope._rotate_half.dtype == torch.float16
+    assert rope._get_device_rotation_cache().dtype == torch.float16
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("flatten", [True, False])
+def test_fp32_requested_rope_forward_oot_on_spyre(default_vllm_config, head_size, flatten):
+    """gpt-oss's rope (YaRN, cache requested in fp32) rotates fp16 q/k on Spyre, returns
+    fp16, and matches forward_native on the split-free (64) and 2x2 (128) paths."""
+    from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
+        YaRNScalingRotaryEmbedding,
+    )
+
+    torch.manual_seed(42)
+    max_position, num_tokens = 4096, 32
+    rope = _fresh_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters=GPT_OSS_ROPE_PARAMS,
+        dtype=torch.float32,
+    )
+    rope.to("spyre")
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query, key = _make_qk(num_tokens, 8, 1, head_size, flatten)
+
+    actual_query, actual_key = rope.forward_oot(
+        positions.to("spyre"), query.to("spyre"), key.to("spyre")
+    )
+    expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
+        rope, positions, query.clone(), key.clone()
+    )
+
+    assert actual_query.dtype == torch.float16 and actual_key.dtype == torch.float16
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)

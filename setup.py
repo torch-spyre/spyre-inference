@@ -39,8 +39,8 @@ class cmake_build_ext(build_ext):
     def build_extensions(self) -> None:
         if self._extract_from_prebuilt_wheel():
             return
-        # The kernels are optional: without them the samplers fall back to
-        # PyTorch ops, so a failed build must not fail the install.
+        # Ordinary sampling can fall back to PyTorch after a failed build.
+        # Rejection sampling requires the extension and raises on first use.
         try:
             self._build_with_cmake()
         except (OSError, subprocess.CalledProcessError) as e:
@@ -51,8 +51,8 @@ class cmake_build_ext(build_ext):
             why = "see the CMake output above" if cmake_failed else e
             print(
                 f"WARNING: spyre-inference sampling kernels failed to build ({why}). "
-                "Installing without them: host sampling falls back to PyTorch ops "
-                "and gets no kernel speedup.",
+                "Installing without them: ordinary sampling falls back to PyTorch; "
+                "speculative decoding requires a successful kernel build.",
                 file=sys.stderr,
             )
             # setuptools copies and lists outputs from this list; nothing was built.
@@ -102,7 +102,7 @@ class cmake_build_ext(build_ext):
         subprocess.check_call(["cmake", str(ROOT), *cmake_args], cwd=build_temp)
 
         targets = [ext.name.removeprefix("spyre_inference.") for ext in self.extensions]
-        # Two sources per target, so more jobs only oversubscribe a shared runner.
+        # Keep compilation parallelism bounded on shared runners.
         num_jobs = os.environ.get("MAX_JOBS") or str(2 * len(targets))
         subprocess.check_call(
             ["cmake", "--build", ".", f"-j={num_jobs}"] + [f"--target={t}" for t in targets],

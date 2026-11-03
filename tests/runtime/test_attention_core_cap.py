@@ -22,8 +22,13 @@ from torch._dynamo.testing import CompileCounter
 from torch.utils._config_module import install_config_module
 
 from spyre_inference import envs
-from spyre_inference.moe import _token_cores
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import _run_with_capped_cores
+
+
+def _core_count() -> int:
+    from torch_spyre._inductor import config as spyre_config
+
+    return spyre_config.sencores
 
 
 @pytest.fixture(params=[None, 16], ids=["default", "overridden"])
@@ -42,12 +47,12 @@ def core_config(request, monkeypatch):
     torch._dynamo.reset()
 
 
-def test_attention_core_cap_preserves_a_compiled_moe_config_read(core_config):
+def test_attention_core_cap_preserves_a_compiled_config_read(core_config):
     counter = CompileCounter()
 
     @torch.compile(backend=counter, fullgraph=True)
     def model(x):
-        return x + _token_cores(x.shape[0])
+        return x + _core_count()
 
     x = torch.zeros(64)
     expected = x + core_config.sencores

@@ -424,6 +424,10 @@ def test_post_load_advertises_no_preprocessed_weight_support(monkeypatch):
 _STANDARD = ("silu", "topk_softmax")
 
 
+def _identity_down(weight):
+    return weight
+
+
 @pytest.mark.parametrize(
     ("overrides", "recipe_args", "match"),
     [
@@ -438,9 +442,10 @@ _STANDARD = ("silu", "topk_softmax")
         ({"local_num_experts": EXPERTS // 2}, _STANDARD, "remapped experts"),
         ({"renormalize": False}, _STANDARD, "normalized top-k"),
         ({"apply_router_weight_on_input": True}, _STANDARD, "input-weighted"),
+        # A down-weight transform scales w2 and never sees w2_bias.
+        ({"moe_config": {"has_bias": True}}, (*_STANDARD, _identity_down), "prepare_down_weight"),
         ({"quant_method": object()}, _STANDARD, "quantized experts"),
         ({"moe_config": {"is_lora_enabled": True}}, _STANDARD, "LoRA experts"),
-        ({"moe_config": {"has_bias": True}}, _STANDARD, "expert biases"),
         # The recipe's activation must be the one the layer actually asks for.
         ({}, ("gelu_tanh", "topk_softmax"), "requires activation="),
         # Only model adapters may request a non-standard upstream routing recipe.
@@ -512,6 +517,7 @@ def _dispatch_layer(routing):
         spyre_moe_stick=16,
         spyre_moe_chunks=4,
         spyre_moe_route_dtype=torch.float16,
+        spyre_moe_biases=None,
         top_k=TOP_K,
     )
 
@@ -850,6 +856,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
         spyre_moe_chunks=device["chunks"],
         spyre_moe_chunk_scale=device["chunk_scale"],
         spyre_moe_chunk_offsets=device["chunk_offsets"],
+        spyre_moe_biases=None,
     )
 
     with warnings.catch_warnings(record=True) as caught:
@@ -982,6 +989,7 @@ def test_traced_persistent_dispatch_matches_dense_reference():
         spyre_moe_down=device["down"],
         spyre_moe_stick=stick,
         spyre_moe_route_identity=torch.eye(stick, dtype=torch.float16).to("spyre"),
+        spyre_moe_biases=None,
         top_k=top_k,
     )
     gen = torch.Generator().manual_seed(stick)
@@ -1010,22 +1018,6 @@ def test_traced_persistent_dispatch_matches_dense_reference():
     )
     assert actual.shape == x.shape
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
-
-
-# One core; a split that is the whole axis; a divisor below the core count; and a
-# core-count split at a longer axis.
-@pytest.mark.parametrize("tokens", [1, 24, 40, 64])
-def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
-    """The token work-division split must divide the axis and not exceed the cores."""
-    from torch_spyre._inductor import config as spyre_config
-
-    from spyre_inference.moe import _token_cores
-
-    limit = min(tokens, spyre_config.sencores)
-    cores = _token_cores(tokens)
-    assert tokens % cores == 0, f"{cores} does not divide {tokens}"
-    assert 1 <= cores <= limit
-    assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
 
 
 def test_persistent_expert_loop_matches_dense_on_host():

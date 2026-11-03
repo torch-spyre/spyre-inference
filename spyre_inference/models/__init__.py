@@ -40,6 +40,7 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
+    "DFlashDraftModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
     # Vision tower only: upstream builds its language model through the registry, as
     # Gemma4ForCausalLM below.
@@ -57,6 +58,13 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
     ),
+}
+
+# Temporary XPress registrations; test_xpress_vendored.py flags the upstream migration.
+# Cleanup: https://github.com/torch-spyre/spyre-inference/issues/1417
+_NEW_ARCHS = {
+    "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
+    "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
 }
 
 
@@ -108,8 +116,16 @@ def register_models() -> None:
             "model adaptations need updating for this vLLM version."
         )
 
-    for arch, model_cls in models.items():
+    for arch, model_cls in (models | _NEW_ARCHS).items():
         ModelRegistry.register_model(arch, model_cls)
+
+
+def spyre_model_cls(architecture: str) -> type | None:
+    target = spyre_models().get(architecture)
+    if target is None:
+        return None
+    module_name, _, cls_name = target.partition(":")
+    return getattr(importlib.import_module(module_name), cls_name)
 
 
 def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
@@ -124,14 +140,12 @@ def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
     Raises:
         RuntimeError: if ``model`` is not an instance of the Spyre class.
     """
-    target = spyre_models().get(architecture)
-    if target is None:
+    spyre_cls = spyre_model_cls(architecture)
+    if spyre_cls is None:
         return
-    module_name, _, cls_name = target.partition(":")
-    spyre_cls = getattr(importlib.import_module(module_name), cls_name)
     if not isinstance(model, spyre_cls):
         raise RuntimeError(
-            f"{architecture} was built as {type(model).__name__}, not {cls_name}: vLLM "
+            f"{architecture} was built as {type(model).__name__}, not {spyre_cls.__name__}: vLLM "
             "resolved it before the Spyre model adaptations were registered. Make sure "
             "VLLM_PLUGINS allows the spyre_inference general plugin."
         )

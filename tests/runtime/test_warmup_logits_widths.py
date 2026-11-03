@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import types
 
+import pytest
 import torch
 from vllm.config import CompilationMode
 
@@ -37,7 +38,7 @@ class _Bucketer:
         self.warmed_up = True
 
 
-def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
+def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS, num_spec_tokens=0):
     # NONE keeps warmup off the attention recorder, which this file does not
     # exercise and which needs a real KV cache.
     compilation_config = types.SimpleNamespace(
@@ -59,13 +60,15 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
     runner._spyre_device = torch.device("cpu")
     runner.spyre_shape_bucketer = _Bucketer(list(bucket_sizes))
     runner.max_num_reqs = max_num_reqs
+    runner.num_spec_tokens = num_spec_tokens
 
     body_rows: list[int] = []
     projected_rows: list[int] = []
 
     def dummy_run(size, *args, **kwargs):
         body_rows.append(size)
-        return None, torch.zeros(size, HIDDEN, dtype=torch.float16)
+        hidden = torch.zeros(size, HIDDEN, dtype=torch.float16)
+        return hidden, hidden[:max_num_reqs]
 
     def dummy_sampler_run(hidden_states):
         projected_rows.append(hidden_states.shape[0])
@@ -118,3 +121,13 @@ def test_warmup_marks_the_bucketer_warmed():
     runner.warming_up_model()
 
     assert runner.spyre_shape_bucketer.warmed_up
+
+
+@pytest.mark.parametrize("max_num_reqs,expected", [(1, [1, 16]), (4, [1, 16, 64])])
+def test_speculative_warmup_projects_all_verification_rows(max_num_reqs, expected):
+    runner, _, projected_rows = _runner(
+        bucket_sizes=[1, 16, 64, 128], max_num_reqs=max_num_reqs, num_spec_tokens=15
+    )
+    runner.warming_up_model()
+
+    assert sorted(projected_rows) == expected

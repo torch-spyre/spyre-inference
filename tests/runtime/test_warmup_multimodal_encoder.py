@@ -70,6 +70,7 @@ def _runner(
     )
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
     runner.model_config = model_config
+    runner.num_spec_tokens = 0
     runner.supports_mm_inputs = multimodal
     runner._compiled_tower_blocks = compiled_tower_blocks
     runner.vllm_config = types.SimpleNamespace(

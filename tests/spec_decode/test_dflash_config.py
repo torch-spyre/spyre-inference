@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from spyre_inference.v1.spec_decode.config import (
+    MAX_DFLASH_BATCH_SIZE,
     normalize_speculative_config,
     validate_dflash_config,
 )
@@ -90,6 +91,43 @@ def test_upstream_dflash_spelling_and_shortlist_override_are_preserved():
     assert args.enable_prefix_caching is False
 
 
+@pytest.mark.parametrize("method", [{}, {"method": None}])
+@pytest.mark.parametrize("prefix_cache", [None, False, True])
+def test_inferred_dflash_normalizes_before_vllm_cache_defaults(method, prefix_cache):
+    original = dict(model="z-lab/Qwen3-8B-DFlash", **method)
+    args = NS(
+        speculative_config=original,
+        additional_config=None,
+        enable_prefix_caching=prefix_cache,
+    )
+    normalize_speculative_config(args)
+    assert args.speculative_config == dict(
+        model=original["model"], method="dflash", disable_padded_drafter_batch=True
+    )
+    assert args.additional_config is None
+    assert args.enable_prefix_caching is (prefix_cache is True)
+    assert original == dict(model="z-lab/Qwen3-8B-DFlash", **method)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        {"model": "draft"},
+        {"model": "eagle-DFlash"},
+        {"model": "EAGLE3-DFlash"},
+        {"model": "DFlash", "method": "eagle3"},
+        {"model": "DFlash", "method": "draft_model"},
+    ],
+)
+def test_dflash_inference_preserves_other_methods(spec):
+    args = NS(speculative_config=spec, additional_config=None, enable_prefix_caching=None)
+    normalize_speculative_config(args)
+    assert args.speculative_config is spec
+    assert args.enable_prefix_caching is None
+    assert args.additional_config is None
+
+
 @pytest.mark.parametrize("name", ["xpress_topc", "xpress_num_passes"])
 @pytest.mark.parametrize("value", [-1, True, 1.5, "512"])
 def test_invalid_cli_refiner_options_fail_before_vllm(name, value):
@@ -118,7 +156,12 @@ def config():
     return NS(
         speculative_config=NS(
             use_dflash=lambda: True,
-            draft_model_config=NS(hf_config=draft, quantization=None, dtype=torch.float16),
+            draft_model_config=NS(
+                hf_config=draft,
+                architecture="DFlashQwen3XPressModel",
+                quantization=None,
+                dtype=torch.float16,
+            ),
             num_speculative_tokens=15,
             max_num_new_slots_for_drafting=15,
             draft_sample_method="greedy",
@@ -137,7 +180,7 @@ def config():
     )
 
 
-@pytest.mark.parametrize("batch", [1])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4])
 def test_published_contract_is_accepted(config, batch):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = 128
@@ -156,6 +199,7 @@ def test_checkpoint_detection_and_topc_precedence(
 ):
     draft = config.speculative_config.draft_model_config.hf_config
     draft.architectures = [architecture]
+    config.speculative_config.draft_model_config.architecture = architecture
     draft.xpress_topc = checkpoint
     config.additional_config = {} if override is None else {"spyre_xpress": {"topc": override}}
     validate_dflash_config(config)
@@ -183,10 +227,28 @@ def test_invalid_refinement_passes_fail_before_model_loading(config, source, val
 def test_plain_dflash_does_not_accept_xpress_options(config):
     draft = config.speculative_config.draft_model_config.hf_config
     draft.architectures = ["DFlashDraftModel"]
+    config.speculative_config.draft_model_config.architecture = "DFlashDraftModel"
     del draft.xpress_rank
     with pytest.raises(ValueError, match="XPress options"):
         validate_dflash_config(config)
     config.additional_config = {}
+    validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("architecture", [None, "DFlash2DraftModel", "MuseGlimmerAssistantModel"])
+def test_unsupported_draft_architecture_fails_before_model_loading(config, architecture):
+    config.speculative_config.draft_model_config.architecture = architecture
+    config.speculative_config.draft_model_config.hf_config = NS()
+    with pytest.raises(ValueError, match="Unsupported Spyre DFlash/XPress draft architecture"):
+        validate_dflash_config(config)
+
+
+def test_draft_validation_uses_the_architecture_vllm_selected(config):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.architectures = ["UnknownDraftModel", "DFlashDraftModel", "Qwen3XPressModel"]
+    config.speculative_config.draft_model_config.architecture = "DFlashDraftModel"
+    config.additional_config = {}
+    del draft.xpress_rank
     validate_dflash_config(config)
 
 
@@ -235,7 +297,7 @@ def test_incompatible_checkpoint_or_serving_configuration_fails_early(config, in
     elif invalid == "prefix_cache":
         config.cache_config.enable_prefix_caching = True
     elif invalid == "batch":
-        config.scheduler_config.max_num_seqs = 2
+        config.scheduler_config.max_num_seqs = MAX_DFLASH_BATCH_SIZE + 1
     elif invalid == "bf16":
         config.model_config.dtype = torch.bfloat16
     elif invalid == "draft_bf16":
@@ -248,15 +310,17 @@ def test_incompatible_checkpoint_or_serving_configuration_fails_early(config, in
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("batch,budget", [(1, 15), (1, 16), (1, 30)])
+@pytest.mark.parametrize(
+    "batch,budget", [(1, 15), (1, 16), (1, 30), (2, 31), (2, 61), (3, 64), (4, 63), (4, 123)]
+)
 def test_draft_batch_requires_enough_token_capacity(config, batch, budget):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget
-    with pytest.raises(ValueError, match="draft block"):
+    with pytest.raises(ValueError, match="per-request drafting reservation"):
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("batch,budget", [(1, 31)])
+@pytest.mark.parametrize("batch,budget", [(1, 31), (2, 62), (3, 93), (4, 124)])
 def test_token_budget_includes_the_vllm_drafting_reservation(config, batch, budget):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget

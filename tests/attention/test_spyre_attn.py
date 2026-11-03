@@ -1515,19 +1515,21 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
     suffix = {
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (2, 3)
     }
-    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    torch.testing.assert_close(calls, [stacks_cpu[2], stacks_cpu[3]], rtol=0, atol=0)
     assert sum(t.numel() * t.element_size() for t in calls) == sum(
         stacks_cpu[i].numel() * stacks_cpu[i].element_size() for i in (2, 3)
     )
     for seq_idx in (2, 3):
         assert _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) is suffix[seq_idx]
-    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    torch.testing.assert_close(calls, [stacks_cpu[2], stacks_cpu[3]], rtol=0, atol=0)
 
     # A later layer that cannot use batched decode fills only the missing prefix.
     prefix = {
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (0, 1)
     }
-    assert calls == [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]]
+    torch.testing.assert_close(
+        calls, [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]], rtol=0, atol=0
+    )
     assert metadata.attention_mask_stacks_device is not None
     for seq_idx, stack_device in (prefix | suffix).items():
         assert metadata.attention_mask_stacks_device[seq_idx] is stack_device

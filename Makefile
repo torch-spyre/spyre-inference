@@ -9,9 +9,9 @@ SHELL := /bin/bash
 #   integration — the unit-level smoke tests (tests/e2e excluded) plus the
 #                 opt-in e2e_smoke and attention_smoke subsets (TEST_TYPE=smoke
 #                 by itself is rejected below)
-#   regression  — integration plus the opt-in regression_extra set (PRs and
-#                 the merge queue)
-#   trunk       — everything; push-to-main CI label
+#   regression  — integration plus the opt-in regression_extra set
+#                 (cross-repo dispatches)
+#   trunk       — everything; this repo's own PR, merge-queue and push CI
 #   perf        — vLLM benchmark suite (perf-tests target), not a pytest
 #                 marker subset
 # Empty / unset defaults to "regression". This Makefile is the single source

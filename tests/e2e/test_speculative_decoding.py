@@ -17,6 +17,7 @@
 import json
 import math
 import os
+import platform
 import time
 from pathlib import Path
 
@@ -25,7 +26,11 @@ import torch
 from spyre_testing_plugin.pytest_plugin import spyre_hardware_present
 from vllm import LLM, SamplingParams
 
-pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
+pytestmark = [
+    pytest.mark.model_quality,
+    pytest.mark.uses_subprocess,
+    pytest.mark.skipif(platform.machine() == "ppc64le", reason="Qwen is unsupported on ppc64le"),
+]
 
 TARGET = "Qwen/Qwen3-8B"
 TARGET_REVISION = "b968826d9c46dd6066d109eabc6255188de91218"

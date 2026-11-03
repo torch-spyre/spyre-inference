@@ -226,6 +226,12 @@ class SpyreGranite4VisionForConditionalGeneration(
         side = vision.image_size // vision.patch_size
         merge = window // query
         self._patch_width = vision.num_channels * vision.patch_size**2
+        # Upstream sets spatial_projectors to None when spatial sampling is off. The loops in
+        # process_weights_after_loading and vision_project iterate it, so fail clearly here.
+        if self.spatial_projectors is None:
+            raise NotImplementedError(
+                "Granite Vision encoder needs spatial sampling (use_spatial_sampling=True)"
+            )
         if (
             window % query
             or merge != 2  # the spatial projectors take one of 2x2 offsets

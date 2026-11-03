@@ -57,21 +57,16 @@ def _layer_norm_kernel(
     bias: torch.Tensor | None,
     eps: float,
 ) -> torch.Tensor:
-    # Casting back to fp16 before the affine step -- rather than after -- hits a
-    # torch-spyre layout limitation ("Multi-arg pointwise with mixed EA") when
-    # multiplying by `weight`: the fp32 reduction's device layout doesn't
-    # broadcast against a plain fp16 parameter. Keeping weight/bias in fp32 too
-    # and casting only the final result avoids it.
     input_dtype = x.dtype
     x = x.float()
     mean = x.mean(dim=-1, keepdim=True)
     var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-    x_norm = (x - mean) * torch.rsqrt(var + eps)
+    x_norm = ((x - mean) * torch.rsqrt(var + eps)).to(input_dtype)
     if weight is not None:
-        x_norm = x_norm * weight.float()
+        x_norm = x_norm * weight
     if bias is not None:
-        x_norm = x_norm + bias.float()
-    return x_norm.to(input_dtype)
+        x_norm = x_norm + bias
+    return x_norm
 
 
 class SpyreLayerNorm(CompileOutermost, torch.nn.LayerNorm):

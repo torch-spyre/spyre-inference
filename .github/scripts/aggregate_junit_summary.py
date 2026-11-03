@@ -27,6 +27,40 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from xml.parsers import expat
+
+
+class DTDRefused(ValueError):
+    """Raised when a JUnit file declares a DTD.
+
+    stdlib ElementTree/expat expands internal entities by default, so a crafted
+    <!DOCTYPE> with nested entities is a billion-laughs memory/CPU DoS against
+    this aggregation step. Legitimate JUnit XML never carries a DOCTYPE, so the
+    safe posture is to refuse any document that declares one.
+    """
+
+
+def _parse_no_dtd(path: str) -> ET.Element:
+    """Parse one JUnit file like ``ET.parse(path).getroot()`` but refuse any
+    document that declares a DTD. A DOCTYPE is the only way to introduce the
+    entity definitions an entity-expansion DoS needs, and real JUnit XML has
+    none; refusing it closes that class without a new dependency."""
+    builder = ET.TreeBuilder()
+    parser = expat.ParserCreate()
+
+    def _forbid_doctype(name, sysid, pubid, has_internal_subset):
+        raise DTDRefused(
+            f"Refusing {Path(path).name}: JUnit XML must not declare a DTD "
+            "(entity-expansion DoS guard)"
+        )
+
+    parser.StartDoctypeDeclHandler = _forbid_doctype
+    parser.StartElementHandler = builder.start
+    parser.EndElementHandler = builder.end
+    parser.CharacterDataHandler = builder.data
+    with open(path, "rb") as f:
+        parser.ParseFile(f)
+    return builder.close()
 
 # emoji, word (word is plain text so a browser ctrl+f for "xpass" hits the row).
 STATUS_META = {
@@ -102,8 +136,8 @@ def _case_id(case: ET.Element) -> str:
 
 def parse_file(path: str) -> tuple[str, float, list[Case]] | None:
     try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError) as e:
+        root = _parse_no_dtd(path)
+    except (OSError, expat.ExpatError, DTDRefused) as e:
         print(f"Skipping unreadable {path}: {e}", file=sys.stderr)
         return None
 

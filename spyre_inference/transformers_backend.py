@@ -317,6 +317,9 @@ class SpyreTransformersMixin:
                 quant_config=self.quant_config,
                 prefix=prefix,
             )
+            if binding.position_bias is not None:
+                attention.encoder_position_bias = binding.position_bias
+                attention.impl.position_bias = binding.position_bias
             executor = PagedAdapterAttention(attention)
             self.adapter_attentions.append(executor)
             binding.bind(executor)

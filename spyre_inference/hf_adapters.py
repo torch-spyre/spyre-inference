@@ -43,6 +43,7 @@ class AttentionBinding:
     bind: Callable[[nn.Module], None]
     is_causal: bool = True
     uses_cache: bool = True
+    position_bias: nn.Module | None = None
 
 
 class PagedAdapterAttention(nn.Module):
@@ -163,6 +164,7 @@ def prepare_execution(model: nn.Module, *, vllm_config: VllmConfig) -> PreparedB
             bind=attention.bind,
             is_causal=attention.spec.is_causal,
             uses_cache=attention.spec.uses_cache,
+            position_bias=attention.spec.position_bias,
         )
         for attention in prepared.runtime.attentions
     )
@@ -202,6 +204,10 @@ def prepare_body(model: nn.Module, config: VllmConfig) -> PreparedBody:
     ):
         raise ValueError("Attention bindings must cover each layer exactly once, in order")
     for binding in result.attention_bindings:
+        if binding.position_bias is not None and (
+            binding.uses_cache or not isinstance(binding.position_bias, nn.Module)
+        ):
+            raise ValueError("Position bias requires a cache-free attention binding and module")
         if (
             type(binding.is_causal) is not bool
             or type(binding.uses_cache) is not bool

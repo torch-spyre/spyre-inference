@@ -589,7 +589,9 @@ def test_existing_adapter_execution_uses_explicit_attention(backend_factory, mon
         )
 
 
-@pytest.mark.parametrize("failure", ["duplicate", "width", "scale", "head_count"])
+@pytest.mark.parametrize(
+    "failure", ["duplicate", "width", "scale", "head_count", "cached_bias", "invalid_bias"]
+)
 def test_malformed_explicit_bindings_rejected(config_factory, monkeypatch, failure):
     from spyre_inference.hf_adapters import AttentionBinding, prepare_body
 
@@ -603,6 +605,17 @@ def test_malformed_explicit_bindings_rejected(config_factory, monkeypatch, failu
         second = AttentionBinding(1, 2, 2, 128, float("nan"), lambda module: None)
     elif failure == "head_count":
         second = AttentionBinding(1, 4, 2, 128, 0.125, lambda module: None)
+    elif failure in ("cached_bias", "invalid_bias"):
+        second = AttentionBinding(
+            1,
+            2,
+            2,
+            128,
+            0.125,
+            lambda module: None,
+            uses_cache=failure == "cached_bias",
+            position_bias=nn.Identity() if failure == "cached_bias" else torch.zeros(1),
+        )
     result = PreparedBody(
         128,
         compile_body=lambda model: None,
@@ -825,8 +838,11 @@ def test_generic_wrapper_does_not_enable_unsupported_adapter(config_factory):
         ("qwen3", 128, "LAST"),
         ("bert", 32, "MEAN"),
         ("bert", 64, "CLS"),
+        ("distilbert", 32, "MEAN"),
+        ("distilbert", 64, "MEAN"),
         ("roberta", 32, "CLS"),
         ("xlm-roberta", 64, "MEAN"),
+        ("mpnet", 64, "MEAN"),
     ],
 )
 def test_embedding_wrapper_loads_and_runs_shared_backbone(
@@ -855,6 +871,7 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
         max_position_embeddings=66,
         pad_token_id=0,
         **({"num_key_value_heads": 1} if family == "qwen3" else {}),
+        **({"hidden_dim": 256} if family == "distilbert" else {}),
     )
     config = config_factory(
         hf_config=hf, runner="pooling", pooler_config=PoolerConfig(seq_pooling_type=pooling)
@@ -868,7 +885,7 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
     assert not backend.attention_fusers
     assert type(backend.model.get_input_embeddings()) is nn.Embedding
     reference_config = copy.deepcopy(backend.model.config)
-    reference_config._attn_implementation = "sdpa"
+    reference_config._attn_implementation = "eager" if family == "mpnet" else "sdpa"
     reference = AutoModel.from_config(reference_config).eval().to(torch.float16)
     # Bare AutoModel state dict names, as shipped by embedding checkpoints.
     backend.load_weights(iter(reference.state_dict().items()))
@@ -879,9 +896,11 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
     from spyre_inference.models.roberta import roberta_position_delta
 
     offset = roberta_position_delta(backend.model_config.hf_config)
-    assert offset == (1 if family in ("roberta", "xlm-roberta") else 0)
+    assert offset == (1 if family in ("roberta", "xlm-roberta", "mpnet") else 0)
     positions = torch.cat([torch.arange(n) + offset for n in lengths])
-    token_types = torch.arange(8).remainder(2) if family != "qwen3" else None
+    token_types = (
+        torch.arange(8).remainder(2) if family in ("bert", "roberta", "xlm-roberta") else None
+    )
     expected = []
     start = 0
     with torch.inference_mode():
@@ -910,6 +929,10 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
         )
 
         class NumericalAttention(RecordedAttention):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.impl = SimpleNamespace()
+
             def forward(self, query, key, value):
                 heads, kv_heads, dim = binding.num_heads, binding.num_kv_heads, binding.head_size
                 q = query.view(1, -1, heads, dim).transpose(1, 2)
@@ -927,6 +950,11 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
                             scale=binding.scale,
                             is_causal=binding.is_causal,
                             enable_gqa=True,
+                            attn_mask=(
+                                binding.position_bias()[:, :, :n, :n]
+                                if binding.position_bias is not None
+                                else None
+                            ),
                         )
                     )
                     start = end

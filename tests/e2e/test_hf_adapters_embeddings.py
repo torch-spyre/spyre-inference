@@ -28,21 +28,24 @@ from vllm.config import PoolerConfig
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize(
-    "model,pooling",
+    "model,pooling,max_model_len",
     [
-        ("Qwen/Qwen3-Embedding-0.6B", "LAST"),
-        ("sentence-transformers/all-MiniLM-L6-v2", "MEAN"),
-        ("ibm-granite/granite-embedding-30m-english", "CLS"),
+        ("Qwen/Qwen3-Embedding-0.6B", "LAST", 128),
+        ("sentence-transformers/all-MiniLM-L6-v2", "MEAN", 128),
+        ("ibm-granite/granite-embedding-30m-english", "CLS", 128),
+        ("sentence-transformers/multi-qa-distilbert-cos-v1", "MEAN", 128),
+        ("sentence-transformers/all-mpnet-base-v2", "MEAN", 256),
     ],
 )
-def test_hf_adapters_embeddings(model, pooling):
+def test_hf_adapters_embeddings(model, pooling, max_model_len):
     pytest.importorskip("hf_adapters.execution")
     if not spyre_available():
         pytest.skip("Spyre hardware is required")
     prompts = [
         "Hi.",
         "The capital of France is Paris.",
-        "Sentence embeddings support semantic search across documents. " * 9,
+        "Sentence embeddings support semantic search across documents. "
+        * (18 if max_model_len == 256 else 9),
     ]
     tokenizer = AutoTokenizer.from_pretrained(model)
     reference = AutoModel.from_pretrained(model, dtype=torch.float32).eval()
@@ -60,7 +63,7 @@ def test_hf_adapters_embeddings(model, pooling):
         model=model,
         model_impl="transformers",
         runner="pooling",
-        max_model_len=128,
+        max_model_len=max_model_len,
         max_num_batched_tokens=512,
         max_num_seqs=4,
         pooler_config=PoolerConfig(seq_pooling_type=pooling, use_activation=True),

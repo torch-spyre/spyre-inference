@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationConfig
 from vllm.v1.attention.backend import AttentionType
@@ -302,6 +303,82 @@ class TestTracedForward:
             output,
         )
         assert torch.equal(traced, opaque.reshape(-1, heads * dim))
+
+
+@pytest.mark.parametrize("path", ["inline", "rectangle", "grouped", "fused"])
+def test_learned_position_bias_is_local_to_each_request(path):
+    torch.manual_seed(19)
+    heads, dim, extent, width = 2, 64, 64, 2
+    lengths = [19, 37]
+    layer = _layer(num_heads=heads, num_kv_heads=heads)
+
+    class Bias(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("values", torch.randn(1, heads, 128, 128))
+
+        def forward(self):
+            return self.values
+
+    layer.encoder_position_bias = layer.impl.position_bias = Bias()
+    # Exercise dispatch with the eager kernel functions, without compiling CPU code.
+    layer.impl._rect_out_fn = enc._encoder_rect_kernel_out
+    layer.impl._sdpa_fn = enc._encoder_sdpa_kernel
+    layer.impl._fused_fn = enc._encoder_fused_kernel
+    q, k, v = [torch.randn(width * extent, heads, dim) for _ in range(3)]
+    mask = encoder_key_pad_mask(extent, lengths, q.dtype)
+    expected = []
+    for index, length in enumerate(lengths):
+        start = index * extent
+        inputs = [x[start : start + length].transpose(0, 1).unsqueeze(0) for x in (q, k, v)]
+        expected.append(
+            F.scaled_dot_product_attention(
+                *inputs,
+                attn_mask=layer.encoder_position_bias()[:, :, :length, :length],
+                scale=layer.impl.scale,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+    if path == "inline":
+        install_encoder([layer])
+        publish_encoder_grid(EncoderRectPlan(extent, width, mask, lengths))
+        actual = layer.forward(*(x.reshape(width * extent, -1) for x in (q, k, v)))
+        actual = actual.reshape_as(q)
+    elif path == "rectangle":
+        actual = layer.impl._run_rect(
+            torch.empty_like(q), q, k, v, mask, width, extent, heads, heads, dim
+        )
+    elif path == "grouped":
+        actual = layer.impl._run_attn(q, k, v, mask, width, heads, heads, dim)
+    else:
+        plan = enc.build_encoder_plan(
+            _encoder_md(lengths),
+            rectangles=(),
+            width_cap_for={extent: width},
+            device=torch.device("cpu"),
+            dtype=q.dtype,
+            batched=True,
+        )[0]
+        rows = plan.row_table
+        packed = [torch.zeros(width * extent * 2, heads, dim) for _ in range(3)]
+        for target, source in zip(packed, (q, k, v)):
+            for i, (start, length) in enumerate(zip(plan.starts, lengths)):
+                target[start : start + length] = source[i * extent : i * extent + length]
+        out = layer.impl._run_fused(
+            torch.empty_like(packed[0]),
+            rows,
+            *packed,
+            mask,
+            width,
+            heads,
+            heads,
+            dim,
+            plan.output_row_table,
+        )
+        actual = out.index_select(0, rows)
+    for index, (length, reference) in enumerate(zip(lengths, expected)):
+        torch.testing.assert_close(actual[index * extent : index * extent + length], reference)
 
 
 class TestForcedWarmupPlan:

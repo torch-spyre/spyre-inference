@@ -100,6 +100,12 @@ class _ForcedNorm(CompileOutermost, nn.Module):
         return x * 2
 
 
+class _TwoKernels(_Norm):
+    @maybe_compile(force=True)
+    def shifted(self, x: torch.Tensor, shift: int) -> torch.Tensor:
+        return x + shift
+
+
 def test_compiles_itself_on_the_first_outermost_call(compile_calls, mode) -> None:
     mode(CompilationMode.STOCK_TORCH_COMPILE)
     norm = _Norm()
@@ -120,6 +126,32 @@ def test_compiles_once_and_reuses_the_artifact(compile_calls, mode) -> None:
 
     assert len(compile_calls) == 1
     assert norm.calls == 3
+
+
+@pytest.mark.parametrize(
+    "compilation_mode", [CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE]
+)
+@pytest.mark.parametrize("forced_first", [False, True])
+def test_methods_cache_separate_kernels(
+    compile_calls, mode, compilation_mode, forced_first
+) -> None:
+    mode(compilation_mode)
+    layer = _TwoKernels()
+    x = torch.ones(2)
+    calls = [(layer.kernel, (x,), x * 2), (layer.shifted, (x, 3), x + 3)]
+    if forced_first:
+        calls.reverse()
+
+    for method, args, expected in calls:
+        torch.testing.assert_close(method(*args), expected)
+    cached = dict(layer.spyre_compiled_kernels)
+    layer.arm_outer_compile()
+    for method, args, expected in reversed(calls):
+        torch.testing.assert_close(method(*args), expected)
+
+    expected_count = 1 if compilation_mode is CompilationMode.NONE else 2
+    assert len(compile_calls) == len(cached) == expected_count
+    assert layer.spyre_compiled_kernels == cached
 
 
 def test_does_not_compile_while_another_graph_is_tracing(compile_calls, mode, monkeypatch) -> None:
@@ -239,6 +271,7 @@ def test_the_real_layers_opt_in() -> None:
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
+        (SpyreGemma4SelfDecoderLayers, "get_per_layer_inputs"),
         (SpyreGemma4SelfDecoderLayers, "split_per_layer_inputs"),
     ):
         assert issubclass(cls, CompileOutermost), cls.__name__
@@ -273,7 +306,7 @@ def test_an_enclosing_graph_absorbs_the_layer_without_breaking(mode) -> None:
             out = block(x)
 
         # fullgraph=True would already have raised on a graph break.
-        assert block.norm.spyre_compiled_kernel is None
+        assert not block.norm.spyre_compiled_kernels
         assert counters["stats"]["unique_graphs"] == 1
 
     with torch.inference_mode():
@@ -296,7 +329,7 @@ def test_a_real_compile_of_an_outermost_kernel_matches_eager(mode) -> None:
         tail = _Tail()
         with torch.inference_mode():
             got, got_residual = tail.kernel(x, residual)
-        assert tail.spyre_compiled_kernel is not None
+        assert tail.spyre_compiled_kernels
 
         eager = _Tail()
         with torch.inference_mode():

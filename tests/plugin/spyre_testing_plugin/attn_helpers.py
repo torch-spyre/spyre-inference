@@ -212,7 +212,6 @@ def ref_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
-    alibi_slopes: list[float] | None = None,
 ) -> torch.Tensor:
     """Reference implementation of attention for validation."""
     num_seqs = len(query_lens)
@@ -251,18 +250,6 @@ def ref_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
-        if alibi_slopes is not None:
-            # bias[h, q, k] = slope[h] * (k_abs_pos - q_abs_pos), applied before mask.
-            # Under strict causal decoding the q_abs_pos term cancels through
-            # softmax, so any per-row-constant simplification is equivalent —
-            # keep the full form here for clarity in the reference.
-            slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
-            context_len = kv_len - query_len
-            q_abs = torch.arange(query_len, dtype=torch.float32) + context_len
-            kv_abs = torch.arange(kv_len, dtype=torch.float32)
-            rel = kv_abs.unsqueeze(0) - q_abs.unsqueeze(1)  # [query_len, kv_len]
-            bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
-            attn = attn + bias
         attn.masked_fill_(mask, float("-inf"))
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)

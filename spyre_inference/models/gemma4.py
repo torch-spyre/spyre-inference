@@ -216,14 +216,10 @@ class _PerLayerRows(torch.Tensor):
 
 
 class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
+    @maybe_compile(force=True)
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
-        # Drops upstream's in-vocab mask: no Spyre lowering, and a no-op when every
-        # token has a per-layer row (checked at retype).
-        embed = cast("nn.Module", self.embed_tokens_per_layer)
-        per_layer_embeds = embed(input_ids) * self.embed_scale_per_layer
-        return per_layer_embeds.reshape(
-            *input_ids.shape, self.config.num_hidden_layers, self.hidden_size_per_layer_input
-        )
+        # The upstream mask needs a compiled region even outside decoder blocks.
+        return super().get_per_layer_inputs(input_ids)
 
     @maybe_compile
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -244,11 +240,6 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         decoder = self.model.self_decoder
         if decoder.embed_tokens_per_layer is not None:
-            if decoder.vocab_size_per_layer_input < self.config.vocab_size:
-                raise NotImplementedError(
-                    "Gemma-4 per-layer embeddings on Spyre need vocab_size_per_layer_input "
-                    ">= vocab_size."
-                )
             retype(decoder, SpyreGemma4SelfDecoderLayers).arm_outer_compile()
         # Without the recipe the experts run upstream's path, which is wrong on Spyre.
         # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.

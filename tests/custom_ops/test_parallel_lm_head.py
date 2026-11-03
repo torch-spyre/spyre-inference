@@ -543,11 +543,11 @@ def test_projection_compiles_itself_and_matches_eager(tp_group, monkeypatch, spy
         lambda: types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
     )
     compiled_method = SpyreUnquantizedLMHeadMethod()
-    assert compiled_method.spyre_compiled_kernel is None
+    assert not compiled_method.spyre_compiled_kernels
 
     actual = compiled_method.apply(layer, x)
 
-    assert compiled_method.spyre_compiled_kernel is not None, "projection did not compile"
+    assert compiled_method.spyre_compiled_kernels, "projection did not compile"
     assert actual.shape == (rows, vocab_size)
     torch.testing.assert_close(actual.cpu().float(), eager.cpu().float(), atol=1e-2, rtol=1e-2)
 
@@ -580,7 +580,7 @@ def test_projection_stays_eager_inside_an_enclosing_graph(tp_group, monkeypatch)
     out = method.apply(layer, torch.randn(3, 8, dtype=torch.float16))
 
     assert out.shape == (3, 16)
-    assert method.spyre_compiled_kernel is None
+    assert not method.spyre_compiled_kernels
 
 
 def _cpu_gather_worker(rank: int, world_size: int, port: int, shards: list) -> None:

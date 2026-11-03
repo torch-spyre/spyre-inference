@@ -64,7 +64,7 @@ def _disarm_compile_guard():
 
     Only the arming is undone, never the registry: `watch` runs at import for the
     attention kernels and once per memoized kernel elsewhere (`_compiled_kernels`,
-    `layer.spyre_moe_regions`, `self.spyre_compiled_kernel`), and those memos outlive
+    `layer.spyre_moe_regions`, `self.spyre_compiled_kernels`), and those memos outlive
     the test, so a registration dropped here never comes back and a later
     warmup-coverage test would pass with its kernel silently unwatched. Clearing the
     reported-once set is enough for isolation: it is what makes one violation log

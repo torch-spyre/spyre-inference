@@ -202,8 +202,13 @@ class SpyreGranite4VisionForConditionalGeneration(
             proj.image_positions.data = (
                 proj.image_positions.data[:, self._window_order]  # ty: ignore[not-subscriptable]
             )
-        # Plain tensor, so it stays on the host: the packing in postprocess runs there.
-        self._image_newline_host = convert(self.image_newline.detach(), device="cpu").clone()
+        # The only state upstream's packing reads. The newline is a plain tensor, so it stays on
+        # the host, where the packing in postprocess runs.
+        self._packer = SimpleNamespace(
+            config=self.config,
+            _downsample_rate=Fraction(self.config.downsample_rate),
+            image_newline=convert(self.image_newline.detach(), device="cpu").clone(),
+        )
 
     def _apply(self, fn, recurse=True):
         """Also move ``_ds_buffers``: plain tensors, so ``model.to`` skips them, but forward
@@ -363,14 +368,8 @@ class SpyreGranite4VisionForConditionalGeneration(
             tiles = unwindow(chunk, n, self._query)  # [tiles, tokens per tile, levels * H]
             for level, feats in enumerate(tiles.split(hidden, dim=-1)):
                 per_level[level].append(feats.contiguous())
-        # The only state upstream's packing reads, with the newline on the host.
-        packer = SimpleNamespace(
-            config=self.config,
-            _downsample_rate=Fraction(self.config.downsample_rate),
-            image_newline=self._image_newline_host,
-        )
         packed = [
-            _Upstream._pack_and_unpad_image_features(packer, f, sizes)  # ty: ignore[invalid-argument-type]
+            _Upstream._pack_and_unpad_image_features(self._packer, f, sizes)  # ty: ignore[invalid-argument-type]
             for f in per_level
         ]
         for position, idx in enumerate(indices):

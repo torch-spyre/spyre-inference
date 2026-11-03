@@ -190,7 +190,11 @@ def _postprocess_model(levels: int = 5) -> SimpleNamespace:
         _window=WINDOW,
         _query=QUERY,
         _levels=levels,
-        _image_newline_host=torch.randn(LM_HIDDEN),
+        _packer=SimpleNamespace(
+            config=config,
+            _downsample_rate=Fraction(config.downsample_rate),
+            image_newline=torch.randn(LM_HIDDEN),
+        ),
         _image_sizes=lambda kw: kw["image_sizes"],
     )
 
@@ -231,7 +235,7 @@ def test_postprocess_matches_upstream_packing():
     packer = SimpleNamespace(
         config=model.config,
         _downsample_rate=Fraction(model.config.downsample_rate),
-        image_newline=model._image_newline_host,
+        image_newline=model._packer.image_newline,
     )
     unpack = granite4_vision.Granite4VisionForConditionalGeneration._pack_and_unpad_image_features
     want_levels = [

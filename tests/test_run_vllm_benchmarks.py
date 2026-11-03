@@ -609,3 +609,125 @@ def test_sampler_thread_survives_an_unparsable_sample(monkeypatch):
     sampler.stop()
 
     assert sampler._cpu_samples and sampler._mem_samples == [2.0] * len(sampler._cpu_samples)
+
+
+bench_support = importlib.import_module("bench_support")
+
+
+def _fake_sampler(t0, rows):
+    s = type("S", (), {})()
+    s.t0, s.series = t0, rows
+    return s
+
+
+def test_recorder_writes_the_shared_format_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {"host": "h", "_missing": {}})
+    rec = bench_support.Recorder(tmp_path, "t1", {"bench_type": "latency"})
+    rec.mark("run")
+    t = time.monotonic()
+    rows = [
+        {"t_s": t + i, "cpu_cores": 2.0, "cgroup_b": 1e9, "rss_b": 5e8, "throttled_cum_s": i * 0.5}
+        for i in range(1, 4)
+    ]
+    rec.add_sampler(_fake_sampler(t, rows))
+    rec.write()
+
+    d = tmp_path / "t1"
+    env = json.loads((d / "env.json").read_text())
+    assert env["host"] == "h" and env["runtime_config"] == {"bench_type": "latency"}
+    phases = json.loads((d / "phases.json").read_text())
+    assert phases["clock"] == "monotonic" and phases["phases"][0]["name"] == "run"
+    res = json.loads((d / "host_resources.json").read_text())
+    assert res["series_file"] == "host_series.jsonl"
+    other_or_run = res["phases"].get("run") or res["phases"]["other"]
+    assert other_or_run["cpu_cores_peak"] == 2.0
+    series = [json.loads(x) for x in (d / "host_series.jsonl").read_text().splitlines()]
+    assert len(series) == 3 and {"t_s", "phase", "cpu_cores", "rss_b", "cgroup_b"} <= set(series[0])
+
+
+def test_recorder_write_never_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {})
+    (tmp_path / "t").write_text("a file where the directory should go")
+    bench_support.Recorder(tmp_path, "t", {}).write()
+
+
+def test_series_is_downsampled(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {})
+    rec = bench_support.Recorder(tmp_path, "t", {})
+    rows = [{"t_s": float(i), "cpu_cores": 1.0, "cgroup_b": 1.0} for i in range(1, 5001)]
+    rec.add_sampler(_fake_sampler(0.0, rows))
+    rec.write()
+    n = len((tmp_path / "t" / "host_series.jsonl").read_text().splitlines())
+    assert n <= bench_support.MAX_SERIES_POINTS
+
+
+def test_env_fingerprint_never_raises_and_records_missing(monkeypatch):
+    bench_support.env_fingerprint.cache_clear()
+    monkeypatch.setattr(bench_support, "ARTIFACT_JSON", "/nonexistent/spyre_artifact.json")
+    monkeypatch.setattr(bench_support, "_cpu", lambda m: 1 / 0)
+    env = bench_support.env_fingerprint()
+    assert "fingerprint" in env["_missing"]
+    bench_support.env_fingerprint.cache_clear()
+
+
+def test_env_fingerprint_reads_artifact(tmp_path, monkeypatch):
+    bench_support.env_fingerprint.cache_clear()
+    art = tmp_path / "a.json"
+    art.write_text(json.dumps({"id12": "abc123def456"}))
+    monkeypatch.setattr(bench_support, "ARTIFACT_JSON", str(art))
+    env = bench_support.env_fingerprint()
+    assert env["artifact"]["id12"] == "abc123def456" and "_missing" in env
+    bench_support.env_fingerprint.cache_clear()
+
+
+def test_greedy_output_hashes_is_stable_and_none_on_failure(monkeypatch):
+    class Resp:
+        def __init__(self, ids):
+            self.ids = ids
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *a):
+            return json.dumps({"choices": [{"text": "x", "token_ids": self.ids}]}).encode()
+
+    monkeypatch.setattr(
+        bench_support.urllib.request, "urlopen", lambda req, timeout=0: Resp([1, 2, 3])
+    )
+    a = bench_support.greedy_output_hashes("http://x", "m")
+    b = bench_support.greedy_output_hashes("http://x", "m")
+    assert a == b and a["prompts"] == len(bench_support.OUTPUT_PROMPTS) and a["greedy"] is True
+
+    def boom(req, timeout=0):
+        raise OSError("down")
+
+    monkeypatch.setattr(bench_support.urllib.request, "urlopen", boom)
+    assert bench_support.greedy_output_hashes("http://x", "m") is None
+
+
+def test_repeat_dirs(tmp_path):
+    assert runner._repeat_dirs({"test_name": "t"}, tmp_path) == [tmp_path]
+    dirs = runner._repeat_dirs({"test_name": "t", "repeats": 3}, tmp_path)
+    assert dirs == [tmp_path, tmp_path / "repeats" / "r2", tmp_path / "repeats" / "r3"]
+    with pytest.raises(SystemExit):
+        runner._repeat_dirs({"test_name": "t", "repeats": 0}, tmp_path)
+
+
+def test_run_benchmark_writes_records_without_a_card(tmp_path, monkeypatch):
+    """Mock the vllm subprocess: the harness still writes every always-on file."""
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {"host": "h", "_missing": {}})
+
+    class Done:
+        returncode, stderr = 0, ""
+
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: (time.sleep(2.2), Done())[1])
+    ok = runner.run_benchmark("latency", "lat_t", {"model": "m"}, {}, tmp_path, "0", "1")
+    assert ok
+    names = {p.name for p in (tmp_path / "lat_t").iterdir()}
+    assert {"env.json", "phases.json"} <= names
+    assert not list(tmp_path.glob("*.json")) or all(
+        p.name.endswith(".host_resources.json") for p in tmp_path.glob("*.json")
+    )

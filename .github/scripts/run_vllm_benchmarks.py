@@ -37,6 +37,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import yaml
+from bench_support import Recorder, greedy_output_hashes
 from resource_sampler import ContainerSampler, write_resource_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -114,6 +115,13 @@ def parse_args():
         help="config suite to run: empty for the CI configs (<type>-tests.yaml), "
         "or e.g. 'dev' for <type>-tests-dev.yaml; a bench type with no file "
         "for the suite is skipped, and a suite with no file at all is an error",
+    )
+    parser.add_argument(
+        "--no-output-hash",
+        action="store_true",
+        default=os.environ.get("BENCH_OUTPUT_HASH") == "0",
+        help="skip the greedy output hash that serve tests take after the timed run "
+        "(also BENCH_OUTPUT_HASH=0)",
     )
     return parser.parse_args()
 
@@ -378,12 +386,16 @@ def run_benchmark(
     log.info("Command: %s", cmd_line)
 
     log_file = results_dir / f"{test_name}.log"
+    rec = Recorder(results_dir, test_name, {"bench_type": bench_type, "parameters": parameters})
     sampler = _make_sampler()
+    rec.add_sampler(sampler)
+    rec.mark("run")
     with open(log_file, "w") as lf:
         lf.write(f"# {cmd_line}\n")
         lf.flush()
         result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
     sampler.stop()
+    rec.write()
     # "total": covers compile + inference in one window, unlike the serve path
     # which splits compile_host_* from the bare bench-phase host_* metrics.
     write_resource_metrics(
@@ -398,6 +410,23 @@ def run_benchmark(
         return False
     log.info("Test %s passed", test_name)
     return True
+
+
+def _repeat_dirs(config: dict, results_dir: Path) -> list[Path]:
+    """Result dirs for a config's runs: `results_dir`, then `results_dir/repeats/r<k>` per extra.
+
+    Only the first run lands where ingest reads, so a repeat adds samples for an A-A
+    comparison without adding a second series.
+    """
+    repeats = int(config.get("repeats", 1))
+    if repeats < 1:
+        log.error("%s: repeats must be >= 1, got %d", config.get("test_name"), repeats)
+        sys.exit(2)
+    dirs = [results_dir]
+    for k in range(2, repeats + 1):
+        dirs.append(results_dir / "repeats" / f"r{k}")
+        dirs[-1].mkdir(parents=True, exist_ok=True)
+    return dirs
 
 
 def run_benchmarks_from_file(
@@ -427,14 +456,19 @@ def run_benchmarks_from_file(
         parameters = config.get("parameters", {})
         env_config = config.get("environment_variables", {})
 
-        success = run_benchmark(
-            bench_type=bench_type,
-            test_name=test_name,
-            parameters=parameters,
-            env_config=env_config,
-            results_dir=results_dir,
-            spyre_devices=spyre_devices,
-            aiu_world_size=aiu_world_size,
+        success = all(
+            [
+                run_benchmark(
+                    bench_type=bench_type,
+                    test_name=test_name,
+                    parameters=parameters,
+                    env_config=env_config,
+                    results_dir=run_dir,
+                    spyre_devices=spyre_devices,
+                    aiu_world_size=aiu_world_size,
+                )
+                for run_dir in _repeat_dirs(config, results_dir)
+            ]
         )
         if success:
             passed += 1
@@ -453,6 +487,7 @@ def run_serve_benchmark(
     spyre_devices: str,
     aiu_world_size: str,
     health_timeout: int = 180,
+    output_hash: bool = True,
 ) -> bool:
     """Start vllm serve, wait for health, run bench serve, cleanup."""
     # As in run_benchmark: env_config is applied last and overrides the CLI
@@ -491,10 +526,14 @@ def run_serve_benchmark(
 
     server_log = results_dir / f"{test_name}_server.log"
     bench_result = None
+    rec = Recorder(
+        results_dir, test_name, {"bench_type": "serve", "server_parameters": server_parameters}
+    )
     with open(server_log, "w") as server_lf:
         server_lf.write(f"# {server_cmd_line}\n")
         server_lf.flush()
         server_start_ts = time.monotonic()
+        rec.mark("load")
         server_proc = subprocess.Popen(
             server_cmd,
             env=env,
@@ -505,6 +544,7 @@ def run_serve_benchmark(
 
         try:
             compile_sampler = _make_sampler()
+            rec.add_sampler(compile_sampler)
             # Timed from before the spawn: for large models this is mostly the
             # one-time warmup compile, which is worth comparing run to run.
             health_url = f"http://{host}:{port}/health"
@@ -568,6 +608,8 @@ def run_serve_benchmark(
 
             bench_log = results_dir / f"{test_name}_bench.log"
             bench_sampler = _make_sampler()
+            rec.add_sampler(bench_sampler)
+            rec.mark("serve")
             try:
                 with open(bench_log, "w") as blf:
                     blf.write(f"# {bench_cmd_line}\n")
@@ -577,6 +619,11 @@ def run_serve_benchmark(
                     )
             finally:
                 bench_sampler.stop()
+                rec.mark(None)
+
+            # After the timed request phase, so no measured number sees these requests.
+            if output_hash and bench_result.returncode == 0:
+                rec.write_outputs(greedy_output_hashes(f"http://{host}:{port}", model))
 
             combined = {
                 **compile_sampler.summary(phase="compile"),
@@ -586,6 +633,7 @@ def run_serve_benchmark(
 
         finally:
             _kill_server(server_proc)
+            rec.write()
 
     if bench_result.returncode != 0:
         log.error("Serve test %s failed with exit code %d", test_name, bench_result.returncode)
@@ -617,6 +665,7 @@ def run_serve_benchmarks_from_file(
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
+    output_hash: bool = True,
 ) -> tuple[int, int]:
     """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -640,15 +689,21 @@ def run_serve_benchmarks_from_file(
         # let a config bump this past the 180s default.
         health_timeout = int(config.get("server_health_timeout", 180))
 
-        success = run_serve_benchmark(
-            test_name=test_name,
-            server_parameters=server_parameters,
-            bench_parameters=bench_parameters,
-            env_config=env_config,
-            results_dir=results_dir,
-            spyre_devices=spyre_devices,
-            aiu_world_size=aiu_world_size,
-            health_timeout=health_timeout,
+        success = all(
+            [
+                run_serve_benchmark(
+                    test_name=test_name,
+                    server_parameters=server_parameters,
+                    bench_parameters=bench_parameters,
+                    env_config=env_config,
+                    results_dir=run_dir,
+                    spyre_devices=spyre_devices,
+                    aiu_world_size=aiu_world_size,
+                    health_timeout=health_timeout,
+                    output_hash=output_hash,
+                )
+                for run_dir in _repeat_dirs(config, results_dir)
+            ]
         )
         if success:
             passed += 1
@@ -752,6 +807,7 @@ def main():
                 aiu_world_size=args.aiu_world_size,
                 models=models,
                 tps=tps,
+                output_hash=not args.no_output_hash,
             )
             total_passed += passed
             total_failed += failed

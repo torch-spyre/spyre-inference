@@ -18,6 +18,7 @@ Writes one *.host_resources.json (JSONEachRow) per test, ingested by
 spyre_clickhouse_ingest.vllm (torch-spyre), which expects this suffix and record shape.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -27,6 +28,11 @@ import threading
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+try:
+    import psutil
+except ImportError:  # the series then omits rss_b
+    psutil = None
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +84,12 @@ def _read_cgroup_cpu_usec(root: Path) -> int:
     raise OSError(f"usage_usec not found in {v2}")
 
 
+def _read_cgroup_throttle(root: Path) -> tuple[float, int]:
+    """Cumulative (throttled seconds, throttled periods) from cpu.stat."""
+    stat = dict(line.split() for line in (root / "cpu.stat").read_text().splitlines())
+    return int(stat.get("throttled_usec", 0)) / 1e6, int(stat.get("nr_throttled", 0))
+
+
 def _read_cgroup_mem_mb(root: Path) -> float:
     # working_set = memory.current - memory.stat[inactive_file]
     v2_current = root / "memory.current"
@@ -103,6 +115,10 @@ class ContainerSampler:
         self._interval = interval
         self._cpu_samples: list[float] = []
         self._mem_samples: list[float] = []
+        # One row per sample for bench_support: t_s (monotonic), cpu_cores, cgroup_b, and
+        # rss_b / throttled_cum_s / nr_throttled where readable.
+        self.series: list[dict[str, float]] = []
+        self._proc = psutil.Process() if psutil else None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -111,6 +127,7 @@ class ContainerSampler:
         # Baseline so first sample reflects the interval immediately after start().
         self._last_cpu_usec: int = _read_cgroup_cpu_usec(self._cgroup)
         self._last_ts: float = time.monotonic()
+        self.t0 = self._last_ts
 
     def start(self) -> None:
         self._thread.start()
@@ -134,6 +151,24 @@ class ContainerSampler:
         cpu_pct = (delta_usec / elapsed_us * 100) if elapsed_us > 0 else 0.0
         return cpu_pct, mem_mb
 
+    def _extras(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        with contextlib.suppress(OSError, ValueError):
+            out["throttled_cum_s"], out["nr_throttled"] = _read_cgroup_throttle(self._cgroup)
+        if self._proc:
+            rss = 0
+            try:
+                procs = [self._proc, *self._proc.children(recursive=True)]
+            except psutil.Error:
+                return out
+            for p in procs:
+                try:
+                    rss += p.memory_info().rss
+                except psutil.Error:  # exited between listing and reading
+                    continue
+            out["rss_b"] = rss
+        return out
+
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             try:
@@ -143,6 +178,14 @@ class ContainerSampler:
                 continue
             self._cpu_samples.append(cpu)
             self._mem_samples.append(mem)
+            self.series.append(
+                {
+                    "t_s": time.monotonic(),
+                    "cpu_cores": cpu / 100,
+                    "cgroup_b": mem * 1e6,
+                    **self._extras(),
+                }
+            )
 
     def summary(self, phase: str = "") -> dict[str, dict[str, float]]:
         """Return {metric: {mean, peak, p99}}; phase prefix for compile vs bench."""

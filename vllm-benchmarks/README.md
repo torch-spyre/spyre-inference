@@ -45,3 +45,9 @@ make perf-tests RESULTS_DIR=benchmark-results \
 make perf-tests RESULTS_DIR=benchmark-results BENCH_SUITE=dev \
   MODELS=ibm-granite/granite-3.3-8b-instruct
 ```
+
+## Run records and repeats
+
+Every test also writes, under `<results-dir>/<test_name>/` (a subdirectory, so ingest's top-level `*.json` glob never reads it), records of the environment it ran in: `env.json` (host, CPU, cgroup limits, cards, knobs, `/home/senuser/spyre_artifact.json`), `phases.json` (monotonic phase spans: `run` for latency/throughput, `load` then `serve` for serve), and `host_resources.json` plus `host_series.jsonl` (about 1 Hz: CPU cores, RSS of the harness process tree, cgroup memory and throttling). Serve tests also write `outputs.json`, a SHA-256 of the greedy completion of four fixed prompts, taken after the timed run; `--no-output-hash` (or `BENCH_OUTPUT_HASH=0`) skips it. Device memory is not recorded: the benchmarked process is a subprocess.
+
+Set `repeats: N` on a test to run it N times. The first run writes where ingest reads; run k writes under `<results-dir>/repeats/r<k>/` with the same layout, so repeats add samples without adding a series. For an A-A noise check, run the same commit twice (`repeats: 2`, or two runs into different `RESULTS_DIR`s) and compare the metric across the pair: the spread is the noise floor a change must exceed.

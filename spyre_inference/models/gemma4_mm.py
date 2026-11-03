@@ -527,6 +527,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
         return (x @ tail.weight.t()).to(tail.dtype)
 
+    @property
+    def vision_pack_tokens(self) -> int:
+        return self.max_tokens_per_item
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],

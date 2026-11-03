@@ -62,8 +62,20 @@ def tile_position_ids(patch_mask: torch.Tensor, side: int) -> torch.Tensor:
     return torch.where(patch_mask.flatten(1), bucket_h * side + bucket_w, 0)
 
 
-class SpyreIdefics3ForConditionalGeneration(SpyreVisionEncoderMixin, idefics3.Idefics3ForConditionalGeneration):
+def group_projection_weight(weight: torch.Tensor, groups: int) -> torch.Tensor:
+    """The connector's ``[D_out, groups * D]`` weight as ``[groups, D, D_out]``, one slice per
+    offset group.
 
+    Upstream's ``pixel_shuffle`` concatenates a window's patches as ``(hi, wi, D)``, so the
+    columns are group-major, unlike a conv merge's ``unfold`` order.
+    """
+    out_dim, in_dim = weight.shape
+    return weight.reshape(out_dim, groups, in_dim // groups).permute(1, 2, 0).contiguous()
+
+
+class SpyreIdefics3ForConditionalGeneration(
+    SpyreVisionEncoderMixin, idefics3.Idefics3ForConditionalGeneration
+):
     vision_max_items_per_call = SEGMENT_ITEMS
 
     # --- construction ---
@@ -85,6 +97,35 @@ class SpyreIdefics3ForConditionalGeneration(SpyreVisionEncoderMixin, idefics3.Id
             # Index into the learned position embedding.
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
+
+    def process_weights_after_loading(self) -> None:
+        """Reshape the vision weights for the graphs, in place, as the Spyre linears do, so one
+        copy of each reaches the card. Runs on the host, before the runner moves the model."""
+        embeddings = self.model.vision_model.embeddings
+
+        # Patch conv -> [patch width, D], as a linear over (c, py, px)-flattened patches.
+        conv = embeddings.patch_embedding
+        width = cast(int, self.vision_buffers["patches"].width)
+        weight = conv.weight.detach().flatten(1)
+        weight_t = F.pad(weight, (0, width - weight.shape[1])).t().contiguous()
+        # A plain holder, not the conv layer: nothing runs the conv, so the runner must not
+        # place a tiled conv copy of the weight on the card as well.
+        embeddings.patch_embedding = nn.Module()
+        embeddings.patch_embedding.weight = nn.Parameter(weight_t, requires_grad=False)
+        embeddings.patch_embedding.bias = conv.bias
+
+        # Position embedding -> a row-gathered table.
+        table = convert(embeddings.position_embedding.weight.detach(), device="cpu")
+        self.spyre_position_table = GatherTable(table.to(torch.float16).contiguous())
+        # Nothing runs the embedding now, so the runner must not place a second copy on the card.
+        del embeddings.position_embedding
+
+        # Connector projection -> [scale_factor**2, D, D_out], one slice per offset group.
+        proj = self.model.connector.modality_projection.proj
+        proj.weight = nn.Parameter(
+            group_projection_weight(linear_weight(proj), self.patches_per_token),
+            requires_grad=False,
+        )
 
     # --- SpyreVisionEncoderMixin hooks ---
 
@@ -134,7 +175,7 @@ class SpyreIdefics3ForConditionalGeneration(SpyreVisionEncoderMixin, idefics3.Id
         x = (torch.matmul(values["patches"], patch_weight_t) + bias + position).unsqueeze(0)
         # No pre-norm and no RoPE: the blocks take only the same-tile mask.
         return x, {"attention_mask": segment_mask(values["segments"], x.dtype)}
-    
+
     def vision_blocks(self) -> nn.ModuleList:
         return self.model.vision_model.encoder.layers
 
@@ -146,4 +187,3 @@ class SpyreIdefics3ForConditionalGeneration(SpyreVisionEncoderMixin, idefics3.Id
         # [scale_factor**2, D, D_out] since process_weights_after_loading.
         proj_weight = cast(torch.Tensor, self.model.connector.modality_projection.proj.weight)
         return torch.matmul(x, proj_weight).sum(dim=0)
-

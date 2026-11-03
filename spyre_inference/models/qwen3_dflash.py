@@ -103,8 +103,26 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def load_weights(self, weights):
         weights = dict(weights)
         validate_dflash_weights(self.config, weights)
-        if self.xpress_head is None and any(name.startswith("xpress_head.") for name in weights):
+        head = self.xpress_head
+        names = {
+            name.removeprefix("xpress_head.") for name in weights if name.startswith("xpress_head.")
+        }
+        if head is None and names:
             raise ValueError("XPress weights require an XPress checkpoint architecture")
+        if head is not None:
+            # Upstream loads partial heads and permits broadcasting the raw mixer.
+            expected = head.HYBRID_KEY_MAP.keys()
+            if names != expected:
+                raise ValueError(
+                    f"Invalid XPress head weights: missing={sorted(expected - names)}, "
+                    f"unexpected={sorted(names - expected)}"
+                )
+            raw = weights["xpress_head.mix.L"]
+            if raw.shape != head.mix_L.shape:
+                raise ValueError(
+                    f"Invalid xpress_head.mix.L shape: expected {tuple(head.mix_L.shape)}, "
+                    f"got {tuple(raw.shape)}"
+                )
         super().load_weights(weights.items())
 
     def prepare_for_spyre(self) -> None:

@@ -33,6 +33,25 @@ from pathlib import Path
 FAILED_SUITES_DIR = Path("failed_suites")
 
 
+def safe_segment(name: str) -> bool:
+    """True iff `name` is a single, non-traversing path component.
+
+    The `failed-suite-<attempt>-` prefix filter is kept by a traversing name
+    such as `failed-suite-1-../../../../tmp/evil`, so joining it onto
+    FAILED_SUITES_DIR would escape that directory and let an attacker-chosen
+    artifact name steer both the `.zip` write and the `unzip -d` extraction
+    target (arbitrary file write on the runner).
+    """
+    return (
+        name not in ("", ".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and os.sep not in name
+        and (os.altsep is None or os.altsep not in name)
+        and not name.startswith(".")
+    )
+
+
 def list_artifacts(repo: str, run_id: str, attempt: str) -> list[dict]:
     # --paginate (30/page default); attempt-scoped so a rerun skips already-passed suites.
     result = subprocess.run(
@@ -54,8 +73,19 @@ def list_artifacts(repo: str, run_id: str, attempt: str) -> list[dict]:
 
 def download_and_extract(repo: str, artifacts: list[dict]) -> None:
     FAILED_SUITES_DIR.mkdir(exist_ok=True)
+    base = FAILED_SUITES_DIR.resolve()
+    downloaded = 0
     for artifact in artifacts:
-        out_dir = FAILED_SUITES_DIR / artifact["name"]
+        name = artifact["name"]
+        if not safe_segment(name):
+            # Attacker-controllable: any run that uploads artifacts picks the
+            # name. Refuse (visibly) rather than let the join escape `base`.
+            print(f"::warning::skipping failed-suite artifact with unsafe name {name!r}")
+            continue
+        out_dir = FAILED_SUITES_DIR / name
+        if out_dir.resolve().parent != base:
+            print(f"::warning::skipping failed-suite artifact {name!r}: escapes {base}")
+            continue
         out_dir.mkdir(parents=True, exist_ok=True)
         zip_path = out_dir.with_suffix(".zip")
         result = subprocess.run(
@@ -65,7 +95,8 @@ def download_and_extract(repo: str, artifacts: list[dict]) -> None:
         )
         zip_path.write_bytes(result.stdout)
         subprocess.run(["unzip", "-q", "-o", str(zip_path), "-d", str(out_dir)], check=True)
-    print(f"Downloaded {len(artifacts)} failed-suite descriptor(s).")
+        downloaded += 1
+    print(f"Downloaded {downloaded} failed-suite descriptor(s).")
 
 
 def build_retry_matrix() -> dict:

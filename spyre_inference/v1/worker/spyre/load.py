@@ -20,7 +20,7 @@ host, applies the shared fix-ups, moves the model to Spyre, compiles per block a
 returns the _SpyreModelWrapper. Everything upstream builds from ``self.model``
 afterwards (model state, sampler, pooling runner) therefore holds the wrapper.
 init_model_state and PoolingRunner are swapped for their Spyre counterparts for the
-duration of the call, and compile.py stops upstream's own whole-model compile.
+duration of the call, and upstream's own whole-model stock compile is skipped.
 """
 
 import contextlib
@@ -28,7 +28,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import CompilationMode, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
@@ -45,7 +45,6 @@ from spyre_inference.v1.worker.model_load import (
     move_model_to_spyre,
     resolve_kv_scales,
 )
-from spyre_inference.v1.worker.spyre import compile
 from spyre_inference.v1.worker.spyre.model_states import resolve_spyre_model_state
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
@@ -115,30 +114,69 @@ class _SpyreModelLoader:
         )
 
 
+_SWAPPED = (
+    "get_model_loader",
+    "init_model_state",
+    "PoolingRunner",
+    "compile_model_with_stock_torch",
+)
+
+
 @contextlib.contextmanager
 def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
-    get_model_loader = upstream_model_runner.get_model_loader
-    init_model_state = upstream_model_runner.init_model_state
-    pooling_runner_cls = upstream_model_runner.PoolingRunner
+    """Every upstream name Spyre swaps during GPUModelRunner.load_model.
+
+    Each is a module global of vllm/v1/worker/gpu/model_runner.py that load_model
+    looks up at call time. If a vLLM bump imports one locally instead, the swap is a
+    silent no-op, so the swaps load_model always reaches must report that they ran.
+    """
+    original = {name: getattr(upstream_model_runner, name) for name in _SWAPPED}
+    called: set[str] = set()
 
     def spyre_model_loader(load_config: Any) -> _SpyreModelLoader:
-        return _SpyreModelLoader(get_model_loader(load_config), runner)
+        called.add("get_model_loader")
+        return _SpyreModelLoader(original["get_model_loader"](load_config), runner)
 
     def spyre_init_model_state(vllm_config, model, encoder_cache, device):
+        called.add("init_model_state")
         return resolve_spyre_model_state(
             vllm_config, model, encoder_cache, device, runner.spyre_device
         )
 
-    upstream_model_runner.get_model_loader = spyre_model_loader  # ty: ignore[invalid-assignment]
-    upstream_model_runner.init_model_state = spyre_init_model_state  # ty: ignore[invalid-assignment]
-    upstream_model_runner.PoolingRunner = SpyrePoolingRunner  # ty: ignore[invalid-assignment]
+    class _SpyrePoolingRunner(SpyrePoolingRunner):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            called.add("PoolingRunner")
+            super().__init__(*args, **kwargs)
+
+    def no_stock_compile(model: Any, vllm_config: Any) -> None:
+        # Would trace the whole model over the per-block graphs, through vLLM's own
+        # backend rather than Spyre's inductor; compile_for_spyre has already run.
+        called.add("compile_model_with_stock_torch")
+
+    replacements = {
+        "get_model_loader": spyre_model_loader,
+        "init_model_state": spyre_init_model_state,
+        "PoolingRunner": _SpyrePoolingRunner,
+        "compile_model_with_stock_torch": no_stock_compile,
+    }
+    for name, replacement in replacements.items():
+        setattr(upstream_model_runner, name, replacement)
     try:
-        with compile.no_stock_compile():
-            yield
+        yield
     finally:
-        upstream_model_runner.get_model_loader = get_model_loader
-        upstream_model_runner.init_model_state = init_model_state
-        upstream_model_runner.PoolingRunner = pooling_runner_cls
+        for name, value in original.items():
+            setattr(upstream_model_runner, name, value)
+
+    expected = {"get_model_loader", "init_model_state"}
+    if runner.is_pooling_model:
+        expected.add("PoolingRunner")
+    if runner.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+        expected.add("compile_model_with_stock_torch")
+    if missed := expected - called:
+        raise RuntimeError(
+            f"Upstream GPUModelRunner.load_model bypassed Spyre's swap of {sorted(missed)}; "
+            "it no longer reads them as module globals of vllm/v1/worker/gpu/model_runner.py."
+        )
 
 
 def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> None:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""load.py and compile.py: the wrapped loader, the swapped upstream names, and a real
+"""load.py: the wrapped loader, the swapped upstream names, and a real
 SpyreModelRunnerV2.load_model through upstream's own body."""
 
 import os
@@ -29,18 +29,16 @@ from vllm.config import CompilationMode
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from spyre_inference.v1.worker.spyre import compile, load
+from spyre_inference.v1.worker.spyre import load
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper, unwrap_model
 
 from .fakes import FakeModel
 
-_SWAPPED = ("get_model_loader", "init_model_state", "PoolingRunner")
-
 
 def _snapshot() -> dict[str, object]:
-    return {name: getattr(upstream, name) for name in (*_SWAPPED, "compile_model_with_stock_torch")}
+    return {name: getattr(upstream, name) for name in load._SWAPPED}
 
 
 def _runner(**attrs) -> SimpleNamespace:
@@ -51,6 +49,8 @@ def _runner(**attrs) -> SimpleNamespace:
         "lora_config": None,
         "speculator": None,
         "parallel_config": SimpleNamespace(enable_batch_sharded_sampling=False),
+        "is_pooling_model": False,
+        "compilation_config": SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
     }
     return SimpleNamespace(**{**defaults, **attrs})
 
@@ -175,17 +175,61 @@ def test_swapped_names_are_restored_after_a_raise() -> None:
     with pytest.raises(RuntimeError, match="boom"), load._patched(_runner()):
         during = _snapshot()
         assert all(during[name] is not before[name] for name in during)
-        assert upstream.PoolingRunner is SpyrePoolingRunner
+        assert issubclass(upstream.PoolingRunner, SpyrePoolingRunner)
         raise RuntimeError("boom")
     assert _snapshot() == before
 
 
-def test_upstreams_stock_compile_is_a_no_op_inside(monkeypatch: pytest.MonkeyPatch) -> None:
+def _load_through(runner, reached: set[str]) -> None:
+    """Stand in for upstream's load_model, looking up only the names in ``reached``."""
+    if "get_model_loader" in reached:
+        upstream.get_model_loader(None)
+    if "init_model_state" in reached:
+        upstream.init_model_state(None, None, None, None)
+    if "PoolingRunner" in reached:
+        upstream.PoolingRunner(FakeModel(), _vllm_config(runner_type="pooling"))
+    if "compile_model_with_stock_torch" in reached:
+        upstream.compile_model_with_stock_torch(FakeModel(), _vllm_config())
+
+
+@pytest.fixture
+def stub_targets(monkeypatch):
+    """The swapped-in callables' own work, which this check doesn't need."""
+    monkeypatch.setattr(upstream, "get_model_loader", lambda load_config: None)
+    monkeypatch.setattr(load, "_SpyreModelLoader", lambda loader, runner: None)
+    monkeypatch.setattr(load, "resolve_spyre_model_state", lambda *args: None)
+    monkeypatch.setattr(SpyrePoolingRunner, "__init__", lambda self, *args: None)
+
+
+def test_upstreams_stock_compile_is_a_no_op_inside(monkeypatch, stub_targets) -> None:
     compiled = []
     monkeypatch.setattr(nn.Module, "compile", lambda self, **kw: compiled.append(self))
-    with compile.no_stock_compile():
-        upstream.compile_model_with_stock_torch(FakeModel(), _vllm_config())
+    with load._patched(_runner()):
+        _load_through(
+            _runner(), {"get_model_loader", "init_model_state", "compile_model_with_stock_torch"}
+        )
     assert compiled == []
+
+
+@pytest.mark.parametrize(
+    "bypassed",
+    ["get_model_loader", "init_model_state", "compile_model_with_stock_torch", "PoolingRunner"],
+)
+def test_a_swap_upstream_bypasses_fails_loudly(stub_targets, bypassed) -> None:
+    """A vLLM bump that imports one of these locally would otherwise make the swap a
+    silent no-op: Spyre's loader or model state never installed, or a whole-model
+    stock compile over the block graphs."""
+    runner = _runner(is_pooling_model=True)
+    reached = set(load._SWAPPED) - {bypassed}
+    with pytest.raises(RuntimeError, match=bypassed), load._patched(runner):
+        _load_through(runner, reached)
+
+
+def test_swaps_load_model_may_skip_are_not_required(stub_targets) -> None:
+    """No PoolingRunner for a generative model, no stock compile when eager."""
+    runner = _runner(compilation_config=SimpleNamespace(mode=CompilationMode.NONE))
+    with load._patched(runner):
+        _load_through(runner, {"get_model_loader", "init_model_state"})
 
 
 def test_load_refuses_lora_spec_decode_and_caller_built_models() -> None:
@@ -201,17 +245,18 @@ def test_load_refuses_lora_spec_decode_and_caller_built_models() -> None:
         load.load_and_wrap(_runner(), model=FakeModel())
 
 
-def test_load_wires_the_pooling_runner_to_the_model_state(monkeypatch) -> None:
+def test_load_wires_the_pooling_runner_to_the_model_state(monkeypatch, stub_targets) -> None:
     pooling_runner = SpyrePoolingRunner.__new__(SpyrePoolingRunner)
     model_state = SimpleNamespace(encoder_plan="plan")
 
     def upstream_load_model(runner, *args, **kwargs):
+        _load_through(runner, set(load._SWAPPED))
         runner.model_state, runner.pooling_runner = model_state, pooling_runner
         runner.pooling_on_spyre = True
         runner.model_memory_usage = 123
 
     monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load_model)
-    runner = _runner(spyre_device=torch.device("meta"))
+    runner = _runner(spyre_device=torch.device("meta"), is_pooling_model=True)
 
     load.load_and_wrap(runner)
 

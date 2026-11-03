@@ -18,6 +18,7 @@ import contextlib
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from spyre_inference.v1.worker.spyre import model_runner
@@ -64,7 +65,7 @@ def test_reload_rewarms_only_when_the_kv_scales_change(
         lambda reason: contextlib.nullcontext(events.append("allow")),
     )
     runner = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
-    runner.model = object()
+    runner.model = nn.Identity()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     monkeypatch.setattr(runner, "warming_up_model", lambda: events.append("warm"))
 

@@ -58,7 +58,9 @@ class SpyreModelRunnerV2(GPUModelRunner):
         load.load_and_wrap(self, *args, **kwargs)
 
     def get_model(self) -> nn.Module:
-        return unwrap_model(self.model)
+        model = unwrap_model(self.model)
+        assert isinstance(model, nn.Module), type(model)
+        return model
 
     def initialize_kv_cache(
         self,

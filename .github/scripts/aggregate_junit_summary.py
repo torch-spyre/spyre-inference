@@ -62,6 +62,7 @@ def _parse_no_dtd(path: str) -> ET.Element:
         parser.ParseFile(f)
     return builder.close()
 
+
 # emoji, word (word is plain text so a browser ctrl+f for "xpass" hits the row).
 STATUS_META = {
     "error": ("🔥", "error"),

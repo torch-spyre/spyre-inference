@@ -889,11 +889,15 @@ def test_head_major_dispatches_by_query_width(
 
 # Not named "batched_decode": tests/conftest.py skips those under the tiled walk.
 @pytest.mark.parametrize(
-    "seq_lens",
+    ("seq_lens", "use_sinks"),
     [
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], id="long_and_shorts"),
-        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], id="graded"),
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], id="with_prefill"),
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], False, id="long_and_shorts"),
+        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], False, id="graded"),
+        pytest.param(
+            [(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], False, id="with_prefill"
+        ),
+        # Sinks barely move the 7000-token row, so the short group is what catches a miss.
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], True, id="long_and_shorts_sinks"),
     ],
 )
 @pytest.mark.parametrize(
@@ -905,7 +909,7 @@ def test_head_major_dispatches_by_query_width(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_head_major_grouped_decode_matches_reference(
-    default_vllm_config, monkeypatch, seq_lens, configure_compilation, configure_device
+    default_vllm_config, monkeypatch, seq_lens, use_sinks, configure_compilation, configure_device
 ):
     from vllm.config import get_current_vllm_config
 
@@ -931,6 +935,7 @@ def test_head_major_grouped_decode_matches_reference(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+        use_sinks=use_sinks,
     )
 
     assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"

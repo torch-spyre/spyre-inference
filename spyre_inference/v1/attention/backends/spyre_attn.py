@@ -1305,7 +1305,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 f"got shape {tuple(sinks.shape)}"
             )
         self._sinks_source = sinks
-        self._sinks: torch.Tensor | None = None
+        self._sinks_device: torch.Tensor | None = None
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1456,16 +1456,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         if self._sinks_source is None:
             return None
-        if self._sinks is None:
+        if self._sinks_device is None:
             sinks = convert(self._sinks_source, device="cpu", dtype=self.model_dtype)
-            self._sinks = convert(
+            self._sinks_device = convert(
                 sinks.reshape(self.num_kv_heads, self.num_queries_per_kv, 1), device
             )
-        return self._sinks
+        return self._sinks_device
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         # Loaded (or reloaded) weights replace the sink values; rebuild on next use.
-        self._sinks = None
+        self._sinks_device = None
 
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (

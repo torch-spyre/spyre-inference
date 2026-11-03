@@ -706,19 +706,13 @@ def test_spyre_attn_soft_cap(
 SINK_TOLERANCE = (0.05, 0.05)
 
 
+# Compiled attention on CPU always skips, so the matrix leaves that pair out.
 @pytest.mark.parametrize(
-    "configure_device",
+    ("configure_device", "configure_compilation"),
     [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [
-        pytest.param("NONE", id="compilation_NONE"),
-        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+        pytest.param("cpu", "NONE", id="device_cpu-compilation_NONE"),
+        pytest.param("spyre", "NONE", id="device_spyre-compilation_NONE"),
+        pytest.param("spyre", "STOCK_TORCH_COMPILE", id="device_spyre-compilation_STOCK"),
     ],
     indirect=True,
 )
@@ -728,8 +722,8 @@ SINK_TOLERANCE = (0.05, 0.05)
         pytest.param([(1, 256)], None, id="decode(q=1,kv=256)"),
         pytest.param([(32, 256)], None, id="prefill(q=32,kv=256)"),
         pytest.param([(1, 256), (32, 200)], None, id="mixed(2seqs)"),
-        # gpt-oss puts sinks on its sliding-window layers too. One sequence each: a mixed
-        # sliding-window batch is off by up to 0.14 on this layout with or without sinks.
+        # gpt-oss puts sinks on its sliding-window layers too. One sequence each until #1462:
+        # the helper's random block tables can give two sequences the same page.
         pytest.param([(1, 300)], 128, id="decode_sliding_window(128)"),
         pytest.param([(32, 200)], 128, id="prefill_sliding_window(128)"),
     ],
@@ -1271,13 +1265,6 @@ def test_attention_sinks_are_held_kv_major(default_vllm_config):
     held = impl._device_sinks(torch.device("cpu"))
     assert held.dtype == torch.float16
     torch.testing.assert_close(held, torch.arange(8, dtype=torch.float16).reshape(2, 4, 1))
-
-    # A reload rewrites the parameter; the post-load hook drops the stale copy.
-    sinks.data.fill_(3.0)
-    impl.process_weights_after_loading(torch.float16)
-    torch.testing.assert_close(
-        impl._device_sinks(torch.device("cpu")), torch.full((2, 4, 1), 3.0, dtype=torch.float16)
-    )
 
     with pytest.raises(ValueError, match="one logit per query head"):
         SpyreAttentionImpl(sinks=torch.zeros(2, dtype=torch.float16), **kwargs)

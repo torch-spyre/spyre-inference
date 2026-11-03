@@ -38,16 +38,12 @@ dependencies = [
     # vLLM 0.28.0 imports PixtralRotaryEmbedding, which transformers 5.17 renamed to
     # PixtralVisionRotaryEmbedding; vLLM only floors transformers (>=5.5.3), so cap it here.
     "transformers<5.17",
+
+    # vLLM's suffix decoding proposer.
+    "arctic-inference",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
-
-[project.optional-dependencies]
-# Speculative decoding (vLLM's n-gram / suffix proposers)
-spec-decode = [
-    "numba",
-    "arctic-inference",
-]
 
 [project.urls]
 Homepage = "https://github.com/torch-spyre/spyre-inference"

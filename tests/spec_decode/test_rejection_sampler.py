@@ -498,7 +498,7 @@ def test_recovery_preserves_zero_times_infinite_noise(dtype, no_draft):
     assert output.tolist() == [1, 1]
 
 
-# Drafts without probabilities (ngram, suffix): recovery is a fused_gumbel_argmax draw over
+# Drafts without probabilities (suffix): recovery is a fused_gumbel_argmax draw over
 # the masked target logits, and acceptance reads only each draft's target probability.
 
 

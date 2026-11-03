@@ -956,7 +956,7 @@ def speculative_decoding(default_vllm_config, monkeypatch):
             get_current_vllm_config(),
             "speculative_config",
             SimpleNamespace(
-                method="ngram",
+                method="suffix",
                 num_speculative_tokens=num_speculative_tokens,
                 num_speculative_tokens_per_batch_size=None,
                 parallel_drafting=False,

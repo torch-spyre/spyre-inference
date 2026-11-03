@@ -98,7 +98,7 @@ def test_attention_warmup_reads_causality_from_draft_model(recording_runner, wit
 
 def test_attention_warmup_skips_model_free_proposer(recording_runner):
     runner, record = recording_runner
-    # An ngram proposer has no model and no draft layers.
+    # A suffix proposer has no model and no draft layers.
     runner.speculative_config = SimpleNamespace(uses_draft_kv_cache=lambda: False)
     runner.drafter = SimpleNamespace()
     runner._spyre_kv_caches = {"target": object()}

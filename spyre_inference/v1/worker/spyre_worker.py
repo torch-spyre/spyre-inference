@@ -180,13 +180,6 @@ class TorchSpyreWorker(Worker):
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
 
-        # ngram's batch_propose saves and restores numba's thread count, which shares
-        # libgomp with torch, and Dynamo guards on that count: align them before warmup.
-        if self.speculative_config is not None and self.speculative_config.method == "ngram":
-            from numba import set_num_threads  # ty: ignore[unresolved-import]
-
-            set_num_threads(torch.get_num_threads())
-
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time

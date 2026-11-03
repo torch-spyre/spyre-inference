@@ -646,10 +646,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.lora_config:
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
-        # load_model loads only DFlash drafter weights; ngram and suffix need none.
+        # load_model loads only DFlash drafter weights; suffix needs none.
         spec = self.speculative_config
         if hasattr(self, "drafter") and (
-            spec is None or not (spec.method in ("ngram", "suffix") or spec.use_dflash())
+            spec is None or not (spec.method == "suffix" or spec.use_dflash())
         ):
             raise NotImplementedError(
                 "Models with a drafter model are not yet implemented and tested for Spyre."
@@ -1081,7 +1081,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        # Model-free proposers (ngram, suffix) have no draft attention layers.
+        # A model-free proposer (suffix) has no draft attention layers.
         if self.speculative_config is not None and self.speculative_config.uses_draft_kv_cache():
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.

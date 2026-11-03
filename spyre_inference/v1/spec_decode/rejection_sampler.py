@@ -146,7 +146,7 @@ def recover_without_draft_probs(
     num_draft_tokens: list[int],
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """Recovered tokens for drafts without probabilities (ngram, suffix): one
+    """Recovered tokens for drafts without probabilities (suffix): one
     ``fused_gumbel_argmax`` draw per position over the target logits with the draft masked.
 
     That samples the target distribution with the draft removed and renormalized, upstream's

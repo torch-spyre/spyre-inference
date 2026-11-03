@@ -26,8 +26,30 @@ from pathlib import Path
 ID_ARTIFACTS = {"run-id", "artifact-id"}
 
 
+def safe_segment(name: str) -> bool:
+    """True iff `name` is a single, non-traversing path component.
+
+    Artifact names come from the GHA artifacts API and are attacker-controlled:
+    any run that uploads artifacts (including a contributor's pull_request run)
+    picks the name. `wanted()` only checks the `junit-` prefix, and
+    `junit-../../x` keeps that prefix, so without this guard `out_dir / name`
+    would escape `out_dir` and `unzip -d <dest>` would write attacker-chosen
+    files outside it — on a runner that holds ClickHouse credentials. Reject
+    anything that is not one plain segment.
+    """
+    return (
+        name not in ("", ".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and os.sep not in name
+        and (os.altsep is None or os.altsep not in name)
+        and not name.startswith(".")
+    )
+
+
 def wanted(artifact: dict) -> bool:
-    return artifact["name"].startswith("junit-") or artifact["name"] in ID_ARTIFACTS
+    name = artifact["name"]
+    return safe_segment(name) and (name.startswith("junit-") or name in ID_ARTIFACTS)
 
 
 def fetch(repo: str, artifact: dict, zip_path: Path, dest: Path, attempts: int) -> bool:
@@ -74,13 +96,34 @@ def main() -> None:
     if not args.repo:
         parser.error("--repo is required when $GITHUB_REPOSITORY is unset")
 
-    artifacts = [a for a in json.loads(args.artifacts) if wanted(a)]
+    all_artifacts = json.loads(args.artifacts)
+    for a in all_artifacts:
+        # Surface — rather than silently drop — a name that would escape out_dir,
+        # so a traversal attempt leaves a trace in the ingest log.
+        if a["name"].startswith("junit-") and not safe_segment(a["name"]):
+            print(
+                f"::warning::Rejecting artifact {a['name']!r} (id={a['id']}): "
+                "name is not a single safe path segment; refusing to use it as a path."
+            )
+    artifacts = [a for a in all_artifacts if wanted(a)]
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    out_root = args.out_dir.resolve()
     failed = []
     for a in artifacts:
         print(f"Downloading: {a['name']} (id={a['id']})")
         # Own subdir per artifact so same-basename XMLs never clobber; ingest globs recursively.
         dest = args.out_dir / a["name"]
+        # Defence in depth: wanted() already requires a safe single segment, so
+        # this never fires for a benign name — but keep the containment check
+        # right next to the write so no future caller can slip a path out.
+        resolved = dest.resolve()
+        if resolved.parent != out_root:
+            print(
+                f"::warning::Rejecting artifact {a['name']!r} (id={a['id']}): "
+                "resolved destination escapes the output directory."
+            )
+            failed.append(a["name"])
+            continue
         if not fetch(args.repo, a, args.out_dir / f"{a['name']}.zip", dest, args.attempts):
             print(
                 f"::warning::Skipping artifact {a['name']} (id={a['id']}): "

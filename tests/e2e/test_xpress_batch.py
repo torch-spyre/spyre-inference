@@ -99,6 +99,10 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
                 ("3, 4, 5, 6, 7, 8, 9,", 48, -1),
             )
         ]
+        if not tuned:
+            # One prefill per step needs longer outputs to keep four requests active.
+            for index, case in enumerate(cases):
+                case["max_tokens"] = 64 + 8 * index
         assert sum(len(case["prompt_ids"]) for case in cases) <= 128 - 4 * 15
         engine = llm.llm_engine
 
@@ -274,17 +278,20 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
         engine.abort_request(cancelled[:1], internal=True)
         # Frontend step() can consume outputs queued before the abort; wait
         # for an actual worker batch without the cancelled request.
+        saw_shrunk_batch = False
         for _ in range(16):
             engine.step()
             shrunk_state = llm.collective_rpc("validation_state")[0]
-            if any(len(batch) == 3 for batch in shrunk_state["batch_steps"]):
-                break
-            if not engine.has_unfinished_requests():
+            saw_shrunk_batch = any(
+                len(batch) == 3 and all(row["request"] != cancelled[0] for row in batch)
+                for batch in shrunk_state["batch_steps"]
+            )
+            if saw_shrunk_batch or not engine.has_unfinished_requests():
                 break
         report["cancel_before"] = cancel_state
         report["cancel_after_one"] = shrunk_state
         save()
-        assert any(len(batch) == 3 for batch in shrunk_state["batch_steps"])
+        assert saw_shrunk_batch
         assert cancelled[0] not in shrunk_state["runner_requests"]
         engine.abort_request(cancelled[1:], internal=True)
         assert not engine.has_unfinished_requests()

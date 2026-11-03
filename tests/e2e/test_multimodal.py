@@ -125,7 +125,14 @@ def _generate(conversations, enforce_eager: bool, **llm_kwargs):
 
 
 @pytest.mark.multimodal
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        # Over the per-case limit: regression_extra's named exception for compiled vision.
+        pytest.param(False, id="compiled", marks=pytest.mark.regression_extra),
+    ],
+)
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
 def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):

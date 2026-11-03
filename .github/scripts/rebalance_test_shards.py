@@ -72,6 +72,12 @@ SUITES = [
         "var": "E2E_SMOKE_DIST_SHARDS",
         "collect_upstream": False,
     },
+    {
+        "key": "regression-extra",
+        "makefile_name": "regression-extra",
+        "var": "REGRESSION_EXTRA_SHARDS",
+        "collect_upstream": False,
+    },
     {"key": "attn", "makefile_name": "attention", "var": "ATTN_SHARDS", "collect_upstream": False},
     {
         "key": "upstream",

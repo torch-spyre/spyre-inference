@@ -88,6 +88,7 @@ def test_skipped_final_proposal_commits_only_accepted_context():
         ),
         draft_block_size=16,
         max_model_len=512,
+        max_batch_size=1,
     )
     result = SpyreDFlashProposer.propose_spyre(
         drafter,

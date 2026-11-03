@@ -213,7 +213,15 @@ def test_context_limit_check_reaches_per_request_dflash_handling():
 
 
 @pytest.mark.parametrize(
-    "capacity,shapes", [(1, [16]), (2, [32, 16]), (3, [64, 32, 16]), (4, [64, 32, 16])]
+    "capacity,shapes",
+    [
+        (1, [16]),
+        (2, [32, 16]),
+        (3, [64, 32, 16]),
+        (4, [64, 32, 16]),
+        (5, [128, 64, 32, 16]),
+        (8, [128, 64, 32, 16]),
+    ],
 )
 def test_warmup_covers_shrinking_and_padded_proposals_once(proposer, monkeypatch, capacity, shapes):
     proposer.max_batch_size = capacity
@@ -231,3 +239,9 @@ def test_warmup_covers_shrinking_and_padded_proposals_once(proposer, monkeypatch
         assert positions.shape == slots.shape == (context.shape[0],)
         assert slots.dtype == torch.int64
         assert not slots.any()
+
+
+def test_proposal_rejects_requests_beyond_configured_capacity(proposer):
+    proposer.max_batch_size = 2
+    with pytest.raises(AssertionError, match="one to 2 active requests"):
+        dflash.SpyreDFlashProposer.propose_spyre(proposer, [[1]] * 3, None, None, None, None)

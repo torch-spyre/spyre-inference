@@ -94,9 +94,9 @@ class SpyreDFlashProposer(DFlashProposer):
             )
             self._context_warmed_rows.add(num_tokens)
         block = self.draft_block_size
-        largest_batch = 1 << (self.max_batch_size - 1).bit_length()
-        for batch in (4, 2, 1):
-            if batch > largest_batch or batch in self._warmed_draft_batches:
+        for power in range((self.max_batch_size - 1).bit_length(), -1, -1):
+            batch = 1 << power
+            if batch in self._warmed_draft_batches:
                 continue
             rows = batch * block
             attn_layer.publish_null_slots(rows)
@@ -123,7 +123,9 @@ class SpyreDFlashProposer(DFlashProposer):
     ):
         """Commit accepted context even when no further draft is needed."""
         num_reqs = len(sampled_token_ids)
-        assert 1 <= num_reqs <= 4, "Spyre DFlash requires one to four active requests"
+        assert 1 <= num_reqs <= self.max_batch_size, (
+            f"Spyre DFlash requires one to {self.max_batch_size} active requests"
+        )
         assert aux_hidden_states is not None, "Spyre DFlash requires auxiliary hidden states"
         starts = common_attn_metadata.query_start_loc_cpu.tolist()
         scheduled = target_positions.shape[0]

@@ -41,6 +41,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
+    _mirror_mask_stack,
 )
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
@@ -177,12 +178,28 @@ def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_b
     assert mixed.aligned_query_lens == [query_bucket, query_bucket]
     assert mixed.padded_num_blocks == [1, 4]
     torch.testing.assert_close(
-        mixed.attention_mask_stacks[0],
-        recorded.attention_mask_stacks[0],
+        _mirror_mask_stack(mixed, 0, torch.device("cpu")),
+        _mirror_mask_stack(recorded, 0, torch.device("cpu")),
         rtol=0,
         atol=0,
         check_stride=True,
     )
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 64), (4, 1, 64), (1, 1, 64)])
+def test_mask_mirror_normalizes_singleton_strides_and_keeps_its_cached_copy(shape):
+    source = torch.arange(4096, dtype=torch.float32)
+    stack = source[64 : 64 + shape[0] * shape[1] * shape[2]].view(shape)
+    stack = stack.as_strided(
+        shape, tuple(1 if size == 1 else stride for size, stride in zip(shape, stack.stride()))
+    )
+    metadata = SimpleNamespace(
+        attention_mask_stacks=[stack], attention_mask_stacks_device=None, num_seqs=1
+    )
+    mirrored = _mirror_mask_stack(metadata, 0, torch.device("cpu"))
+    torch.testing.assert_close(mirrored, stack, rtol=0, atol=0)
+    assert mirrored.stride() == (shape[1] * shape[2], shape[2], 1)
+    assert _mirror_mask_stack(metadata, 0, torch.device("cpu")) is mirrored
 
 
 @pytest.mark.parametrize(

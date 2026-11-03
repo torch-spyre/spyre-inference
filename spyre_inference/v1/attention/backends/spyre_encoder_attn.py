@@ -565,6 +565,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Upstream checks supports_sink() on CUDA/ROCm only, and these kernels never read
+        # the sinks (openai_privacy_filter passes them), so this is the only guard.
+        if self._sinks_source is not None:
+            raise NotImplementedError("Spyre encoder attention does not support attention sinks")
         if self._compile_attn:
             self._rect_fn = _encoder_rect_compiled
             self._rect_out_fn = _encoder_rect_out_compiled

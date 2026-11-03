@@ -50,11 +50,14 @@ def random_block_tables(
 ) -> torch.Tensor:
     """Random block tables whose real blocks are distinct across all sequences.
 
-    Padding points only at pages no sequence owns, so it stays inert even if a mask
-    regresses. The global stream sees only the plain ``randint`` table the tests drew
-    before, so the K/V data drawn after this call is unchanged.
+    Padding points only at pages no sequence owns, so it never aliases live KV. The
+    global stream sees only the plain ``randint`` table the tests drew before, so the
+    K/V data drawn after this call is unchanged.
     """
     real = [cdiv(kv_len, block_size) for kv_len in kv_lens]
+    assert all(n <= width for n in real), (
+        f"a sequence needs {max(real)} blocks, more than the table width {width}"
+    )
     num_real = sum(real)
     needs_spare = any(n < width for n in real)
     assert num_real + needs_spare <= num_blocks, (

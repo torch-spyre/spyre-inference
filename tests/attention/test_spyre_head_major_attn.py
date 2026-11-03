@@ -184,7 +184,7 @@ def _run_head_major_attn_test(
     kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
 
     # Widened onto the recorder's buckets, as a real engine's block table is; the extra
-    # entries point at garbage pages on purpose (padded blocks must stay inert).
+    # entries point at pages no sequence owns.
     from vllm.config import get_current_vllm_config
 
     max_num_blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size

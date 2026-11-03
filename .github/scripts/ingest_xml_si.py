@@ -87,8 +87,33 @@ def classify_testcase(tc_el):
     return "passed", "", ""
 
 
+# The JUnit XML parsed here arrives as a CI test artifact (downloaded by
+# download_xml_artifacts.py from runs that PR branches can trigger), so its
+# content is not trusted. lxml expands internal entities even inside attribute
+# values, so a crafted <!DOCTYPE> with nested entities is a billion-laughs
+# memory/CPU DoS against the ingest process (which runs on a runner holding
+# ClickHouse credentials); an external SYSTEM entity or DTD is XXE (file read /
+# SSRF) once DTD loading is on. JUnit XML never carries a DOCTYPE, so the safe
+# and sufficient defence is to parse with entity resolution and network access
+# off and to refuse any document that declares a DTD at all.
+_SAFE_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    load_dtd=False,
+    dtd_validation=False,
+)
+
+
 def parse_test_xml(xml_path: Path):
-    tree = etree.parse(str(xml_path))
+    tree = etree.parse(str(xml_path), parser=_SAFE_XML_PARSER)
+    docinfo = tree.docinfo
+    if docinfo.internalDTD is not None or docinfo.externalDTD is not None:
+        # A DTD is never present in legitimate JUnit XML; its only use here would
+        # be to smuggle entity-expansion (billion-laughs) or external references.
+        raise ValueError(
+            f"Refusing {xml_path.name}: JUnit XML must not declare a DTD "
+            "(possible XML entity-expansion / XXE payload)."
+        )
     root = tree.getroot()
 
     suites = root.findall(".//testsuite")

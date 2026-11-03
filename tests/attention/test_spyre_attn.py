@@ -2839,19 +2839,19 @@ def test_batched_verify_matches_fp32_reference(
         k_pages = k_tm.permute(0, 2, 1, 3).contiguous()
         v_pages = v_tm.permute(0, 2, 1, 3).contiguous()
     actual = kernel(
-        staging,
-        md.rep_row_ids_cpu,
-        k_pages,
-        v_pages,
-        md.chunk_page_ids_cpu,
-        md.mask_by_chunk_cpu.float(),
-        scale,
-        md.padded_num_seqs,
-        md.blocks_per_chunk,
-        num_kv_heads,
-        qpk,
-        block_size,
-        head_size,
+        query=staging,
+        rep_row_ids=md.rep_row_ids_cpu,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        chunk_page_ids=md.chunk_page_ids_cpu,
+        mask_by_chunk=md.mask_by_chunk_cpu.float(),
+        scale=scale,
+        num_seqs=md.padded_num_seqs,
+        blocks_per_chunk=md.blocks_per_chunk,
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=qpk,
+        block_size=block_size,
+        head_size=head_size,
         verify_len=md.decode_query_len,
     )
 

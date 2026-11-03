@@ -127,6 +127,8 @@ def _generate(conversations, enforce_eager: bool, **llm_kwargs):
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
+# Over the per-case limit: regression_extra's named exception for compiled vision.
+@pytest.mark.regression_extra
 def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.

@@ -73,7 +73,13 @@ _PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
 
 
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        pytest.param(False, id="compiled", marks=pytest.mark.e2e_smoke),
+    ],
+)
 def test_padded_head_dim_and_intermediate_size_generate(enforce_eager: bool) -> None:
     """Loading the model fires both pads; greedy decode matches the unpadded
     reference token ids. head_dim 64 takes the split-free RoPE path, so the compiled

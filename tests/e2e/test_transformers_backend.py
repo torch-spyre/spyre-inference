@@ -28,6 +28,7 @@ import pytest
 import torch
 
 
+@pytest.mark.e2e_smoke
 def test_rope_frequencies_rebuilt_at_the_pre_pad_head_dim():
     """HF derives inv_freq from the widened head_dim, so the rebuild has to undo it."""
     from transformers import LlamaConfig
@@ -59,6 +60,7 @@ def test_rope_frequencies_rebuilt_at_the_pre_pad_head_dim():
     assert cfg.head_dim == padded, "the padded width must be restored for the model"
 
 
+@pytest.mark.e2e_smoke
 def test_padded_qk_logits_match_the_unpadded_reference():
     """Weight padding + rebuilt rotation + 1/sqrt(orig) scale must leave the logits
     unchanged versus stock HF at the native head_dim."""
@@ -145,6 +147,7 @@ def _gemma3_text_config():
     )
 
 
+@pytest.mark.e2e_smoke
 def test_layer_typed_rope_rotates_each_layer_type_at_its_own_frequencies():
     """Layer-typed ropes key their frequencies on a third ``layer_type`` argument, so the
     replacement needs one cache per type; one cache rotates sliding layers globally."""
@@ -189,6 +192,7 @@ def test_layer_typed_rope_rotates_each_layer_type_at_its_own_frequencies():
     ), "one cache serving both layer types is the bug this guards"
 
 
+@pytest.mark.e2e_smoke
 def test_patched_apply_rotary_leaves_stock_hf_callers_working():
     """The patch is never lifted from sys.modules, so an HF model built later in the same
     process — a CPU reference next to the vLLM one — has to keep getting HF's rotation."""
@@ -350,6 +354,7 @@ def _vllm_config(model: str, model_impl: str = "auto"):
     return VllmConfig(model_config=model_config, load_config=LoadConfig())
 
 
+@pytest.mark.e2e_smoke
 def test_mistral_format_repo_parses_to_a_config_hf_cannot_build_from(tmp_path):
     """The premise of _fix_generic_config: for a repo carrying both params.json and
     config.json, vLLM checks Mistral first and ends at a bare PretrainedConfig."""
@@ -365,6 +370,7 @@ def test_mistral_format_repo_parses_to_a_config_hf_cannot_build_from(tmp_path):
         AutoModel.from_config(hf_config)
 
 
+@pytest.mark.e2e_smoke
 def test_fix_generic_config_re_resolves_and_forces_hf_weights(tmp_path):
     from transformers import AutoModel, LlamaConfig
 
@@ -393,6 +399,7 @@ def test_fix_generic_config_re_resolves_and_forces_hf_weights(tmp_path):
     assert type(AutoModel.from_config(resolved)).__name__ == "LlamaModel"
 
 
+@pytest.mark.e2e_smoke
 def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
     from transformers import LlamaConfig
 

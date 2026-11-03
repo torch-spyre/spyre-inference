@@ -6,8 +6,8 @@ SHELL := /bin/bash
 # are literal, first-class values -- there is no alias-resolution layer:
 #   unit        — all spyre-native tests (per-op + attention + distributed);
 #                 excludes the heavy upstream-vLLM suites
-#   integration — the smoke suite: fast per-op unit tests only (this is the
-#                 ONLY valid top-level tier for that suite -- TEST_TYPE=smoke
+#   integration — the unit-level smoke tests (tests/e2e excluded) plus the
+#                 opt-in e2e_smoke and attention_smoke subsets (TEST_TYPE=smoke
 #                 by itself is rejected below)
 #   regression  — everything
 #   trunk       — same coverage as regression; push-to-main CI label
@@ -102,13 +102,9 @@ UPSTREAM_ARG := --upstream
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
-# Single-invocation integration = the CI smoke suite, which now also carries the
-# compiled (enforce_eager=False) tests/e2e/test_compile.py cases. Probes are
-# excluded here just as the sharded smoke jobs exclude them (they run in their
-# own test-probes job and must not gate integration on strict-xfail flips), and
-# the model-quality gate likewise has its own job: every case compiles a product
-# model, up to the 31B decoders.
+# Unit-level part only: tests/e2e enters integration via e2e_smoke (see tests-integration).
 MARK_EXPR := -m "not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)"
+E2E_IGNORE_ARG := --ignore=tests/e2e
 else ifeq ($(TEST_TYPE),unit)
 # model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
 # out of the unit tier as well. distributed_tp4 has its own 4-card job.
@@ -125,7 +121,8 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-smoke-shard test-quality test-quality-shard \
+        test-smoke test-smoke-shard test-smoke-unit-shard test-quality test-quality-shard \
+        test-e2e-smoke test-e2e-smoke-shard test-e2e-smoke-dist-shard tests-integration \
         test-probes test-probes-shard \
         test-attention test-attention-shard test-attention-smoke \
         test-distributed test-distributed-shard test-distributed-tp4 \
@@ -184,7 +181,7 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	$(OMP_ENV) $(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
+	$(OMP_ENV) $(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(E2E_IGNORE_ARG) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-probe, non-model-quality). Carries the compiled e2e cases.
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' JUNIT_XML=$(JUNIT_XML)
@@ -206,6 +203,42 @@ test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
 # artifact name is unique; the pattern maps <i> to SMOKE_SHARD_ID.
 test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# The integration tier's unit-level jobs: the smoke expression without tests/e2e.
+SMOKE_UNIT_SHARDS ?= 3
+SMOKE_UNIT_SHARD_ID ?= 0
+test-smoke-unit-shard: ## Run one unit-level smoke shard, tests/e2e excluded (SMOKE_UNIT_SHARDS=N SMOKE_UNIT_SHARD_ID=i).
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --ignore=tests/e2e --smoke-unit-shards=$(SMOKE_UNIT_SHARDS) --smoke-unit-shard-id=$(SMOKE_UNIT_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+test-smoke-unit-shard-%:
+	$(MAKE) test-smoke-unit-shard SMOKE_UNIT_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# Opt-in e2e subset for the integration tier (docs/contributing/integration-tier.md),
+# split by card count so the 1-card cases don't hold a second card.
+test-e2e-smoke: ## Run the whole e2e_smoke subset in one process (TP=2 cases skip on a 1-card host).
+	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke' JUNIT_XML=$(JUNIT_XML)
+
+E2E_SMOKE_SHARDS ?= 3
+E2E_SMOKE_SHARD_ID ?= 0
+test-e2e-smoke-shard: ## Run one 1-card e2e_smoke shard (E2E_SMOKE_SHARDS=N E2E_SMOKE_SHARD_ID=i).
+	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and not distributed' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --e2e-smoke-shards=$(E2E_SMOKE_SHARDS) --e2e-smoke-shard-id=$(E2E_SMOKE_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+test-e2e-smoke-shard-%:
+	$(MAKE) test-e2e-smoke-shard E2E_SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+E2E_SMOKE_DIST_SHARDS ?= 2
+E2E_SMOKE_DIST_SHARD_ID ?= 0
+test-e2e-smoke-dist-shard: ## Run one 2-card e2e_smoke shard (E2E_SMOKE_DIST_SHARDS=N E2E_SMOKE_DIST_SHARD_ID=i). Needs 2 cards.
+	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and distributed' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --e2e-smoke-dist-shards=$(E2E_SMOKE_DIST_SHARDS) --e2e-smoke-dist-shard-id=$(E2E_SMOKE_DIST_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+test-e2e-smoke-dist-shard-%:
+	$(MAKE) test-e2e-smoke-dist-shard E2E_SMOKE_DIST_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # The model-output quality gate. Two kinds of heavy case share it: the product-model output
 # checks (`model_quality`; local, every case compiles a product model, up to the 31B decoders)
@@ -352,6 +385,14 @@ tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shard
 	done; \
 	exit $$rc
 
+tests-integration: ## Run the integration tier: unit-level smoke, e2e_smoke, attention_smoke. TP=2 e2e_smoke cases need 2 cards.
+	mkdir -p "$(RESULTS_DIR)"; \
+	rc=0; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-smoke-unit" && $(MAKE) run-one TEST_TYPE=integration JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-unit/junit-test-smoke-unit.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-e2e-smoke" && $(MAKE) test-e2e-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-e2e-smoke/junit-test-e2e-smoke.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-attention-smoke" && $(MAKE) test-attention-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-smoke/junit-test-attention-smoke.xml" || rc=1; \
+	exit $$rc
+
 tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstream-distributed/probes/tp4). Needs 2 cards minimum; TP=4 tests skip gracefully on hosts with fewer than 4 cards.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
@@ -373,6 +414,8 @@ tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstre
 tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default regression) or set MARK_OVERRIDE directly.
 	if [ "$(TEST_TYPE)" = "perf" ]; then \
 	  $(MAKE) perf-tests RESULTS_DIR="$(RESULTS_DIR)"; \
+	elif [ -z "$(MARK_OVERRIDE)" ] && [ "$(TEST_TYPE)" = "integration" ]; then \
+	  $(MAKE) tests-integration RESULTS_DIR="$(RESULTS_DIR)"; \
 	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "regression" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \

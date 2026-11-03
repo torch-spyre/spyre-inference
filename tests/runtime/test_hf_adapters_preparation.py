@@ -281,27 +281,37 @@ def test_unsupported_model_options(config_factory, field, value, error):
         validate_hf_adapters_config(config)
 
 
-def test_adapter_compile_skips_runner_wrapping_but_not_eager(backend_factory):
-    from vllm.config import CompilationMode
+@pytest.mark.parametrize("granularity", ["block", "model"])
+def test_adapter_compile_skips_native_wrapping_but_not_eager(
+    backend_factory, monkeypatch, granularity
+):
+    from vllm.config import CompilationMode, get_current_vllm_config
 
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+    from spyre_inference.v1.worker.compile_granularity import compile_for_spyre
 
-    backend = backend_factory()
-    callback = Mock()
-    backend._prepared_body = execution_result(compile_body=callback)
-    runner = SimpleNamespace(
-        vllm_config=backend.vllm_config,
-        compilation_config=backend.compilation_config,
-        model=backend,
-        _compile_blocks=Mock(side_effect=AssertionError("double compilation")),
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", granularity)
+    monkeypatch.setattr(torch, "compile", Mock(side_effect=AssertionError("double compilation")))
+    monkeypatch.setattr(
+        "spyre_inference.v1.worker.compile_granularity.compile_blocks",
+        Mock(side_effect=AssertionError("double compilation")),
     )
-    TorchSpyreModelRunner._compile_for_spyre(runner)
+    backend = backend_factory()
+
+    def compile_body(model):
+        assert get_current_vllm_config() is backend.vllm_config
+
+    callback = Mock(side_effect=compile_body)
+    backend._prepared_body = execution_result(compile_body=callback)
+    config = backend.vllm_config
+    assert compile_for_spyre(backend, config) == (backend, 0)
     callback.assert_not_called()
     backend.model_config.enforce_eager = False
-    runner.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
-    TorchSpyreModelRunner._compile_for_spyre(runner)
+    config.compilation_config.mode = CompilationMode.NONE
+    assert compile_for_spyre(backend, config) == (backend, 0)
+    callback.assert_not_called()
+    config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    assert compile_for_spyre(backend, config) == (backend, 0)
     callback.assert_called_once_with(backend.model)
-    assert runner._compiled_tower_blocks == 0
 
 
 @pytest.mark.parametrize("adapter", [False, True])
@@ -328,10 +338,14 @@ def test_runner_prepares_before_placement_and_skips_only_body_passes(
     for name, event in [
         ("install_pad_loaders", "pad_loader"),
         ("fix_padded_model", "fix_padding"),
+        ("resolve_kv_scales", "kv_scales"),
         ("move_model_to_spyre", "move"),
         ("apply_multimodal_patches", "multimodal"),
     ]:
         monkeypatch.setattr(module, name, lambda *args, event=event: events.append(event))
+    monkeypatch.setattr(
+        module, "compile_for_spyre", lambda model, cfg: (events.append("compile") or model, 0)
+    )
     monkeypatch.setattr(module.SpyreShapeBucketer, "for_config", lambda cfg: None)
     monkeypatch.setattr(module, "_SpyreModelWrapper", lambda model, *args, **kwargs: model)
     runner = SimpleNamespace(
@@ -339,12 +353,15 @@ def test_runner_prepares_before_placement_and_skips_only_body_passes(
         model_config=config.model_config,
         load_config=config.load_config,
         lora_config=None,
+        speculative_config=None,
+        compilation_config=config.compilation_config,
+        num_spec_tokens=0,
+        use_aux_hidden_state_outputs=False,
+        _setup_eagle3_aux_hidden_state_outputs=lambda: None,
         _spyre_device="cpu",
         max_num_reqs=2,
         inputs_embeds=SimpleNamespace(gpu=None),
         _model_dtype=lambda: torch.float16,
-        _resolve_kv_scales=lambda: events.append("kv_scales"),
-        _compile_for_spyre=lambda: events.append("compile"),
     )
     module.TorchSpyreModelRunner.load_model(runner)
     expected = (

@@ -472,3 +472,7 @@ class TestLogitsRowBuckets:
 
     def test_ignores_non_positive_sizes(self):
         assert logits_row_buckets([0, -1, 4], max_num_reqs=8) == [4]
+
+    def test_speculative_rows_include_drafts_and_bonus(self):
+        assert logits_row_buckets([1, 16, 64], 1, 15) == [1, 16]
+        assert logits_row_buckets([1, 16, 64, 128], 4, 15) == [1, 16, 64]

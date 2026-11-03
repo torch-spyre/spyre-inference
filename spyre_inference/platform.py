@@ -19,7 +19,7 @@ import multiprocessing
 import os
 import sys
 from string import Template
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -38,10 +38,15 @@ from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
     from vllm.config import VllmConfig
+    from vllm.inputs import EngineInput
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 else:
     VllmConfig = None
 
@@ -175,11 +180,12 @@ class TorchSpyrePlatform(CpuPlatform):
     _KV_LAYOUTS = ("token_major", "head_major")
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
+    # Largest item a request may carry per vision modality, in tokens.
+    _vision_token_limits: ClassVar[dict[str, int]] = {}
+
     @classmethod
     def _decoder_backend_path(cls) -> str:
         """The decoder attention backend for the requested KV cache layout."""
-        from spyre_inference import envs
-
         layout = envs.SPYRE_ATTN_KV_LAYOUT
         if layout not in cls._KV_LAYOUTS:
             raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
@@ -224,8 +230,10 @@ class TorchSpyrePlatform(CpuPlatform):
         def _spyre_create_model_config(self):
             from spyre_inference.hf_adapters import uses_hf_adapters
             from spyre_inference.models import apply_prelaunch_overrides
+            from spyre_inference.v1.spec_decode.config import normalize_speculative_config
 
             apply_prelaunch_overrides(self)
+            normalize_speculative_config(self)
             if not uses_hf_adapters(self):
                 return create_model_config(self)
 
@@ -257,6 +265,28 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
         # which don't exist with VLLM_TARGET_DEVICE=empty. Override to no-op.
         pass
+
+    @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        from vllm.triton_utils.dispatcher import register_kernels
+
+        from spyre_inference.v1.spec_decode import rejection_sampler
+
+        # Use our vendored C++ kernels; CpuPlatform's wrappers require the absent vllm._C.
+        register_kernels(
+            {
+                "vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel": (
+                    rejection_sampler.greedy_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel": (
+                    rejection_sampler.random_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.expand_kernel": rejection_sampler.expand,
+                "vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel": (
+                    rejection_sampler.recover
+                ),
+            }
+        )
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -680,7 +710,7 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
-        # The attention KV buckets are powers of two starting at block_size; a
+        # Every KV ladder keeps the powers of two starting at block_size; a
         # non-power-of-two block size makes that ladder start off-grid, so block
         # counts stop being a clean doubling sequence.
         if aligned & (aligned - 1):
@@ -716,6 +746,78 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
     @classmethod
+    def _set_vision_token_limit(cls, vllm_config: VllmConfig) -> None:
+        from spyre_inference.models import spyre_model_cls
+        from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
+
+        cls._vision_token_limits = {}
+        model_config = vllm_config.model_config
+        if model_config.enforce_eager or not model_config.is_multimodal_model:
+            return
+        model_cls = spyre_model_cls(model_config.architecture)
+        if model_cls is None or not issubclass(model_cls, SpyreVisionEncoderMixin):
+            return
+        modalities = model_cls.vision_modalities
+        user_budgets = vllm_config.compilation_config.encoder_cudagraph_token_budgets
+        if user_budgets:
+            limit = max(user_budgets)
+        else:
+            from vllm.multimodal import MULTIMODAL_REGISTRY
+
+            max_tokens = MULTIMODAL_REGISTRY.get_processing_info(
+                model_config
+            ).get_mm_max_tokens_per_item(model_config.max_model_len, dict.fromkeys(modalities, 1))
+            if max_tokens is None:
+                return
+            limit = max(max_tokens[m] for m in modalities)
+        from vllm.v1.core.encoder_cache_manager import compute_mm_encoder_budget
+
+        logger.info("Requests may carry images of up to %d tokens.", limit)
+        cls._vision_token_limits = dict.fromkeys(modalities, limit)
+        scheduler_config = vllm_config.scheduler_config
+        # Upstream's own error here names neither the list nor the 512 default cap.
+        if (
+            user_budgets
+            and scheduler_config.disable_chunked_mm_input
+            and limit > scheduler_config.max_num_batched_tokens
+        ):
+            raise ValueError(
+                f"encoder_cudagraph_token_budgets allows {limit}-token images, but with "
+                "--disable-chunked-mm-input an image must fit in max_num_batched_tokens "
+                f"({scheduler_config.max_num_batched_tokens}). Drop "
+                "--disable-chunked-mm-input, raise --max-num-batched-tokens, or keep the "
+                "list's largest entry within it."
+            )
+        # Upstream sizes the encoder cache and compute budget for the engine's own largest
+        # item and rejects or never schedules a larger one.
+        (
+            scheduler_config.max_num_encoder_input_tokens,
+            scheduler_config.encoder_cache_size,
+        ) = compute_mm_encoder_budget(scheduler_config, cls._vision_token_limits)
+
+    @classmethod
+    def validate_request(
+        cls, processed_inputs: "EngineInput", params: "SamplingParams | PoolingParams"
+    ) -> None:
+        if processed_inputs["type"] != "multimodal":
+            return
+        from vllm.exceptions import VLLMValidationError
+
+        for modality, limit in cls._vision_token_limits.items():
+            for placeholder in processed_inputs["mm_placeholders"].get(modality, ()):
+                tokens = placeholder.get_num_embeds()
+                if tokens > limit:
+                    raise VLLMValidationError(
+                        f"An {modality} item of {tokens} tokens is larger than the {limit} this "
+                        "server compiled its vision encoder for. Lower max_soft_tokens in the "
+                        "request's mm_processor_kwargs, or restart the server with a larger "
+                        "--mm-processor-kwargs or "
+                        "compilation_config.encoder_cudagraph_token_budgets.",
+                        parameter="mm_processor_kwargs",
+                        value=tokens,
+                    )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -742,6 +844,14 @@ class TorchSpyrePlatform(CpuPlatform):
                 raise ValueError(
                     f"The model dtype needs to be one of {supported} for spyre, but "
                     f"was specified to be {vllm_config.model_config.dtype}"
+                )
+
+            # Neither attention layout implements ALiBi; reject before the worker builds the
+            # model. The attention impl constructor keeps a backstop, since this is a heuristic.
+            if vllm_config.model_config.uses_alibi:
+                raise ValueError(
+                    f"Spyre does not support ALiBi attention, which "
+                    f"{vllm_config.model_config.model} uses."
                 )
 
             # SpyreFp8LinearKernel is float16 end to end, its scales included.
@@ -794,6 +904,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
+        # Validate the ladder name now; the bucketer only reads it in the worker, after model load.
+        if not envs.SPYRE_ATTN_KV_BUCKETS:
+            from spyre_inference.v1.attention.spyre_attn_bucketer import kv_ladder
+
+            kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
         from spyre_inference.threading_config import configure_threading
@@ -801,7 +917,7 @@ class TorchSpyrePlatform(CpuPlatform):
         configure_threading(parallel_config.world_size)
 
         # ---- worker ----
-        from spyre_inference import envs, pin_model_runner
+        from spyre_inference import pin_model_runner
         from spyre_inference.v1.worker.spyre import triton_gate
 
         # Read fresh, not from the cache register() filled, so a value changed after
@@ -809,13 +925,13 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        gate = "open" if runner == "v2" else "closed"
-        if triton_gate.state() != gate:
-            raise ValueError(
-                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
-                f"{triton_gate.state() or 'not applied'}: set SPYRE_MODEL_RUNNER before "
-                "vLLM is imported, and the same in every process."
-            )
+        if (
+            runner == "v2"
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_dflash()
+        ):
+            raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
+        triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 
@@ -925,6 +1041,9 @@ class TorchSpyrePlatform(CpuPlatform):
                     max_num_seqs,
                     blocks_per_seq,
                 )
+
+        if vllm_config.model_config is not None:
+            cls._set_vision_token_limit(vllm_config)
 
     @staticmethod
     def _is_pooling_model(vllm_config: VllmConfig) -> bool:

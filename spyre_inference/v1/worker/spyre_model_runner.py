@@ -28,8 +28,9 @@ Data flow in the current WIP version:
   embedding gather run on-device too.
 - What stays on CPU is host-side bookkeeping: slot mapping, attention metadata
   (index tables, mask tiles) built by the metadata builder, logits indexing and
-  sampling, plus the few model-specific workarounds that route one op through the
-  host (see ``spyre_inference.multimodal`` and ``spyre_inference.models``).
+  sampling. An all-random batch with ``SPYRE_DEVICE_RANDOM`` draws on the card
+  instead. A few model-specific workarounds still route one op through the host
+  (see ``spyre_inference.multimodal`` and ``spyre_inference.models``).
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 
 import numpy as np
 import torch
@@ -64,6 +65,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
@@ -87,6 +89,7 @@ from spyre_inference.v1.pool.encoder_grid import (
     unpad_encoder_grid,
 )
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
+from spyre_inference.v1.sample import device_random
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
@@ -332,6 +335,7 @@ class _SpyreModelWrapper:
         model_dtype: torch.dtype,
         inputs_embeds_buffer: torch.Tensor | None = None,
         keep_aux_hidden_states_on_device: bool = False,
+        device_random_fn: Callable[[], bool] | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -344,6 +348,7 @@ class _SpyreModelWrapper:
         object.__setattr__(
             self, "_keep_aux_hidden_states_on_device", keep_aux_hidden_states_on_device
         )
+        object.__setattr__(self, "_device_random_fn", device_random_fn)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -395,6 +400,8 @@ class _SpyreModelWrapper:
         on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice
         and scale -- in ``_apply_head`` at TP=1, right after the all_gather in
         ``_gather_logits`` at TP>1 -- so downstream sampling gets CPU logits.
+        An all-random device batch is the exception: the processor leaves the rows
+        on Spyre and ``_sample`` copies back only the token ids.
 
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
         row buckets keeps the projection on shapes warmup compiled.
@@ -407,7 +414,10 @@ class _SpyreModelWrapper:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
         hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
-        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
+        random_fn = self._device_random_fn
+        use_device_random = random_fn() if random_fn is not None else False
+        with device_random.activated() if use_device_random else nullcontext():
+            logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
             logits = logits[:num_rows]
@@ -707,6 +717,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
             keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
+            device_random_fn=self._device_random_now,
         )
 
     def _input_fits_in_drafter(self, common_attn_metadata):
@@ -772,11 +783,58 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _sample(self, logits, spec_decode_metadata):
         states = [(gen, gen.get_state()) for gen in self._discarded_generators().values()]
+        on_device = (
+            getattr(self, "_device_random_this_step", False)
+            and logits is not None
+            and spec_decode_metadata is None
+        )
+        self._device_random_this_step = False
         try:
+            if on_device:
+                return self._device_random_output(logits)
             return super()._sample(logits, spec_decode_metadata)
         finally:
             for gen, state in states:
                 gen.set_state(state)
+
+    def _device_random_output(self, logits: torch.Tensor):
+        """Draw inside the generator-rewind ``try``, then copy the ids only."""
+        meta = self.input_batch.sampling_metadata
+        assert meta is not None and meta.temperature is not None
+        uniform = device_random.row_uniforms(logits.shape[0], meta.generators)
+        processor = self._spyre_logits_processor()
+        token_ids = device_random.sample(
+            logits,
+            self._random_pad_mask(processor, logits),
+            meta.temperature,
+            uniform,
+            meta.top_k,
+            meta.top_p,
+            compile_kernel=processor.spyre_compile_enabled,
+        )
+        return device_random.sampler_output(convert(token_ids, device="cpu"))
+
+    def _random_pad_mask(
+        self, processor: SpyreLogitsProcessor, logits: torch.Tensor
+    ) -> torch.Tensor:
+        padded = logits.shape[-1]
+        cached = getattr(self, "_random_pad_mask_tensor", None)
+        if cached is None or cached.shape[0] != padded or cached.device != logits.device:
+            self._random_pad_mask_tensor = device_random.padding_mask(
+                padded, processor.org_vocab_size, logits.device
+            )
+        return self._random_pad_mask_tensor
+
+    def _spyre_logits_processor(self) -> SpyreLogitsProcessor:
+        cached = getattr(self, "_cached_logits_processor", None)
+        if cached is not None:
+            return cached
+        for module in self.get_model().modules():
+            inner = getattr(module, "_orig_mod", module)
+            if isinstance(inner, SpyreLogitsProcessor):
+                self._cached_logits_processor = inner
+                return inner
+        raise RuntimeError("model has no SpyreLogitsProcessor")
 
     def _bookkeeping_sync(
         self, scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
@@ -844,6 +902,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
+        self._device_random_ready = False
+        self._device_random_this_step = False
         # Before the first trace: see allocate_staging_buffers.
         allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
 
@@ -875,6 +935,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     self._record_attention_graphs()
                 self._warmup_multimodal_encoder()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
+            self._arm_device_random()
             return
 
         if is_pooling or self.spyre_shape_bucketer is None:
@@ -894,6 +955,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
+            self._arm_device_random()
             return
 
         bucket_sizes = self.spyre_shape_bucketer.bucket_sizes
@@ -924,6 +986,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+                    self._warmup_device_random(widest_hidden_states[:rows])
             self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
@@ -933,6 +996,69 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs()
         self._record_vision_graphs()
+        self._arm_device_random()
+
+    def _device_random_now(self) -> bool:
+        """Whether this step's sample can be an on-device inverse CDF.
+
+        Stays off during warmup so the dummy sampler still receives ``[B, V]`` logits.
+        Prompt logprobs and speculative decoding read the full rows, so they stay
+        on the host path too.
+        """
+        eligible = (
+            getattr(self, "_device_random_ready", False)
+            and envs.SPYRE_DEVICE_RANDOM
+            and not self._device_random_blocked()
+        )
+        self._device_random_this_step = eligible
+        return eligible
+
+    def _device_random_blocked(self) -> bool:
+        parallel = self.vllm_config.parallel_config
+        if parallel.tensor_parallel_size > 1 or parallel.pipeline_parallel_size > 1:
+            return True
+        if self.num_prompt_logprobs or self.speculative_config is not None:
+            return True
+        meta = self.input_batch.sampling_metadata
+        if meta is None:
+            return True
+        has_structured_output = False
+        for req_id in self.input_batch.req_ids:
+            request = self.requests.get(req_id)
+            params = None if request is None else request.sampling_params
+            if params is not None and params.structured_outputs is not None:
+                has_structured_output = True
+                break
+        return not device_random.batch_is_device_random(meta, has_structured_output)
+
+    def _warmup_device_random(self, hidden_states: torch.Tensor) -> None:
+        """Compile the temperature-only draw at this row width. The result is discarded."""
+        if not envs.SPYRE_DEVICE_RANDOM:
+            return
+        wrapper = cast(_SpyreModelWrapper, self.model)
+        with device_random.activated():
+            logits = wrapper._model.compute_logits(
+                convert_tensor_tree(hidden_states, device=wrapper._spyre_device)
+            )
+        if not isinstance(logits, torch.Tensor):
+            return
+        processor = self._spyre_logits_processor()
+        rows = logits.shape[0]
+        device_random.sample(
+            logits,
+            self._random_pad_mask(processor, logits),
+            torch.ones(rows, dtype=torch.float32),
+            torch.rand(rows),
+            None,
+            None,
+            compile_kernel=processor.spyre_compile_enabled,
+        )
+
+    def _arm_device_random(self) -> None:
+        self._device_random_ready = (
+            envs.SPYRE_DEVICE_RANDOM and self.model_config.runner_type != "pooling"
+        )
+        self._device_random_this_step = False
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:

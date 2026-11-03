@@ -21,8 +21,14 @@ from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.platforms.cpu import CpuPlatform
 from vllm.triton_utils import dispatcher
 from vllm.v1.sample import rejection_sampler as upstream
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from spyre_inference.platform import TorchSpyrePlatform
+from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.spec_decode import rejection_sampler as native
 
 
@@ -286,6 +292,107 @@ def test_random_rejection_preserves_target_distribution(with_draft_probs):
     )
     frequency = result[:, 0].bincount(minlength=3).float() / n
     torch.testing.assert_close(frequency, p, atol=0.015, rtol=0)
+
+
+def _random_metadata(rows, temperature, top_k=None, top_p=None):
+    return SamplingMetadata(
+        temperature=torch.full((rows,), temperature),
+        all_greedy=False,
+        all_random=True,
+        top_k=None if top_k is None else torch.full((rows,), top_k, dtype=torch.int32),
+        top_p=None if top_p is None else torch.full((rows,), top_p),
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(rows),
+        presence_penalties=torch.zeros(rows),
+        repetition_penalties=torch.ones(rows),
+        output_token_ids=[[] for _ in range(rows)],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
+    )
+
+
+def _packed_metadata(drafts):
+    metadata = SpecDecodeMetadata.make_dummy(drafts, torch.device("cpu"))
+    widths = torch.tensor([len(draft) + 1 for draft in drafts])
+    metadata.bonus_logits_indices = widths.cumsum(0) - 1
+    metadata.logits_indices = torch.arange(int(widths.sum()))
+    target = torch.ones(len(metadata.logits_indices), dtype=torch.bool)
+    target[metadata.bonus_logits_indices] = False
+    metadata.target_logits_indices = metadata.logits_indices[target]
+    return metadata
+
+
+@pytest.fixture()
+def host_sampler():
+    sampler = Sampler()
+    sampler.topk_topp_sampler = SpyreTopKTopPSampler(sampler.logprobs_mode, sampler.use_fp64_gumbel)
+    sampler.greedy_sample = greedy_sample
+    return sampler
+
+
+@pytest.mark.parametrize(
+    "temperature,top_k,top_p",
+    [(0.7, None, None), (1.3, 3, None), (0.8, None, 0.75), (1.1, 3, 0.8)],
+    ids=["temperature", "topk", "topp", "topk_topp"],
+)
+def test_full_sampler_preserves_two_token_target_distribution(
+    host_sampler, temperature, top_k, top_p
+):
+    torch.random.default_generator.manual_seed(129)
+    draws, vocab = 12000, 4
+    first = torch.tensor([1.2, 0.8, 0.2, -0.9])
+    transitions = torch.tensor(
+        [[0.3, 1.5, 0.6, -0.4], [1.2, -0.7, 0.4, 1.1], [-0.2, 0.2, 1.6, 0.8], [1.5, 0.3, -0.8, 0.7]]
+    )
+    # The target's second-token distribution depends on the first token. A
+    # reject-first draw must resume from the recovered token, not the draft.
+    logits = torch.stack((first, transitions[0], transitions[1])).repeat(draws, 1)
+    metadata = _packed_metadata([[0, 1]] * draws)
+    sampling = _random_metadata(draws, temperature, top_k, top_p)
+    result = upstream.RejectionSampler(host_sampler)(metadata, None, logits, sampling)
+    tokens = result.sampled_token_ids
+    assert torch.all(tokens[:, 0] >= 0)
+    second_present = tokens[:, 1] >= 0
+    assert second_present.any() and (~second_present).any()
+    assert torch.all(tokens[second_present, 0] == 0)
+    bonus_present = tokens[:, 2] >= 0
+    assert bonus_present.any()
+    assert torch.all(tokens[bonus_present, :2] == torch.tensor([0, 1]))
+
+    resumed = host_sampler(
+        logits=transitions[tokens[~second_present, 0]],
+        sampling_metadata=_random_metadata(int((~second_present).sum()), temperature, top_k, top_p),
+    )
+    tokens[~second_present, 1] = resumed.sampled_token_ids.flatten()
+
+    scores = torch.cat((first[None], transitions)).double() / temperature
+    if top_k is not None:
+        scores[scores < scores.topk(top_k).values[:, -1:]] = -torch.inf
+    probabilities = scores.softmax(-1)
+    if top_p is not None:
+        sorted_probs, indices = probabilities.sort(descending=True)
+        keep = sorted_probs.cumsum(-1) - sorted_probs < top_p
+        probabilities = torch.zeros_like(probabilities).scatter_(1, indices, sorted_probs * keep)
+        probabilities /= probabilities.sum(-1, keepdim=True)
+    expected = probabilities[0, :, None] * probabilities[1:]
+    observed = (tokens[:, 0] * vocab + tokens[:, 1]).bincount(minlength=vocab**2)
+    torch.testing.assert_close(
+        observed.reshape(vocab, vocab).double() / draws, expected, atol=0.015, rtol=0
+    )
+
+
+def test_stochastic_topk_one_covers_rejection_bonus_and_empty_drafts(host_sampler):
+    drafts = [[0, 1], [0, 2], [2, 1], []]
+    logits = torch.eye(3).repeat(3, 1)
+    logits = torch.cat((logits, torch.tensor([[0.0, 0.0, 1.0]])))
+    result = upstream.RejectionSampler(host_sampler)(
+        _packed_metadata(drafts), None, logits, _random_metadata(4, 0.9, top_k=1)
+    )
+    assert result.sampled_token_ids.tolist() == [[0, 1, 2], [0, 1, -1], [0, -1, -1], [2, -1, -1]]
 
 
 def test_rejection_sampling_requires_native_extension(monkeypatch):

@@ -657,6 +657,18 @@ def test_quantization_is_rejected_with_bfloat16():
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def test_alibi_model_is_rejected(monkeypatch):
+    """Neither attention layout implements ALiBi; fail in the front end, not in the worker."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    # The Falcon spelling of the flag `ModelConfig.uses_alibi` reads.
+    monkeypatch.setattr(vllm_config.model_config.hf_text_config, "alibi", True, raising=False)
+
+    with pytest.raises(ValueError, match="does not support ALiBi"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_accepted_at_tp1():
     """The guard above must not reject the single-card bf16 path."""
     from spyre_inference.platform import TorchSpyrePlatform

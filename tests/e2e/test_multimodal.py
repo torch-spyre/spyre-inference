@@ -226,7 +226,8 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
 @pytest.mark.uses_subprocess
-@pytest.mark.timeout(3600)
+# Cold cache: decoder warmup takes about 30 minutes, then six vision budgets compile at ~5 minutes each.
+@pytest.mark.timeout(7200)
 def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     """Every opted-in ``max_soft_tokens``, and a default and a 1120 image sharing one encoder
     call, replay a budget compiled at warmup."""

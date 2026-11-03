@@ -27,7 +27,7 @@ import torch
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.models import muse_glimmer as mg
 
-from spyre_inference.models.muse_glimmer import force_language_model_only
+from spyre_inference.models.muse_glimmer import disable_vision
 
 hfm = pytest.importorskip("transformers.models.muse_glimmer.modeling_muse_glimmer")
 
@@ -54,26 +54,36 @@ def _patch_get_config(monkeypatch, model_type):
     )
 
 
-def test_glimmer_checkpoint_defaults_to_text_only(monkeypatch):
-    """The tower is then a placeholder: not loaded, and image requests are refused."""
+@pytest.mark.parametrize("limits", [{}, {"image": 0}, {"video": 0}])
+def test_glimmer_checkpoint_caps_image_and_video_at_zero(monkeypatch, limits):
+    """An unnamed modality defaults to 999, which would keep the tower."""
     _patch_get_config(monkeypatch, "muse_glimmer")
-    engine_args = _engine_args()
-    force_language_model_only(engine_args)
-    assert engine_args.language_model_only
+    engine_args = _engine_args(limit_mm_per_prompt=limits)
+    disable_vision(engine_args)
+    assert engine_args.limit_mm_per_prompt == {"image": 0, "video": 0}
 
 
-def test_explicit_multimodal_limits_are_left_alone(monkeypatch):
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("value", [1, {"count": 2}, {}])
+def test_requested_image_or_video_is_refused(monkeypatch, modality, value):
     _patch_get_config(monkeypatch, "muse_glimmer")
-    engine_args = _engine_args(limit_mm_per_prompt={"image": 1})
-    force_language_model_only(engine_args)
-    assert not engine_args.language_model_only
+    engine_args = _engine_args(limit_mm_per_prompt={modality: value})
+    with pytest.raises(NotImplementedError, match=f"{modality} input is not supported"):
+        disable_vision(engine_args)
+
+
+def test_language_model_only_is_left_alone(monkeypatch):
+    _patch_get_config(monkeypatch, "muse_glimmer")
+    engine_args = _engine_args(language_model_only=True, limit_mm_per_prompt={"image": 1})
+    disable_vision(engine_args)
+    assert engine_args.limit_mm_per_prompt == {"image": 1}
 
 
 def test_other_models_are_left_alone(monkeypatch):
     _patch_get_config(monkeypatch, "gemma4")
     engine_args = _engine_args()
-    force_language_model_only(engine_args)
-    assert not engine_args.language_model_only
+    disable_vision(engine_args)
+    assert engine_args.limit_mm_per_prompt == {}
 
 
 def _close(norm, ref, x):

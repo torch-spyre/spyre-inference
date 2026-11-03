@@ -168,4 +168,4 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     register_models()
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
-    muse_glimmer.force_language_model_only(engine_args)
+    muse_glimmer.disable_vision(engine_args)

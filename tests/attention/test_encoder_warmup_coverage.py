@@ -69,7 +69,6 @@ def _make_impl(config, num_heads=4, num_kv_heads=1, head_size=64):
             head_size=head_size,
             scale=head_size**-0.5,
             num_kv_heads=num_kv_heads,
-            alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="auto",
             logits_soft_cap=None,

@@ -239,13 +239,13 @@ jobs:
 
   # One `artifact-id` record per run for push-to-clickhouse's v2 ingest; every matrix leg shares
   # the image and install inputs. Must run on the image under test: the base id lives in its
-  # filesystem. The perf job links its own artifact, so it is skipped there.
+  # filesystem, but no card, so it takes the cardless pool. The perf job links its own artifact, so it is skipped there.
   artifact_identity:
     name: Derive artifact identity
     needs: resolve
     if: ${{ needs.resolve.outputs.resolved_test_type != 'perf' }}
     continue-on-error: true
-    runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x1","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
+    runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x0","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

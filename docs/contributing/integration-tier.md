@@ -94,10 +94,11 @@ not removed for that alone; it is still the cheap guard on its path.
 
 ## The regression tier
 
-`regression` runs on every push to a PR and in the merge queue. It is the integration tier
-plus one more opt-in marker, `regression_extra`: the product-model quality cases and the one
-heavy compiled vision path that integration leaves out. `trunk` (push to main) still runs
-everything, so a case outside both sets keeps its coverage there.
+`regression` is the broader tier other repos' tooling can request. It is the integration
+tier plus one more opt-in marker, `regression_extra`: the product-model quality cases and the
+one heavy compiled vision path that integration leaves out. This repo's own PRs, merge queue
+and pushes always run `trunk`, which is every test, so a case outside both sets keeps its
+coverage there.
 
 ```bash
 pytest -m regression_extra --collect-only -q   # what regression adds on top of integration

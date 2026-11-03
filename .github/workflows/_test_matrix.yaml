@@ -97,8 +97,9 @@ on:
                           2-card jobs); the upstream-dependency dispatch's
                           default
             regression  — integration plus the opt-in regression_extra
-                          set (default; PRs and the merge queue)
-            trunk       — push-to-main CI; every config
+                          set (default; cross-repo dispatches)
+            trunk       — every config; what this repo's own PRs, merge
+                          queue and pushes run (test_each_commit.yaml)
           Same knob and vocabulary as the sibling repos (torch-spyre,
           hf-adapters); the mapping to configs is repo-internal. Validated
           and defaulted (empty -> regression) once in the "Decide whether to

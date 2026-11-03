@@ -1,9 +1,8 @@
 name: 'test_each_commit'
-# run-name mirrors the test_type passed to _test_matrix.yaml below ("trunk"
-# on push, "regression" otherwise) -- push-to-clickhouse.yaml reads this bare
-# value straight off display_title to recover trigger_type without an extra
-# API call.
-run-name: ${{ github.event_name == 'push' && 'trunk' || 'regression' }}
+# run-name mirrors the test_type passed to _test_matrix.yaml below --
+# push-to-clickhouse.yaml reads this bare value straight off display_title to
+# recover trigger_type without an extra API call.
+run-name: trunk
 
 # ---------------------------------------------------------------------------
 # push / PR / merge_group entrypoint. Thin caller of the reusable
@@ -70,7 +69,9 @@ jobs:
       # should always validate the merged state, not rely on the PR-diff
       # change-detection heuristic.
       skip_if_no_changes: ${{ github.event_name != 'push' }}
-      test_type: ${{ github.event_name == 'push' && 'trunk' || 'regression' }}
+      # Our own PRs, merge queue and pushes run every config; the smaller integration and
+      # regression tiers are for the cross-repo dispatches (integration-tests.yaml).
+      test_type: trunk
 
   # ---------------------------------------------------------------------------
   # Required check gate -- this job name must match the existing branch

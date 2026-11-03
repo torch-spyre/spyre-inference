@@ -51,5 +51,5 @@ repos:
       # deleting a method but forgetting to remove all of the call sites in other files.
       pass_filenames: false
       # Pinned to the pre-commit stage so the manual-stage CI lint run skips it;
-      # CI runs it in its own step, against the project venv.
+      # CI runs it in its own step, with the torch-spyre type stubs on PYTHONPATH.
       stages: [pre-commit]

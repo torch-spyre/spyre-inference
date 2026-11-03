@@ -172,7 +172,8 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
                     if temperature == 0:
                         assert row[token].logprob == max(value.logprob for value in row.values())
                 if capture:
-                    assert internal_ids[output.request_id] in state["snapshots"]
+                    snapshot = state["snapshots"][internal_ids[output.request_id]]
+                    assert snapshot["prompt_rows_checked"] == len(case["prompt_ids"])
             report[label] = dict(
                 outputs=[list(output.outputs[0].token_ids) for output in result],
                 logprobs=[
@@ -227,10 +228,10 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
                         ]["path"],
                         weights_only=True,
                     )
+                    # Prefills share different packed batches across these modes. The worker
+                    # checks prompt preservation against each request's own prefill snapshot.
                     errors = _compare_cache(
-                        {k: v for k, v in cache.items() if k in TARGET_CACHE_NAMES},
-                        base,
-                        prompt_length=len(cases[index]["prompt_ids"]),
+                        {k: v for k, v in cache.items() if k in TARGET_CACHE_NAMES}, base
                     )
                 report[label]["cache_errors"][index] = errors
             snapshots[label] = caches

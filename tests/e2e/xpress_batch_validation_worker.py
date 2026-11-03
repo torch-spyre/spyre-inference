@@ -30,6 +30,7 @@ class BatchValidationWorker(ValidationWorker):
         super().configure_proposer(mode, references, reject_at, passes, tail_salt)
         self.batch_steps = []
         self.snapshots = {}
+        self._prompt_caches = {}
         self.capture_dir = Path(capture_dir) if capture_dir else None
         if self.capture_dir:
             self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -63,6 +64,17 @@ class BatchValidationWorker(ValidationWorker):
                     output_limit=params.max_tokens,
                 )
             )
+        if self.capture_dir:
+            for row in rows:
+                prompt_length = len(row["prompt_ids"])
+                if (
+                    row["committed_end"] >= prompt_length
+                    and row["request"] not in self._prompt_caches
+                ):
+                    # Preserve target prompt rows before the first draft can touch any cache.
+                    self._prompt_caches[row["request"]] = self._read_cache(
+                        row, prompt_length, include_draft=False
+                    )
         result = [[] for _ in rows]
         if self.mode in ("real", "real_scripted"):
             result = self._native_propose(
@@ -111,10 +123,8 @@ class BatchValidationWorker(ValidationWorker):
         self.batch_steps.append(rows)
         return result
 
-    def _capture(self, row):
+    def _read_cache(self, row, length, *, include_draft):
         runner = self.model_runner
-        length = min(len(row["prompt_ids"]) + row["output_limit"] - 1, row["committed_end"])
-        include_draft = self.mode in ("real", "real_scripted")
         cache = {}
         for name, pages in runner._spyre_kv_caches.items():
             if name in runner.drafter._draft_attn_layer_names and not include_draft:
@@ -128,9 +138,25 @@ class BatchValidationWorker(ValidationWorker):
                 .contiguous()
                 for tensor in pages
             )
+        return cache
+
+    def _capture(self, row):
+        prompt_length = len(row["prompt_ids"])
+        length = min(prompt_length + row["output_limit"] - 1, row["committed_end"])
+        cache = self._read_cache(row, length, include_draft=self.mode in ("real", "real_scripted"))
+        for name, pair in self._prompt_caches[row["request"]].items():
+            for label, actual, expected in zip(("key", "value"), cache[name], pair, strict=True):
+                assert torch.equal(actual[:prompt_length], expected), (
+                    row["request"],
+                    name,
+                    label,
+                    "prompt cache changed during decoding",
+                )
         path = self.capture_dir / (hashlib.sha256(row["request"].encode()).hexdigest() + ".pt")
         torch.save(cache, path)
-        self.snapshots[row["request"]] = dict(path=str(path), length=length)
+        self.snapshots[row["request"]] = dict(
+            path=str(path), length=length, prompt_rows_checked=prompt_length
+        )
 
     def validation_state(self):
         state = super().validation_state()

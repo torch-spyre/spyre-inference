@@ -19,6 +19,15 @@ from spyre_inference import envs
 from spyre_inference.v1.worker import compile_guard
 
 
+@pytest.fixture
+def counted_spyre_loops():
+    """Exercise for_each_tile as counted loops, as used by jagged attention."""
+    from torch_spyre._inductor import config
+
+    with config.patch(backend_loop_unroll=False):
+        yield
+
+
 def pytest_collection_modifyitems(items):
     """Skip batched decode until it composes with the default tiled page walk.
 

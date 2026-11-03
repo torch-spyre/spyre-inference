@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
+    SPYRE_JAGGED_ATTENTION: bool = False
+    SPYRE_JAGGED_PARALLEL_ENTRIES: int = 64
+    SPYRE_JAGGED_PAGE_CAPACITY_BUCKETS: str | None = None
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
@@ -91,6 +94,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
+    # Experimental packed prefill, mixed batches and multi-token queries. Pure decode
+    # keeps SPYRE_JAGGED_DECODE. Always compiled. No ALiBi or FP8 KV cache.
+    "SPYRE_JAGGED_ATTENTION": lambda: bool(int(os.getenv("SPYRE_JAGGED_ATTENTION", "0"))),
+    "SPYRE_JAGGED_PARALLEL_ENTRIES": lambda: int(os.getenv("SPYRE_JAGGED_PARALLEL_ENTRIES", "64")),
+    # Comma-separated page-capacity buckets for jagged attention. Unset uses powers
+    # of two up to max_model_len / block_size. Governs both the recorded variants
+    # and the per-step capacity. Experimental: a denser ladder cuts page padding in
+    # the kernel but measured an end-to-end regression on a clustered workload, and
+    # multiplies warmup. Entries above max_model_len / block_size are dropped.
+    "SPYRE_JAGGED_PAGE_CAPACITY_BUCKETS": lambda: os.getenv("SPYRE_JAGGED_PAGE_CAPACITY_BUCKETS"),
     # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.

@@ -908,14 +908,23 @@ def test_head_major_dispatches_by_query_width(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
+@pytest.mark.parametrize("packed_enabled", [False, True], ids=["paged", "packed"])
+@pytest.mark.usefixtures("counted_spyre_loops")
 def test_head_major_grouped_decode_matches_reference(
-    default_vllm_config, monkeypatch, seq_lens, configure_compilation, configure_device
+    default_vllm_config,
+    monkeypatch,
+    seq_lens,
+    configure_compilation,
+    configure_device,
+    packed_enabled,
 ):
     from vllm.config import get_current_vllm_config
 
+    monkeypatch.setenv("SPYRE_JAGGED_ATTENTION", str(int(packed_enabled)))
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     envs.clear_env_cache()
+    assert packed_enabled == envs.SPYRE_JAGGED_ATTENTION
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 8192
@@ -937,7 +946,8 @@ def test_head_major_grouped_decode_matches_reference(
         configure_device=configure_device,
     )
 
-    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+    expected_groups = [] if packed_enabled and any(q > 1 for q, _ in seq_lens) else [2]
+    assert groups_run == expected_groups
 
 
 @pytest.mark.parametrize("block_size", [64, 128])

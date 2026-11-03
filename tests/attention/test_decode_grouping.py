@@ -25,11 +25,12 @@ BLOCK = 128
 KV_HEADS, HEAD = 2, 64
 
 
-@pytest.fixture()
-def decode_config(default_vllm_config, monkeypatch):
+@pytest.fixture(params=[False, True], ids=["paged", "packed"])
+def decode_config(default_vllm_config, monkeypatch, request):
     from vllm.config import get_current_vllm_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_ATTENTION", str(int(request.param)))
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 32768
@@ -143,8 +144,15 @@ def test_neighbouring_buckets_merge(decode_config, monkeypatch):
     assert _build([300, 600]).decode_groups is None
 
 
-def test_groups_cover_only_the_decode_prefix(decode_config, monkeypatch):
+def test_mixed_batch_uses_selected_attention_path(decode_config, monkeypatch):
+    from spyre_inference import envs
+
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     md = _build([32000, 2000, 300], query_lens=[1, 1, 100])
-    assert md.num_decode_seqs == 2
-    assert _members(md) == [[0], [1]]
+    if envs.SPYRE_JAGGED_ATTENTION:
+        assert md.jagged_plan is not None
+        assert md.decode_groups is None
+    else:
+        assert md.jagged_plan is None
+        assert md.num_decode_seqs == 2
+        assert _members(md) == [[0], [1]]

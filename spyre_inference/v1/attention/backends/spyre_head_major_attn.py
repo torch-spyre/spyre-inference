@@ -156,6 +156,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
     supports_fp8_kv_cache: ClassVar[bool] = True
 
+    _jagged_head_major = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # At construction: forward() runs past a custom-op boundary that loses the config.

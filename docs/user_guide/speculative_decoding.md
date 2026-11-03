@@ -8,6 +8,8 @@ the published `UIUC-SSAIL/Qwen3-8B-XPress-b16` checkpoint directly with
 Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
 the V1 runner, up to four active requests, and prefix caching
 disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+The four-request cap reflects the batches validated on Spyre so far. Larger
+batches require additional device validation before raising this limit.
 
 ## Run Qwen3-8B
 
@@ -37,8 +39,13 @@ For four concurrent requests, set `--max-num-seqs 4`,
 `--max-num-batched-tokens 128`, and
 `--compilation-config '{"compile_sizes": [1, 16, 32, 64, 128]}'`.
 Set `SPYRE_ATTN_QUERY_BUCKETS=1,16,64,128` for this token budget.
+Set `SPYRE_MAX_NUM_PARTIAL_PREFILLS=4` to allow four partial prefills.
 The draft body uses batches of 1, 2, or 4; three active requests pad to four.
 Each request retains its own accepted context, page table, and output limit.
+
+The batch-four test also covers default attention buckets, compilation sizes
+and the default single partial prefill. The settings above reduce query padding
+and allow more concurrent partial prefills.
 
 | Maximum requests | Minimum token budget |
 | --- | --- |

@@ -37,13 +37,18 @@ from vllm import LLM, SamplingParams
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
 
 
-def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property):
+@pytest.mark.parametrize("tuned", [False, True], ids=["defaults", "tuned"])
+def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
     monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
-    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
+    if tuned:
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
+        monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "4")
+    else:
+        monkeypatch.delenv("SPYRE_ATTN_QUERY_BUCKETS", raising=False)
+        monkeypatch.delenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", raising=False)
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "4")
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv(
@@ -59,7 +64,7 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property):
         max_num_batched_tokens=128,
         enable_prefix_caching=False,
         disable_log_stats=False,
-        compilation_config={"compile_sizes": [1, 16, 32, 64, 128]},
+        compilation_config={"compile_sizes": [1, 16, 32, 64, 128]} if tuned else None,
         worker_cls="xpress_batch_validation_worker.BatchValidationWorker",
         speculative_config=dict(
             method="dflash",
@@ -72,6 +77,7 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property):
     )
     report = {
         "complete": False,
+        "tuned": tuned,
         "topc": int(os.environ.get("SPYRE_XPRESS_TEST_TOPC", "128")),
         "attention_record": os.environ.get("SPYRE_ATTN_RECORD", "1"),
     }

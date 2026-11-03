@@ -1437,8 +1437,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
 
         Kv-major, matching the kernels' head order. Built on first use and dropped by
-        ``process_weights_after_loading``. ``move_model_to_spyre`` points the source at the
-        parameter the model holds on Spyre, which is the one a reload writes.
+        ``process_weights_after_loading``.
         """
         if self._sinks_source is None:
             return None

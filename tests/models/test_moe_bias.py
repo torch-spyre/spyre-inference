@@ -186,7 +186,8 @@ def test_relayout_without_biases_keeps_none(monkeypatch):
 
 
 def test_quant_config_follows_the_biases_moved_to_spyre(monkeypatch):
-    """On Spyre, ``model.to`` replaces ``w13_bias``/``w2_bias`` with new Parameters."""
+    """The quant config holds the ``w13_bias``/``w2_bias`` Parameters, so ``model.to`` on
+    Spyre must keep those objects for it to see the device tensors."""
     from types import MethodType
 
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts

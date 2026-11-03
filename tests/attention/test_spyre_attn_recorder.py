@@ -83,7 +83,6 @@ def impl(default_vllm_config):
         head_size=HEAD_SIZE,
         scale=1.0 / (HEAD_SIZE**0.5),
         num_kv_heads=NUM_KV_HEADS,
-        alibi_slopes=None,
         sliding_window=None,
     )
 
@@ -708,22 +707,6 @@ class TestRecordBatchedDecode:
         bucketer = builder._attn_bucketer = make_bucketer()
 
         assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
-
-    def test_alibi_layer_records_nothing_batched(self, default_vllm_config, wide_cache, builder):
-        """The batched kernel doesn't implement ALiBi, so those layers never dispatch to it."""
-        torch._dynamo.reset()
-        get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
-        alibi_impl = SpyreAttentionImpl(
-            num_heads=NUM_HEADS,
-            head_size=HEAD_SIZE,
-            scale=1.0 / (HEAD_SIZE**0.5),
-            num_kv_heads=NUM_KV_HEADS,
-            alibi_slopes=[0.5] * NUM_HEADS,
-            sliding_window=None,
-        )
-        bucketer = builder._attn_bucketer = make_bucketer()
-
-        assert _record(alibi_impl, wide_cache, builder) == self._expected(bucketer, 0)
 
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """The gather's entry axis, not the block count, is what a small cache bounds."""

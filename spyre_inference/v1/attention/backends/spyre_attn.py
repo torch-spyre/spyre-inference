@@ -791,9 +791,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         real_num_blocks: list[int] = []
 
         if self.sliding_window is None:
-            # seq_lens itself is NOT padded: it feeds the mask's kv_valid cutoff,
-            # causal context_len, and ALiBi offset, all of which need the true
-            # length. The padded block count is carried separately.
+            # seq_lens itself is NOT padded: it feeds the mask's kv_valid cutoff
+            # and causal context_len, which need the true length. The padded
+            # block count is carried separately.
             for s in range(num_seqs):
                 n = (int(seq_lens[s].item()) + block_size - 1) // block_size
                 real_num_blocks.append(n)
@@ -1303,6 +1303,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # upstream checks supports_sink() on CUDA/ROCm only.
         if sinks is not None:
             raise NotImplementedError("Spyre attention does not support attention sinks")
+        # Backstop for the platform's `uses_alibi` check, which is a heuristic over HF config.
+        if alibi_slopes is not None:
+            raise NotImplementedError("ALiBi is not supported by the Spyre attention backends.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1318,7 +1321,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
-        # Resolved before the ALiBi slopes below, which are built at this dtype.
         # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
@@ -1356,22 +1358,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
         self._kv_scales: tuple[float, float] | None = None
-
-        # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
-        # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
-        # per-block bias construction in _online_softmax_attention broadcasts
-        # cleanly against the score-tile shape.
-        if alibi_slopes is not None:
-            slopes_t = torch.tensor(alibi_slopes, dtype=self.model_dtype)
-            if slopes_t.numel() != num_heads:
-                raise ValueError(
-                    f"alibi_slopes must have length num_heads={num_heads}, got {slopes_t.numel()}"
-                )
-            self.alibi_slopes: torch.Tensor | None = slopes_t.view(
-                num_kv_heads, self.num_queries_per_kv, 1, 1
-            )
-        else:
-            self.alibi_slopes = None
 
         # Normalise the API's Optional[float] into a plain float so the kernel
         # can bake it as a closure constant. logits_soft_cap == 0.0 disables
@@ -1461,10 +1447,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return False
         # The 2-D page index lowers to aten.index, which upcasts the int32 index
         # to int64 and fails eager; eager takes the per-seq loop instead.
-        if not self._compile_attn:
-            return False
-        # The batched kernel doesn't implement ALiBi.
-        return self.alibi_slopes is None
+        return self._compile_attn
 
     def _tiled_batched_decode_supported(self) -> bool:
         """Whether batched decode may run under the tiled walk; overridable."""
@@ -1515,8 +1498,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # and upstream's own unified_kv_cache_update op covers the rest.
 
         # Mirror batched-decode precomputes to device once per step, only for
-        # layers whose impl can actually use the batched kernel (skips ALiBi
-        # layers, eager attention and, under the tiled walk, the token-major layout).
+        # layers whose impl can actually use the batched kernel (skips eager
+        # attention and, under the tiled walk, the token-major layout).
         if (
             not self._grouped_decode_preconditions_met(attn_metadata, k_pages.shape[0])
             and self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
@@ -1537,8 +1520,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def graph_key(self) -> tuple:
         """The kernel arguments that may differ between layers of one attention group."""
-        alibi = None if self.alibi_slopes is None else tuple(self.alibi_slopes.flatten().tolist())
-        return (self.num_heads, self.scale, self.logits_soft_cap, alibi, self._kv_scales)
+        return (self.num_heads, self.scale, self.logits_soft_cap, self._kv_scales)
 
     def record_graphs(
         self,
@@ -2048,7 +2030,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run one sequence's page attention. The point where a subclass swaps kernels."""
@@ -2072,7 +2053,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             logits_soft_cap=self.logits_soft_cap,
-            alibi_stack=alibi_stack,
             out=out,
         )
 
@@ -2199,41 +2179,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if isinstance(index_table, torch.Tensor):
                 assert index_table.shape[0] == len(active_bs)
 
-            # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
-            #
-            # The full ALiBi form is slope[h] * (kv_pos - (context_len + q_rel)),
-            # which varies over both query and KV positions. The (context_len + q_rel)
-            # term is a per-query-row constant, and softmax is invariant under adding
-            # any per-row constant to its input (numerator and denominator both pick
-            # up the same exp() factor). We therefore drop it and keep only the
-            # kv-dependent term — the softmax output is bit-identical to the full
-            # form, and each tile stays 1D over KV (block_size floats per head)
-            # instead of 2D (aligned_query_len * block_size).
-            #
-            # Padded blocks get a tile too (the loop iterates active_bs); their
-            # values stay finite (slopes are small negative powers of two) and
-            # saturate under the mask's finfo.min, so they stay inert.
-            #
-            # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
-            # (alibi_offset = seq_offset - context_len) — the production Triton path.
-            #
-            # Stacked block-major on the host, then one transfer, because the
-            # kernel tiles the block axis rather than indexing a list.
-            alibi_stack: torch.Tensor | None = None
-            if self.alibi_slopes is not None:
-                context_len = kv_len - query_len
-                bias_tiles = []
-                for b in active_bs:
-                    kv_pos = torch.arange(
-                        b * block_size,
-                        (b + 1) * block_size,
-                        dtype=self.model_dtype,
-                    )
-                    rel = (kv_pos - context_len).view(1, 1, 1, block_size)
-                    bias_tiles.append(self.alibi_slopes * rel)
-                alibi_stack = convert(torch.stack(bias_tiles), device=_target_device)
-                assert alibi_stack.shape[0] == len(active_bs)
-
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(
                     attn_metadata, _target_device
@@ -2250,7 +2195,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_stack,
                 len(active_bs),
                 aligned_query_lens[seq_idx],
-                alibi_stack,
                 out_staging if store_out else None,
             )
 

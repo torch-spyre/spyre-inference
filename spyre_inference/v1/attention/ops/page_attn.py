@@ -35,7 +35,6 @@ def page_attn_kernel(
     num_kv_heads,
     head_size,
     logits_soft_cap=0.0,
-    alibi_stack=None,
     out=None,
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
@@ -54,10 +53,6 @@ def page_attn_kernel(
             tensor, row i holding the i-th active block's page index at
             column 0.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
-        alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size],
-            or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
-            per-query-row constants — see the derivation at the bias-tile
-            construction site in _online_softmax_attention.
         out: buffer to store into, or None to return the result instead.
 
     Returns [padded_query_len, num_heads, head_size], or ``out`` when this
@@ -84,12 +79,9 @@ def page_attn_kernel(
         q,
     ]
     dims: list[int | None] = [0, None, None, 0, None]
-    if alibi_stack is not None:
-        operands.append(alibi_stack[:num_blocks])
-        dims.append(0)
 
     def block_body(carry, tiles):
-        page_index, k_pages, v_pages, mask_tile, q, *rest = tiles
+        page_index, k_pages, v_pages, mask_tile, q = tiles
         page_idx = page_index[0, 0:1]
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
@@ -102,14 +94,8 @@ def page_attn_kernel(
         scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Pull logits into (-cap, +cap) before the mask add so masked
-            # positions still map cleanly to -inf. Applied before the ALiBi
-            # bias so the positional term is not squashed by the tanh.
+            # positions still map cleanly to -inf.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        if rest:
-            # ALiBi bias slope[h] * (kv_pos - context_len). The additive
-            # mask_tile below uses finfo.min for masked positions, so this
-            # bias cannot un-mask them.
-            scores = scores + rest[0][0]
         scores = scores + mask_tile[0]
 
         scores_max = torch.amax(scores, dim=-1, keepdim=True)

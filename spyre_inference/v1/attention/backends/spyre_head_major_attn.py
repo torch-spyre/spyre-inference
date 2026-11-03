@@ -24,7 +24,7 @@ too, so it needs none of the per-sequence kernel's ``(page, kv_head)`` fold.
 
 Everything above the cache's memory is shared with ``spyre_attn``; the places that touch
 it — advertised shape, allocation, kernels, index tables — are duplicated rather than
-parameterised. This layout does not carry ALiBi.
+parameterised.
 """
 
 from collections.abc import Callable
@@ -168,11 +168,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # this leaves the rest of the model eager.
         self._decode_attn_fn = _page_attn_decode_compiled
         self._decode_fn = _batched_decode_compiled
-        if self.alibi_slopes is not None:
-            raise NotImplementedError(
-                "ALiBi is not supported on the head-major KV layout; use the "
-                "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
-            )
         self._folded: SpyrePagedKVCache | None = None
         self._kv_row_pool_device: torch.Tensor | None = None
 
@@ -350,7 +345,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import warnings
 from unittest.mock import Mock
 
@@ -38,6 +37,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
+from spyre_inference.v1.attention.backends.spyre_head_major_attn import SpyreHeadMajorAttentionImpl
 from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
@@ -102,23 +103,6 @@ def configure_compilation(request, monkeypatch):
     torch._dynamo.reset()
 
 
-def _alibi_slopes(num_heads: int) -> list[float]:
-    """Standard ALiBi slope generator (Press et al. 2022).
-
-    For power-of-two head counts, uses the geometric sequence from the paper.
-    For non-power-of-two counts, interleaves the next power-of-two sequence.
-    """
-
-    def _pow2(n: int) -> list[float]:
-        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-        return [start * (start**i) for i in range(n)]
-
-    if math.log2(num_heads).is_integer():
-        return _pow2(num_heads)
-    closest = 2 ** math.floor(math.log2(num_heads))
-    return _pow2(closest) + _pow2(2 * closest)[0::2][: num_heads - closest]
-
-
 @torch.inference_mode()
 def _run_spyre_attn_test(
     seq_lens: list[tuple[int, int]],
@@ -126,7 +110,6 @@ def _run_spyre_attn_test(
     sliding_window: int | None,
     configure_compilation: str,
     configure_device: str,
-    use_alibi: bool = False,
     soft_cap: float | None = None,
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
@@ -152,8 +135,6 @@ def _run_spyre_attn_test(
 
     torch.set_default_device("cpu")
     set_random_seed(0)
-
-    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -237,7 +218,6 @@ def _run_spyre_attn_test(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
@@ -304,17 +284,12 @@ def _run_spyre_attn_test(
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
-        alibi_slopes=alibi_slopes,
     )
 
     if max(query_lens) >= 32:
         atol, rtol = 0.3, 0.2
     else:
         atol, rtol = 0.2, 0.2
-    if dtype is torch.bfloat16 and alibi_slopes is not None:
-        # The reference builds the ALiBi bias in fp32, the impl at model dtype: bf16 costs
-        # up to 0.5 of a logit at kv=512. Non-ALiBi bf16 holds the fp16 tolerance.
-        atol, rtol = atol * 4, rtol * 2
 
     assert_close_outliers(
         output.to("cpu"),
@@ -601,47 +576,6 @@ def test_spyre_attn_sliding_window(
         sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
-    )
-
-
-@pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [
-        pytest.param("NONE", id="compilation_NONE"),
-        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
-        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
-        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
-    ],
-)
-def test_spyre_attn_alibi(
-    default_vllm_config,
-    seq_lens: list[tuple[int, int]],
-    configure_compilation: str,
-    configure_device: str,
-) -> None:
-    """ALiBi positional bias correctness."""
-    _run_spyre_attn_test(
-        seq_lens=seq_lens,
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        use_alibi=True,
     )
 
 
@@ -1205,6 +1139,16 @@ def test_attention_sinks_are_rejected(default_vllm_config):
 
 
 @pytest.mark.parametrize(
+    "impl_cls", [SpyreAttentionImpl, SpyreHeadMajorAttentionImpl, SpyreEncoderAttentionImpl]
+)
+def test_alibi_is_rejected(default_vllm_config, impl_cls):
+    """The backstop behind the platform's `uses_alibi` check, which is a heuristic over HF
+    config fields; without the raise a model it misses would run without its positional bias."""
+    with pytest.raises(NotImplementedError, match="ALiBi is not supported"):
+        impl_cls(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8, alibi_slopes=[0.5] * 8)
+
+
+@pytest.mark.parametrize(
     "configure_device",
     [pytest.param("spyre", id="device_spyre")],
     indirect=True,
@@ -1218,24 +1162,22 @@ def test_attention_sinks_are_rejected(default_vllm_config):
     indirect=True,
 )
 @pytest.mark.parametrize(
-    ("seq_lens", "sliding_window", "use_alibi"),
+    ("seq_lens", "sliding_window"),
     [
-        pytest.param([(1, 512)], None, False, id="decode(q=1,kv=512)"),
-        pytest.param([(32, 256)], None, False, id="prefill(q=32,kv=256)"),
-        pytest.param([(1, 256), (32, 256)], None, False, id="mixed(decode+prefill)"),
-        pytest.param([(32, 256)], 64, False, id="sliding_window(q=32,kv=256)"),
-        pytest.param([(1, 512)], None, True, id="alibi_decode(q=1,kv=512)"),
+        pytest.param([(1, 512)], None, id="decode(q=1,kv=512)"),
+        pytest.param([(32, 256)], None, id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (32, 256)], None, id="mixed(decode+prefill)"),
+        pytest.param([(32, 256)], 64, id="sliding_window(q=32,kv=256)"),
     ],
 )
 def test_spyre_attn_bfloat16(
     default_vllm_config,
     seq_lens: list[tuple[int, int]],
     sliding_window: int | None,
-    use_alibi: bool,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Run the kernels at bf16: KV cache, masks and ALiBi slopes all follow model dtype.
+    """Run the kernels at bf16: KV cache and masks follow model dtype.
 
     TP1 only, matching the platform — bf16 with TP>1 is rejected as all_reduce is fp16-only.
     """
@@ -1245,7 +1187,6 @@ def test_spyre_attn_bfloat16(
         sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
-        use_alibi=use_alibi,
         dtype=torch.bfloat16,
     )
 
@@ -2222,12 +2163,11 @@ def test_batched_decode_matches_fp32_reference(
 
 
 @pytest.mark.parametrize(
-    "num_blocks,padded_query_len,num_kv_heads,qpk,use_alibi",
+    "num_blocks,padded_query_len,num_kv_heads,qpk",
     [
-        pytest.param(1, 4, 2, 1, False, id="one_block"),
-        pytest.param(4, 4, 2, 1, False, id="four_blocks"),
-        pytest.param(3, 8, 2, 2, False, id="gqa"),
-        pytest.param(4, 8, 2, 2, True, id="alibi"),
+        pytest.param(1, 4, 2, 1, id="one_block"),
+        pytest.param(4, 4, 2, 1, id="four_blocks"),
+        pytest.param(3, 8, 2, 2, id="gqa"),
     ],
 )
 def test_page_attn_matches_fp32_reference(
@@ -2235,7 +2175,6 @@ def test_page_attn_matches_fp32_reference(
     padded_query_len: int,
     num_kv_heads: int,
     qpk: int,
-    use_alibi: bool,
 ) -> None:
     """Prefill's online softmax equals one softmax over the whole KV window.
 
@@ -2272,17 +2211,6 @@ def test_page_attn_matches_fp32_reference(
     mask = torch.full((padded_query_len, kv_len), mask_min, dtype=torch.float32)
     mask.masked_fill_(torch.arange(kv_len).unsqueeze(0) <= q_pos.unsqueeze(1), 0.0)
     mask_tiles = mask.reshape(padded_query_len, num_blocks, block_size).transpose(0, 1).contiguous()
-    alibi_stack = None
-    alibi = torch.zeros(num_kv_heads, qpk, 1, kv_len, dtype=torch.float32)
-    if use_alibi:
-        slopes = torch.linspace(0.01, 0.08, num_heads).reshape(num_kv_heads, qpk, 1, 1)
-        alibi_stack = torch.stack(
-            [
-                slopes * torch.arange(b * block_size, (b + 1) * block_size).reshape(1, 1, 1, -1)
-                for b in range(num_blocks)
-            ]
-        )
-        alibi = alibi_stack.permute(1, 2, 3, 0, 4).reshape(num_kv_heads, qpk, 1, kv_len)
 
     actual = page_attn_kernel(
         query=query,
@@ -2297,14 +2225,13 @@ def test_page_attn_matches_fp32_reference(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
-        alibi_stack=alibi_stack,
     )
 
     q_rows = query.index_select(0, query_row_index)
     q = q_rows.transpose(0, 1).reshape(num_kv_heads, qpk, padded_query_len, head_size)
     k = k_pages[page_ids].reshape(kv_len, num_kv_heads, head_size)
     v = v_pages[page_ids].reshape(kv_len, num_kv_heads, head_size)
-    scores = torch.einsum("hgid,thd->hgit", q, k) * scale + alibi + mask
+    scores = torch.einsum("hgid,thd->hgit", q, k) * scale + mask
     probs = torch.softmax(scores, dim=-1)
     expected = (
         torch.einsum("hgit,thd->hgid", probs, v)

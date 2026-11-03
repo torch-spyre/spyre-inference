@@ -56,6 +56,7 @@ def token_major_output(attn, num_seqs, num_kv_heads, num_queries_per_kv, verify_
 
 
 def batched_decode_kernel(
+    *,
     query,
     rep_row_ids,
     k_pages,

@@ -71,6 +71,7 @@ def _entry_local_update(
 
 
 def _merge_entry_local(
+    *,
     tile_max,
     tile_sum,
     tile_output,
@@ -88,6 +89,7 @@ def _merge_entry_local(
 
 
 def batched_decode_head_major_kernel(
+    *,
     query,
     rep_row_ids,
     k_pages,
@@ -234,7 +236,13 @@ def batched_decode_head_major_kernel(
     if use_entry_local:
         tile_max, tile_sum, tile_output = carry
         attn = _merge_entry_local(
-            tile_max, tile_sum, tile_output, num_seqs, num_kv_heads, m, head_size
+            tile_max=tile_max,
+            tile_sum=tile_sum,
+            tile_output=tile_output,
+            num_seqs=num_seqs,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=m,
+            head_size=head_size,
         )
     else:
         _, tile_sum, tile_output = carry

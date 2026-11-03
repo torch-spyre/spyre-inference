@@ -1988,21 +1988,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> torch.Tensor:
         """Run the batch's decode attention. The point where a subclass swaps kernels."""
         return self._decode_fn(
-            query_dev,
-            rep_row_ids,
-            k_pages,
-            v_pages,
-            chunk_index_tables,
-            mask_by_chunk,
-            self.scale,
-            b_seqs,
-            blocks_per_chunk,
-            self.num_kv_heads,
-            self.num_queries_per_kv,
-            block_size,
-            self.head_size,
-            self.logits_soft_cap,
-            out,
+            query=query_dev,
+            rep_row_ids=rep_row_ids,
+            k_pages=k_pages,
+            v_pages=v_pages,
+            chunk_page_ids=chunk_index_tables,
+            mask_by_chunk=mask_by_chunk,
+            scale=self.scale,
+            num_seqs=b_seqs,
+            blocks_per_chunk=blocks_per_chunk,
+            num_kv_heads=self.num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            block_size=block_size,
+            head_size=self.head_size,
+            logits_soft_cap=self.logits_soft_cap,
+            out=out,
         )
 
     def build_index_tables(
@@ -2040,20 +2040,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
         )
         return self._attn_fn(
-            query,
-            row_table,
-            k_pages,
-            v_pages,
-            index_table,
-            mask_stack,
-            self.scale,
-            num_blocks,
-            padded_query_len,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self.logits_soft_cap,
-            out,
+            query=query,
+            query_row_index=row_table,
+            k_pages=k_pages,
+            v_pages=v_pages,
+            page_index_table=index_table,
+            mask_stack=mask_stack,
+            scale=self.scale,
+            num_blocks=num_blocks,
+            padded_query_len=padded_query_len,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            logits_soft_cap=self.logits_soft_cap,
+            out=out,
         )
 
     @_record_function("spyre_attn::online_softmax")

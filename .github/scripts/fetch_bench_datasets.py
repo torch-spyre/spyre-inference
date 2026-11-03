@@ -78,8 +78,8 @@ from pathlib import Path
 # new dataset or artifact anywhere under the root is a line here rather than
 # another secret.
 #
-# All thirteen files in the trace prefix are listed, not only the two that a
-# benchmark config selects today (aiops and cics). A fork PR gets no secrets and
+# All thirteen files in the trace prefix are listed, not only the ones that a
+# benchmark config selects today. A fork PR gets no secrets and
 # so cannot fetch a missing artifact for itself, which would make every new
 # trace-replaying config wait on a config change PLUS a cache dispatch. Mirroring
 # the whole prefix costs one transfer on a shared volume and removes that wait.

@@ -1,0 +1,36 @@
+# Throughput benchmarks for ibm-granite/granite-4.1-8b-fp8.
+#
+# An entry runs in each suite its `labels` name, and every entry runs in the
+# exhaustive suite. See vllm-benchmarks/README.md.
+#
+# in<N>_out<N> is part of the benchmark identity downstream
+# (ingest_vllm_benchmarks.py::_parse_input_shapes), so a shape change here
+# starts a new trend line.
+
+defaults:
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
+  parameters:
+    dtype: float16
+    load_format: auto
+    dataset-name: random
+    random-range-ratio: 0
+    max-num-seqs: 4
+    model: ibm-granite/granite-4.1-8b-fp8
+    tensor_parallel_size: 4
+    num-prompts: 100
+
+tests:
+  - test_name: throughput_granite41-8b-fp8_tp4_in1024_out1024
+    parameters:
+      random-input-len: 1024
+      random-output-len: 1024
+      max-model-len: 2048
+
+  - test_name: throughput_granite41-8b-fp8_tp4_in2048_out2048
+    parameters:
+      random-input-len: 2048
+      random-output-len: 2048
+      max-model-len: 4096

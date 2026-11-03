@@ -14,26 +14,24 @@
 
 """Generate a simplified vLLM benchmark CI matrix for Spyre runners."""
 
-import glob
+import importlib.util
 import json
 import logging
 import os
 from argparse import Action, ArgumentParser, Namespace
 from logging import warning
+from pathlib import Path
 from typing import Any
-
-import yaml
 
 logging.basicConfig(level=logging.INFO)
 
-# Tried in order; the first section that actually names a model wins. A serve
-# config has `server_parameters.model` and no `parameters.model`, so an
-# existing-but-modelless section must not stop the search.
-VLLM_BENCHMARK_CONFIGS_PARAMETER = (
-    "parameters",
-    "server_parameters",
-    "common_parameters",
-)
+# The scripts are not a package, so load the runner by path: the matrix uses
+# the same suite selection as the run.
+_RUNNER_SCRIPT = Path(__file__).resolve().parent / "run_vllm_benchmarks.py"
+_runner_spec = importlib.util.spec_from_file_location("run_vllm_benchmarks", _RUNNER_SCRIPT)
+assert _runner_spec and _runner_spec.loader
+runner = importlib.util.module_from_spec(_runner_spec)
+_runner_spec.loader.exec_module(runner)
 
 
 class ValidateDir(Action):
@@ -57,9 +55,16 @@ def parse_args() -> Any:
     parser.add_argument(
         "--benchmark-configs-dir",
         type=str,
-        default="vllm-benchmarks/benchmarks",
+        default="vllm-benchmarks/benchmarks/spyre",
         action=ValidateDir,
-        help="the directory containing vLLM benchmark configs",
+        help="the directory searched for *-runs.yaml benchmark configs",
+    )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default=runner.DEFAULT_SUITE,
+        choices=runner.SUITES,
+        help=f"suite whose models make up the matrix (default: {runner.DEFAULT_SUITE})",
     )
     parser.add_argument(
         "--models",
@@ -82,40 +87,26 @@ def set_output(name: str, val: Any) -> None:
         env.write(f"{name}={val}\n")
 
 
-def generate_benchmark_matrix(benchmark_configs_dir: str, models: list[str]) -> dict[str, Any]:
-    """
-    Parse serving config JSON files in the spyre benchmark configs directory
-    to build a matrix of models to benchmark.
-    """
+def generate_benchmark_matrix(
+    benchmark_configs_dir: str, models: list[str], suite: str = runner.DEFAULT_SUITE
+) -> dict[str, Any]:
+    """Build a matrix with one entry per model that has a config in `suite`."""
     benchmark_matrix: dict[str, Any] = {
         "include": [],
     }
 
     selected_models = []
 
-    # Only the CI configs: *-tests-<suite>.yaml files are for manual runs.
-    for file in glob.glob(f"{benchmark_configs_dir}/spyre/*-tests.yaml"):
-        with open(file) as f:
-            try:
-                configs = yaml.safe_load(f)
-            except yaml.YAMLError as e:
-                warning("Failed to load %s: %s", file, e)
-                continue
-
-        # Only the per-test `model` matters here, so `defaults` is not merged in.
-        if isinstance(configs, dict):
-            configs = configs.get("tests") or []
-
+    selected = runner.collect_configs(
+        Path(benchmark_configs_dir), suite, set(runner.VALID_BENCH_TYPES)
+    )
+    for configs in selected.values():
         for config in configs:
-            model = None
-            for key in VLLM_BENCHMARK_CONFIGS_PARAMETER:
-                candidate = config.get(key, {}).get("model")
-                if candidate:
-                    model = candidate.lower()
-                    break
+            model = runner._config_model(config)
             if model is None:
-                warning("Model name not set in %s, skipping...", config)
+                warning("Model name not set in %s, skipping...", config.get("test_name"))
                 continue
+            model = model.lower()
 
             # Dedup
             if model in selected_models:
@@ -140,6 +131,7 @@ def main() -> None:
     benchmark_matrix = generate_benchmark_matrix(
         args.benchmark_configs_dir,
         models,
+        args.suite,
     )
     print(json.dumps(benchmark_matrix))
     set_output("benchmark_matrix", json.dumps(benchmark_matrix))

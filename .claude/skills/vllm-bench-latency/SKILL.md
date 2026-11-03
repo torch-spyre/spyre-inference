@@ -23,7 +23,7 @@ Run `vllm bench latency` for a model the user names against **this** `spyre-infe
 
 - **`<model>`** (required): HF model id or locally-cached path. If omitted, default to `ibm-granite/granite-3.3-8b-instruct` and say so in the report.
 - **`--compare-main`**: after the current-branch run, run the **identical** benchmark on local `main` and print a comparison. Only when the user asks to compare.
-- Benchmark params (optional; defaults in parens): `--input-len` (64), `--output-len` (64), `--batch-size` (1), `--max-model-len` (128), `--num-iters` (10), `--num-iters-warmup` (2). Only on request, use the 8k shape from `vllm-benchmarks/benchmarks/spyre/latency-tests-dev.yaml` (`--input-len 4096 --output-len 4096 --max-model-len 8192`) to compare against a dev-suite run; it runs much longer, so drop `--num-iters` to 3.
+- Benchmark params (optional; defaults in parens): `--input-len` (64), `--output-len` (64), `--batch-size` (1), `--max-model-len` (128), `--num-iters` (10), `--num-iters-warmup` (2). Only on request, use the 8k shape from `vllm-benchmarks/benchmarks/spyre/serve-tests/decoder/latency-<model>-runs.yaml` (`--input-len 4096 --output-len 4096 --max-model-len 8192`) to compare against an exhaustive-suite run; it runs much longer, so drop `--num-iters` to 3.
 - **`--enforce-eager`**: benchmark the uncompiled path. Only pass it if the user asks — compiled (`STOCK_TORCH_COMPILE`) is the platform default.
 
 ## Steps

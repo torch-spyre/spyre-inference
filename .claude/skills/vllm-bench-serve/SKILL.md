@@ -57,7 +57,7 @@ Read the diff between baseline and target(s) (`git diff --stat`, then the releva
 
 | axis | choice |
 |---|---|
-| model | **`google/gemma-4-26B-A4B`**; another decoder from `vllm-benchmarks/benchmarks/spyre/serve-tests.yaml` when the change targets it: `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-4.1-8b`, or an FP8 model (`ibm-granite/granite-3.3-8b-instruct-FP8`, `ibm-granite/granite-4.1-8b-fp8`) |
+| model | **`google/gemma-4-26B-A4B`**; another decoder from `vllm-benchmarks/benchmarks/spyre/serve-tests/decoder/` when the change targets it: `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-4.1-8b`, or an FP8 model (`ibm-granite/granite-3.3-8b-instruct-FP8`, `ibm-granite/granite-4.1-8b-fp8`) |
 | tensor-parallel-size | **4**; 1 when the change targets single-card execution, or both if the change touches collectives |
 | max-model-len + dataset | 4096 + `${SPYRE_AIOPS_DATASET}` for short-context changes; **8192 + `${SPYRE_CICS_DATASET}`**; 32768 + `${SPYRE_ALL_SEQUENCES_DATASET}` for long-context changes |
 | max-num-seqs | **4**; another power of two (8, 16, 32) if the change targets batching. Keep `max-concurrency` equal to it |
@@ -75,7 +75,7 @@ serve_gemma4-26b-a4b_tp4_cics8k_bs4: gemma-4-26B-A4B, TP4, max-model-len 8192, m
 
 ### 3. Write the bench directory
 
-Create `<spyre-inference>/../bench-<tag>/` (e.g. `bench-pr1043/`), outside the git tree so it survives worktree swaps. Write `serve-tests.yaml` there in the same `defaults`/`tests` format as `vllm-benchmarks/benchmarks/spyre/serve-tests.yaml`: copy its `defaults` block, then one entry per confirmed config. Give TP4 and 32k entries `server_health_timeout: 3600`, and double it when the caches are off. `test_name` must be unique per config; the leg is encoded in the results directory, not the name.
+Create `<spyre-inference>/../bench-<tag>/` (e.g. `bench-pr1043/`), outside the git tree so it survives worktree swaps. Write `serve-tests.yaml` there in the same `defaults`/`tests` format as `vllm-benchmarks/benchmarks/spyre/serve-tests/decoder/serve-<model>-runs.yaml`: copy its `defaults` block, then one entry per confirmed config. Give TP4 and 32k entries `server_health_timeout: 3600`, and double it when the caches are off. `test_name` must be unique per config; the leg is encoded in the results directory, not the name.
 
 ### 4. Run each leg (targets first)
 
@@ -91,7 +91,7 @@ Run [scripts/run_leg.sh](scripts/run_leg.sh) (`<skill>` is `<spyre-inference>/.c
 1. Checks the ref out into a throwaway `git worktree` (`.`: the working copy itself) and runs `UV_PROJECT_ENVIRONMENT=<spyre-inference>/.venv uv sync --frozen --project <worktree>`.
 2. Fails the leg unless `spyre_inference` imports from the worktree and the installed torch-spyre rev is the one that ref pins. This import check is the only guarantee that the leg runs its own code: the server inherits the same `.venv` and `PYTHONSAFEPATH=1`.
 3. Exports the leg's env vars and writes `<bench>/<leg>/env.txt` (the `SPYRE|VLLM|TORCH|...` vars) and `<bench>/<leg>/leg.json`: label, role, sha, worktree path, torch-spyre, torch and vLLM versions, the RPMs and where they were read from, the `--env` overrides, host and date. The RPMs come from `components.txt` of the installed tree (`$SENTIENT_BASE_INSTALL_DIR`, or `$LIB_VERSION_FILE` when it lies in that tree); when the tree has none, from the versions `spyre-rpms.lock` requests for this arch. `env.txt` is the env before `make perf-tests`: the harness then re-sources `ibm-aiu-setup.sh` and applies each config's `environment_variables` (`SPYRE_DEVICES` and `AIU_WORLD_SIZE` included), so the per-config `env` in `summary.json` and the `.cmd` files are what the server ran with.
-4. Runs `make perf-tests BENCH_TYPES=serve BENCH_CONFIGS_DIR=<bench> RESULTS_DIR=<bench>/<leg>/results` from the harness checkout, logging to `<bench>/<leg>/run.log`.
+4. Runs `make perf-tests BENCH_TYPES=serve BENCH_CONFIGS_DIR=<bench>/serve-tests.yaml RESULTS_DIR=<bench>/<leg>/results` from the harness checkout, logging to `<bench>/<leg>/run.log`.
 5. Gates the leg with `collect.py validate <bench> <leg>`: every config needs a result JSON with `completed == num_prompts` and `failed == 0` (`vllm bench serve` exits 0 and prints a complete-looking table even when most requests fail), and its `_server.log` must reach `Application startup complete`.
 6. Always restores the install (`uv sync --frozen` in `<spyre-inference>`) and removes the worktree, even on failure or interrupt, and warns when `uv pip freeze` differs from before the leg. An interrupt (`INT` / `TERM`) stops the running config and its server.
 

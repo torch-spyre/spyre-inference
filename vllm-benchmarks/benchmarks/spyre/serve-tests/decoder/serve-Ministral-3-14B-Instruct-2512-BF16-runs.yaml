@@ -1,0 +1,221 @@
+# Serve benchmarks for mistralai/Ministral-3-14B-Instruct-2512-BF16.
+#
+# An entry runs in each suite its `labels` name, and every entry runs in the
+# exhaustive suite. See vllm-benchmarks/README.md.
+#
+# TP4 entries use the defaults. TP1 entries override them with max-model-len
+# 8192 and max-num-seqs 8: the TP4 KV cache does not fit on one card. The TP1
+# `all` entries therefore replay the all_sequences trace truncated to 8k.
+
+defaults:
+  server_health_timeout: 7200
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+    load-format: auto
+    tensor-parallel-size: 4
+    max-model-len: 32768
+    max-num-seqs: 32
+    enable-chunked-prefill: true
+    enable-prefix-caching: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 200
+    custom-output-len: -1
+    ignore-eos: true
+    disable-shuffle: true
+    temperature: 0.1
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+
+tests:
+  # TP4 · aiops
+  - test_name: serve_ministral3-14b_tp4_conc4_aiops
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 4
+
+  - test_name: serve_ministral3-14b_tp4_conc5_aiops
+    labels: [reference]
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 5
+
+  - test_name: serve_ministral3-14b_tp4_conc8_aiops
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 8
+
+  - test_name: serve_ministral3-14b_tp4_conc16_aiops
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 16
+
+  - test_name: serve_ministral3-14b_tp4_conc32_aiops
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 32
+
+  # TP4 · cics
+  - test_name: serve_ministral3-14b_tp4_conc4_cics
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 4
+
+  - test_name: serve_ministral3-14b_tp4_conc5_cics
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 5
+
+  - test_name: serve_ministral3-14b_tp4_conc8_cics
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 8
+
+  - test_name: serve_ministral3-14b_tp4_conc16_cics
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 16
+
+  - test_name: serve_ministral3-14b_tp4_conc32_cics
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 32
+
+  # TP4 · all
+  - test_name: serve_ministral3-14b_tp4_conc4_all
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      max-concurrency: 4
+
+  - test_name: serve_ministral3-14b_tp4_conc5_all
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      max-concurrency: 5
+
+  - test_name: serve_ministral3-14b_tp4_conc8_all
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      max-concurrency: 8
+
+  - test_name: serve_ministral3-14b_tp4_conc16_all
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      max-concurrency: 16
+
+  - test_name: serve_ministral3-14b_tp4_conc32_all
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      max-concurrency: 32
+
+  # TP4 · vision
+  - test_name: serve_ministral3-14b_tp4_conc4_vision
+    labels: [reference]
+    parameters:
+      dataset-name: custom_image
+      dataset-path: ${SPYRE_VISION_DATASET}
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4
+
+  # TP4 · random-mm: 8192 input tokens plus one 2048x2048 image
+  - test_name: serve_ministral3-14b_tp4_conc4_mm_random
+    labels: [base]
+    parameters:
+      dataset-name: random-mm
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      input-len: 8192
+      output-len: 128
+      random-mm-limit-mm-per-prompt: '{"image": 1, "video": 0}'
+      random-mm-bucket-config: '{(2048, 2048, 1): 1}'
+      max-concurrency: 4
+
+  # TP1 · aiops
+  - test_name: serve_ministral3-14b_tp1_conc4_aiops
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 4
+
+  - test_name: serve_ministral3-14b_tp1_conc5_aiops
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 5
+
+  - test_name: serve_ministral3-14b_tp1_conc8_aiops
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 8
+
+  # TP1 · cics
+  - test_name: serve_ministral3-14b_tp1_conc4_cics
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 4
+
+  - test_name: serve_ministral3-14b_tp1_conc5_cics
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 5
+
+  - test_name: serve_ministral3-14b_tp1_conc8_cics
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      max-concurrency: 8
+
+  # TP1 · all
+  - test_name: serve_ministral3-14b_tp1_conc4_all
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}
+      max-concurrency: 4
+
+  - test_name: serve_ministral3-14b_tp1_conc5_all
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}
+      max-concurrency: 5
+
+  - test_name: serve_ministral3-14b_tp1_conc8_all
+    server_parameters:
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 8
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}
+      max-concurrency: 8

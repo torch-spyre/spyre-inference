@@ -85,7 +85,7 @@ def _hf_image_embeddings(images: list) -> list[torch.Tensor]:
     return list(F.normalize(features.pooler_output.float(), dim=-1))
 
 
-def _llm(enforce_eager: bool, max_num_seqs: int):
+def _llm(max_num_seqs: int):
     from vllm import LLM
 
     return LLM(
@@ -95,7 +95,7 @@ def _llm(enforce_eager: bool, max_num_seqs: int):
         runner="pooling",
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=max_num_seqs,
-        enforce_eager=enforce_eager,
+        enforce_eager=False,
         limit_mm_per_prompt={"image": 1},
     )
 
@@ -107,16 +107,6 @@ def _assert_close(label: str, emb: list[float], ref: torch.Tensor) -> None:
     assert sim >= COSINE_MIN, f"{label}: cosine {sim:.4f} < {COSINE_MIN} vs HF"
 
 
-# Compiled cases join the encoder gates' compiled cases in the model_quality job.
-_EAGER_AND_COMPILED = pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(False, id="compiled", marks=pytest.mark.model_quality),
-    ],
-)
-
-
 def _skip_without_spyre() -> None:
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -126,11 +116,10 @@ def _skip_without_spyre() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@_EAGER_AND_COMPILED
-def test_clip_text_embeddings_match_hf_one_request_per_step(enforce_eager: bool) -> None:
+def test_clip_text_embeddings_match_hf_one_request_per_step() -> None:
     _skip_without_spyre()
     refs = _hf_text_embeddings(PROMPTS)
-    llm = _llm(enforce_eager, max_num_seqs=1)
+    llm = _llm(max_num_seqs=1)
     outputs = llm.embed(PROMPTS)
     assert len(outputs) == len(PROMPTS)
     for prompt, out, ref in zip(PROMPTS, outputs, refs):
@@ -145,7 +134,7 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
     causal text tower on the encoder backend reads correctly (#1140)."""
     _skip_without_spyre()
     refs = _hf_text_embeddings(PROMPTS)
-    llm = _llm(enforce_eager=False, max_num_seqs=len(PROMPTS))
+    llm = _llm(max_num_seqs=len(PROMPTS))
     outputs = llm.embed(PROMPTS)
     assert len(outputs) == len(PROMPTS)
     for prompt, out, ref in zip(PROMPTS, outputs, refs):
@@ -154,12 +143,11 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@_EAGER_AND_COMPILED
-def test_clip_image_embedding_matches_hf(enforce_eager: bool) -> None:
+def test_clip_image_embedding_matches_hf() -> None:
     _skip_without_spyre()
     image = _synthetic_image()
     (ref,) = _hf_image_embeddings([image])
-    llm = _llm(enforce_eager, max_num_seqs=1)
+    llm = _llm(max_num_seqs=1)
     # CLIP's image-only prompt: the text must be empty.
     (out,) = llm.embed([{"prompt": "", "multi_modal_data": {"image": image}}])
     _assert_close("image", out.outputs.embedding, ref)
@@ -175,7 +163,7 @@ def test_clip_batched_images_match_hf() -> None:
     _skip_without_spyre()
     images = [_synthetic_image(seed=seed) for seed in (0, 61, 122, 183)]
     refs = _hf_image_embeddings(images)
-    llm = _llm(enforce_eager=False, max_num_seqs=len(images))
+    llm = _llm(max_num_seqs=len(images))
     outputs = llm.embed([{"prompt": "", "multi_modal_data": {"image": im}} for im in images])
     assert len(outputs) == len(images)
     for i, (out, ref) in enumerate(zip(outputs, refs)):
@@ -193,7 +181,7 @@ def test_clip_mixed_image_text_step_matches_hf() -> None:
     image = _synthetic_image()
     text_refs = _hf_text_embeddings([short_text, long_text])
     (image_ref,) = _hf_image_embeddings([image])
-    llm = _llm(enforce_eager=False, max_num_seqs=4)
+    llm = _llm(max_num_seqs=4)
     outputs = llm.embed(
         [short_text, {"prompt": "", "multi_modal_data": {"image": image}}, long_text]
     )

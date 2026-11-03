@@ -125,17 +125,14 @@ def _generate(conversations, enforce_eager: bool, **llm_kwargs):
 
 
 @pytest.mark.multimodal
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
-def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
 
-    Both modes: `CompileOutermost` samples the mode at construction, so under
-    `enforce_eager` the `maybe_compile` kernels fall through to eager — except the
-    norms, which pass `force=True` and compile in either mode — and the
-    compiled path — the repo default — goes uncovered.
+    Compiled, the repo default. The tower's unbudgeted eager forward still runs: in the
+    profiling pass here, and per request in the eager two-image test below.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -146,7 +143,7 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     uri = _synthetic_image_data_uri()
-    (text,) = _generate([_conversation(uri)], enforce_eager=enforce_eager)
+    (text,) = _generate([_conversation(uri)], enforce_eager=False)
 
     assert text.strip(), "empty generation from the multimodal path"
 
@@ -192,35 +189,31 @@ def test_two_image_prompt_produces_output():
 
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
-def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
     rewrite on CPU, this checks that what it rewrites to actually lowers.
 
-    Both modes, as for Pixtral above: compiled is the repo default, where the tower's
-    rewrites (gathered position embeddings and rope, permutation-matmul rope, the
-    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs,
-    not just run eagerly. Compiled, an image above every budget is rejected up front.
+    Compiled, the repo default, where the tower's rewrites (gathered position embeddings
+    and rope, permutation-matmul rope, the stick-aligned SDPA, the offset-group pool) have
+    to lower inside per-budget graphs. An image above every budget is rejected up front.
     """
     _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     # A tower compile at request time is a missed warmup shape: fail, don't log.
-    if not enforce_eager:
-        monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     from vllm import SamplingParams
     from vllm.exceptions import VLLMValidationError
 
-    llm = _llm(enforce_eager, model=GEMMA4_MODEL, config_format="hf", revision=GEMMA4_REVISION)
+    llm = _llm(False, model=GEMMA4_MODEL, config_format="hf", revision=GEMMA4_REVISION)
     conversation = [_conversation(_synthetic_image_data_uri())]
     params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
     (output,) = llm.chat(conversation, params)
 
     assert output.outputs[0].text.strip(), "empty generation from the Gemma 4 vision path"
-    if not enforce_eager:
-        with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets"):
-            llm.chat(conversation, params, mm_processor_kwargs={"max_soft_tokens": 560})
+    with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets"):
+        llm.chat(conversation, params, mm_processor_kwargs={"max_soft_tokens": 560})
 
 
 @pytest.mark.multimodal

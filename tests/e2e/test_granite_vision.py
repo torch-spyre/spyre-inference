@@ -19,12 +19,11 @@ Granite Vision path.  A synthetic image carries no meaningful semantics, so
 the tests only assert that the full pipeline (SigLIP encoder → BLIP-2
 Q-Former projector → Granite decoder) runs and produces non-empty text.
 
-Both `enforce_eager` modes are covered:
-- eager: every `maybe_compile` kernel falls through to eager;
-  InterpolateDownsampler and _pack_and_unpad_image_features offload to CPU,
-  while Q-Former attention uses the patched SDPA path on Spyre.
-- compiled: the compiled graph is built once per shape and the patches
-  must survive the compilation boundary intact.
+The SigLIP tower is never compiled, so it runs the same way in both modes:
+InterpolateDownsampler and _pack_and_unpad_image_features offload to CPU, while
+Q-Former attention uses the patched SDPA path on Spyre. The single-image test runs
+compiled, the repo default, where the patches must survive the decoder's compile
+boundary; the multi-tile test runs eager.
 """
 
 import io
@@ -102,14 +101,13 @@ def _generate(conversations, enforce_eager: bool, images_per_prompt: int = 1):
 
 @pytest.mark.granite_vision_e2e
 @pytest.mark.multimodal
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
-def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole Granite Vision path (SigLIP encoder → InterpolateDownsampler
     → BLIP-2 Q-Former → _pack_and_unpad → Granite decoder) runs and decodes text.
 
-    Both modes exercise the CPU-offload and on-device attention patches;
-    under the compiled path the patches must survive the torch.compile boundary.
+    Compiled: the CPU-offload and on-device attention patches must survive the
+    torch.compile boundary.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -120,7 +118,7 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     uri = _synthetic_image_data_uri()
-    (text,) = _generate([_conversation(uri)], enforce_eager=enforce_eager)
+    (text,) = _generate([_conversation(uri)], enforce_eager=False)
 
     assert text.strip(), "empty generation from the Granite Vision path"
 

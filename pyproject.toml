@@ -152,7 +152,7 @@ PYTORCH_VERSION = "2.13.0"
 [tool.uv.extra-build-variables.torch-spyre]
 USE_SPYRE_PROFILER = "0"
 # Must equal [tool.spyre-rpms] bundle: a change makes uv rebuild a cached torch-spyre wheel against the new RPMs.
-SPYRE_RPM_BUNDLE = "main_snap_2026_11_02_18"
+SPYRE_RPM_BUNDLE = "main_snap_2026_11_02_06"
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
@@ -232,7 +232,7 @@ provides-extras = ["gdown", "scipy"]
 # spyre-rpms.lock is generated from this; after editing, re-run
 # `python3 scripts/lock_spyre_rpms.py`. Bump SPYRE_RPM_BUNDLE above with `bundle`.
 [tool.spyre-rpms]
-bundle = "main_snap_2026_11_02_18"
+bundle = "main_snap_2026_11_02_06"
 packages = [
   "ibm-aiu-toolbox-e2e",
   "ibm-deeptools",

@@ -49,6 +49,32 @@ That is also the configuration the tensor-parallel and compile e2e tests run the
 checkpoints under. A repository with no vision tower gets the override by default, so
 this is only needed for the multimodal ones.
 
+## Gemma-4: per-request image sizes
+
+The vision tower is compiled per token budget at warmup, for the image size the engine runs
+at: `max_soft_tokens` from `--mm-processor-kwargs`, default 280. A request can ask for a
+larger size (560 or 1120) in its own `mm_processor_kwargs`: offline through `LLM.chat` or
+`LLM.generate`, and online only when the server runs with `--trust-request-mm-kwargs`.
+
+Each larger size needs its own budget, compiled at warmup, so they are opt-in through
+`encoder_cudagraph_token_budgets`. To serve requests up to 1120:
+
+```bash
+vllm serve google/gemma-4-26B-A4B-it --tensor-parallel-size 4 \
+  --trust-request-mm-kwargs \
+  -cc '{"encoder_cudagraph_token_budgets": [64, 128, 256, 280, 576, 1152]}'
+```
+
+The list replaces the default budgets, so keep the small ones in it: 64 to 280 cover the
+engine's own 280, 576 covers 560 and 1152 covers 1120. Each budget is rounded up to a whole
+patch group. An image larger than the largest entry, as listed, is rejected with a 400
+(`VLLMValidationError` offline) rather than compiled mid-request, and the encoder cache is
+raised to hold one at that size. An entry above `max_num_batched_tokens` (512 unless
+`--max-num-batched-tokens` sets it) needs chunked MM input, so `--disable-chunked-mm-input`
+with it fails at startup.
+Raising the engine-wide `--mm-processor-kwargs '{"max_soft_tokens": 560}'` instead makes
+every image that size.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup

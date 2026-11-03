@@ -20,6 +20,7 @@ from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
 def batched_decode_kernel(
+    *,
     query,
     rep_row_ids,
     k_pages,

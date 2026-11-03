@@ -262,9 +262,13 @@ warmup is a shape warmup missed. A tower whose per-image shape varies beyond the
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
 marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
 (`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
-budget, and rejects video. The budgets stop at the largest image the engine's
-`max_soft_tokens` allows, so a request passing a larger `max_soft_tokens` compiles on first
-use: the guard reports it at its default `warn` level and refuses it at `error`.
+budget, and rejects video. Upstream's doubling covers the engine's `max_soft_tokens`. Larger
+per-request sizes get budgets only when listed in `encoder_cudagraph_token_budgets` (see
+[per-request image sizes](../user_guide/configuration.md#gemma-4-per-request-image-sizes));
+`TorchSpyrePlatform.validate_request` rejects an image above the largest budget at the
+frontend, and the platform raises the encoder cache and compute budget to hold one. Several
+images pack into one call only up to the budget covering the engine's own largest image,
+since attention spans the whole packed sequence; a larger image runs alone at its own budget.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -299,8 +303,9 @@ grows with layer count (gemma-4-E2B: about 6x the block compile).
 A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
 class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. The mixin implements
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
-`EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
-pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
+`EncoderCudaGraphManager` picks power-of-two token budgets (or takes
+`encoder_cudagraph_token_budgets`), packs a step's images into them, pads the inputs and splits
+the output per image. `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
@@ -330,6 +335,7 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
@@ -348,10 +354,11 @@ placeholders and `embed_input_ids` are inherited unchanged.
 
 Constraints the layout follows:
 
-- The largest budget is the largest item the model's upstream processor can produce
+- The doubling's largest budget is the largest item the model's upstream processor can produce
   (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
   uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
-  warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+  warmup skipped; user budgets may go above it, and the platform rejects a request image
+  above the largest. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
 - Patches are **offset-major**: one group per offset inside a merge group, each padded at
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
@@ -466,14 +473,13 @@ cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
 device dim 0, which is where an indexed axis has to sit for the gather to cost one page
 rather than the whole tensor.
 
-Three things follow from those choices. The gather is a 2-D subscript, which lowers to
+Two things follow from those choices. The gather is a 2-D subscript, which lowers to
 `aten.index` and fails eager by upcasting its int32 index, so this backend always compiles
 attention even under `--enforce-eager` — attention compiles in its own domain, so the rest
 of the model still runs eager. Because the bmm's output axes
 (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
 mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
-at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries no ALiBi (which
-needs a bias tile per query group), so an ALiBi model needs `token_major`. Batched decode
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. Batched decode
 runs the other way round: its page index is uploaded one entry per stick here, which is
 what the tiled walk needs, so the batched kernel is reached on this layout and declined on
 token-major until that port lands.
@@ -535,7 +541,8 @@ Key constraints:
   are all exercised, on both layouts (`tests/attention/test_spyre_attn.py`,
   `tests/attention/test_spyre_head_major_attn.py`)
 - **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
-  layers stay unwindowed) and logits soft-capping on both layouts; ALiBi on token-major only
+  layers stay unwindowed) and logits soft-capping on both layouts
+- **Not supported**: ALiBi, on either layout
 
 ### Encoder-only attention
 

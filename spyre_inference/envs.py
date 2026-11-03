@@ -105,9 +105,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which
     #    drops the per-page permute the kernels do before the matmuls and is the only
     #    layout with a batched decode kernel under the default tiled walk. It always
-    #    compiles attention, even under --enforce-eager, and carries no ALiBi.
+    #    compiles attention, even under --enforce-eager.
     #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size], the fallback
-    #    for an ALiBi model or a fully eager attention run.
+    #    for a fully eager attention run.
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "head_major",
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.

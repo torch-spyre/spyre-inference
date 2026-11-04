@@ -27,6 +27,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import string
 import subprocess
@@ -36,8 +37,9 @@ import urllib.request
 from argparse import ArgumentParser
 from pathlib import Path
 
+import bench_trace
 import yaml
-from bench_support import Recorder, greedy_output_hashes
+from bench_support import Recorder, env_fingerprint, greedy_output_hashes
 from resource_sampler import ContainerSampler, write_resource_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -122,6 +124,15 @@ def parse_args():
         default=os.environ.get("BENCH_OUTPUT_HASH") == "0",
         help="skip the greedy output hash that serve tests take after the timed run "
         "(also BENCH_OUTPUT_HASH=0)",
+    )
+    parser.add_argument(
+        "--profile-level",
+        choices=bench_trace.LEVELS,
+        default=None,
+        help="profile every selected test (overrides each test's `profile_level` key): "
+        "light = torch profiler with engine-step regions, full = light + shapes, memory, "
+        "kernel cost and device memory samples. A profiled test writes its result and "
+        "trace bundle under <results-dir>/<test_name>/trace/ only, never where ingest reads",
     )
     return parser.parse_args()
 
@@ -347,10 +358,10 @@ class _Noop:
         return {}
 
 
-def _make_sampler() -> ContainerSampler:
+def _make_sampler(interval: float | None = None) -> ContainerSampler:
     """Construct and start a ContainerSampler, degrading to a no-op on any error."""
     try:
-        s = ContainerSampler()
+        s = ContainerSampler(interval)
         s.start()
         return s
     except Exception:
@@ -366,11 +377,16 @@ def run_benchmark(
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
+    profile_level: str = "off",
 ) -> bool:
     """Run a single vllm bench command. Returns True on success."""
+    trace_dir = _trace_dir(results_dir, test_name, profile_level)
+    out_dir = trace_dir or results_dir
     cmd = [*VLLM_CLI, "bench", bench_type]
     cmd.extend(build_command_args(parameters))
-    cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
+    cmd.extend(["--output-json", str(out_dir / f"{test_name}.json")])
+    if trace_dir:
+        cmd.extend(_profile_args(trace_dir, profile_level))
 
     # The CLI device values are only a base: env_config carries the per-test
     # values from _derive_config and is applied last, so it wins.
@@ -378,17 +394,22 @@ def run_benchmark(
     env["SPYRE_DEVICES"] = spyre_devices
     env["AIU_WORLD_SIZE"] = aiu_world_size
     config_env = build_env_vars(env_config)
+    if trace_dir:
+        config_env.update(bench_trace.child_env(trace_dir, profile_level))
     env.update(config_env)
 
-    cmd_line = record_command(cmd, config_env, results_dir / f"{test_name}.cmd")
+    cmd_line = record_command(cmd, config_env, out_dir / f"{test_name}.cmd")
 
     log.info("=== Running %s test: %s ===", bench_type, test_name)
     log.info("Command: %s", cmd_line)
 
-    log_file = results_dir / f"{test_name}.log"
-    rec = Recorder(results_dir, test_name, {"bench_type": bench_type, "parameters": parameters})
+    log_file = out_dir / ("vllm.log" if trace_dir else f"{test_name}.log")
+    runtime = {"bench_type": bench_type, "parameters": parameters}
+    if trace_dir:
+        runtime["profile_level"] = profile_level
+    rec = Recorder(results_dir, test_name, runtime)
     rec.child_env(env)
-    sampler = _make_sampler()
+    sampler = _make_sampler(PROFILE_SAMPLER_INTERVAL_S if trace_dir else None)
     rec.add_sampler(sampler)
     rec.mark("run")
     with open(log_file, "w") as lf:
@@ -400,8 +421,10 @@ def run_benchmark(
     # "total": covers compile + inference in one window, unlike the serve path
     # which splits compile_host_* from the bare bench-phase host_* metrics.
     write_resource_metrics(
-        test_name, results_dir, sampler.summary(phase="total"), model=parameters.get("model", "")
+        test_name, out_dir, sampler.summary(phase="total"), model=parameters.get("model", "")
     )
+    if trace_dir:
+        _write_trace_bundle(trace_dir, test_name, profile_level, bench_type, parameters, rec)
 
     if result.returncode != 0:
         log.error("Test %s failed with exit code %d", test_name, result.returncode)
@@ -411,6 +434,56 @@ def run_benchmark(
         return False
     log.info("Test %s passed", test_name)
     return True
+
+
+PROFILE_SAMPLER_INTERVAL_S = 0.2
+
+
+def _profile_level(config: dict, override: str | None) -> str:
+    """The CLI level if given, else the test's `profile_level` key, else off."""
+    level = override or config.get("profile_level") or "off"
+    if level not in bench_trace.LEVELS:
+        log.error(
+            "%s: profile_level must be one of %s, got %r",
+            config.get("test_name"),
+            bench_trace.LEVELS,
+            level,
+        )
+        sys.exit(2)
+    return level
+
+
+def _trace_dir(results_dir: Path, test_name: str, level: str) -> Path | None:
+    """A fresh `<results_dir>/<test_name>/trace/` for a profiled run, else None."""
+    if level == "off":
+        return None
+    trace_dir = results_dir / test_name / "trace"
+    shutil.rmtree(trace_dir, ignore_errors=True)
+    trace_dir.mkdir(parents=True)
+    return trace_dir
+
+
+def _profile_args(trace_dir: Path, level: str) -> list[str]:
+    config = json.dumps(bench_trace.profiler_config(trace_dir, level), separators=(",", ":"))
+    return ["--profile", "--profiler-config", config]
+
+
+def _write_trace_bundle(trace_dir, test_name, level, bench_type, parameters, rec) -> None:
+    summary = trace_dir.parent / "compile_summary.json"
+    if summary.is_file():
+        shutil.copy(summary, trace_dir / summary.name)
+    manifest = bench_trace.write_bundle(
+        trace_dir,
+        test_name=test_name,
+        level=level,
+        bench_type=bench_type,
+        parameters=parameters,
+        env_fingerprint=env_fingerprint(),
+        samples=rec.wall_series(),
+    )
+    for what, why in manifest.get("absent", {}).items():
+        log.warning("%s trace bundle: no %s (%s)", test_name, what, why)
+    log.info("Trace bundle for %s in %s", test_name, trace_dir)
 
 
 def _repeat_dirs(config: dict, results_dir: Path) -> list[Path]:
@@ -438,6 +511,7 @@ def run_benchmarks_from_file(
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
+    profile_level: str | None = None,
 ) -> tuple[int, int]:
     """Run all benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -467,6 +541,7 @@ def run_benchmarks_from_file(
                     results_dir=run_dir,
                     spyre_devices=spyre_devices,
                     aiu_world_size=aiu_world_size,
+                    profile_level=_profile_level(config, profile_level),
                 )
                 for run_dir in _repeat_dirs(config, results_dir)
             ]
@@ -489,14 +564,19 @@ def run_serve_benchmark(
     aiu_world_size: str,
     health_timeout: int = 180,
     output_hash: bool = True,
+    profile_level: str = "off",
 ) -> bool:
     """Start vllm serve, wait for health, run bench serve, cleanup."""
+    trace_dir = _trace_dir(results_dir, test_name, profile_level)
+    out_dir = trace_dir or results_dir
     # As in run_benchmark: env_config is applied last and overrides the CLI
     # device values.
     env = os.environ.copy()
     env["SPYRE_DEVICES"] = spyre_devices
     env["AIU_WORLD_SIZE"] = aiu_world_size
     config_env = build_env_vars(env_config)
+    if trace_dir:
+        config_env.update(bench_trace.child_env(trace_dir, profile_level))
     env.update(config_env)
 
     # Build server command
@@ -506,10 +586,10 @@ def run_serve_benchmark(
     port = int(server_params.get("port", 8000))
     server_cmd = [*VLLM_CLI, "serve", model]
     server_cmd.extend(build_command_args(server_params))
+    if trace_dir:
+        server_cmd.extend(_profile_args(trace_dir, profile_level)[1:])
 
-    server_cmd_line = record_command(
-        server_cmd, config_env, results_dir / f"{test_name}_server.cmd"
-    )
+    server_cmd_line = record_command(server_cmd, config_env, out_dir / f"{test_name}_server.cmd")
 
     log.info("=== Starting vLLM server for serve test: %s ===", test_name)
     log.info("Server command: %s", server_cmd_line)
@@ -525,11 +605,13 @@ def run_serve_benchmark(
                 os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
 
-    server_log = results_dir / f"{test_name}_server.log"
+    server_log = out_dir / ("vllm.log" if trace_dir else f"{test_name}_server.log")
     bench_result = None
-    rec = Recorder(
-        results_dir, test_name, {"bench_type": "serve", "server_parameters": server_parameters}
-    )
+    runtime = {"bench_type": "serve", "server_parameters": server_parameters}
+    if trace_dir:
+        runtime["profile_level"] = profile_level
+    rec = Recorder(results_dir, test_name, runtime)
+    sampler_interval = PROFILE_SAMPLER_INTERVAL_S if trace_dir else None
     rec.child_env(env)
     with open(server_log, "w") as server_lf:
         server_lf.write(f"# {server_cmd_line}\n")
@@ -545,7 +627,7 @@ def run_serve_benchmark(
         )
 
         try:
-            compile_sampler = _make_sampler()
+            compile_sampler = _make_sampler(sampler_interval)
             rec.add_sampler(compile_sampler)
             # Timed from before the spawn: for large models this is mostly the
             # one-time warmup compile, which is worth comparing run to run.
@@ -558,7 +640,7 @@ def run_serve_benchmark(
                     compile_sampler.stop()
                     write_resource_metrics(
                         test_name,
-                        results_dir,
+                        out_dir,
                         compile_sampler.summary(phase="compile"),
                         model=model,
                     )
@@ -580,7 +662,7 @@ def run_serve_benchmark(
                 if server_log.exists():
                     log.error("Server log:\n%s", server_log.read_text())
                 write_resource_metrics(
-                    test_name, results_dir, compile_sampler.summary(phase="compile"), model=model
+                    test_name, out_dir, compile_sampler.summary(phase="compile"), model=model
                 )
                 return False
 
@@ -595,21 +677,23 @@ def run_serve_benchmark(
                     "--skip-chat-template",
                     "--save-result",
                     "--result-dir",
-                    str(results_dir),
+                    str(out_dir),
                     "--result-filename",
                     f"{test_name}.json",
                 ]
             )
+            if trace_dir:
+                bench_cmd.append("--profile")
 
             bench_cmd_line = record_command(
-                bench_cmd, config_env, results_dir / f"{test_name}_bench.cmd"
+                bench_cmd, config_env, out_dir / f"{test_name}_bench.cmd"
             )
 
             log.info("=== Running serve benchmark: %s ===", test_name)
             log.info("Bench command: %s", bench_cmd_line)
 
-            bench_log = results_dir / f"{test_name}_bench.log"
-            bench_sampler = _make_sampler()
+            bench_log = out_dir / f"{test_name}_bench.log"
+            bench_sampler = _make_sampler(sampler_interval)
             rec.add_sampler(bench_sampler)
             rec.mark("serve")
             try:
@@ -631,11 +715,20 @@ def run_serve_benchmark(
                 **compile_sampler.summary(phase="compile"),
                 **bench_sampler.summary(),
             }
-            write_resource_metrics(test_name, results_dir, combined, model=model)
+            write_resource_metrics(test_name, out_dir, combined, model=model)
 
         finally:
             _kill_server(server_proc)
             rec.write()
+            if trace_dir:
+                _write_trace_bundle(
+                    trace_dir,
+                    test_name,
+                    profile_level,
+                    "serve",
+                    {**server_parameters, **bench_parameters},
+                    rec,
+                )
 
     if bench_result.returncode != 0:
         log.error("Serve test %s failed with exit code %d", test_name, bench_result.returncode)
@@ -647,7 +740,7 @@ def run_serve_benchmark(
     # `vllm bench serve` only measures the request phase. A local artifact:
     # not in spyre_clickhouse_ingest.vllm's `_SERVE_METRICS`, so it does not
     # reach ClickHouse.
-    result_file = results_dir / f"{test_name}.json"
+    result_file = out_dir / f"{test_name}.json"
     try:
         data = json.loads(result_file.read_text())
         data["server_startup_sec"] = server_startup_sec
@@ -668,6 +761,7 @@ def run_serve_benchmarks_from_file(
     models: set[str],
     tps: set[int],
     output_hash: bool = True,
+    profile_level: str | None = None,
 ) -> tuple[int, int]:
     """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -703,6 +797,7 @@ def run_serve_benchmarks_from_file(
                     aiu_world_size=aiu_world_size,
                     health_timeout=health_timeout,
                     output_hash=output_hash,
+                    profile_level=_profile_level(config, profile_level),
                 )
                 for run_dir in _repeat_dirs(config, results_dir)
             ]
@@ -781,6 +876,7 @@ def main():
             aiu_world_size=args.aiu_world_size,
             models=models,
             tps=tps,
+            profile_level=args.profile_level,
         )
         total_passed += passed
         total_failed += failed
@@ -795,6 +891,7 @@ def main():
             aiu_world_size=args.aiu_world_size,
             models=models,
             tps=tps,
+            profile_level=args.profile_level,
         )
         total_passed += passed
         total_failed += failed
@@ -810,6 +907,7 @@ def main():
                 models=models,
                 tps=tps,
                 output_hash=not args.no_output_hash,
+                profile_level=args.profile_level,
             )
             total_passed += passed
             total_failed += failed

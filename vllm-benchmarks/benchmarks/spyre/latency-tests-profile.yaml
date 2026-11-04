@@ -1,0 +1,19 @@
+# Profiled latency run for a Perf Lab trace bundle (`make perf-tests BENCH_SUITE=profile`).
+# Not a regression input: the result lands under <results-dir>/<test_name>/trace/ only.
+- test_name: latency_granite33-8b_tp1_in128_out64_bs4
+  profile_level: full
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 128
+    output-len: 64
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 1
+    max-model-len: 256

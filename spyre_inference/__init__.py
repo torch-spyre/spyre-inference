@@ -87,12 +87,17 @@ def keep_sigterm_handler():
 
 def register_ops():
     """Register the Spyre OOT custom ops and model adaptations."""
+    from spyre_inference import envs
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
 
     with keep_sigterm_handler():
         register_all()
         register_models()
+    if envs.SPYRE_PROFILE_DIR:
+        from spyre_inference.v1.worker import profile_hooks
+
+        profile_hooks.install()
 
 
 def _route_logging() -> None:

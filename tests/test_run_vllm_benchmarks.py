@@ -763,3 +763,225 @@ def test_no_compile_summary_without_sidecar_files(tmp_path, monkeypatch):
     monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {})
     bench_support.Recorder(tmp_path, "t", {}).write()
     assert not (tmp_path / "t" / "compile_summary.json").exists()
+
+
+bench_trace = importlib.import_module("bench_trace")
+_STEP_REGIONS = (("prefill", 512), ("decode", 4), ("decode", 4), ("decode", 4))
+
+
+def _synthetic_trace(path, regions=_STEP_REGIONS, spyre_tags=True):
+    """A Kineto-shaped trace: per step a host region, one launch, one kernel and a gap."""
+    ev, t = [], 1000.0
+    for i, (kind, tokens) in enumerate(regions):
+        if spyre_tags:
+            ev.append({"ph": "X", "cat": "user_annotation", "name": "spyre::step",
+                       "ts": t, "dur": 1000.0, "tid": 1, "pid": 1})  # fmt: skip
+            ev.append({"ph": "X", "cat": "user_annotation", "name": f"spyre::{kind}:{tokens}",
+                       "ts": t + 50, "dur": 900.0, "tid": 1, "pid": 1})  # fmt: skip
+        else:
+            ctx, gen = (1, 0) if kind == "prefill" else (0, 4)
+            name = f"execute_context_{ctx}({tokens if ctx else 0})_generation_{gen}({gen})"
+            ev.append({"ph": "X", "cat": "user_annotation", "name": name,
+                       "ts": t, "dur": 1000.0, "tid": 1, "pid": 1})  # fmt: skip
+        ev.append({"ph": "X", "cat": "cpu_op", "name": "launch::Compute",
+                   "ts": t + 100, "dur": 50.0, "tid": 1, "pid": 1})  # fmt: skip
+        key = "k_prefill" if kind == "prefill" else "k_decode"
+        ev.append({"ph": "X", "cat": "kernel", "name": f"{key}#0", "ts": t + 200, "dur": 400.0,
+                   "tid": 9, "pid": 2, "args": {"provenance_key": key}})  # fmt: skip
+        t += 2000 + i
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"traceEvents": ev}))
+
+
+def test_profile_level_resolution():
+    assert runner._profile_level({}, None) == "off"
+    assert runner._profile_level({"profile_level": "light"}, None) == "light"
+    assert runner._profile_level({"profile_level": "light"}, "full") == "full"
+    with pytest.raises(SystemExit):
+        runner._profile_level({"test_name": "t", "profile_level": "loud"}, None)
+
+
+def test_profiler_config_levels(tmp_path):
+    light = bench_trace.profiler_config(tmp_path, "light")
+    full = bench_trace.profiler_config(tmp_path, "full")
+    assert light["profiler"] == "torch" and "PrivateUse1" in light["torch_profiler_activities"]
+    assert not light["torch_profiler_record_shapes"] and not light["torch_profiler_with_memory"]
+    assert full["torch_profiler_record_shapes"] and full["torch_profiler_with_memory"]
+    assert light["torch_profiler_dir"] == str((tmp_path / "raw").resolve())
+    assert "TORCH_SPYRE_KERNEL_COST_DIR" not in bench_trace.child_env(tmp_path, "light")
+    full_env = bench_trace.child_env(tmp_path, "full")
+    assert full_env["TORCH_SPYRE_KERNEL_COST_DIR"].endswith("kernel_cost")
+    assert float(full_env["SPYRE_PROFILE_MEMORY_INTERVAL"]) > 0
+
+
+def test_step_windows_prefer_spyre_tags_and_fall_back_to_vllm(tmp_path):
+    _synthetic_trace(tmp_path / "a.json")
+    win = bench_trace.steps.windows(bench_trace.steps.load(str(tmp_path / "a.json")))
+    assert [(w["kind"], w["tokens"]) for w in win] == list(_STEP_REGIONS)
+    assert win[0]["dur"] == 1000.0  # the outer spyre::step, not the inner tag
+    _synthetic_trace(tmp_path / "b.json", spyre_tags=False)
+    win = bench_trace.steps.windows(bench_trace.steps.load(str(tmp_path / "b.json")))
+    assert [(w["kind"], w["tokens"]) for w in win] == [(k, n) for k, n in _STEP_REGIONS]
+
+
+def test_host_report_splits_busy_and_exposed(tmp_path):
+    _synthetic_trace(tmp_path / "t.json")
+    ev = bench_trace.steps.load(str(tmp_path / "t.json"))
+    rep = bench_trace.steps.host_report("t.json", ev, bench_trace.steps.windows(ev))
+    dec = rep["decode_summary"]
+    assert dec["n"] == 2  # first decode step dropped as the shape transition
+    assert dec["wall_ms"] == pytest.approx(1.0) and dec["busy_ms"] == pytest.approx(0.4)
+    assert dec["host_exposed_ms"] == pytest.approx(0.6) and dec["launches_per_step"] == 1
+    assert sum(dec["waterfall_ms_per_step"].values()) == pytest.approx(0.6)
+    assert rep["prefill_summary"]["n"] == 1 and rep["mixed_summary"] == {}
+
+
+def test_roofline_joins_the_kernel_cost_sidecar(tmp_path):
+    _synthetic_trace(tmp_path / "t.json")
+    ev = bench_trace.steps.load(str(tmp_path / "t.json"))
+    side = tmp_path / "kernel_cost.1.jsonl"
+    cost = {"predicted_us": 300.0, "hbm_read_bytes": 30000, "hbm_write_bytes": 30000,
+            "macs": 0, "cores": 4, "floor_inputs": {"bw_peak_gbps": 100.0}}  # fmt: skip
+    side.write_text(
+        json.dumps({"provenance_key": "k_decode", "aten_ops": ["aten.mm.default"], "cost": cost})
+        + "\n"
+        + json.dumps({"provenance_key": "k_prefill", "aten_ops": [], "cost": None})
+        + "\n"
+    )
+    roof = bench_trace.roofline.build(
+        ev, bench_trace.steps.windows(ev), bench_trace.roofline.load_costs([side])
+    )
+    by = {(k["key"], k["phase"]): k for k in roof["kernels"]}
+    dec = by[("k_decode", "decode")]
+    assert dec["calls"] == 2 and dec["median_us"] == 400.0
+    assert dec["floor_us"] == 0.6 and dec["bound"] == "memory" and dec["ratio"] == 666.67
+    assert "floor_us" not in by[("k_prefill", "prefill")]
+    assert roof["unjoined_keys"] == ["k_prefill"]
+
+
+def _fake_vllm_bench(trace_dir_level):
+    """A `subprocess.run` stand-in that writes what vllm bench --profile would."""
+
+    class Done:
+        returncode, stderr = 0, ""
+
+    def run(cmd, env=None, **kwargs):
+        # Like vllm bench latency: --profile runs one profiled batch and writes no result.
+        if "--profile" not in cmd:
+            out = Path(cmd[cmd.index("--output-json") + 1])
+            out.write_text(json.dumps({"avg_latency": 1.5, "latencies": [1.5]}))
+        else:
+            cfg = json.loads(cmd[cmd.index("--profiler-config") + 1])
+            trace_dir_level.append(cfg)
+            _synthetic_trace(
+                Path(cfg["torch_profiler_dir"]) / "dp0_pp0_tp0_rank0.123.pt.trace.json"
+            )
+            markers = Path(env["SPYRE_PROFILE_DIR"])
+            markers.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+            (markers / "phases.7.jsonl").write_text(
+                "".join(
+                    json.dumps({"t": now - 3 + i * 0.5, "phase": p, "pid": 7}) + "\n"
+                    for i, p in enumerate(
+                        [
+                            "weight_load",
+                            "compile_warmup",
+                            "ready",
+                            "warmup",
+                            "profiled",
+                            "prefill",
+                            "decode",
+                            "post",
+                        ]  # fmt: skip
+                    )
+                )
+            )
+        return Done()
+
+    return run
+
+
+def test_unprofiled_run_writes_no_trace_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: {"host": "h", "_missing": {}})
+    seen = []
+    monkeypatch.setattr(runner.subprocess, "run", _fake_vllm_bench(seen))
+    assert runner.run_benchmark("latency", "t", {"model": "m"}, {}, tmp_path, "0", "1")
+    assert not seen and not (tmp_path / "t" / "trace").exists()
+    assert json.loads((tmp_path / "t.json").read_text()) == {"avg_latency": 1.5, "latencies": [1.5]}
+    assert "--profile" not in (tmp_path / "t.cmd").read_text()
+
+
+@pytest.mark.parametrize("level", ["light", "full"])
+def test_profiled_run_writes_the_bundle_and_nothing_ingest_reads(tmp_path, monkeypatch, level):
+    fp = {"host": "h", "artifact": {"artifact_id": "a" * 8, "id12": "b" * 12}, "_missing": {}}
+    monkeypatch.setattr(bench_support, "env_fingerprint", lambda: fp)
+    monkeypatch.setattr(runner, "env_fingerprint", lambda: fp)
+    seen = []
+    monkeypatch.setattr(runner.subprocess, "run", _fake_vllm_bench(seen))
+    params = {"model": "org/m", "tensor_parallel_size": 1, "batch-size": 4, "input-len": 128,
+              "output-len": 64, "max-model-len": 256}  # fmt: skip
+    assert runner.run_benchmark(
+        "latency", "lat", params, {}, tmp_path, "0", "1", profile_level=level
+    )
+
+    assert not list(tmp_path.glob("*.json")) and not list(tmp_path.glob("*.cmd"))
+    trace = tmp_path / "lat" / "trace"
+    assert seen[0]["torch_profiler_record_shapes"] is (level == "full")
+    assert "--output-json" in (trace / "lat.cmd").read_text() and not (trace / "lat.json").exists()
+    manifest = json.loads((trace / "manifest.json").read_text())
+    assert manifest["label"] == "lat" and manifest["artifact"]["artifact_id"] == "a" * 8
+    assert manifest["traces"] == ["raw/dp0_pp0_tp0_rank0.123.pt.trace.json"]
+    if level == "full":
+        assert set(manifest["absent"]) == {"kernel_cost", "device_memory"}
+    else:
+        assert manifest["absent"] == {}
+    e2e = json.loads((trace / "e2e.json").read_text())
+    assert e2e["profile_level"] == level and e2e["e2e_s"] > 0
+    args = e2e["args"]
+    assert (args["model"], args["tp"], args["batch_size"]) == ("org/m", 1, 4)
+    assert (args["input_len"], args["output_len"], args["max_model_len"]) == (128, 64, 256)
+    res = json.loads((trace / "res.json").read_text())
+    assert {"weight_load", "compile_warmup", "profiled", "decode"} <= set(res["phases"])
+    host = json.loads((trace / "host.json").read_text())
+    assert host[0]["decode_summary"]["n"] == 2
+    roof = json.loads((trace / "roof.json").read_text())
+    assert {k["key"] for k in roof["kernels"]} == {"k_prefill", "k_decode"}
+    assert len((trace / "phases.jsonl").read_text().splitlines()) == 8
+
+
+def test_bundle_marks_a_profiled_result_json(tmp_path):
+    (tmp_path / "t.json").write_text(json.dumps({"request_throughput": 2.0}))
+    bench_trace.write_bundle(
+        tmp_path, test_name="t", level="light", bench_type="serve", parameters={},
+        env_fingerprint={}, samples=[],
+    )  # fmt: skip
+    got = json.loads((tmp_path / "t.json").read_text())
+    assert got == {"request_throughput": 2.0, "profile_level": "light"}
+
+
+def test_bundle_analysis_failure_still_writes_a_manifest(tmp_path):
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "x.pt.trace.json").write_text("not json")
+    m = bench_trace.write_bundle(
+        tmp_path, test_name="t", level="light", bench_type="latency", parameters={},
+        env_fingerprint={}, samples=[],
+    )  # fmt: skip
+    assert "analysis" in m["absent"] and (tmp_path / "manifest.json").is_file()
+
+
+def test_lifecycle_phases_count_once_across_ranks():
+    marks = [{"t": 1.0, "phase": "weight_load"}, {"t": 1.5, "phase": "weight_load"},
+             {"t": 2.0, "phase": "compile_warmup"}, {"t": 3.0, "phase": "decode"}]  # fmt: skip
+    spans = bench_trace._timeline(marks, 0.0, 4.0)
+    assert [s[0] for s in spans] == ["startup", "weight_load", "compile_warmup", "decode"]
+    assert spans[1] == ("weight_load", 1.0, 2.0)
+
+
+def test_profile_yaml_is_a_profiled_small_latency_config():
+    configs = runner._load_configs(_CONFIGS / "latency-tests-profile.yaml")
+    assert [c.get("profile_level") for c in configs] == ["full"]
+    p = configs[0]["parameters"]
+    assert (p["tensor_parallel_size"], p["input-len"], p["output-len"], p["batch-size"]) == (
+        1, 128, 64, 4,
+    )  # fmt: skip
+    assert runner._suite_config_files(_CONFIGS, "profile", {"latency"})["latency"].exists()

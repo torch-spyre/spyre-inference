@@ -247,6 +247,17 @@ class Recorder:
         except Exception as e:
             log.warning("Could not write bench records: %s", e)
 
+    def wall_series(self) -> list[dict]:
+        """Every sampler row with wall-clock `t` and the `dt_s` it covers, in time order."""
+        offset = time.time() - time.monotonic()
+        rows = []
+        for s in self._samplers:
+            prev = getattr(s, "t0", None)
+            for r in getattr(s, "series", []):
+                rows.append({**r, "t": r["t_s"] + offset, "dt_s": r["t_s"] - prev if prev else 0.0})
+                prev = r["t_s"]
+        return sorted(rows, key=lambda r: r["t"])
+
     def _phase_of(self, t: float) -> str:
         for p in self._phases:
             if p["t_end"] is not None and p["t_start"] <= t <= p["t_end"]:

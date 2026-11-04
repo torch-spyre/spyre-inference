@@ -422,6 +422,9 @@ BENCH_TYPES ?=
 # Directory holding the {latency,throughput,serve}-tests.yaml files to run.
 BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks/spyre
 BENCH_SUITE ?=
+# off|light|full: profile every selected test (see vllm-benchmarks/README.md); empty
+# leaves each test's own `profile_level` key in charge.
+PROFILE_LEVEL ?=
 
 # The serve configs replay trace files that are not in the repo, so the fetch is
 # what makes a serve config runnable at all and is on by default. Set
@@ -443,7 +446,7 @@ else
 BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them. Set PROFILE_LEVEL=light|full (or BENCH_SUITE=profile) for a profiled run that writes a trace bundle instead of an ingested result.
 	mkdir -p "$(RESULTS_DIR)"
 	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \
@@ -454,4 +457,5 @@ perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
 		--models "$(MODELS)" \
 		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)" \
-		--suite "$(BENCH_SUITE)"
+		--suite "$(BENCH_SUITE)" \
+		$(if $(strip $(PROFILE_LEVEL)),--profile-level "$(PROFILE_LEVEL)")

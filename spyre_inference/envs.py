@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_PROFILE_DIR: str | None = None
+    SPYRE_PROFILE_MEMORY_INTERVAL: float = 0.0
 
 _cache: dict[str, Any] = {}
 
@@ -155,6 +157,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # Directory for profiled benchmark runs (set by run_vllm_benchmarks.py --profile-level).
+    # When set, each process writes its phase changes there and, while a torch profiler
+    # runs, wraps each EngineCore step in a spyre::<prefill|decode|mixed>:<tokens> region.
+    # Unset (default) installs nothing.
+    "SPYRE_PROFILE_DIR": lambda: os.getenv("SPYRE_PROFILE_DIR") or None,
+    # Seconds between device-memory samples written under SPYRE_PROFILE_DIR by each worker.
+    # "0" (default) samples nothing.
+    "SPYRE_PROFILE_MEMORY_INTERVAL": lambda: float(os.getenv("SPYRE_PROFILE_MEMORY_INTERVAL", "0")),
 }
 # --8<-- [end:env-vars-definition]
 

@@ -125,6 +125,13 @@ override-dependencies = [
     # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
     # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.
     "pyzmq>=27.2.0",
+
+    # orjson dropped its ppc64le/s390x wheels at 3.12.0 and its sdist wants rustc >=1.95
+    # against UBI10's 1.92. Capped unconditionally rather than per-arch: a marker-gated
+    # pair forks the resolution, so the lock carries two orjson versions and every
+    # downstream marker grows an arch term. One version everywhere keeps x86_64 resolving
+    # the same as the Power/Z builds.
+    "orjson>=3.11.6,<3.12",
 ]
 
 constraint-dependencies = [

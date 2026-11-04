@@ -36,7 +36,6 @@ Data flow in the current WIP version:
 from __future__ import annotations
 
 import bisect
-import os
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol, cast

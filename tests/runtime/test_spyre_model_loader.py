@@ -25,7 +25,7 @@ from vllm.model_executor.model_loader import get_model_loader
 
 from spyre_inference.model_loader import (
     SpyreModelLoader,
-    _bind_weight,
+    _check_all_weights_loaded,
     _get_host_loaded_param_names,
 )
 from spyre_inference.platform import (
@@ -62,11 +62,7 @@ def _make_vllm_config(
     if transformers_backend:
         model_config.using_transformers_backend = lambda: True
     if moe:
-
-        class FakeMoEConfig:
-            num_experts = 8
-
-        model_config.hf_config = FakeMoEConfig()
+        model_config.hf_text_config.num_experts = 8
     return VllmConfig(
         model_config=model_config,
         load_config=LoadConfig(load_format=load_format),
@@ -147,7 +143,7 @@ def _make_ns(
     model_config = SimpleNamespace(
         runner_type=runner_type,
         quantization=quantization,
-        hf_config=SimpleNamespace(num_experts=8) if moe else SimpleNamespace(),
+        hf_text_config=SimpleNamespace(num_experts=8) if moe else SimpleNamespace(),
         multimodal_config=object() if multimodal else None,
         is_multimodal_model=False,
     )
@@ -206,13 +202,16 @@ def test_explicit_spyre_load_format_rejected_for_unsupported_config():
     _spyre_loader_supported is mocked to False to simulate an unsupported config.
     """
     import unittest.mock as mock
+
     import spyre_inference.platform as plat_mod
 
     vllm_config = _make_vllm_config()
     vllm_config.load_config.load_format = "spyre"
-    with mock.patch.object(plat_mod, "_spyre_loader_supported", return_value=False):
-        with pytest.raises(ValueError, match="--load-format spyre is not supported"):
-            TorchSpyrePlatform.check_and_update_config(vllm_config)
+    with (
+        mock.patch.object(plat_mod, "_spyre_loader_supported", return_value=False),
+        pytest.raises(ValueError, match="--load-format spyre is not supported"),
+    ):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
 def test_get_host_loaded_param_names(tp_group):
@@ -230,48 +229,53 @@ def test_get_host_loaded_param_names(tp_group):
     assert "dense.weight" not in host_names
 
 
-def test_bind_weight_custom_loader():
-    """Verify _bind_weight uses custom weight_loader when present."""
-
-    class MockParam(nn.Parameter):
-        def __new__(cls, data):
-            return super().__new__(cls, data)
-
-    calls = []
-
-    def mock_loader(param, tensor):
-        calls.append((param, tensor))
-
-    class SubModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = MockParam(torch.zeros(2, 2))
-            self.weight.weight_loader = mock_loader
-
-    class ParentModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.sub = SubModel()
-
-    model = ParentModel()
-    dummy_weight = torch.ones(2, 2)
-    _bind_weight(model, "sub.weight", dummy_weight)
-
-    assert len(calls) == 1
-    assert calls[0][0] is model.sub.weight
-    assert torch.equal(calls[0][1], dummy_weight)
+def test_check_all_weights_loaded_passes_when_complete():
+    model = nn.Sequential(nn.Linear(2, 2))
+    _check_all_weights_loaded(model, {"0.weight", "0.bias"})
 
 
-def test_bind_weight_standard_param():
-    """Verify _bind_weight updates parameter data directly."""
+def test_check_all_weights_loaded_raises_on_missing_param():
+    """A parameter with no checkpoint tensor would keep its uninitialized placeholder."""
+    model = nn.Sequential(nn.Linear(2, 2))
+    with pytest.raises(ValueError, match="not initialized from checkpoint.*0.bias"):
+        _check_all_weights_loaded(model, {"0.weight"})
 
-    class StandardModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear = nn.Linear(2, 2, bias=False)
 
-    model = StandardModel()
-    new_data = torch.ones(2, 2) * 5.0
-    _bind_weight(model, "linear.weight", new_data)
+def test_check_all_weights_loaded_skips_untracked_models():
+    """A model whose load_weights returns None cannot be checked; it must not raise."""
+    model = nn.Sequential(nn.Linear(2, 2))
+    _check_all_weights_loaded(model, None)
 
-    assert torch.equal(model.linear.weight.data, new_data)
+
+@pytest.mark.parametrize("attr", ["_spyre_orig_head_dim", "_spyre_orig_intermediate_size"])
+def test_spyre_loader_supported_rejects_padded(attr):
+    ns = _make_ns()
+    ns.model_config.hf_text_config = SimpleNamespace(**{attr: 16})
+    assert not _spyre_loader_supported(ns)
+
+
+def test_spyre_loader_supported_accepts_unpadded_text_config():
+    ns = _make_ns()
+    ns.model_config.hf_text_config = SimpleNamespace()
+    assert _spyre_loader_supported(ns)
+
+
+def test_gate_sees_padding_applied_by_the_hook(monkeypatch):
+    """The hook must pad before gating, since check_and_update_config runs later."""
+    vllm_config = _make_vllm_config()
+    vllm_config.load_config.load_format = "auto"
+
+    def fake_pad(cls, config):
+        config.model_config.hf_text_config._spyre_orig_head_dim = 16
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_maybe_pad_head_dim", classmethod(fake_pad))
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "auto"
+
+
+def test_explicit_spyre_load_format_rejected_for_padded_config():
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_text_config._spyre_orig_intermediate_size = 160
+    vllm_config.load_config.load_format = "spyre"
+    with pytest.raises(ValueError, match="--load-format spyre is not supported"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)

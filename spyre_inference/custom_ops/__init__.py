@@ -36,6 +36,7 @@ from . import (
     vocab_parallel_embedding,  # noqa: F401
 )
 from .fp8_linear_kernel import register_spyre_fp8_linear_kernel
+from .fp8_linear_method import register_spyre_fp8_config
 
 logger = init_logger(__name__)
 
@@ -44,5 +45,6 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
+    register_spyre_fp8_config()
     utils.register()
     multimodal_embeddings.register()

@@ -21,6 +21,7 @@ in-graph ``qfp8wt`` path  not a CPU golden.
 """
 
 import warnings
+from typing import cast
 
 import pytest
 import torch
@@ -703,3 +704,82 @@ def test_process_weights_rejects_fp16():
     layer.weight_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float16), requires_grad=False)
     with pytest.raises(TypeError, match="float8_e4m3fn"):
         kernel.process_weights_after_loading(layer)
+
+
+@pytest.mark.parametrize(
+    "scales, expected_shape",
+    [
+        ([0.25, 0.25, 0.25], (1,)),
+        ([0.25, 0.5, 1.0], (6, 1)),
+        ([0.5, torch.finfo(torch.float32).min, torch.finfo(torch.float32).min], (1,)),
+    ],
+    ids=["equal", "differ", "fused-on-disk"],
+)
+def test_shard_scales_to_kernel_scale(scales, expected_shape):
+    """Equal or fused-on-disk shard scales collapse to their max; differing ones go per row."""
+    from spyre_inference.custom_ops.fp8_linear_method import shard_scales_to_kernel_scale
+
+    scale = shard_scales_to_kernel_scale(torch.tensor(scales), [2, 2, 2])
+    assert tuple(scale.shape) == expected_shape
+    if expected_shape == (1,):
+        assert scale.item() == max(scales)
+    else:
+        assert scale.flatten().tolist() == [0.25, 0.25, 0.5, 0.5, 1.0, 1.0]
+
+
+@pytest.mark.fp8
+@pytest.mark.parametrize("scales", [[0.25, 0.25, 0.25], [0.25, 0.5, 1.0]], ids=["equal", "differ"])
+def test_per_tensor_qkv_loads_without_requant(scales, tp_group, monkeypatch):
+    """A per-tensor static QKV keeps its FP8 bytes and never calls the missing ``_C`` op."""
+    if SpyreFp8LinearKernel is None:
+        pytest.skip("vLLM FP8 kernel base unavailable")
+    import vllm._custom_ops as ops
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    from spyre_inference.custom_ops.fp8_linear_method import (
+        SpyreFp8Config,
+        SpyreFp8LinearMethod,
+    )
+
+    def _no_requant(*args, **kwargs):
+        raise AssertionError("scaled_fp8_quant needs _C, which the empty vLLM build lacks")
+
+    monkeypatch.setattr(ops, "scaled_fp8_quant", _no_requant)
+    # The DMA needs a card; the scale handling under test does not.
+    monkeypatch.setattr(fp8_linear_kernel, "_dma_checkpoint_qfp8wt", lambda w: w)
+    register_spyre_fp8_linear_kernel()
+
+    layer = QKVParallelLinear(
+        hidden_size=128,
+        head_size=64,
+        total_num_heads=2,
+        total_num_kv_heads=2,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=SpyreFp8Config(activation_scheme="static"),
+        prefix="test.qkv_proj",
+    )
+    assert isinstance(layer.quant_method, SpyreFp8LinearMethod)
+
+    weight = torch.randn(384, 128, dtype=torch.float16).to(torch.float8_e4m3fn)
+    # Shard by shard through weight_loader, as a checkpoint loads.
+    for i, shard_id in enumerate(("q", "k", "v")):
+        for name, value in (
+            ("weight", weight[i * 128 : (i + 1) * 128]),
+            ("weight_scale", torch.tensor(scales[i])),
+            ("input_scale", torch.tensor([0.5, 2.0, 1.0][i])),
+        ):
+            param = getattr(layer, name)
+            param.weight_loader(param, value, shard_id)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    loaded = cast(torch.Tensor, layer.weight).contiguous().view(torch.uint8)
+    assert torch.equal(loaded, weight.t().contiguous().view(torch.uint8))
+    weight_scale = cast(torch.Tensor, layer.weight_scale)
+    assert weight_scale.dtype == torch.float16
+    if scales[0] == scales[1] == scales[2]:
+        assert weight_scale.tolist() == [scales[0]]
+    else:
+        expected = torch.tensor(scales, dtype=torch.float16).repeat_interleave(128)
+        assert torch.equal(weight_scale.flatten(), expected)
+    assert cast(torch.Tensor, layer.input_scale).tolist() == [2.0]

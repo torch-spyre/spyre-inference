@@ -640,20 +640,78 @@ def test_adapter_sliding_layers_require_covering_context(config_factory, window,
     if accepted:
         validate_hf_adapters_config(config)
     else:
-        with pytest.raises(ValueError, match="dense full-attention backbone"):
+        with pytest.raises(ValueError, match="full attention for generation"):
             validate_hf_adapters_config(config)
 
 
-def test_adapter_non_attention_layer_rejected_with_covering_window(config_factory):
+@pytest.mark.parametrize("runner", ["generate", "pooling"])
+def test_adapter_non_attention_layer_rejected_with_covering_window(config_factory, runner):
     from spyre_inference.hf_adapters import validate_hf_adapters_config
 
-    config = config_factory()
+    config = config_factory(runner=runner)
     config.model_config.hf_text_config.layer_types = [
         "linear_attention",
         "full_attention",
     ]
     config.model_config.hf_text_config.sliding_window = 64
-    with pytest.raises(ValueError, match="dense full-attention backbone"):
+    with pytest.raises(ValueError, match="adapter-supported attention"):
+        validate_hf_adapters_config(config)
+
+
+def test_embedding_sliding_attention_validation_is_model_independent(config_factory):
+    from spyre_inference.hf_adapters import validate_hf_adapters_config
+
+    config = config_factory(runner="pooling")
+    text = config.model_config.hf_text_config
+    text.model_type = "another_encoder"
+    text.layer_types = ["full_attention", "sliding_attention"]
+    text.sliding_window = 4
+    validate_hf_adapters_config(config)
+
+
+def test_embedding_sliding_attention_requires_adapter_support(config_factory):
+    from spyre_inference.hf_adapters import validate_hf_adapters_config
+
+    config = config_factory(runner="pooling")
+    text = config.model_config.hf_text_config
+    text.layer_types = ["full_attention", "sliding_attention"]
+    text.sliding_window = 4
+    model = GraniteModel(text).eval()
+    validate_hf_adapters_config(config)
+    with pytest.raises(ValueError, match="full attention within max_model_len"):
+        prepare_execution(model, vllm_config=config)
+    assert not hasattr(model, "_spyre_compiled_blocks")
+
+
+@pytest.mark.parametrize("family", ["granite", "modernbert"])
+@pytest.mark.parametrize("field", ["head_size", "total_num_attention_heads", "total_num_kv_heads"])
+def test_adapter_per_layer_geometry_overrides_are_rejected(config_factory, family, field):
+    from transformers import ModernBertConfig
+
+    from spyre_inference.hf_adapters import validate_hf_adapters_config
+
+    hf = (
+        ModernBertConfig(
+            hidden_size=128,
+            num_attention_heads=2,
+            num_hidden_layers=2,
+            intermediate_size=256,
+            vocab_size=101,
+            max_position_embeddings=64,
+            local_attention=4,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+        )
+        if family == "modernbert"
+        else None
+    )
+    config = config_factory(hf_config=hf, runner="pooling")
+    arch = config.model_config.model_arch_config
+    assert arch.per_layer_overrides is None
+    validate_hf_adapters_config(config)
+    arch.per_layer_overrides = [{}, {field: getattr(arch, field) // 2}]
+    with pytest.raises(ValueError, match="uniform layer geometry"):
         validate_hf_adapters_config(config)
 
 
@@ -843,6 +901,8 @@ def test_generic_wrapper_does_not_enable_unsupported_adapter(config_factory):
         ("roberta", 32, "CLS"),
         ("xlm-roberta", 64, "MEAN"),
         ("mpnet", 64, "MEAN"),
+        ("modernbert", 32, "MEAN"),
+        ("modernbert", 64, "MEAN"),
     ],
 )
 def test_embedding_wrapper_loads_and_runs_shared_backbone(
@@ -872,6 +932,17 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
         pad_token_id=0,
         **({"num_key_value_heads": 1} if family == "qwen3" else {}),
         **({"hidden_dim": 256} if family == "distilbert" else {}),
+        **(
+            {
+                "local_attention": 4,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "cls_token_id": 1,
+                "sep_token_id": 2,
+            }
+            if family == "modernbert"
+            else {}
+        ),
     )
     config = config_factory(
         hf_config=hf, runner="pooling", pooler_config=PoolerConfig(seq_pooling_type=pooling)
@@ -964,7 +1035,9 @@ def test_embedding_wrapper_loads_and_runs_shared_backbone(
 
     monkeypatch.setattr(backend, "_adapter_attention_cls", select)
     backend.prepare_hf_adapters()
-    assert backend.model_config.get_head_size() == max(head_dim, 64)
+    assert backend.model_config.get_head_size() == max(
+        head_dim, 128 if family == "modernbert" else 64
+    )
     kw = {} if token_types is None else {"token_type_ids": token_types}
     with torch.inference_mode():
         actual = backend(ids, positions, **kw)

@@ -125,21 +125,27 @@ def validate_hf_adapters_config(config: VllmConfig) -> None:
     if config.load_config.load_format not in ("auto", "hf", "safetensors", "pt"):
         raise ValueError("hf_adapters preparation requires ordinary HF checkpoint loading")
     text = model.hf_text_config
-    layer_types = getattr(text, "layer_types", None)
-    full_attention_types = {"attention", "full_attention"}
-    window = getattr(text, "sliding_window", None)
-    if window is not None and window >= model.max_model_len:
-        full_attention_types.add("sliding_attention")
     if (
         model.is_moe
         or model.use_mla
         or model.is_hybrid
         or getattr(text, "is_encoder_decoder", False)
         or model.model_arch_config.per_layer_overrides is not None
-        or (layer_types and any(kind not in full_attention_types for kind in layer_types))
     ):
         raise ValueError(
-            "hf_adapters preparation currently requires a dense full-attention backbone"
+            "hf_adapters preparation requires a dense attention backbone "
+            "with uniform layer geometry"
+        )
+    attention_types = {"attention", "full_attention"}
+    window = getattr(text, "sliding_window", None)
+    # Pooling bindings can carry local masks as position_bias. The adapter checks
+    # its own support during worker preparation; keep that import out of config validation.
+    if model.runner_type == "pooling" or (window is not None and window >= model.max_model_len):
+        attention_types.add("sliding_attention")
+    if any(kind not in attention_types for kind in (getattr(text, "layer_types", None) or [])):
+        raise ValueError(
+            "hf_adapters preparation requires full attention for generation "
+            "or adapter-supported attention for embedding"
         )
 
 

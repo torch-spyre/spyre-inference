@@ -306,7 +306,8 @@ class TestTracedForward:
 
 
 @pytest.mark.parametrize("path", ["inline", "rectangle", "grouped", "fused"])
-def test_learned_position_bias_is_local_to_each_request(path):
+@pytest.mark.parametrize("bias_kind", ["learned", "local_window"])
+def test_position_bias_is_local_to_each_request(path, bias_kind):
     torch.manual_seed(19)
     heads, dim, extent, width = 2, 64, 64, 2
     lengths = [19, 37]
@@ -315,7 +316,13 @@ def test_learned_position_bias_is_local_to_each_request(path):
     class Bias(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.register_buffer("values", torch.randn(1, heads, 128, 128))
+            values = torch.randn(1, heads, 128, 128)
+            if bias_kind == "local_window":
+                positions = torch.arange(128)
+                allowed = (positions[:, None] - positions[None, :]).abs() <= 7
+                values = torch.where(allowed, 0.0, torch.finfo(torch.float16).min / 4)
+                values = values[None, None]
+            self.register_buffer("values", values)
 
         def forward(self):
             return self.values

@@ -35,6 +35,8 @@ from vllm.config import PoolerConfig
         ("ibm-granite/granite-embedding-30m-english", "CLS", 128),
         ("sentence-transformers/multi-qa-distilbert-cos-v1", "MEAN", 128),
         ("sentence-transformers/all-mpnet-base-v2", "MEAN", 256),
+        ("nomic-ai/modernbert-embed-base", "MEAN", 256),
+        ("Alibaba-NLP/gte-modernbert-base", "CLS", 256),
     ],
 )
 def test_hf_adapters_embeddings(model, pooling, max_model_len):

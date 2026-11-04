@@ -57,7 +57,7 @@ Read the diff between baseline and target(s) (`git diff --stat`, then the releva
 
 | axis | choice |
 |---|---|
-| model | **`google/gemma-4-26B-A4B`**; another decoder from `vllm-benchmarks/benchmarks/spyre/serve-tests/decoder/` when the change targets it: `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-4.1-8b`, or an FP8 model (`ibm-granite/granite-3.3-8b-instruct-FP8`, `ibm-granite/granite-4.1-8b-fp8`) |
+| model | **`google/gemma-4-26B-A4B`**; another decoder from `vllm-benchmarks/benchmarks/decoder/` when the change targets it: `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-4.1-8b`, or an FP8 model (`ibm-granite/granite-3.3-8b-instruct-FP8`, `ibm-granite/granite-4.1-8b-fp8`) |
 | tensor-parallel-size | **4**; 1 when the change targets single-card execution, or both if the change touches collectives |
 | max-model-len + dataset | 4096 + `${SPYRE_AIOPS_DATASET}` for short-context changes; **8192 + `${SPYRE_CICS_DATASET}`**; 32768 + `${SPYRE_ALL_SEQUENCES_DATASET}` for long-context changes |
 | max-num-seqs | **4**; another power of two (8, 16, 32) if the change targets batching. Keep `max-concurrency` equal to it |
@@ -75,7 +75,7 @@ serve_gemma4-26b-a4b_tp4_cics8k_bs4: gemma-4-26B-A4B, TP4, max-model-len 8192, m
 
 ### 3. Write the bench directory
 
-Create `<spyre-inference>/../bench-<tag>/` (e.g. `bench-pr1043/`), outside the git tree so it survives worktree swaps. Write `serve-tests.yaml` there in the same `defaults`/`tests` format as `vllm-benchmarks/benchmarks/spyre/serve-tests/decoder/serve-<model>-runs.yaml`: copy its `defaults` block, then one entry per confirmed config. Give TP4 and 32k entries `server_health_timeout: 3600`, and double it when the caches are off. `test_name` must be unique per config; the leg is encoded in the results directory, not the name.
+Create `<spyre-inference>/../bench-<tag>/` (e.g. `bench-pr1043/`), outside the git tree so it survives worktree swaps. Write `serve-tests.yaml` there in the same `defaults`/`tests` format as `vllm-benchmarks/benchmarks/decoder/serve-<model>-runs.yaml`: copy its `defaults` block, then one entry per confirmed config. Give TP4 and 32k entries `server_health_timeout: 3600`, and double it when the caches are off. `test_name` must be unique per config; the leg is encoded in the results directory, not the name.
 
 ### 4. Run each leg (targets first)
 

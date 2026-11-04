@@ -86,7 +86,7 @@ jobs:
           set -eux
           pip install pyyaml
           python .github/scripts/generate_vllm_benchmark_matrix.py \
-            --benchmark-configs-dir vllm-benchmarks/benchmarks/spyre \
+            --benchmark-configs-dir vllm-benchmarks/benchmarks \
             --models "${MODELS}"
 
   # ─── Run vLLM benchmarks on Spyre hardware ───

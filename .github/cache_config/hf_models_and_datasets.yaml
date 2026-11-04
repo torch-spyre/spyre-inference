@@ -78,7 +78,7 @@ public_models:
 # correct copy is already cached, so a re-dispatch is cheap and idempotent.
 #
 # The whole prefix is mirrored: 13 files, 474MB. Only a few have a consumer in
-# benchmarks/spyre/serve-tests/ today, but a fork PR cannot fetch a missing
+# benchmarks/ today, but a fork PR cannot fetch a missing
 # one for itself, so a partial mirror would make every new trace-replaying
 # config wait on a config change plus a dispatch. Caching all 13 up front costs
 # one transfer on a 770T shared volume and makes that wait go away.

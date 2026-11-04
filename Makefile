@@ -422,7 +422,7 @@ TPS ?=
 BENCH_TYPES ?=
 # Directory searched for *-runs.yaml config files, or a single config file,
 # which runs every entry whatever BENCH_SUITE says.
-BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks/spyre
+BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks
 BENCH_SUITE ?= minimal
 
 # The serve configs replay trace files that are not in the repo, so the fetch is

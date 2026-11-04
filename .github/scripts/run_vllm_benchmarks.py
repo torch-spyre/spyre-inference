@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument(
         "--configs-dir",
         type=str,
-        default="vllm-benchmarks/benchmarks/spyre",
+        default="vllm-benchmarks/benchmarks",
         help="directory searched for *-runs.yaml config files, or a single config "
         "file, which runs unfiltered by suite",
     )

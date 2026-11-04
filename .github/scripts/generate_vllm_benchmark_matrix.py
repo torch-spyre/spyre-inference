@@ -55,7 +55,7 @@ def parse_args() -> Any:
     parser.add_argument(
         "--benchmark-configs-dir",
         type=str,
-        default="vllm-benchmarks/benchmarks/spyre",
+        default="vllm-benchmarks/benchmarks",
         action=ValidateDir,
         help="the directory searched for *-runs.yaml benchmark configs",
     )

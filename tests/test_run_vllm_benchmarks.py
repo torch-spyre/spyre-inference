@@ -44,7 +44,12 @@ _matrix_spec = importlib.util.spec_from_file_location(
 matrix = importlib.util.module_from_spec(_matrix_spec)
 _matrix_spec.loader.exec_module(matrix)
 
-_CONFIGS = _REPO / "vllm-benchmarks" / "benchmarks" / "spyre"
+_TABLES_SCRIPT = _REPO / ".github" / "scripts" / "generate_bench_config_tables.py"
+_tables_spec = importlib.util.spec_from_file_location("bench_config_tables", _TABLES_SCRIPT)
+tables = importlib.util.module_from_spec(_tables_spec)
+_tables_spec.loader.exec_module(tables)
+
+_CONFIGS = _REPO / "vllm-benchmarks" / "benchmarks"
 CONFIG_FILES = runner.config_files(_CONFIGS)
 SERVE_FILES = [f for f in CONFIG_FILES if f.name.startswith("serve-")]
 OFFLINE_FILES = [f for f in CONFIG_FILES if not f.name.startswith("serve-")]
@@ -422,6 +427,23 @@ def test_checked_in_test_names_and_labels_are_valid():
     assert all(selected.values())
     for suite in runner.SUITE_LABELS:
         assert any(runner.collect_configs(_CONFIGS, suite, {"serve"}).values()), suite
+
+
+def test_readme_config_tables_are_up_to_date():
+    current = tables.README.read_text()
+
+    assert tables.updated_readme(current, tables.render(tables.load_entries())) == current
+
+
+def test_tables_reject_a_duplicate_test_name(monkeypatch, tmp_path):
+    _write_runs(tmp_path / "a", "serve-x-runs.yaml", {"t": ["base"]})
+    _write_runs(tmp_path / "b", "latency-y-runs.yaml", {"t": None})
+    monkeypatch.setattr(tables, "CONFIGS_DIR", tmp_path)
+    monkeypatch.setattr(tables, "README", tmp_path / "README.md")
+
+    with pytest.raises(SystemExit) as exc:
+        tables.load_entries()
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize("config_file", SERVE_FILES, ids=lambda f: f.name)

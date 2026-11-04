@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.model_executor.models.gpt_oss import GptOssForCausalLM, MLPBlock
 
-from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer, deinterleave_gate_up
+from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -36,12 +36,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-GPT_OSS_MOE_RECIPE = SpyreMoERecipe(
-    activation="swigluoai",
-    routing="topk_softmax",
-    prepare_gate_up_weight=deinterleave_gate_up,
-)
-
+GPT_OSS_MOE_RECIPE = SpyreMoERecipe(activation="swigluoai", routing="topk_softmax")
 
 
 def configure_gpt_oss_moe_layers(layers: Iterable[nn.Module]) -> int:

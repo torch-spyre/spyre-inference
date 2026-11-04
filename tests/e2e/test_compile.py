@@ -39,10 +39,13 @@ _COSINE_MIN = 0.99
 @pytest.mark.parametrize(
     "model_ref_output",
     [
-        (
-            "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            "\n\nIBMs main businesses are the companies that provide the services of the",
-            None,
+        pytest.param(
+            (
+                "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+                "\n\nIBMs main businesses are the companies that provide the services of the",
+                None,
+            ),
+            marks=pytest.mark.e2e_smoke,
         ),
         # FP8 checkpoint of the same model: QFP8WT weights and FP8 linears traced into the
         # block graph.
@@ -52,7 +55,7 @@ _COSINE_MIN = 0.99
                 "\n\nIBMs are a set of standards that are used to measure the performance",
                 None,
             ),
-            marks=pytest.mark.fp8,
+            marks=[pytest.mark.fp8, pytest.mark.e2e_smoke],
         ),
         (
             "google/gemma-3-1b-it",
@@ -70,10 +73,13 @@ _COSINE_MIN = 0.99
         ),
         # The 26B-A4B layout (MoE, sliding + full attention) at 6 layers, real weights;
         # the full 26B-A4B is compiled by the quality gate (test_model_quality.py).
-        (
-            "joerunde/gemma-4-moe-nano",
-            " street and ball ball. people's hats off then I account it high time",
-            GEMMA4_TEXT_BACKBONE_OVERRIDE,
+        pytest.param(
+            (
+                "joerunde/gemma-4-moe-nano",
+                " street and ball ball. people's hats off then I account it high time",
+                GEMMA4_TEXT_BACKBONE_OVERRIDE,
+            ),
+            marks=pytest.mark.e2e_smoke,
         ),
     ],
     ids=[
@@ -110,6 +116,7 @@ def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.e2e_smoke
 def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compiled pooling pads to ``(B, L)`` and matches cached HF refs.
 
@@ -144,6 +151,7 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
         assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
+@pytest.mark.e2e_smoke
 def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compile the Transformers backend and check against a known reference.
 

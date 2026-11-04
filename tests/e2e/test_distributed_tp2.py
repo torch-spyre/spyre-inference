@@ -30,6 +30,7 @@ MAX_MODEL_LEN = 128
 MAX_NUM_SEQS = 2
 
 
+@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
@@ -124,6 +125,7 @@ def _assert_matches_tp1(
         )
 
 
+@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
@@ -148,7 +150,9 @@ def test_tp2_llm_generate_matches_tp1() -> None:
 @pytest.mark.parametrize(
     "model,hf_overrides",
     [
-        ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", None),
+        pytest.param(
+            "ibm-ai-platform/micro-g3.3-8b-instruct-1b", None, marks=pytest.mark.e2e_smoke
+        ),
         # gemma-4 vision checkpoints resolve the multimodal architecture, so this row
         # pins the text-only backbone -- the decoder is what TP splits anyway, and the
         # tower's weights and warmup would be paid for nothing. The nano model keeps
@@ -261,6 +265,7 @@ def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
     _assert_matches_tp1(_generate_image(tp=1), _generate_image(tp=2))
 
 
+@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(

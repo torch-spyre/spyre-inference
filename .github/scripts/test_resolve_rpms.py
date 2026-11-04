@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""resolve_rpms.py: the lock is fetched from untrusted fork PR heads, so its
-name/version/tree fields reach a credentialed Artifactory AQL query. Lock
-values that could escape the query JSON (or the download URL path) must be
-rejected before any network call; clean locks must still resolve to specs.
-"""
-
 from __future__ import annotations
 
 import pathlib
@@ -51,11 +45,11 @@ def test_override_version_wildcard_is_allowed():
 @pytest.mark.parametrize(
     "tree",
     [
-        'x","$or":[{"repo":{"$match":"*"',  # break out of the JSON "path" value
-        'a" b',  # whitespace / stray quote
-        "a$b",  # AQL operator sigil
-        "..",  # path traversal into the download URL
-        "a/../b",  # traversal in a deeper segment
+        'x","$or":[{"repo":{"$match":"*"',
+        'a" b',
+        "a$b",
+        "..",
+        "a/../b",
     ],
 )
 def test_injection_in_tree_is_rejected(tree):

@@ -43,14 +43,8 @@ import urllib.request
 ARCHES = ("x86_64", "ppc64le", "s390x")
 DEFAULT_LOCK = "spyre-rpms.lock"
 
-# The lock is attacker-controllable: populate-rpm-cache.yaml fetches
-# spyre-rpms.lock from an untrusted fork PR head and feeds it to this script's
-# `validate`/`resolve`, which POST these fields into an Artifactory AQL query
-# (a JSON body) with the credentialed ARTIFACTORY_TOKEN. Unvalidated values
-# that contain a `"` break out of the quoted JSON and rewrite the query, so
-# every lock-derived field is checked against a strict allowlist and the run
-# fails closed before any network call. RPM names, versions and tree subdirs
-# are well-defined charsets; the `*` build wildcard is only legal in a version.
+# The lock can come from an untrusted fork PR and its fields are formatted into
+# a credentialed AQL query, so they must not be able to escape it.
 _NAME_RE = re.compile(r"\A[A-Za-z0-9._+-]+\Z")
 _VERSION_RE = re.compile(r"\A[A-Za-z0-9._+*-]+\Z")
 _TREE_RE = re.compile(r"\A[A-Za-z0-9._/-]*\Z")
@@ -63,9 +57,6 @@ def _check_field(kind, value, pattern):
 
 
 def _check_tree(value):
-    # The tree is a subdir of the RPM repo; it is joined into the AQL `path`
-    # and the download URL. Besides the charset, reject `..` segments so an
-    # untrusted lock cannot traverse out of the pinned repo path.
     _check_field("tree", value, _TREE_RE)
     if ".." in value.split("/"):
         sys.exit(f"::error::illegal tree in spyre-rpms.lock (path traversal): {value!r}")
@@ -94,8 +85,6 @@ def resolve_specs(data, arch):
         ov = overrides.get(name, {})
         version = ov.get("version", spec["version"])
         tree = ov.get("tree", spec.get("tree", default_tree))
-        # Fail closed on any field that could escape the AQL query JSON or the
-        # download URL path (see the allowlist comment above).
         _check_field("package name", name, _NAME_RE)
         _check_field("version", version, _VERSION_RE)
         _check_tree(tree)

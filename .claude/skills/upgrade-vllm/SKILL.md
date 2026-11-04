@@ -11,8 +11,8 @@ If `$ARGUMENTS` is empty, ask the user which target version before doing anythin
 **Follow the complete procedure in `docs/contributing/vllm-upgrade-procedure.md`.**
 
 The vendored-code review includes `csrc/cpu/`, `SpyreTopKTopPSampler`, and the
-temporary XPress port. `tests/spec_decode/test_xpress_vendored.py` intentionally
-fails when vLLM ships XPress; follow [the cleanup issue](https://github.com/torch-spyre/spyre-inference/issues/1417)
-to replace the port with upstream model/head subclasses and retain the Spyre overrides.
+Spyre subclasses of upstream's XPress model and head. Re-check their device
+layouts, compiled refinement helpers, checkpoint validation and CPU sampling
+adapters against the pinned release.
 
 When you see `{VERSION}` in that document, replace it with `$ARGUMENTS` (the version provided by the user or requested from them).

@@ -234,30 +234,9 @@ def _vision_pattern(patches, rank, device):
     return values.reshape(1, patches, 1024).to(device)
 
 
-def probe_all_reduce_vision_flattened(device, device_group, world_size, rank):
-    """The vision o_proj reduction as a flat view. 528 is the patch count whose rank-3
-    collective made deeptools' L3 scheduler assert; 3120 is the count that built."""
-    gn = _group_name(device_group)
-    scale = float(sum(range(1, world_size + 1)))
-    for patches in (528, 3120):
-        t = _vision_pattern(patches, rank, device)
-        out = torch.ops._c10d_functional.all_reduce(t.reshape(-1), "sum", gn)
-        out = torch.ops._c10d_functional.wait_tensor(out).reshape(t.shape)
-
-        expected = _vision_pattern(patches, 0, "cpu") * scale
-        actual = out.cpu()
-        if not torch.equal(actual, expected):
-            bad = (actual != expected).nonzero()
-            raise AssertionError(
-                f"patches={patches}: {bad.shape[0]} of {expected.numel()} elements wrong; "
-                f"first bad index {bad[0].tolist()} "
-                f"got {actual[tuple(bad[0])]} want {expected[tuple(bad[0])]}"
-            )
-        print(f"[rank {rank}] patches={patches} flattened all_reduce exact")
-
-
 def probe_all_reduce_vision_rank3(device, device_group, world_size, rank):
-    """The same reduction without flattening. 528 is expected to fail the build."""
+    """The vision o_proj reduction. 528 patches once made deeptools' L3 scheduler assert
+    building the rank-3 sum kernel; 3120 always built."""
     gn = _group_name(device_group)
     scale = float(sum(range(1, world_size + 1)))
     for patches in (528, 3120):
@@ -281,13 +260,12 @@ def _all_reduce_rank2_exact(device, device_group, world_size, rank, rows, hidden
 
 
 def probe_all_reduce_rank2(device, device_group, world_size, rank):
-    """A rank-2 [3, 4096] reduction without flattening."""
+    """A rank-2 [3, 4096] reduction."""
     _all_reduce_rank2_exact(device, device_group, world_size, rank, 3, 4096)
 
 
 def probe_all_reduce_rank2_prefill(device, device_group, world_size, rank):
-    """gemma-4-26B's 64-token prefill reduction without flattening. Expected to fail
-    the sum-kernel build."""
+    """gemma-4-26B's 64-token prefill reduction, which once found no core split."""
     _all_reduce_rank2_exact(device, device_group, world_size, rank, 64, 2816)
 
 
@@ -373,7 +351,6 @@ def probe_compiled_all_reduce_padded(device, device_group, world_size, rank):
 
 PROBES = {
     "compiled_all_reduce_padded": probe_compiled_all_reduce_padded,
-    "all_reduce_vision_flattened": probe_all_reduce_vision_flattened,
     "all_reduce_vision_rank3": probe_all_reduce_vision_rank3,
     "all_reduce_rank2": probe_all_reduce_rank2,
     "all_reduce_rank2_prefill": probe_all_reduce_rank2_prefill,

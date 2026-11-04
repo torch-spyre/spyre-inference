@@ -283,6 +283,39 @@ def test_spyre_bool_mask_index_put(spyre_device):
     torch.testing.assert_close(t.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A scatter along the last (stick) dim does not compile (torch-spyre#4404), and "
+        "torch-spyre#3878 keeps topk's indices in fp16, which scatter rejects. With "
+        "#4404's fix, a last-dim scatter still writes wrong values (torch-spyre#4403). "
+        "spyre_inference.moe._topk_probs masks the logits with keep_by_index instead. "
+        "When this probe passes, revisit that workaround."
+    ),
+)
+def test_spyre_topk_scatter_dense_routing(spyre_device):
+    """Dense top-k routing weights: topk, then scatter the softmaxed weights back.
+
+    The canonical form of vLLM's ``topk_softmax`` routing, as ``_topk_probs`` wrote it
+    before the keep_by_index workaround.
+    """
+    tokens, experts, top_k = 16, 64, 4
+    gen = torch.Generator().manual_seed(0)
+    # Distinct logits per row, so the selected set has no fp16 ties.
+    ranks = torch.stack([torch.randperm(experts, generator=gen) for _ in range(tokens)])
+    logits = (ranks.float() / experts * 4 - 2).to(torch.float16)
+
+    @torch.compile(dynamic=False)
+    def fn(logits):
+        weights, ids = torch.topk(logits, top_k, dim=-1)
+        return torch.zeros_like(logits).scatter(-1, ids, torch.softmax(weights, dim=-1))
+
+    weights, ids = torch.topk(logits.float(), top_k, dim=-1)
+    expected = torch.zeros(tokens, experts).scatter(-1, ids, torch.softmax(weights, dim=-1))
+    out = fn(logits.to(spyre_device))
+    torch.testing.assert_close(out.cpu().float(), expected, atol=2e-3, rtol=2e-3)
+
+
 # ---------------------------------------------------------------------------
 # 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------
@@ -1256,3 +1289,31 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 14. Parameter identity across model.to("spyre")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#5976: model.to('spyre') installs a new Parameter for each moved one "
+        "instead of keeping the object, as nn.Module.to does. When this XPASS-es, drop "
+        "_sink_owners and the moe_quant_config rebuild from move_model_to_spyre."
+    ),
+)
+def test_spyre_module_to_keeps_parameter_objects(spyre_device):
+    """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
+    must see the device tensor after the move, and a reload's in-place write."""
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    held = model.sinks
+
+    model.to(spyre_device)
+
+    assert model.sinks is held
+    new = torch.full((8,), 3.0, dtype=torch.float16)
+    model.sinks.data.copy_(new.to(spyre_device))
+    torch.testing.assert_close(held.cpu(), new)

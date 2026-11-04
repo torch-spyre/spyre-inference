@@ -37,7 +37,7 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -72,7 +72,6 @@ from spyre_inference.models.roberta import offset_host_positions, roberta_positi
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
-    SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
@@ -91,12 +90,7 @@ from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_r
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.compile_granularity import (
-    block_sharing_defeated_by,
-    compile_blocks,
-    compile_granularity,
-    repeated_block_lists,
-)
+from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
     encoder_pad_token_id,
@@ -110,6 +104,7 @@ from spyre_inference.v1.worker.model_load import (
     fix_padded_model,
     install_pad_loaders,
     move_model_to_spyre,
+    resolve_kv_scales,
 )
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -120,6 +115,9 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     group_width_caps,
     logits_row_buckets,
 )
+
+if TYPE_CHECKING:
+    from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
 
 logger = init_logger(__name__)
 
@@ -333,6 +331,7 @@ class _SpyreModelWrapper:
         *,
         model_dtype: torch.dtype,
         inputs_embeds_buffer: torch.Tensor | None = None,
+        keep_aux_hidden_states_on_device: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -342,6 +341,9 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
         object.__setattr__(self, "_inputs_embeds_buffer", inputs_embeds_buffer)
+        object.__setattr__(
+            self, "_keep_aux_hidden_states_on_device", keep_aux_hidden_states_on_device
+        )
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -364,7 +366,11 @@ class _SpyreModelWrapper:
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
-            result = convert_tensor_tree(result, device="cpu")
+            if self._keep_aux_hidden_states_on_device:
+                hidden_states, aux_hidden_states = result
+                result = (convert_tensor_tree(hidden_states, device="cpu"), aux_hidden_states)
+            else:
+                result = convert_tensor_tree(result, device="cpu")
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
@@ -545,6 +551,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _make_buffer can place .gpu tensors on Spyre directly.
         self._spyre_device = device
 
+        from spyre_inference.v1.spec_decode.config import validate_dflash_config
+
+        validate_dflash_config(vllm_config)
+
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
 
@@ -576,7 +586,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Spyre doesn't support all dtypes (int32, bool) natively.
         # _make_buffer (overridden below) already places .gpu on Spyre
         # via self._spyre_device regardless of self.device.
-        with _torch_cuda_wrapper():
+        from spyre_inference.v1.spec_decode.dflash import use_spyre_dflash_proposer
+
+        with _torch_cuda_wrapper(), use_spyre_dflash_proposer():
             super().__init__(vllm_config, torch.device("cpu"))
         # Patch upstream's Sampler in place, so every holder of it (e.g. the
         # RejectionSampler) takes the host-side draws.
@@ -631,18 +643,29 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.lora_config:
             raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
 
-        if hasattr(self, "drafter"):
+        if hasattr(self, "drafter") and (
+            self.speculative_config is None or not self.speculative_config.use_dflash()
+        ):
             raise NotImplementedError(
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
+
+        if self.speculative_config and self.speculative_config.use_dflash():
+            self.drafter.load_model(self.model)
 
         fix_padded_model(self.model, self.model_config)
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
-        self._resolve_kv_scales()
+        resolve_kv_scales(self.model, self.compilation_config.static_forward_context)
 
         move_model_to_spyre(self.model, self._spyre_device)
+        if self.speculative_config and self.speculative_config.use_dflash():
+            from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
+
+            assert isinstance(self.drafter, SpyreDFlashProposer)
+            move_model_to_spyre(self.drafter.model, self._spyre_device)
+            self.drafter.model.prepare_for_spyre()
 
         # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
         # falls back to the host elsewhere. FP32 linear heads stay on CPU.
@@ -659,8 +682,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # in OptimizedModule and breaks traversal.
         apply_multimodal_patches(self.model, self._spyre_device)
 
+        self._setup_eagle3_aux_hidden_state_outputs()
+
         # Compile for Spyre (no-op if enforce_eager=True)
-        self._compile_for_spyre()
+        self.model, self._compiled_tower_blocks = compile_for_spyre(self.model, self.vllm_config)
 
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
@@ -681,7 +706,93 @@ class TorchSpyreModelRunner(GPUModelRunner):
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
+            keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
         )
+
+    def _input_fits_in_drafter(self, common_attn_metadata):
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            # Commit each request's context, then decide which individual drafts fit.
+            return common_attn_metadata is not None
+        return super()._input_fits_in_drafter(common_attn_metadata)
+
+    def propose_draft_token_ids(
+        self,
+        scheduler_output,
+        sampled_token_ids,
+        sampling_metadata,
+        hidden_states,
+        sample_hidden_states,
+        aux_hidden_states,
+        spec_decode_metadata,
+        common_attn_metadata,
+        slot_mappings,
+    ):
+        assert self.speculative_config is not None
+        if self.speculative_config.use_dflash():
+            # Greedy proposals use the rejection sampler's point-mass distribution,
+            # including when the target uses stochastic sampling.
+            self._draft_probs = None
+            self._draft_prob_req_ids = None
+            # CPU bookkeeping has already appended this step's sampled tokens.
+            at_output_limit = []
+            for request_id in self.input_batch.req_ids:
+                request = self.requests[request_id]
+                params = request.sampling_params
+                assert params is not None
+                at_output_limit.append(
+                    params.max_tokens is not None
+                    and len(request.output_token_ids) >= params.max_tokens
+                )
+            return cast("SpyreDFlashProposer", self.drafter).propose_spyre(
+                sampled_token_ids,
+                aux_hidden_states,
+                self._get_positions(scheduler_output.total_num_scheduled_tokens),
+                spec_decode_metadata,
+                common_attn_metadata,
+                skip_proposal=at_output_limit,
+                max_model_len=self.effective_drafter_max_model_len,
+            )
+        return super().propose_draft_token_ids(
+            scheduler_output,
+            sampled_token_ids,
+            sampling_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            spec_decode_metadata,
+            common_attn_metadata,
+            slot_mappings,
+        )
+
+    # TEMPORARY port of vllm#62688 (#1420): upstream rewinds discarded prefill samples
+    # with set_offset, which CPU generators lack. Delete once the vLLM pin includes it.
+    def _discarded_generators(self) -> dict[int, torch.Generator]:
+        discard = self.discard_request_mask.np[: self.input_batch.num_reqs]
+        return {i: gen for i, gen in self.input_batch.generators.items() if discard[i]}
+
+    def _sample(self, logits, spec_decode_metadata):
+        states = [(gen, gen.get_state()) for gen in self._discarded_generators().values()]
+        try:
+            return super()._sample(logits, spec_decode_metadata)
+        finally:
+            for gen, state in states:
+                gen.set_state(state)
+
+    def _bookkeeping_sync(
+        self, scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+    ):
+        generators = self.input_batch.generators
+        discarded = self._discarded_generators()
+        # A new dict, not an in-place edit: sampling_metadata aliases this one.
+        self.input_batch.generators = {
+            i: gen for i, gen in generators.items() if i not in discarded
+        }
+        try:
+            return super()._bookkeeping_sync(
+                scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+            )
+        finally:
+            self.input_batch.generators = generators
 
     def _copy_draft_token_ids_to_cpu(self, scheduler_output, zeros_only=False):
         assert not self.use_async_scheduling, (
@@ -697,137 +808,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
-    def _resolve_kv_scales(self) -> bool:
-        """Read each float8-cache layer's KV scales into its impl; True when any changed."""
-        changed = False
-        pairs = set()
-        shared = []
-        for module in self.get_model().modules():
-            impl = getattr(module, "impl", None)
-            if not (isinstance(module, Attention) and isinstance(impl, SpyreAttentionImpl)):
-                continue
-            if getattr(module, "kv_sharing_target_layer_name", None) is not None:
-                shared.append(module)
-                continue
-            if not impl.kv_cache_fp8:
-                continue
-            k_scale = getattr(module, "_k_scale", None)
-            if isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1:
-                # Upstream's per-head scheme reduces the heads to their max scale, so a head
-                # with a much smaller one keeps only a few e4m3 steps of its range.
-                logger.warning_once(
-                    "The checkpoint carries per-head KV cache scales; the fp8 KV cache uses "
-                    "one scale per layer, the largest head's, which coarsens the others."
-                )
-            old = impl._kv_scales
-            impl.prepare_kv_scales(module)
-            changed |= old is not None and impl._kv_scales != old
-            pairs.add(impl._kv_scales)
-        # A sharing layer reads the cache its target wrote, so it dequantizes with the
-        # target's scales; its own usually default to 1.0, as it stores nothing.
-        static_ctx = self.compilation_config.static_forward_context if shared else {}
-        for module in shared:
-            target = static_ctx[module.kv_sharing_target_layer_name]
-            if module.impl.kv_cache_fp8 != target.impl.kv_cache_fp8:
-                # It reads the target's pages, so it must decode them in the dtype they hold.
-                raise ValueError(
-                    f"KV-sharing layer {module.layer_name} and its target "
-                    f"{module.kv_sharing_target_layer_name} disagree on the fp8 KV cache; "
-                    "list both or neither in kv_cache_dtype_skip_layers."
-                )
-            if not module.impl.kv_cache_fp8:
-                continue
-            old = module.impl._kv_scales
-            module.impl._kv_scales = target.impl._kv_scales
-            changed |= old is not None and module.impl._kv_scales != old
-        if len(pairs) > 1:
-            # The scales are graph constants, so each distinct pair is its own compile.
-            logger.warning_once(
-                "The fp8 KV cache has %d distinct per-layer (k_scale, v_scale) pairs; the "
-                "transformer block and every recorded attention kernel compile once per "
-                "pair, which lengthens warmup.",
-                len(pairs),
-            )
-        return changed
-
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
         # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
         # The graphs that read them guard on their values, so only those retrace; warming
         # here does that before the next request, which an armed compile guard would fail.
-        if self._resolve_kv_scales():
+        if resolve_kv_scales(self.get_model(), self.compilation_config.static_forward_context):
             logger.warning(
                 "KV cache scales changed on weight reload; re-warming the graphs that "
                 "depend on them."
             )
             with compile_guard.allow_compile("KV cache scales changed on weight reload"):
                 self.warming_up_model()
-
-    def _compile_for_spyre(self) -> None:
-        """Install torch.compile wrappers; tracing happens on the first forward.
-
-        `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
-        """
-        mode = self.compilation_config.mode
-        if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
-            raise ValueError(
-                f"Unsupported compilation mode {mode} for Spyre. Only "
-                f"CompilationMode.NONE and CompilationMode.STOCK_TORCH_COMPILE "
-                f"are supported."
-            )
-
-        # Validated before the eager short-circuit so a typo is not silently ignored.
-        # Per-block is the default: identical blocks share a ``forward`` code object,
-        # so the backend compiles one block rather than a program that grows with depth.
-        granularity = compile_granularity()
-        self._compiled_tower_blocks = 0
-
-        if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
-            logger.info("Compilation disabled (enforce_eager=True)")
-            return
-
-        model_name = type(self.model).__name__
-
-        if granularity == "block":
-            defeated_by = block_sharing_defeated_by()
-            if defeated_by:
-                logger.warning(
-                    "SPYRE_COMPILE_GRANULARITY=block will not share one artifact across "
-                    "blocks: %s. Expect compile time to grow with layer count; "
-                    "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
-                    defeated_by,
-                )
-            num_blocks = self._compile_blocks()
-            tower = self._compiled_tower_blocks
-            if num_blocks:
-                logger.info(
-                    "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre.",
-                    num_blocks,
-                    f" and {tower} tower blocks" if tower else "",
-                    model_name,
-                )
-                return
-            logger.warning(
-                "Found no attention-bearing block ModuleList in %s; falling back to a "
-                "whole-model graph. Models whose attention is not a vLLM Attention "
-                "(MLA, encoder-only vision towers) take this path.",
-                model_name,
-            )
-
-        self.model = torch.compile(
-            self.model,
-            backend="inductor",
-            fullgraph=True,
-            dynamic=False,
-        )
-        compile_guard.watch(self.model, f"{model_name} (whole-model graph)")
-        logger.info("Wrapped %s as a single graph for Spyre.", model_name)
-
-    def _compile_blocks(self) -> int:
-        num_blocks, self._compiled_tower_blocks = compile_blocks(
-            repeated_block_lists(cast(nn.Module, self.model))
-        )
-        return num_blocks
 
     def warming_up_model(self) -> None:
         """Warm kernels / compile.
@@ -1084,7 +1076,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for group in groups
             for name in group.layer_names
         }
-        if self.speculative_config is not None:
+        if self.speculative_config is not None and hasattr(self.drafter, "model"):
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(

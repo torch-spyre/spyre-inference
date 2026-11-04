@@ -57,17 +57,6 @@ def test_native_all_reduce_works(run_tp_probe) -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
-def test_all_reduce_vision_flattened_is_exact(run_tp_probe) -> None:
-    """Does the flatten workaround return the right values, not just compile?"""
-    run_tp_probe("all_reduce_vision_flattened", world_size=2)
-
-
-@pytest.mark.uses_subprocess
-@pytest.mark.distributed
-@pytest.mark.skipif(
-    spyre_device_count() < 2,
-    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
-)
 def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
     """Padding a collective inside a compiled graph, alongside unpadded controls.
 
@@ -83,16 +72,6 @@ def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
 @pytest.mark.skipif(
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "deeptools' L3 scheduler asserts 'Expect valid lower and upper bound "
-        "parameters' building the collective's sum kernel for a rank-3 "
-        "[1, 528, 1024] fp16 all_reduce; [1, 3120, 1024] builds. The flatten in "
-        "SpyreCommunicator.all_reduce can go once this and "
-        "test_all_reduce_rank2_prefill_works both pass."
-    ),
 )
 def test_all_reduce_vision_rank3_works(run_tp_probe) -> None:
     run_tp_probe("all_reduce_vision_rank3", world_size=2)
@@ -113,16 +92,6 @@ def test_all_reduce_rank2_works(run_tp_probe) -> None:
 @pytest.mark.skipif(
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "deeptools' L3 scheduler finds no core split ('There must be at least one "
-        "valid candidate') building the eager sum kernel for a rank-2 [64, 2816] fp16 "
-        "all_reduce; a rank-2 [T, H] of ~2**17+ elements fails unless H is a multiple "
-        "of 2048. The flatten in SpyreCommunicator.all_reduce can go once this and "
-        "test_all_reduce_vision_rank3_works both pass."
-    ),
 )
 def test_all_reduce_rank2_prefill_works(run_tp_probe) -> None:
     run_tp_probe("all_reduce_rank2_prefill", world_size=2)

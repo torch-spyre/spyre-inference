@@ -127,23 +127,23 @@ def test_v2_without_triton_builds_only_on_power_and_z(machine: str, want: list[s
 
 
 def test_v2_without_triton_keeps_upstreams_other_checks(monkeypatch: pytest.MonkeyPatch) -> None:
-    import vllm.config.vllm as config_module
+    import vllm.v1.worker.gpu_worker as worker_module
 
     calls = []
 
-    def validate(self):
-        calls.append(config_module.HAS_TRITON)
+    def init(self, *args, **kwargs):
+        calls.append(worker_module.HAS_TRITON)
         raise ValueError("Model Runner V2 does not yet support: pipeline parallelism")
 
-    monkeypatch.setattr(config_module.VllmConfig, "_validate_v2_model_runner", validate)
-    monkeypatch.setattr(config_module, "HAS_TRITON", False)
+    monkeypatch.setattr(worker_module.Worker, "__init__", init)
+    monkeypatch.setattr(worker_module, "HAS_TRITON", False)
 
     triton_gate._allow_v2_without_triton()
     with pytest.raises(ValueError, match="pipeline parallelism"):
-        config_module.VllmConfig._validate_v2_model_runner(None)
+        worker_module.Worker.__init__(None)
 
-    assert calls == [True], "upstream's validator ran without seeing HAS_TRITON=True"
-    assert config_module.HAS_TRITON is False
+    assert calls == [True], "upstream's __init__ ran without seeing HAS_TRITON=True"
+    assert worker_module.HAS_TRITON is False
 
 
 def _fresh_find_spec(monkeypatch: pytest.MonkeyPatch) -> None:

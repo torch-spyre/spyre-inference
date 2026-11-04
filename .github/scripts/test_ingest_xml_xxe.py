@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""parse_test_xml must refuse DTD-bearing (entity-expansion / XXE) JUnit XML.
-
-The JUnit XML it parses is a CI artifact from PR-triggered runs, so the content
-is untrusted. lxml expands internal entities even inside attribute values, so a
-crafted <!DOCTYPE> with nested entities is a billion-laughs DoS, and an external
-SYSTEM entity/DTD is XXE. Legitimate JUnit XML never declares a DTD, so these
-tests pin that parse_test_xml refuses any document with one and still parses
-clean XML. They fail if the DTD guard is removed.
-"""
-
 from __future__ import annotations
 
 import importlib.util
@@ -49,8 +39,6 @@ def _load(name, **stubs):
 
 @pytest.fixture(scope="module")
 def xml_mod():
-    # spyre_clickhouse_ingest is installed from a floating source in CI only;
-    # stub the names parse_test_xml's module imports so the module loads here.
     stub = types.ModuleType("spyre_clickhouse_ingest")
     stub.extract_properties = lambda tc: {}
     stub.get_client = lambda *a, **k: None
@@ -65,8 +53,6 @@ def _write(tmp_path, body):
 
 
 def test_billion_laughs_dtd_is_refused(xml_mod, tmp_path):
-    # Nested internal entities expand exponentially in attribute values; the
-    # guard must refuse the document before that becomes a memory/CPU DoS.
     xml = _write(
         tmp_path,
         """<?xml version="1.0"?>
@@ -87,10 +73,6 @@ def test_billion_laughs_dtd_is_refused(xml_mod, tmp_path):
 
 
 def test_external_entity_dtd_is_refused(xml_mod, tmp_path):
-    # An external SYSTEM entity (classic XXE file-read / SSRF) also travels in a
-    # DTD; the no-network / no-DTD parser refuses to resolve it and the DTD guard
-    # refuses the document — either way parsing must not succeed and must not
-    # read the file.
     secret = tmp_path / "secret.txt"
     secret.write_text("TOP-SECRET")
     xml = _write(
@@ -111,7 +93,6 @@ def test_external_entity_dtd_is_refused(xml_mod, tmp_path):
 
 
 def test_clean_junit_xml_still_parses(xml_mod, tmp_path):
-    # The guard must not reject legitimate, DTD-free JUnit XML.
     xml = _write(
         tmp_path,
         """<?xml version="1.0"?>

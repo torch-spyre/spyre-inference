@@ -22,12 +22,7 @@ from pathlib import Path
 DEFAULT_ARCH = "x86_64"
 KNOWN_ARCHES = ("x86_64", "ppc64le", "s390x")
 
-# The arch label becomes a filesystem path segment (dest / arch), but it is read
-# from a leg-arch-*.txt sidecar that ships inside the untrusted junit-* CI
-# artifacts. An arch carrying path separators or ".." would escape the
-# destination tree (and mkdir(parents=True) would create attacker-chosen dirs on
-# a runner that holds ClickHouse credentials). Legitimate arches are a flat
-# lowercase/digit/underscore token, so anything else falls back to the default.
+# The arch comes from an untrusted artifact sidecar and becomes a path segment.
 _SAFE_ARCH = re.compile(r"[a-z0-9_]+")
 
 

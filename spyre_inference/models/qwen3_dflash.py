@@ -16,6 +16,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import contextmanager
+from copy import copy
 from typing import cast
 
 import torch
@@ -46,7 +47,19 @@ def _project_context(attention, context, positions):
     )
 
 
+class SpyreDFlashQwen3DecoderLayer(DFlashQwen3DecoderLayer):
+    def __init__(self, *args, config, layer_idx, **kwargs):
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types and len(set(layer_types)) > 1:
+            # Resolve each layer upstream; Spyre keeps mixed attention in one KV pool.
+            config = copy(config)
+            config.layer_types = [layer_types[layer_idx]] * len(layer_types)
+            config.dflash_config = config.dflash_config | {"use_swa": False}
+        super().__init__(*args, config=config, layer_idx=layer_idx, **kwargs)
+
+
 class SpyreDFlashQwen3Model(DFlashQwen3Model):
+    decoder_layer_cls = SpyreDFlashQwen3DecoderLayer
     fc: ReplicatedLinear
 
     def _build_fused_kv_buffers(self) -> None:

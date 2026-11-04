@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'win32'",
@@ -889,7 +889,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "torch", version = "2.13.0a0+gitcf30153", source = { git = "https://github.com/pytorch/pytorch?tag=v2.13.0#cf30153c4c131c8164ee7798e5022d810682e2cb" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
     { name = "transformers" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2c/9e/d7f18bd9a0354088abc11a0c1f2c7698f7c49e5a709faedf6a46e388f693/compressed_tensors-0.17.0.tar.gz", hash = "sha256:15c20d06bdbcf35b51fc99fd125e7b9be1e1855567c33b7a46dfac26ad6fb126", size = 257091, upload-time = "2026-06-03T16:49:17.208Z" }
@@ -5409,7 +5409,7 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch", version = "2.13.0a0+gitcf30153", source = { git = "https://github.com/pytorch/pytorch?tag=v2.13.0#cf30153c4c131c8164ee7798e5022d810682e2cb" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
     { name = "tqdm" },
     { name = "transformers" },
     { name = "typing-extensions" },
@@ -5660,7 +5660,7 @@ dependencies = [
     { name = "arctic-inference" },
     { name = "torch", version = "2.13.0a0+gitcf30153", source = { git = "https://github.com/pytorch/pytorch?tag=v2.13.0#cf30153c4c131c8164ee7798e5022d810682e2cb" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
     { name = "torch-spyre", extra = ["cpsat"] },
     { name = "torchvision", version = "0.28.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.28.0", source = { git = "https://github.com/pytorch/vision?tag=v0.28.0#8fb87713a24951e639c494b0f2a8a81b5f8e33a6" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
@@ -6038,7 +6038,7 @@ dependencies = [
     { name = "regex" },
     { name = "torch", version = "2.13.0a0+gitcf30153", source = { git = "https://github.com/pytorch/pytorch?tag=v2.13.0#cf30153c4c131c8164ee7798e5022d810682e2cb" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
 ]
 
 [package.optional-dependencies]
@@ -6660,7 +6660,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "torch", version = "2.13.0a0+gitcf30153", source = { git = "https://github.com/pytorch/pytorch?tag=v2.13.0#cf30153c4c131c8164ee7798e5022d810682e2cb" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
     { name = "transformers" },
     { name = "triton", version = "3.8.0+cpu", source = { url = "https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }, marker = "python_full_version < '3.12' and platform_machine == 'x86_64'" },
     { name = "triton", version = "3.8.0+cpu", source = { url = "https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }, marker = "python_full_version >= '3.12' and platform_machine == 'x86_64'" },

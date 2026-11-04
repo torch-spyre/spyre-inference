@@ -34,14 +34,7 @@ FAILED_SUITES_DIR = Path("failed_suites")
 
 
 def safe_segment(name: str) -> bool:
-    """True iff `name` is a single, non-traversing path component.
-
-    The `failed-suite-<attempt>-` prefix filter is kept by a traversing name
-    such as `failed-suite-1-../../../../tmp/evil`, so joining it onto
-    FAILED_SUITES_DIR would escape that directory and let an attacker-chosen
-    artifact name steer both the `.zip` write and the `unzip -d` extraction
-    target (arbitrary file write on the runner).
-    """
+    # The name is attacker-chosen and the prefix filter keeps `failed-suite-1-../x`.
     return (
         name not in ("", ".", "..")
         and "/" not in name
@@ -78,8 +71,6 @@ def download_and_extract(repo: str, artifacts: list[dict]) -> None:
     for artifact in artifacts:
         name = artifact["name"]
         if not safe_segment(name):
-            # Attacker-controllable: any run that uploads artifacts picks the
-            # name. Refuse (visibly) rather than let the join escape `base`.
             print(f"::warning::skipping failed-suite artifact with unsafe name {name!r}")
             continue
         out_dir = FAILED_SUITES_DIR / name

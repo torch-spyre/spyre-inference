@@ -31,19 +31,13 @@ INCLUDE = [
 ]
 A, B, C = (e["cfg"] for e in INCLUDE)
 PLACEHOLDER = "${{ matrix.cfg }}"
-SUFFIX = {0: "", 1: " (pod-level retry)", 2: " (pod-level retry 2)"}
 
 
-def _job(cfg: str, conclusion: str | None, rnd: int = 0, tests_failed: bool = False) -> dict:
-    steps = [{"name": "Set up job", "conclusion": "success"}]
-    if conclusion is not None:
-        step = "failure" if tests_failed else ("success" if conclusion == "success" else None)
-        steps.append({"name": "Run matrix config" + SUFFIX[rnd], "conclusion": step})
+def _job(cfg: str, conclusion: str | None, retry: bool = False) -> dict:
     return {
-        "name": f"test / build and run tests ({cfg}){SUFFIX[rnd]}",
+        "name": f"test / build and run tests ({cfg})" + (" (pod-level retry)" if retry else ""),
         "status": "completed" if conclusion else "in_progress",
         "conclusion": conclusion,
-        "steps": steps,
     }
 
 
@@ -51,16 +45,15 @@ def _passed(*extra: dict) -> cfs.Legs:
     return cfs.parse(
         [
             *(_job(cfg, "success") for cfg in (A, B, C)),
-            _job(PLACEHOLDER, "skipped", rnd=1),
-            _job(PLACEHOLDER, "skipped", rnd=2),
+            _job(PLACEHOLDER, "skipped", retry=True),
             {"name": "test / Test matrix result", "status": "in_progress", "conclusion": None},
             *extra,
         ]
     )
 
 
-def _retried(legs: cfs.Legs, rnd: int) -> list[str]:
-    return [e["cfg"] for e in cfs.retry_matrix(legs, INCLUDE, rnd)["include"]]
+def _retried(legs: cfs.Legs) -> list[str]:
+    return [e["cfg"] for e in cfs.retry_matrix(legs, INCLUDE)["include"]]
 
 
 def test_static_matrix_cfgs_are_unique():
@@ -69,65 +62,44 @@ def test_static_matrix_cfgs_are_unique():
 
 
 def test_clean_run_retries_nothing_and_verifies():
-    assert _retried(_passed(), 1) == []
-    assert _retried(_passed(), 2) == []
+    assert _retried(_passed()) == []
     assert cfs.verify(_passed(), INCLUDE) == []
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", None])
 def test_any_unsuccessful_leg_is_retried_with_its_full_entry(conclusion):
     legs = _passed(_job(B, conclusion))
-    assert cfs.retry_matrix(legs, INCLUDE, 1) == {"include": [INCLUDE[1]]}
+    assert cfs.retry_matrix(legs, INCLUDE) == {"include": [INCLUDE[1]]}
 
 
 def test_leg_missing_from_job_list_is_retried():
     legs = _passed()
     del legs.test[C]
-    assert _retried(legs, 1) == [C]
-    assert cfs.verify(legs, INCLUDE) == [f"{C}: did not pass (test, then each retry round: [])"]
+    assert _retried(legs) == [C]
+    assert cfs.verify(legs, INCLUDE) == [
+        f"{C}: did not pass (test: missing, pod-level retry: missing)"
+    ]
 
 
 def test_unretried_failure_fails_verify():
     errors = cfs.verify(_passed(_job(A, "failure")), INCLUDE)
-    assert errors == [f"{A}: did not pass (test, then each retry round: ['failure'])"]
+    assert errors == [f"{A}: did not pass (test: failure, pod-level retry: missing)"]
 
 
 def test_retry_outcome_decides_verify():
-    assert cfs.verify(_passed(_job(A, "failure"), _job(A, "success", rnd=1)), INCLUDE) == []
-    assert cfs.verify(_passed(_job(A, "failure"), _job(A, "failure", rnd=1)), INCLUDE)
-
-
-def test_second_round_only_reruns_infra_deaths():
-    legs = _passed(
-        _job(A, "failure", tests_failed=True),
-        _job(A, "failure", rnd=1, tests_failed=True),
-        _job(B, "failure"),
-        _job(B, "failure", rnd=1),
-        _job(C, "failure"),
-        _job(C, "success", rnd=1),
-    )
-    assert _retried(legs, 2) == [B]
-
-
-def test_second_round_reruns_a_leg_round_one_never_reached():
-    legs = _passed(_job(A, "failure"))
-    assert _retried(legs, 2) == [A]
-
-
-def test_second_round_success_passes_verify():
-    legs = _passed(_job(B, "failure"), _job(B, "failure", rnd=1), _job(B, "success", rnd=2))
-    assert cfs.verify(legs, INCLUDE) == []
+    assert cfs.verify(_passed(_job(A, "failure"), _job(A, "success", retry=True)), INCLUDE) == []
+    assert cfs.verify(_passed(_job(A, "failure"), _job(A, "failure", retry=True)), INCLUDE)
 
 
 def test_unexpanded_matrix_fails_verify_without_crashing_collect():
-    legs = cfs.parse([_job(PLACEHOLDER, "cancelled"), _job(PLACEHOLDER, "skipped", rnd=1)])
-    assert _retried(legs, 1) == []
+    legs = cfs.parse([_job(PLACEHOLDER, "cancelled"), _job(PLACEHOLDER, "skipped", retry=True)])
+    assert _retried(legs) == []
     assert cfs.verify(legs, INCLUDE) == ["the `test` matrix never expanded, so no suite ran"]
 
 
 def test_failed_leg_outside_static_matrix_warns_and_fails_verify():
     legs = _passed(_job("Renamed suite", "failure"))
-    assert _retried(legs, 1) == []
+    assert _retried(legs) == []
     assert cfs.verify(legs, INCLUDE) == ["Renamed suite: failed, and is not in the static matrix"]
 
 
@@ -137,6 +109,14 @@ def test_partial_rerun_falls_back_to_earlier_attempt(monkeypatch):
     monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: attempt2}[a])
     legs = cfs.load("r", "1", 2, {A, B, C})
     assert {c: j["conclusion"] for c, j in legs.test.items()} == dict.fromkeys((A, B, C), "success")
+
+
+def test_empty_attempt_falls_back_to_earlier_attempt(monkeypatch):
+    attempt1 = [_job(A, "success"), _job(B, "success"), _job(C, "failure")]
+    attempt2 = [_job(C, "success", retry=True)]
+    monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: attempt2}[a])
+    legs = cfs.load("r", "1", 2, {A, B, C})
+    assert cfs.verify(legs, INCLUDE) == []
 
 
 def test_pending_legs_are_polled_until_complete(monkeypatch):

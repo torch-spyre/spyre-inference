@@ -92,18 +92,6 @@ def test_swigluoai_activation_matches_transformers():
     torch.testing.assert_close(actual, _swiglu_oai(gate_up))
 
 
-def test_routing_function_is_softmax_over_the_selected_logits():
-    """``full_softmax`` + renormalize equals gpt-oss's softmax over its top-k logits."""
-    from spyre_inference.models.gpt_oss import gpt_oss_routing
-
-    gen = torch.Generator().manual_seed(0)
-    logits = torch.randn(8, EXPERTS, generator=gen)
-    weights, ids = gpt_oss_routing(None, logits, TOP_K, renormalize=True)
-    top, top_ids = torch.topk(logits, TOP_K, dim=-1)
-    torch.testing.assert_close(ids.long(), top_ids)
-    torch.testing.assert_close(weights, torch.softmax(top, dim=-1))
-
-
 def _gpt_oss_layer(**moe_overrides):
     """A ``RoutedExperts`` as vLLM builds it for gpt-oss."""
     from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
@@ -135,11 +123,10 @@ def _gpt_oss_layer(**moe_overrides):
 
 
 def test_configure_accepts_a_biased_swigluoai_layer():
-    from spyre_inference.models.gpt_oss import GPT_OSS_MOE_RECIPE, gpt_oss_routing
+    from spyre_inference.models.gpt_oss import GPT_OSS_MOE_RECIPE
     from spyre_inference.moe import configure_spyre_moe_layer
 
     layer = _gpt_oss_layer()
-    layer.custom_routing_function = gpt_oss_routing
     configure_spyre_moe_layer(layer, GPT_OSS_MOE_RECIPE)
     assert layer.spyre_moe_recipe is GPT_OSS_MOE_RECIPE
 
@@ -149,11 +136,10 @@ def test_configure_accepts_a_biased_swigluoai_layer():
 )
 def test_configure_rejects_swigluoai_constants_the_kernel_does_not_use(overrides):
     """The activation hard-codes vLLM's swigluoai_and_mul constants; refuse others."""
-    from spyre_inference.models.gpt_oss import GPT_OSS_MOE_RECIPE, gpt_oss_routing
+    from spyre_inference.models.gpt_oss import GPT_OSS_MOE_RECIPE
     from spyre_inference.moe import configure_spyre_moe_layer
 
     layer = _gpt_oss_layer(**overrides)
-    layer.custom_routing_function = gpt_oss_routing
     with pytest.raises(NotImplementedError, match="swigluoai uses limit="):
         configure_spyre_moe_layer(layer, GPT_OSS_MOE_RECIPE)
 

@@ -169,6 +169,47 @@ def resource_report(label, spans, samples, devmem) -> dict:
     return {"schema": 1, "label": label, "phases": phases, "device_memory": device_memory}
 
 
+def compile_block(summary: dict, per_pid: Path) -> dict:
+    """res.json `compile`, from the merged torch-spyre compile summary.
+
+    `by_pass` keys are `Pipeline:pass` with self seconds; `n` is the number of processes that
+    reported the pass (per-pass call counts are not in the summary). `n_compiles` counts the
+    per-process summaries, one per TP worker, not compiled graphs.
+    """
+    procs = sorted(per_pid.glob("compile_summary.*.json"))
+    counts: dict[str, int] = {}
+    for f in procs:
+        with contextlib.suppress(OSError, ValueError):
+            for name in json.loads(f.read_text()).get("passes") or {}:
+                counts[name] = counts.get(name, 0) + 1
+    passes = summary.get("passes") or {}
+    return {
+        "total_s": summary.get("total_s"),
+        "n_compiles": len(procs) or None,
+        "kernel_cache": summary.get("cache"),
+        "by_pass": {
+            name: {"self_s": round(s, 6), "n": counts.get(name, 0)}
+            for name, s in sorted(passes.items(), key=lambda kv: -kv[1])
+        },
+        "source": "compile_summary",
+    }
+
+
+def _write_series(path: Path, spans, samples: list[dict]) -> None:
+    """samples.jsonl: the host sampler's rows on the bundle's phase timeline, one per line."""
+    with open(path, "w") as f:
+        for s in samples:
+            row = {
+                "t_s": round(s["t"], 3),
+                "phase": _phase_at(spans, s["t"]),
+                "cpu_cores": s.get("cpu_cores"),
+                "rss_b": s.get("rss_b"),
+                "cgroup_b": s.get("cgroup_b"),
+                "throttled_s": s.get("throttled_cum_s"),
+            }
+            f.write(json.dumps(row) + "\n")
+
+
 def workload(bench_type: str, parameters: dict) -> dict:
     """e2e.json `args`: the workload keys the ingest hashes, from the test's vllm bench flags."""
     p = {k.replace("_", "-"): v for k, v in parameters.items()}
@@ -260,12 +301,18 @@ def _analyse(trace_dir, manifest, bench_type, parameters, samples) -> None:
     if summary.is_file():
         with contextlib.suppress(OSError, ValueError):
             res["compile_summary"] = json.loads(summary.read_text())
+            # Per-process summaries sit in the always-on records' compile/ beside trace/.
+            res["compile"] = compile_block(res["compile_summary"], trace_dir.parent / "compile")
+    if not res.get("compile"):
+        absent["compile"] = "no compile_summary.json: torch-spyre wrote no compile summary"
     _write(trace_dir / "res.json", res)
+    _write_series(trace_dir / "samples.jsonl", spans, samples)
     report = {
         "schema": 1, "trace": None, "audit": None, "steps": {"decode": {}, "prefill": {}},
         "roofline": None,
         "resources": {
-            "phases": res["phases"], "device_memory": res["device_memory"], "compile": None,
+            "phases": res["phases"], "device_memory": res["device_memory"],
+            "compile": res.get("compile"),
             "compile_summary": res.get("compile_summary"),
         },
     }  # fmt: skip

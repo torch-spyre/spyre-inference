@@ -66,7 +66,8 @@ A profiled test writes nothing to `<results-dir>/*.json`, so it never reaches in
 | `manifest.json` | label, `profile_level`, artifact, env fingerprint, profiler config, traces, and `absent`: each input the run did not produce, with the reason |
 | `e2e.json` | `args` (model, tp, batch_size, input_len, output_len, and the engine's resolved max_model_len, max_num_seqs, max_num_batched_tokens = budget), `e2e_s` of the profiled steps |
 | `phases.jsonl` | every process's phase markers, wall clock |
-| `res.json` | per traced phase (harness-only `startup`, `ready`, `profiled`, `post` are left out): wall, CPU, throttling, RSS and cgroup peaks, device memory peaks; `compile_summary` |
+| `res.json` | per traced phase (harness-only `startup`, `ready`, `profiled`, `post` are left out): wall, CPU, throttling, RSS and cgroup peaks, device memory peaks; `compile` (total_s, n_compiles, kernel cache, per-pass self seconds) and the raw `compile_summary` |
+| `samples.jsonl` | the host sampler's series on the bundle's phases: `t_s`, `phase`, `cpu_cores`, `rss_b`, `cgroup_b`, `throttled_s` |
 | `host.json` | per trace: device-row `audit`, per-step rows, prefill/decode/mixed summaries (wall, device busy, host-exposed time by host class, launches, copies, CPU fallbacks) |
 | `roof.json` | per kernel and step kind: calls, median, and with the sidecar the compiler-model floor, ratio, bound and predicted time; per-step `timeline` |
 | `profile_report.json` | the same analysis in spyre-perf-suite `spsprofile.profile_report()`'s shape: `schema`, `trace`, `audit`, `steps.{decode,prefill}`, `roofline`, `resources` |

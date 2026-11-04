@@ -895,6 +895,18 @@ def _fake_vllm_bench(trace_dir_level):
             )
             markers = Path(env["SPYRE_PROFILE_DIR"])
             markers.mkdir(parents=True, exist_ok=True)
+            compile_dir = Path(env["TORCH_SPYRE_COMPILE_SUMMARY_DIR"])
+            compile_dir.mkdir(parents=True, exist_ok=True)
+            for pid, s in ((7, 1.0), (8, 3.0)):
+                (compile_dir / f"compile_summary.{pid}.json").write_text(
+                    json.dumps(
+                        {
+                            "total_s": 2 * s,
+                            "passes": {"Pre:a": s, "Post:b": s / 2},
+                            "cache": {"entries": 2, "hits": 1, "misses": 1},
+                        }  # fmt: skip
+                    )
+                )
             (markers / "engine.7.json").write_text(
                 json.dumps({"max_num_batched_tokens": 256, "max_num_seqs": 4, "max_model_len": 256})
             )
@@ -938,6 +950,29 @@ def test_profiled_run_writes_the_bundle_and_nothing_ingest_reads(tmp_path, monke
     monkeypatch.setattr(runner, "env_fingerprint", lambda: fp)
     seen = []
     monkeypatch.setattr(runner.subprocess, "run", _fake_vllm_bench(seen))
+
+    class Sampler:
+        def __init__(self, interval=None):
+            t = time.monotonic()
+            self.t0 = t - 3
+            self.series = [
+                {
+                    "t_s": t - 2 + i * 0.5,
+                    "cpu_cores": 1.0 + i,
+                    "cgroup_b": 1e9,
+                    "rss_b": 5e8,
+                    "throttled_cum_s": 0.1 * i,
+                }  # fmt: skip
+                for i in range(4)
+            ]
+
+        def stop(self):
+            pass
+
+        def summary(self, phase=""):
+            return {}
+
+    monkeypatch.setattr(runner, "_make_sampler", Sampler)
     params = {"model": "org/m", "tensor_parallel_size": 1, "batch-size": 4, "input-len": 128,
               "output-len": 64, "max-model-len": 256}  # fmt: skip
     assert runner.run_benchmark(
@@ -964,10 +999,22 @@ def test_profiled_run_writes_the_bundle_and_nothing_ingest_reads(tmp_path, monke
     res = json.loads((trace / "res.json").read_text())
     assert {"weight_load", "compile_warmup", "warmup", "prefill", "decode"} <= set(res["phases"])
     assert not set(res["phases"]) & set(bench_trace.NOT_TRACE_PHASES)
+    comp = res["compile"]
+    assert (comp["total_s"], comp["n_compiles"]) == (8.0, 2)
+    assert comp["kernel_cache"] == {"entries": 4, "hits": 2, "misses": 2}
+    assert comp["by_pass"] == {"Pre:a": {"self_s": 4.0, "n": 2}, "Post:b": {"self_s": 2.0, "n": 2}}
+    series = [json.loads(x) for x in (trace / "samples.jsonl").read_text().splitlines()]
+    assert [r["cpu_cores"] for r in series] == [1.0, 2.0, 3.0, 4.0]
+    assert {r["phase"] for r in series} <= set(bench_trace.LIFECYCLE) | {"startup", "warmup",
+        "prefill", "decode", "post", "profiled"}  # fmt: skip
+    assert set(series[0]) == {
+        "t_s", "phase", "cpu_cores", "rss_b", "cgroup_b", "throttled_s"
+    }  # fmt: skip
     report = json.loads((trace / "profile_report.json").read_text())
     assert set(report) == {"schema", "trace", "audit", "steps", "roofline", "resources"}
     assert report["steps"]["decode"]["n"] == 2 and report["roofline"] is None
     assert report["resources"]["phases"] == res["phases"]
+    assert report["resources"]["compile"] == comp
     host = json.loads((trace / "host.json").read_text())
     assert host[0]["decode_summary"]["n"] == 2
     roof = json.loads((trace / "roof.json").read_text())

@@ -12,70 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-License-Identifier: Apache-2.0
-
-# TEMPORARY VENDORED ADAPTATION: vllm-project/vllm#54448 postdates vLLM 0.32.0.
-# Source: https://github.com/vllm-project/vllm/blob/ce9467b757c024a55fea4d0919ac2e682f28a894/vllm/model_executor/models/qwen3_xpress.py
-# On upgrade, subclass upstream Qwen3XPressForCausalLM/head and retain only Spyre overrides.
-# Cleanup: https://github.com/torch-spyre/spyre-inference/issues/1417
-# test_xpress_vendored.py flags native support. Serving compiles these step helpers;
-# the CPU Jacobi oracle lives in tests/spec_decode/xpress_reference.py.
-
-from collections.abc import Mapping
+# Upstream's Jacobi loop is Triton-only; Spyre compiles these step helpers instead.
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead as _UpstreamHead
 
 
-class XPressRefinerHead(nn.Module):
-    """Causal block refiner, with the raw checkpoint mixer folded at load time."""
+class XPressRefinerHead(_UpstreamHead):
+    """Upstream's head, construction and loading included, with Spyre step helpers."""
 
-    _PUBLISHED_KEYS = {
-        "w1.weight": "w1.weight",
-        "down_h.weight": "down_h.weight",
-        "down_g.weight": "down_g.weight",
-        "in_proj.weight": "in_proj.weight",
-        "mix.L": "mix_L",
-        "mlp.gate_proj.weight": "mlp_gate.weight",
-        "mlp.up_proj.weight": "mlp_up.weight",
-        "mlp.down_proj.weight": "mlp_down.weight",
-        "w2.weight": "w2.weight",
-    }
+    _mix_kjc: torch.Tensor | None = None
+    _readout_t: torch.Tensor | None = None
+    _hidden_proj_t: torch.Tensor | None = None
+    _token_proj_t: torch.Tensor | None = None
 
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        block_size: int,
-        rank: int = 256,
-        mlp_hidden: int = 512,
-        topc: int = 128,
-    ) -> None:
-        super().__init__()
-        if min(vocab_size, hidden_size, rank, mlp_hidden) <= 0 or block_size < 2:
-            raise ValueError(
-                "XPress requires positive dimensions and a block of at least two tokens"
-            )
-        self.block_size = block_size
-        self.rank = rank
-        if type(topc) is not int or topc < 0:
-            raise ValueError("topc must be a nonnegative integer")
-        self.topc = topc
-        self.w1 = nn.Embedding(vocab_size, rank)
-        self.down_h = nn.Linear(hidden_size, rank, bias=False)
-        self.down_g = nn.Linear(hidden_size, rank, bias=False)
-        self.in_proj = nn.Linear(3 * rank, rank, bias=False)
-        self.mix_L = nn.Parameter(torch.eye(block_size).expand(rank, -1, -1).clone())
-        self.mlp_gate = nn.Linear(rank, mlp_hidden, bias=False)
-        self.mlp_up = nn.Linear(rank, mlp_hidden, bias=False)
-        self.mlp_down = nn.Linear(mlp_hidden, rank, bias=False)
-        self.w2 = nn.Linear(rank, vocab_size, bias=False)
-        self.register_buffer("_mix_kjc", None, persistent=False)
-        self.register_buffer("_readout_t", None, persistent=False)
-        self.register_buffer("_hidden_proj_t", None, persistent=False)
-        self.register_buffer("_token_proj_t", None, persistent=False)
+    def build_fused_buffers(self) -> None:
+        # Only the Triton kernels read these; prepare_for_spyre builds the device layouts.
+        pass
 
     def prepare_for_spyre(self) -> None:
         """Build device layouts after the checkpoint is loaded in its serving dtype."""
@@ -99,20 +54,6 @@ class XPressRefinerHead(nn.Module):
         # Match the target LM head's output tiling; trim only full sticks.
         padded = F.pad(weight, (0, 0, 0, (-weight.shape[0]) % 2048))
         self._readout_t = padded.t().contiguous().to(device)
-
-    def load_checkpoint_weights(self, weights: Mapping[str, torch.Tensor]) -> None:
-        """Load raw checkpoint weights; use load_state_dict for an already folded mixer."""
-        prefix, mapping = "xpress_head.", self._PUBLISHED_KEYS
-        names = {name[len(prefix) :] for name in weights if name.startswith(prefix)}
-        if names != mapping.keys():
-            raise ValueError(
-                f"Invalid XPress head weights: missing={sorted(mapping.keys() - names)}, "
-                f"unexpected={sorted(names - mapping.keys())}"
-            )
-        state = {dest: weights[prefix + source] for source, dest in mapping.items()}
-        raw = state["mix_L"].to(dtype=self.mix_L.dtype)
-        state["mix_L"] = raw.tril() + torch.eye(self.block_size, dtype=raw.dtype, device=raw.device)
-        self.load_state_dict(state, strict=True)
 
     def _mix_and_mlp(self, x):
         # Keep rank as the contiguous dimension for Spyre's stick layout.

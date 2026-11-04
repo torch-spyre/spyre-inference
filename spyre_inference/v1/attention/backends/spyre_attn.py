@@ -158,6 +158,11 @@ def _mirror_mask_stack(
 
     stack_device = stacks_device[seq_idx]
     if stack_device is None:
+        _, query_rows, block_size = stack_cpu.shape
+        # Singleton strides must match between recorded and serving masks.
+        stack_cpu = stack_cpu.contiguous().as_strided(
+            stack_cpu.shape, (query_rows * block_size, block_size, 1)
+        )
         # `convert` copies, so even a nonzero-offset host view arrives contiguous at
         # offset 0, ready for an in-graph dim-0 slice.
         stack_device = convert(stack_cpu, device=device)

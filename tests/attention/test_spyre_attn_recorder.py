@@ -41,6 +41,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
+    _mirror_mask_stack,
 )
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
@@ -71,7 +72,9 @@ def compiles() -> int:
 
 
 @pytest.fixture()
-def impl(default_vllm_config):
+def impl(default_vllm_config, monkeypatch):
+    # CPU graph-reuse tests use the Python walk; Spyre e2e tests cover tiled lowering.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
@@ -150,6 +153,52 @@ def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
     return [v for v in bucketer.variants() if v.num_blocks <= pages]
+
+
+@pytest.mark.parametrize("query_bucket", [16, 64])
+def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
+    from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
+
+    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
+    envs.clear_env_cache()
+    cfg = get_current_vllm_config()
+    monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 128)
+    builder._attn_bucketer = SpyreAttnBucketer(cfg)
+    recorded = builder.build_for_variant(SpyreAttnBucket(1, query_bucket))
+    query_len = recorded.max_query_len
+    mixed = _padded_mask_metadata(
+        [(query_len, BLOCK_SIZE), (query_len, 3 * BLOCK_SIZE + 1)],
+        block_size=BLOCK_SIZE,
+        num_query_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        max_num_blocks=4,
+    )
+    assert mixed.aligned_query_lens == [query_bucket, query_bucket]
+    assert mixed.padded_num_blocks == [1, 4]
+    torch.testing.assert_close(
+        _mirror_mask_stack(mixed, 0, torch.device("cpu")),
+        _mirror_mask_stack(recorded, 0, torch.device("cpu")),
+        rtol=0,
+        atol=0,
+        check_stride=True,
+    )
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 64), (4, 1, 64), (1, 1, 64)])
+def test_mask_mirror_normalizes_singleton_strides_and_keeps_its_cached_copy(shape):
+    source = torch.arange(4096, dtype=torch.float32)
+    stack = source[64 : 64 + shape[0] * shape[1] * shape[2]].view(shape)
+    stack = stack.as_strided(
+        shape, tuple(1 if size == 1 else stride for size, stride in zip(shape, stack.stride()))
+    )
+    metadata = SimpleNamespace(
+        attention_mask_stacks=[stack], attention_mask_stacks_device=None, num_seqs=1
+    )
+    mirrored = _mirror_mask_stack(metadata, 0, torch.device("cpu"))
+    torch.testing.assert_close(mirrored, stack, rtol=0, atol=0)
+    assert mirrored.stride() == (shape[1] * shape[2], shape[2], 1)
+    assert _mirror_mask_stack(metadata, 0, torch.device("cpu")) is mirrored
 
 
 @pytest.mark.parametrize(

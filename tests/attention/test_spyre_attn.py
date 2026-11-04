@@ -22,6 +22,7 @@ from spyre_testing_plugin.attn_helpers import (
     _fused_qkv_kv_views,
     _padded_mask_metadata,
     assert_close_outliers,
+    random_block_tables,
     ref_attn,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -163,8 +164,9 @@ def _run_spyre_attn_test(
 
     # Widened to the recorder's num_blocks buckets, as a real engine's block
     # table is, so build()'s padding isn't suppressed by an exactly-sized table.
-    # The extra entries point at garbage pages on purpose: padded blocks are
-    # fully masked and must not affect the result.
+    # The extra entries point at pages no sequence owns, so they cannot alias
+    # live KV. An unmasked padded block mostly stays within tolerance, so this
+    # does not test the padding mask.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     # The num_blocks ladder is derived from block_size, so the bucketer needs this
     # test's value rather than the fixture default or it pads to the wrong width.
@@ -174,9 +176,7 @@ def _run_spyre_attn_test(
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-    )
+    block_tables = random_block_tables(kv_lens, max_num_blocks_per_seq, block_size, num_blocks)
 
     slot_mapping = []
     q_offset = 0
@@ -1515,19 +1515,21 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
     suffix = {
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (2, 3)
     }
-    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    torch.testing.assert_close(calls, [stacks_cpu[2], stacks_cpu[3]], rtol=0, atol=0)
     assert sum(t.numel() * t.element_size() for t in calls) == sum(
         stacks_cpu[i].numel() * stacks_cpu[i].element_size() for i in (2, 3)
     )
     for seq_idx in (2, 3):
         assert _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) is suffix[seq_idx]
-    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    torch.testing.assert_close(calls, [stacks_cpu[2], stacks_cpu[3]], rtol=0, atol=0)
 
     # A later layer that cannot use batched decode fills only the missing prefix.
     prefix = {
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (0, 1)
     }
-    assert calls == [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]]
+    torch.testing.assert_close(
+        calls, [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]], rtol=0, atol=0
+    )
     assert metadata.attention_mask_stacks_device is not None
     for seq_idx, stack_device in (prefix | suffix).items():
         assert metadata.attention_mask_stacks_device[seq_idx] is stack_device

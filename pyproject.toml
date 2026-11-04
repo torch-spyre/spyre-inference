@@ -19,7 +19,7 @@ dependencies = [
     # Only reaches wheel consumers: the `[tool.uv.sources]` pin below drops this
     # specifier from uv's own resolution. `>=0.5.0` would reject the 0.5.0rc1 release.
     "torch-spyre[cpsat]>=0.5.0rc1",
-    "vllm[grpc]>=0.32.0,<0.33",
+    "vllm[grpc]>=0.33.0,<0.34",
 
     # Direct dep so it's picked up from the pytorch-cpu index. Pinned to the
     # [build-system] torch: the csrc/ extension links libtorch, so wheel consumers
@@ -159,7 +159,7 @@ SPYRE_RPM_BUNDLE = "main_snap_2026_11_02_06"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f8a09bb0e96870ab30fa69e209b8915ac88bd130" }
 torch = [

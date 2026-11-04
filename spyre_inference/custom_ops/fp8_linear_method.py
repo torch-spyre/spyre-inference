@@ -21,9 +21,13 @@ from typing import cast
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    register_weight_loader_v2_supported_method,
+)
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import convert_to_channelwise
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 
@@ -81,12 +85,14 @@ class SpyreFp8LinearMethod(Fp8LinearMethod):
 
 class SpyreFp8Config(Fp8Config):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        method = super().get_quant_method(layer, prefix)
-        if type(method) is Fp8LinearMethod:
-            spyre_method = SpyreFp8LinearMethod(self)
-            spyre_method.marlin_input_dtype = method.marlin_input_dtype
-            return spyre_method
-        return method
+        if isinstance(layer, LinearBase) and not is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+            match_mode=self.ignored_layers_match_mode,
+        ):
+            return SpyreFp8LinearMethod(self)
+        return super().get_quant_method(layer, prefix)
 
 
 def register_spyre_fp8_config() -> None:

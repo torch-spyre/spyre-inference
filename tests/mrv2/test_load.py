@@ -36,9 +36,11 @@ from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper, unw
 
 from .fakes import FakeModel
 
+_ALL = ("get_model_loader", "init_model_state", "PoolingRunner", "compile_model_with_stock_torch")
+
 
 def _snapshot() -> dict[str, object]:
-    return {name: getattr(upstream, name) for name in load._SWAPPED}
+    return {name: getattr(upstream, name) for name in _ALL}
 
 
 def _runner(**attrs) -> SimpleNamespace:
@@ -220,7 +222,7 @@ def test_a_swap_upstream_bypasses_fails_loudly(stub_targets, bypassed) -> None:
     silent no-op: Spyre's loader or model state never installed, or a whole-model
     stock compile over the block graphs."""
     runner = _runner(is_pooling_model=True)
-    reached = set(load._SWAPPED) - {bypassed}
+    reached = set(_ALL) - {bypassed}
     with pytest.raises(RuntimeError, match=bypassed), load._patched(runner):
         _load_through(runner, reached)
 
@@ -230,6 +232,35 @@ def test_swaps_load_model_may_skip_are_not_required(stub_targets) -> None:
     runner = _runner(compilation_config=SimpleNamespace(mode=CompilationMode.NONE))
     with load._patched(runner):
         _load_through(runner, {"get_model_loader", "init_model_state"})
+
+
+def test_every_swap_is_checked(stub_targets) -> None:
+    """A fifth swap without its _required entry would never report a bypass."""
+    assert set(load._required(_runner(is_pooling_model=True))) == set(_ALL)
+
+
+def test_a_bypass_is_reported_when_load_model_then_fails(stub_targets) -> None:
+    """A bypassed loader can be what makes load_model fail further on; the original
+    error still propagates, carrying the bypass."""
+    with pytest.raises(ValueError, match="bad checkpoint") as info, load._patched(_runner()):
+        _load_through(_runner(), {"init_model_state"})
+        raise ValueError("bad checkpoint")
+    assert any("bypassed Spyre's swap of ['get_model_loader']" in n for n in info.value.__notes__)
+
+
+def test_a_failure_before_any_swap_adds_no_note(stub_targets) -> None:
+    """A bad config fails before load_model reaches a swap; that's no evidence of a
+    bypass, so a note there would only mislead."""
+    with pytest.raises(ValueError, match="bad config") as info, load._patched(_runner()):
+        raise ValueError("bad config")
+    assert not getattr(info.value, "__notes__", None)
+
+
+def test_a_failure_after_the_swaps_ran_adds_no_note(stub_targets) -> None:
+    with pytest.raises(ValueError) as info, load._patched(_runner()):
+        _load_through(_runner(), set(_ALL) - {"PoolingRunner"})
+        raise ValueError("late failure")
+    assert not getattr(info.value, "__notes__", None)
 
 
 def test_load_refuses_lora_spec_decode_and_caller_built_models() -> None:
@@ -250,7 +281,7 @@ def test_load_wires_the_pooling_runner_to_the_model_state(monkeypatch, stub_targ
     model_state = SimpleNamespace(encoder_plan="plan")
 
     def upstream_load_model(runner, *args, **kwargs):
-        _load_through(runner, set(load._SWAPPED))
+        _load_through(runner, set(_ALL))
         runner.model_state, runner.pooling_runner = model_state, pooling_runner
         runner.pooling_on_spyre = True
         runner.model_memory_usage = 123

@@ -24,7 +24,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -32,14 +31,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
-from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.model_load import resolve_kv_scales
+from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
-
-logger = init_logger(__name__)
 
 
 class SpyreModelRunnerV2(GPUModelRunner):
@@ -78,14 +74,7 @@ class SpyreModelRunnerV2(GPUModelRunner):
 
     def reload_weights(self, *args: Any, **kwargs: Any) -> None:
         super().reload_weights(*args, **kwargs)
-        # As V1: the reload rewrites the KV scales, and the block graphs guard on them.
-        if resolve_kv_scales(self.get_model(), self.compilation_config.static_forward_context):
-            logger.warning(
-                "KV cache scales changed on weight reload; re-warming the graphs that "
-                "depend on them."
-            )
-            with compile_guard.allow_compile("KV cache scales changed on weight reload"):
-                self.warming_up_model()
+        rewarm_after_reload(self)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         # Upstream asks PoolingRunner about self.model, the wrapper, which fails

@@ -114,12 +114,18 @@ class _SpyreModelLoader:
         )
 
 
-_SWAPPED = (
-    "get_model_loader",
-    "init_model_state",
-    "PoolingRunner",
-    "compile_model_with_stock_torch",
-)
+def _required(runner: "SpyreModelRunnerV2") -> dict[str, bool]:
+    """Each swapped name, in the order load_model reaches it, and whether this load
+    must reach it (upstream skips the pooling runner and the stock compile otherwise).
+    The keys are the whole set of swaps: _patched refuses a replacement missing here."""
+    return {
+        "get_model_loader": True,
+        "init_model_state": True,
+        "PoolingRunner": runner.is_pooling_model,
+        "compile_model_with_stock_torch": (
+            runner.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+        ),
+    }
 
 
 @contextlib.contextmanager
@@ -128,9 +134,10 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
 
     Each is a module global of vllm/v1/worker/gpu/model_runner.py that load_model
     looks up at call time. If a vLLM bump imports one locally instead, the swap is a
-    silent no-op, so the swaps load_model always reaches must report that they ran.
+    silent no-op, so the swaps load_model must reach have to report that they ran.
     """
-    original = {name: getattr(upstream_model_runner, name) for name in _SWAPPED}
+    required = _required(runner)
+    original = {name: getattr(upstream_model_runner, name) for name in required}
     called: set[str] = set()
 
     def spyre_model_loader(load_config: Any) -> _SpyreModelLoader:
@@ -159,24 +166,36 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
         "PoolingRunner": _SpyrePoolingRunner,
         "compile_model_with_stock_torch": no_stock_compile,
     }
+    if replacements.keys() != required.keys():
+        raise AssertionError(
+            f"Spyre swaps {sorted(replacements)} but checks {sorted(required)}; "
+            "a swap added to one needs its entry in the other."
+        )
     for name, replacement in replacements.items():
         setattr(upstream_model_runner, name, replacement)
     try:
         yield
+    except BaseException as e:
+        # load_model failed partway, so the swaps after the failure were never due. One
+        # missing before a swap that did run was bypassed, which is likely the cause.
+        order = list(required)
+        reached = max((order.index(name) + 1 for name in called), default=0)
+        if bypassed := [n for n in order[:reached] if required[n] and n not in called]:
+            e.add_note(_bypass_message(bypassed))
+        raise
     finally:
         for name, value in original.items():
             setattr(upstream_model_runner, name, value)
 
-    expected = {"get_model_loader", "init_model_state"}
-    if runner.is_pooling_model:
-        expected.add("PoolingRunner")
-    if runner.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
-        expected.add("compile_model_with_stock_torch")
-    if missed := expected - called:
-        raise RuntimeError(
-            f"Upstream GPUModelRunner.load_model bypassed Spyre's swap of {sorted(missed)}; "
-            "it no longer reads them as module globals of vllm/v1/worker/gpu/model_runner.py."
-        )
+    if missed := [n for n, needed in required.items() if needed and n not in called]:
+        raise RuntimeError(_bypass_message(missed))
+
+
+def _bypass_message(names: list[str]) -> str:
+    return (
+        f"Upstream GPUModelRunner.load_model bypassed Spyre's swap of {names}; it no "
+        "longer reads them as module globals of vllm/v1/worker/gpu/model_runner.py."
+    )
 
 
 def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> None:

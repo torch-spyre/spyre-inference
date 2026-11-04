@@ -20,9 +20,11 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1GPUModelRunner
 
-from spyre_inference.v1.worker.spyre import model_runner
+from spyre_inference.v1.worker import model_load
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 from .fakes import make_fake_scheduler_output
 
@@ -52,19 +54,26 @@ def test_a_step_without_block_copies_reaches_upstream(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize("scales_changed", [True, False])
+@pytest.mark.parametrize(
+    "runner_cls, upstream_cls",
+    [
+        pytest.param(SpyreModelRunnerV2, GPUModelRunner, id="v2"),
+        pytest.param(TorchSpyreModelRunner, V1GPUModelRunner, id="v1"),
+    ],
+)
 def test_reload_rewarms_only_when_the_kv_scales_change(
-    monkeypatch: pytest.MonkeyPatch, scales_changed: bool
+    monkeypatch: pytest.MonkeyPatch, scales_changed: bool, runner_cls, upstream_cls
 ) -> None:
-    """The block graphs guard on the KV scales a reload rewrites, as in V1."""
+    """The block graphs guard on the KV scales a reload rewrites; V1 and V2 share this."""
     events = []
-    monkeypatch.setattr(GPUModelRunner, "reload_weights", lambda self: events.append("reload"))
-    monkeypatch.setattr(model_runner, "resolve_kv_scales", lambda model, ctx: scales_changed)
+    monkeypatch.setattr(upstream_cls, "reload_weights", lambda self: events.append("reload"))
+    monkeypatch.setattr(model_load, "resolve_kv_scales", lambda model, ctx: scales_changed)
     monkeypatch.setattr(
-        model_runner.compile_guard,
+        model_load.compile_guard,
         "allow_compile",
         lambda reason: contextlib.nullcontext(events.append("allow")),
     )
-    runner = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
+    runner = runner_cls.__new__(runner_cls)
     runner.model = nn.Identity()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     monkeypatch.setattr(runner, "warming_up_model", lambda: events.append("warm"))

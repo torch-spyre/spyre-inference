@@ -39,6 +39,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
@@ -132,3 +133,18 @@ def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) 
             len(pairs),
         )
     return changed
+
+
+def rewarm_after_reload(runner: Any) -> None:
+    """After upstream's reload_weights, shared by the V1 and V2 runners.
+
+    The reload reprocesses the weights, which rewrites the layers' KV scales. The
+    graphs that read them guard on their values, so only those retrace; warming here
+    does that before the next request, which an armed compile guard would fail.
+    """
+    if resolve_kv_scales(runner.get_model(), runner.compilation_config.static_forward_context):
+        logger.warning(
+            "KV cache scales changed on weight reload; re-warming the graphs that depend on them."
+        )
+        with compile_guard.allow_compile("KV cache scales changed on weight reload"):
+            runner.warming_up_model()

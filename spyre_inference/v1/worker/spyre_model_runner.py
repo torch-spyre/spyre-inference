@@ -89,7 +89,6 @@ from spyre_inference.v1.pool.encoder_grid import (
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
-from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
@@ -105,6 +104,7 @@ from spyre_inference.v1.worker.model_load import (
     install_pad_loaders,
     move_model_to_spyre,
     resolve_kv_scales,
+    rewarm_after_reload,
 )
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -708,16 +708,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
-        # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
-        # The graphs that read them guard on their values, so only those retrace; warming
-        # here does that before the next request, which an armed compile guard would fail.
-        if resolve_kv_scales(self.get_model(), self.compilation_config.static_forward_context):
-            logger.warning(
-                "KV cache scales changed on weight reload; re-warming the graphs that "
-                "depend on them."
-            )
-            with compile_guard.allow_compile("KV cache scales changed on weight reload"):
-                self.warming_up_model()
+        rewarm_after_reload(self)
 
     def warming_up_model(self) -> None:
         """Warm kernels / compile.

@@ -41,6 +41,8 @@ Runs are slow (~3 min) due to vLLM startup — prefer single-test invocations wh
 uv run pytest 'tests/attention/test_spyre_attn.py::test_spyre_attn[<id>]' -m "not upstream"
 ```
 
+New e2e tests stay out of the `integration` tier by default. Don't add `@pytest.mark.e2e_smoke` or `attention_smoke` unless the task is specifically to add integration-tier coverage; then follow `docs/contributing/integration-tier.md` (distinct path, ~10 min or less in a cold CI run, fits the ~90-min budget or swaps an entry out) and say in the PR which path it covers.
+
 Upstream vLLM tests are opt-in: they are only cloned and collected when the `-m` expression names the `upstream` marker (a negative mention like `-m "not upstream"` doesn't count) or `--upstream` is passed, so a bare `pytest` won't pull them into a broad selector. Tests needing real hardware guard themselves with `spyre_available()` and skip on CPU-only hosts, so "all green" on a non-Spyre machine does **not** mean the change works.
 
 Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`), which is loaded by the `addopts` entry in `pyproject.toml` — not a global `pytest11` entry point — so it stays inert in sibling repos sharing the venv (e.g. a local `torch-spyre` checkout). Env vars: `SKIP_UPSTREAM_TESTS=1` (hard off-switch, overrides `--upstream`), `VLLM_COMMIT=<sha>`; the upstream test paths come from the `rel_path` entries in `upstream_tests.yaml` (`UPSTREAM_TESTS_PATHS` is not read). After a vLLM bump, resync deps with `uv run sync-upstream-test-deps`.

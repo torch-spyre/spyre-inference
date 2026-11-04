@@ -173,6 +173,7 @@ def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+@pytest.mark.e2e_smoke
 def test_two_image_prompt_produces_output():
     """Two images make the vision mask non-trivial: the `cu_seqlens`-derived
     block-diagonal mask must actually block cross-image attention, not collapse to a

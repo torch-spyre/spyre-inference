@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from typing import cast
 
 import torch
+from torch.nn import functional as F
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3DecoderLayer,
@@ -145,14 +146,18 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 head.refine_candidates, fullgraph=True, dynamic=False
             )
             if envs.SPYRE_XPRESS_DEVICE_FEEDBACK:
-                if head.block_size != 16 or self.xpress_topc not in (128, 512):
+                count = min(self.xpress_topc, self.config.vocab_size)
+                # DL16 represents every integer through 1024 exactly, including
+                # the sentinel used to choose the first tied shortlist position.
+                if not 1 <= count <= 1024:
                     raise ValueError(
-                        "Device XPress feedback requires block size 16 and topc 128 or 512"
+                        "Device XPress feedback requires a shortlist of 1 to 1024 candidates"
                     )
                 self._device_feedback_enabled = True
-                self._feedback_order = torch.arange(
-                    min(self.xpress_topc, self.config.vocab_size), dtype=torch.float16
-                ).to(head.w1.weight.device)
+                count += -count % 64
+                self._feedback_order = torch.arange(count, dtype=torch.float16).to(
+                    head.w1.weight.device
+                )
                 self._prepare_feedback = torch.compile(
                     head.prepare_feedback, fullgraph=True, dynamic=False
                 )
@@ -199,8 +204,13 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 base_c, candidates = host_base.topk(
                     min(self.xpress_topc, host_base.shape[-1]), dim=-1
                 )
+                candidate_ids = candidates
+                if device_feedback and (padding := -candidates.shape[-1] % 64):
+                    # BMM padding cannot split flattened candidate embedding rows.
+                    candidate_ids = F.pad(candidate_ids, (0, padding))
+                    base_c = F.pad(base_c, (0, padding), value=-torch.inf)
                 # Flat indices avoid gather page splits across request axes.
-                candidate_ids = convert(candidates.flatten(), device=hidden_states.device)
+                candidate_ids = convert(candidate_ids.flatten(), device=hidden_states.device)
                 base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
                 if not device_feedback:
                     readout = self._gather_readout(candidate_ids)

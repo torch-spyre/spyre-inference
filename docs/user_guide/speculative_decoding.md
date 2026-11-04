@@ -83,7 +83,9 @@ CPU-sampling hooks ported to V2's speculator interface. See
 ## Optional device feedback
 
 `SPYRE_XPRESS_DEVICE_FEEDBACK=1` keeps per-pass selection and proposal feedback
-on Spyre for block size 16 and `xpress_topc` 128 or 512. It defaults to zero.
+on Spyre. It defaults to zero and requires a shortlist of 1 to 1024 candidates.
+DL16 represents these shortlist positions and their tie-breaking sentinel
+exactly. The block size must match the checkpoint's learned mixer, as on CPU.
 The initial vocabulary top-k still runs on CPU. Each refinement pass selects
 the next token embeddings directly from the shortlist; only the final shortlist
 positions return to CPU to recover token IDs.

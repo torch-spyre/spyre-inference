@@ -30,19 +30,9 @@ import os
 import subprocess
 from pathlib import Path
 
+from download_xml_artifacts import safe_segment
+
 FAILED_SUITES_DIR = Path("failed_suites")
-
-
-def safe_segment(name: str) -> bool:
-    # The name is attacker-chosen and the prefix filter keeps `failed-suite-1-../x`.
-    return (
-        name not in ("", ".", "..")
-        and "/" not in name
-        and "\\" not in name
-        and os.sep not in name
-        and (os.altsep is None or os.altsep not in name)
-        and not name.startswith(".")
-    )
 
 
 def list_artifacts(repo: str, run_id: str, attempt: str) -> list[dict]:

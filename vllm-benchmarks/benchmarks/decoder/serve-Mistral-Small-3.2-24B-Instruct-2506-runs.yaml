@@ -1,11 +1,7 @@
 # Serve benchmarks for mistralai/Mistral-Small-3.2-24B-Instruct-2506.
 #
-# An entry runs in each suite its `labels` name, and every entry runs in the
-# exhaustive suite. See vllm-benchmarks/README.md.
-#
-# TP4 entries use the defaults. TP1 entries override them with max-model-len
-# 8192 and max-num-seqs 8: the TP4 KV cache does not fit on one card. The TP1
-# `all` entries therefore replay the all_sequences trace truncated to 8k.
+# Each entry runs in the suites its `labels` name; an entry needs at least one.
+# See vllm-benchmarks/README.md.
 
 defaults:
   server_health_timeout: 7200
@@ -33,83 +29,11 @@ defaults:
 
 tests:
   # TP4 · aiops
-  - test_name: serve_mistral-small32-24b_tp4_conc4_aiops
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 4
-
   - test_name: serve_mistral-small32-24b_tp4_conc5_aiops
     labels: [reference]
     parameters:
       dataset-path: ${SPYRE_AIOPS_DATASET}
       max-concurrency: 5
-
-  - test_name: serve_mistral-small32-24b_tp4_conc8_aiops
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 8
-
-  - test_name: serve_mistral-small32-24b_tp4_conc16_aiops
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 16
-
-  - test_name: serve_mistral-small32-24b_tp4_conc32_aiops
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 32
-
-  # TP4 · cics
-  - test_name: serve_mistral-small32-24b_tp4_conc4_cics
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 4
-
-  - test_name: serve_mistral-small32-24b_tp4_conc5_cics
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 5
-
-  - test_name: serve_mistral-small32-24b_tp4_conc8_cics
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 8
-
-  - test_name: serve_mistral-small32-24b_tp4_conc16_cics
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 16
-
-  - test_name: serve_mistral-small32-24b_tp4_conc32_cics
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 32
-
-  # TP4 · all
-  - test_name: serve_mistral-small32-24b_tp4_conc4_all
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
-      max-concurrency: 4
-
-  - test_name: serve_mistral-small32-24b_tp4_conc5_all
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
-      max-concurrency: 5
-
-  - test_name: serve_mistral-small32-24b_tp4_conc8_all
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
-      max-concurrency: 8
-
-  - test_name: serve_mistral-small32-24b_tp4_conc16_all
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
-      max-concurrency: 16
-
-  - test_name: serve_mistral-small32-24b_tp4_conc32_all
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
-      max-concurrency: 32
 
   # TP4 · vision
   - test_name: serve_mistral-small32-24b_tp4_conc4_vision
@@ -122,87 +46,3 @@ tests:
       num-prompts: 166
       output-len: 256
       max-concurrency: 4
-
-  # TP1 · aiops
-  - test_name: serve_mistral-small32-24b_tp1_conc4_aiops
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 4
-
-  - test_name: serve_mistral-small32-24b_tp1_conc5_aiops
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 5
-
-  - test_name: serve_mistral-small32-24b_tp1_conc8_aiops
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 8
-
-  # TP1 · cics
-  - test_name: serve_mistral-small32-24b_tp1_conc4_cics
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 4
-
-  - test_name: serve_mistral-small32-24b_tp1_conc5_cics
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 5
-
-  - test_name: serve_mistral-small32-24b_tp1_conc8_cics
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 8
-
-  # TP1 · all
-  - test_name: serve_mistral-small32-24b_tp1_conc4_all
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}
-      max-concurrency: 4
-
-  - test_name: serve_mistral-small32-24b_tp1_conc5_all
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}
-      max-concurrency: 5
-
-  - test_name: serve_mistral-small32-24b_tp1_conc8_all
-    server_parameters:
-      tensor-parallel-size: 1
-      max-model-len: 8192
-      max-num-seqs: 8
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}
-      max-concurrency: 8

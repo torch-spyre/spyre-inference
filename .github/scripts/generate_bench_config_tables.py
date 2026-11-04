@@ -17,12 +17,14 @@
 Reads every *-runs.yaml under vllm-benchmarks/benchmarks and replaces the part
 of the README between the BEGIN/END markers with:
 
-- one matrix per bench family (decoder serve, vision and multimodal, pooling,
-  latency/throughput), showing each entry's labels,
+- one matrix per bench family (decoder serve, pooling, latency/throughput),
+  showing each entry's labels; the decoder matrix groups its concurrency
+  columns under each dataset,
 - one list per suite (minimal, base, reference) with each entry's config.
 
 Fails with exit 2 if two entries share a test_name, since the name is the
-result file and the benchmark's identity downstream.
+result file and the benchmark's identity downstream, or if an entry has no
+label, since it would run in no suite.
 
     python3 .github/scripts/generate_bench_config_tables.py          # rewrite
     python3 .github/scripts/generate_bench_config_tables.py --check  # verify only
@@ -48,15 +50,14 @@ runner = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(runner)
 
 SHORT_LABEL = {"minimal": "min", "base": "base", "reference": "ref"}
-# Shown for an entry with no label: it runs in the exhaustive suite only.
-EXHAUSTIVE_ONLY = "exh"
 TRACE_DATASETS = ("aiops", "cics", "all")
 
 
 def load_entries() -> list[dict]:
     """Every entry of every config file, with its file and bench type.
 
-    Exits on a test_name used more than once, listing every collision.
+    Exits on an entry without labels, and on a test_name used more than once,
+    listing every collision.
     """
     entries = []
     for config_file in runner.config_files(CONFIGS_DIR):
@@ -106,8 +107,7 @@ def _cell(entries: list[dict]) -> str:
         return ""
     cells = []
     for entry in entries:
-        labels = [SHORT_LABEL[label] for label in entry["labels"]]
-        cells.append(" ".join(labels) or EXHAUSTIVE_ONLY)
+        cells.append(" ".join(SHORT_LABEL[label] for label in entry["labels"]))
     # Latency and throughput share a cell; show both only when they differ.
     return " / ".join(dict.fromkeys(cells))
 
@@ -135,6 +135,35 @@ def _matrix(entries: list[dict], columns: list[str], column_of) -> list[str]:
         for model, tp in _row_keys(entries)
     ]
     return _table(["model · TP", *columns], rows)
+
+
+def _grouped_matrix(entries: list[dict], group_of, column_of, groups: list[str]) -> list[str]:
+    """An HTML table whose columns are grouped under a second header row,
+    e.g. each dataset over its concurrencies. Markdown has no column groups."""
+    by_cell: dict[tuple, list[dict]] = {}
+    for entry in entries:
+        key = (_short_model(entry), _tp(entry), group_of(entry), column_of(entry))
+        by_cell.setdefault(key, []).append(entry)
+    columns = {
+        g: _sorted_columns(column_of(e) for e in entries if group_of(e) == g) for g in groups
+    }
+    columns = {g: c for g, c in columns.items() if c}
+    lines = [
+        "<table>",
+        "<thead>",
+        '<tr><th rowspan="2">model · TP</th>'
+        + "".join(f'<th colspan="{len(c)}">{g}</th>' for g, c in columns.items())
+        + "</tr>",
+        "<tr>" + "".join(f"<th>{c}</th>" for cs in columns.values() for c in cs) + "</tr>",
+        "</thead>",
+        "<tbody>",
+    ]
+    for model, tp in _row_keys(entries):
+        cells = [_cell(by_cell.get((model, tp, g, c), [])) for g, cs in columns.items() for c in cs]
+        lines.append(
+            f"<tr><td>{model} · tp{tp}</td>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+        )
+    return [*lines, "</tbody>", "</table>"]
 
 
 def _sorted_columns(values) -> list[str]:
@@ -205,8 +234,6 @@ def _suite_list(entries: list[dict], suite: str) -> list[str]:
 def render(entries: list[dict]) -> str:
     serve = [e for e in entries if e["bench_type"] == "serve"]
     decoder = [e for e in serve if e["file"].startswith("benchmarks/decoder/")]
-    trace = [e for e in decoder if _name_tail(e).rsplit("_", 1)[-1] in TRACE_DATASETS]
-    other_decoder = [e for e in decoder if e not in trace]
     encoder = [e for e in serve if e not in decoder]
     offline = [e for e in entries if e["bench_type"] != "serve"]
 
@@ -220,20 +247,23 @@ def render(entries: list[dict]) -> str:
         "",
         f"{len(entries)} entries: {counts['minimal']} `minimal`, {counts['base']} `base`, "
         f"{counts['reference']} `reference`. Each cell gives the labels of one entry: "
-        f"`min` = minimal, `base` = base, `ref` = reference, `{EXHAUSTIVE_ONLY}` = no label "
-        "(exhaustive suite only). An empty cell has no entry.",
+        "`min` = minimal, `base` = base, `ref` = reference. An empty cell has no entry.",
         "",
     ]
-    for dataset in TRACE_DATASETS:
-        dataset_entries = [e for e in trace if _name_tail(e).endswith(f"_{dataset}")]
-        columns = _sorted_columns(_name_tail(e).split("_", 1)[0] for e in dataset_entries)
-        lines += [f"### Decoder serve · `{dataset}`", ""]
-        lines += _matrix(dataset_entries, columns, lambda e: _name_tail(e).split("_", 1)[0])
+    if decoder:
+        # A decoder tail is `conc<C>_<dataset>`: datasets head the columns, each
+        # over its concurrencies. Traces come first, in TRACE_DATASETS order.
+        datasets = list(TRACE_DATASETS) + sorted(
+            {_name_tail(e).split("_", 1)[1] for e in decoder} - set(TRACE_DATASETS)
+        )
+        lines += ["### Decoder serve", ""]
+        lines += _grouped_matrix(
+            decoder,
+            lambda e: _name_tail(e).split("_", 1)[1],
+            lambda e: _name_tail(e).split("_", 1)[0],
+            datasets,
+        )
         lines += [""]
-    if other_decoder:
-        columns = _sorted_columns(_name_tail(e) for e in other_decoder)
-        lines += ["### Decoder serve · vision and multimodal", ""]
-        lines += _matrix(other_decoder, columns, _name_tail) + [""]
     if encoder:
         columns = _sorted_columns(_name_tail(e) for e in encoder)
         lines += ["### Pooling serve", ""]

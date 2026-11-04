@@ -316,15 +316,14 @@ def _names(selected: dict[str, list]) -> dict[str, list[str]]:
         ("minimal", ["a"]),
         ("base", ["a", "b"]),
         ("reference", ["c"]),
-        ("exhaustive", ["a", "b", "c", "d"]),
     ],
 )
 def test_labels_select_the_suite(tmp_path, suite, expected):
-    """An entry runs in the suites it names, and every entry runs in exhaustive."""
+    """An entry runs in the suites it names."""
     _write_runs(
         tmp_path / "decoder",
         "latency-x-runs.yaml",
-        {"a": ["minimal", "base"], "b": ["base"], "c": ["reference"], "d": None},
+        {"a": ["minimal", "base"], "b": ["base"], "c": ["reference"]},
     )
 
     selected = runner.collect_configs(tmp_path, suite, {"latency"})
@@ -350,9 +349,9 @@ def test_single_config_file_runs_unfiltered(tmp_path):
     assert _names(selected) == {"serve": ["a", "b"]}
 
 
-@pytest.mark.parametrize("labels", [["smoke"], ["exhaustive"], "base"])
-def test_unknown_label_aborts_the_run(tmp_path, labels):
-    """A typo would otherwise drop the entry from its suite without a word."""
+@pytest.mark.parametrize("labels", [None, [], ["smoke"], ["exhaustive"], "base"])
+def test_missing_or_unknown_label_aborts_the_run(tmp_path, labels):
+    """Such an entry would otherwise run in no suite without a word."""
     _write_runs(tmp_path, "serve-x-runs.yaml", {"a": labels})
 
     with pytest.raises(SystemExit) as exc:
@@ -363,10 +362,10 @@ def test_unknown_label_aborts_the_run(tmp_path, labels):
 def test_duplicate_test_name_aborts_the_run(tmp_path):
     """A test_name names the result file, so a duplicate would overwrite it."""
     _write_runs(tmp_path / "a", "serve-x-runs.yaml", {"t": ["base"]})
-    _write_runs(tmp_path / "b", "serve-y-runs.yaml", {"t": None})
+    _write_runs(tmp_path / "b", "serve-y-runs.yaml", {"t": ["reference"]})
 
     with pytest.raises(SystemExit) as exc:
-        runner.collect_configs(tmp_path, "exhaustive", {"serve"})
+        runner.collect_configs(tmp_path, "base", {"serve"})
     assert exc.value.code == 2
 
 
@@ -392,19 +391,19 @@ def test_unknown_suite_aborts_the_run(monkeypatch, tmp_path):
 
 def test_matrix_follows_the_suite(tmp_path):
     """The matrix holds exactly the models the run would bench for that suite."""
-    _write_runs(tmp_path, "latency-x-runs.yaml", {"small": ["minimal"], "big": None})
+    _write_runs(tmp_path, "latency-x-runs.yaml", {"small": ["minimal", "base"], "big": ["base"]})
 
     minimal = matrix.generate_benchmark_matrix(str(tmp_path), [], "minimal")
-    exhaustive = matrix.generate_benchmark_matrix(str(tmp_path), [], "exhaustive")
+    base = matrix.generate_benchmark_matrix(str(tmp_path), [], "base")
 
     assert minimal["include"] == [{"models": "m-small"}]
-    assert exhaustive["include"] == [{"models": "m-small"}, {"models": "m-big"}]
+    assert base["include"] == [{"models": "m-small"}, {"models": "m-big"}]
 
 
 # ── the checked-in config ──
 
-# Each trace is reached through its own env var. `all` at TP1 replays the trace
-# truncated to the TP1 context.
+# Each trace is reached through its own env var. `all` at TP1 would replay the
+# trace truncated to the TP1 context.
 DATASET_PATH_VARS = {
     "aiops": "${SPYRE_AIOPS_DATASET}",
     "cics": "${SPYRE_CICS_DATASET}",
@@ -421,11 +420,8 @@ def test_checked_in_configs_are_found():
 
 
 def test_checked_in_test_names_and_labels_are_valid():
-    """collect_configs exits on a duplicate test_name or an unknown label."""
-    selected = runner.collect_configs(_CONFIGS, "exhaustive", set(runner.VALID_BENCH_TYPES))
-
-    assert all(selected.values())
-    for suite in runner.SUITE_LABELS:
+    """collect_configs exits on a duplicate test_name or a missing or unknown label."""
+    for suite in runner.SUITES:
         assert any(runner.collect_configs(_CONFIGS, suite, {"serve"}).values()), suite
 
 
@@ -437,7 +433,7 @@ def test_readme_config_tables_are_up_to_date():
 
 def test_tables_reject_a_duplicate_test_name(monkeypatch, tmp_path):
     _write_runs(tmp_path / "a", "serve-x-runs.yaml", {"t": ["base"]})
-    _write_runs(tmp_path / "b", "latency-y-runs.yaml", {"t": None})
+    _write_runs(tmp_path / "b", "latency-y-runs.yaml", {"t": ["reference"]})
     monkeypatch.setattr(tables, "CONFIGS_DIR", tmp_path)
     monkeypatch.setattr(tables, "README", tmp_path / "README.md")
 

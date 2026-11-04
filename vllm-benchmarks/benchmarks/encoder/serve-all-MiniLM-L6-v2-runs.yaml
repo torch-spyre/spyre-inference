@@ -1,7 +1,7 @@
 # Serve benchmarks for sentence-transformers/all-MiniLM-L6-v2 (pooling).
 #
-# An entry runs in each suite its `labels` name, and every entry runs in the
-# exhaustive suite. See vllm-benchmarks/README.md.
+# Each entry runs in the suites its `labels` name; an entry needs at least one.
+# See vllm-benchmarks/README.md.
 
 defaults:
   server_health_timeout: 1800

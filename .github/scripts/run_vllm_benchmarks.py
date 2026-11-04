@@ -20,8 +20,7 @@ and executes them.
 
 Config files are named `<bench type>-<model>-runs.yaml` and can sit in any
 subdirectory of the configs dir. Each entry lists the suites it belongs to in
-`labels` (minimal, base, reference); every entry belongs to the exhaustive
-suite.
+`labels`: at least one of minimal, base, reference.
 """
 
 import contextlib
@@ -63,9 +62,7 @@ def _dataset_path_defaults() -> dict[str, str]:
 
 
 VALID_BENCH_TYPES = ("latency", "throughput", "serve")
-SUITE_LABELS = ("minimal", "base", "reference")
-EXHAUSTIVE = "exhaustive"
-SUITES = (*SUITE_LABELS, EXHAUSTIVE)
+SUITES = ("minimal", "base", "reference")
 DEFAULT_SUITE = "minimal"
 
 
@@ -124,7 +121,7 @@ def parse_args():
         type=str,
         default=DEFAULT_SUITE,
         help=f"suite to run: one of {', '.join(SUITES)} (default: {DEFAULT_SUITE}); "
-        "exhaustive runs every entry, the others the entries whose `labels` name them",
+        "it runs the entries whose `labels` name it",
     )
     return parser.parse_args()
 
@@ -603,16 +600,19 @@ def config_files(configs_path: Path) -> list[Path]:
     return sorted(f for f in configs_path.rglob("*-runs.yaml") if _bench_type(f))
 
 
-def _labels(config: dict) -> list[str]:
-    """Suite labels of an entry. Exits on a malformed or unknown label, since a
-    typo would silently drop the entry from its suite."""
-    labels = config.get("labels") or []
-    if not isinstance(labels, list) or not set(labels) <= set(SUITE_LABELS):
+def _labels(config: dict, required: bool = True) -> list[str]:
+    """Suite labels of an entry. Exits on a malformed or unknown label, and, if
+    `required`, on missing or empty labels, since such an entry would run in no
+    suite."""
+    labels = config.get("labels")
+    if labels is None and not required:
+        return []
+    if not isinstance(labels, list) or not set(labels) <= set(SUITES) or (required and not labels):
         log.error(
-            "%s has labels %r; each must be one of %s",
+            "%s has labels %r; it needs a non-empty list of %s",
             config.get("test_name"),
             labels,
-            SUITE_LABELS,
+            SUITES,
         )
         sys.exit(2)
     return labels
@@ -621,8 +621,9 @@ def _labels(config: dict) -> list[str]:
 def collect_configs(configs_path: Path, suite: str, bench_types: set[str]) -> dict[str, list]:
     """Map each selected bench type to the configs of `suite`, in file order.
 
-    A single config file runs every entry, whatever the suite. A test_name
-    that appears twice is an error: it names the result file.
+    A single config file runs every entry, whatever the suite, so its entries
+    may omit `labels`. In a directory, an entry without labels is an error. So
+    is a test_name that appears twice: it names the result file.
     """
     unfiltered = configs_path.is_file()
     selected: dict[str, list] = {b: [] for b in VALID_BENCH_TYPES if b in bench_types}
@@ -641,10 +642,10 @@ def collect_configs(configs_path: Path, suite: str, bench_types: set[str]) -> di
                 log.error("test_name %s is in both %s and %s", name, seen[name], config_file)
                 sys.exit(2)
             seen[name] = config_file
-            labels = _labels(config)
+            labels = _labels(config, required=not unfiltered)
             if bench_type not in selected:
                 continue
-            if unfiltered or suite == EXHAUSTIVE or suite in labels:
+            if unfiltered or suite in labels:
                 selected[bench_type].append(config)
     return selected
 

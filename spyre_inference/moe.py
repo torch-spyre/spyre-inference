@@ -130,6 +130,7 @@ class SpyreMoERecipe:
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
     # Reorders ``w13``'s output rows (dim 1) into ``[gate | up]`` halves. gpt-oss interleaves
     # them, ``[gate0, up0, gate1, ...]``; the gate/up split below takes the first half as gate.
+    # Also applied to ``w13_bias``, whose output axis is dim 1 too.
     prepare_gate_up_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
@@ -744,6 +745,9 @@ def _prepare_biases(
     if not hasattr(layer, "w13_bias"):
         return None
     w13_bias = layer.get_parameter("w13_bias").data
+    prepare_gate_up = layer.spyre_moe_recipe.prepare_gate_up_weight
+    if prepare_gate_up is not None:
+        w13_bias = prepare_gate_up(w13_bias)
     w2_bias = layer.get_parameter("w2_bias").data
     experts, hidden = w2_bias.shape
     # Every rank adds this full down bias before MoERunner's all-reduce, as upstream's

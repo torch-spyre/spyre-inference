@@ -14,12 +14,12 @@
 
 """The gpt-oss recipe over the generic Spyre MoE backend.
 
-gpt-oss needs the ``swigluoai`` activation and gate/up rows interleaved in ``w13``. The
-reference below is the transformers ``GptOssExperts`` math without the expert biases,
-evaluated on the checkpoint layout (interleaved, unpadded), so a mistake in de-interleaving
-the weights shows up as a value error. Shapes keep gpt-oss's hidden width, 2880 (45 sticks,
-so the gathered form picks 15 chunks), and its per-rank expert width at TP1, TP4 and TP8; the
-expert count is cut.
+On top of expert biases (``test_moe_bias.py``), gpt-oss needs the ``swigluoai`` activation
+and gate/up rows interleaved in ``w13``. The reference below is the transformers
+``GptOssExperts`` math, evaluated on the checkpoint layout (interleaved, unpadded), so a
+mistake in de-interleaving the weights or the gate/up bias shows up as a value error. Shapes
+keep gpt-oss's hidden width, 2880 (45 sticks, so the gathered form picks 15 chunks), and its
+per-rank expert width at TP1, TP4 and TP8; the expert count is cut.
 """
 
 from types import SimpleNamespace
@@ -39,9 +39,9 @@ def _swiglu_oai(gate_up: torch.Tensor) -> torch.Tensor:
     return (up + 1) * gate * torch.sigmoid(gate * ALPHA)
 
 
-def _reference(x, logits, w13, w2, top_k):
+def _reference(x, logits, w13, w13_bias, w2, w2_bias, top_k):
     """gpt-oss MoE in float32 on vLLM's parameter layout: ``w13`` [E, 2M, H] interleaved,
-    ``w2`` [E, H, M]."""
+    ``w13_bias`` [E, 2M] interleaved, ``w2`` [E, H, M], ``w2_bias`` [E, H]."""
     weights, indices = torch.topk(logits.float(), top_k, dim=-1)
     weights = torch.softmax(weights, dim=-1)
     out = torch.zeros(x.shape, dtype=torch.float32)
@@ -49,7 +49,8 @@ def _reference(x, logits, w13, w2, top_k):
         row = x[token].float()
         for slot in range(top_k):
             e = int(indices[token, slot])
-            hidden = w2[e].float() @ _swiglu_oai(w13[e].float() @ row)
+            gate_up = w13[e].float() @ row + w13_bias[e].float()
+            hidden = w2[e].float() @ _swiglu_oai(gate_up) + w2_bias[e].float()
             out[token] += hidden * float(weights[token, slot])
     return out
 
@@ -62,7 +63,9 @@ def _checkpoint_like(inter, seed=0):
 
     return {
         "w13": randn(EXPERTS, 2 * inter, HIDDEN, scale=0.02),
+        "w13_bias": randn(EXPERTS, 2 * inter, scale=0.5),
         "w2": randn(EXPERTS, HIDDEN, inter, scale=0.02),
+        "w2_bias": randn(EXPERTS, HIDDEN, scale=0.5),
     }
 
 
@@ -73,6 +76,10 @@ def test_deinterleave_gate_up_splits_even_and_odd_rows_into_halves():
     halves = deinterleave_gate_up(w13)
     torch.testing.assert_close(halves[:, :3], w13[:, 0::2])
     torch.testing.assert_close(halves[:, 3:], w13[:, 1::2])
+    # A [E, 2M] bias is de-interleaved by the same rule.
+    bias = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    expected = torch.cat([bias[:, 0::2], bias[:, 1::2]], 1)
+    torch.testing.assert_close(deinterleave_gate_up(bias), expected)
 
 
 def test_swigluoai_activation_matches_transformers():
@@ -98,7 +105,7 @@ def test_routing_function_is_softmax_over_the_selected_logits():
 
 
 def _gpt_oss_layer(**moe_overrides):
-    """A ``RoutedExperts`` as vLLM builds it for gpt-oss, without the expert biases."""
+    """A ``RoutedExperts`` as vLLM builds it for gpt-oss."""
     from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
 
     moe = {
@@ -110,7 +117,7 @@ def _gpt_oss_layer(**moe_overrides):
         "pcp_size": 1,
         "sp_size": 1,
         "is_lora_enabled": False,
-        "has_bias": False,
+        "has_bias": True,
         "swiglu_limit": None,
         "swiglu_alpha": None,
     } | moe_overrides
@@ -127,7 +134,7 @@ def _gpt_oss_layer(**moe_overrides):
     )
 
 
-def test_configure_accepts_a_swigluoai_layer():
+def test_configure_accepts_a_biased_swigluoai_layer():
     from spyre_inference.models.gpt_oss import GPT_OSS_MOE_RECIPE, gpt_oss_routing
     from spyre_inference.moe import configure_spyre_moe_layer
 
@@ -157,8 +164,9 @@ class _RoutedExperts(torch.nn.Module):
     def __init__(self, params):
         super().__init__()
         for key, value in params.items():
+            name = key if key.endswith("_bias") else f"{key}_weight"
             param = torch.nn.Parameter(value.clone(), requires_grad=False)
-            self.register_parameter(f"{key}_weight", param)
+            self.register_parameter(name, param)
         self.top_k = TOP_K
 
 
@@ -179,14 +187,17 @@ _INTERS = [pytest.param(2880, id="tp1"), pytest.param(720, id="tp4"), pytest.par
 
 
 @pytest.mark.parametrize("inter", _INTERS)
-def test_relayout_deinterleaves_the_gate_up_weights(inter, monkeypatch):
-    """The gate and up pools get the even and odd rows of ``w13``."""
+def test_relayout_deinterleaves_the_weights_and_the_gate_up_bias(inter, monkeypatch):
+    """Gate and up pools, and the gate and up biases, get the even and odd rows."""
     layer, p = _prepared(inter, monkeypatch)
 
     close = {"atol": 1e-4, "rtol": 1e-2}
     gate, up = layer.spyre_moe_gate.cpu(), layer.spyre_moe_up.cpu()
     torch.testing.assert_close(gate[..., :inter], p["w13"][:, 0::2].transpose(1, 2), **close)
     torch.testing.assert_close(up[..., :inter], p["w13"][:, 1::2].transpose(1, 2), **close)
+    b = layer.spyre_moe_biases
+    torch.testing.assert_close(b.gate.cpu()[:, 0, :inter], p["w13_bias"][:, 0::2], **close)
+    torch.testing.assert_close(b.up.cpu()[:, 0, :inter], p["w13_bias"][:, 1::2], **close)
 
 
 def _inputs(tokens, seed):
@@ -213,7 +224,7 @@ def test_gathered_matches_the_gpt_oss_reference(inter, monkeypatch):
     method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
     actual = method.apply_monolithic(layer, x.to("spyre"), logits.to("spyre"))
     assert set(layer.spyre_moe_regions) == {"gathered"}
-    expected = _reference(x, logits, p["w13"], p["w2"], TOP_K)
+    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
 
 
@@ -229,14 +240,14 @@ def test_persistent_matches_the_gpt_oss_reference(inter, tokens, monkeypatch):
     method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
     actual = method.apply_monolithic(layer, x.to("spyre"), logits.to("spyre"))
     assert "experts" in layer.spyre_moe_regions
-    expected = _reference(x, logits, p["w13"], p["w2"], TOP_K)
+    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.parametrize("inter", [pytest.param(720, id="tp4")])
 def test_traced_dispatch_matches_the_gpt_oss_reference(inter, monkeypatch):
     """Traced into one graph with in-graph producers, as a compiled block runs one stick of
-    tokens: the in-graph persistent form."""
+    tokens: the in-graph persistent form, biases included."""
     import warnings
 
     from torch_spyre._C import get_elem_in_stick
@@ -259,5 +270,5 @@ def test_traced_dispatch_matches_the_gpt_oss_reference(inter, monkeypatch):
         actual = compiled(x.to("spyre"), logits.to("spyre"))
     fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
     assert not fallbacks, f"the traced dispatch fell back to CPU: {fallbacks}"
-    expected = _reference(x, logits, p["w13"], p["w2"], TOP_K)
+    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)

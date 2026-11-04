@@ -337,6 +337,8 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_capture_device_output", False)
+        object.__setattr__(self, "_device_output", None)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
@@ -363,6 +365,8 @@ class _SpyreModelWrapper:
 
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
+        if self._capture_device_output:
+            self._device_output = result
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
@@ -1268,18 +1272,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if num_tokens is not None:
             attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
-        keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
-        if keep:
-            object.__setattr__(wrapper, "_keep_outputs_on_device", False)
+        if not isinstance(wrapper, _SpyreModelWrapper) or not wrapper._keep_outputs_on_device:
+            return super()._dummy_run(*args, **kwargs)
+        object.__setattr__(wrapper, "_keep_outputs_on_device", False)
+        wrapper._capture_device_output = True
         try:
             hidden_states, last_hidden_states = super()._dummy_run(*args, **kwargs)
+            if isinstance(wrapper._device_output, torch.Tensor):
+                # A CPU round trip changes the Spyre layout. Warm the pooler with
+                # the actual model output, while upstream still indexes on CPU.
+                hidden_states = wrapper._device_output
         finally:
-            if keep:
-                object.__setattr__(wrapper, "_keep_outputs_on_device", True)
+            object.__setattr__(wrapper, "_keep_outputs_on_device", True)
+            wrapper._capture_device_output = False
+            wrapper._device_output = None
 
         if (
-            keep
-            and isinstance(hidden_states, torch.Tensor)
+            isinstance(hidden_states, torch.Tensor)
             and hidden_states.numel() > 0
             and hidden_states.device.type != "spyre"
         ):
@@ -1361,7 +1370,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         if not self._pooling_on_spyre or not self._encoder_rectangles:
             return
-        select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+        packed = select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+        # LAST and token poolers read the re-compacted output, whose device layout
+        # can differ from the backbone's. Warm their row gathers on that output too.
+        self._warm_pooler_row_widths(packed)
 
     @torch.inference_mode()
     def _warm_encoder_embed_gather(self) -> None:

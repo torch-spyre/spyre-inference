@@ -1027,26 +1027,7 @@ jobs:
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
           hf_token: ${{ secrets.HF_TOKEN }}
 
-      # Records this leg's matrix entry as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
-      - name: Save suite descriptor for pod-level retry
-        if: failure()
-        run: |
-          mkdir -p "${RUNNER_TEMP}/failed_suite"
-          cat > "${RUNNER_TEMP}/failed_suite/suite.json" <<'JSONEOF'
-          ${{ toJSON(matrix) }}
-          JSONEOF
-
-      # github.run_attempt in the name: the artifacts REST API is run-scoped not attempt-scoped, so a re-run's descriptors from a prior attempt would otherwise retry a suite that already passed.
-      - name: Upload failed-suite descriptor
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: failed-suite-${{ github.run_attempt }}-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/failed_suite/suite.json
-          if-no-files-found: error
-          retention-days: 1
-
-  # Collect suites that need a pod-level retry: reads the failed-suite-* artifacts uploaded above and rebuilds a retry matrix for test_retry below to consume via fromJSON.
+  # Built from this attempt's job conclusions: a leg whose runner died cannot upload anything (#1454).
   collect_failed_suites:
     name: Collect suites for pod-level retry
     needs: test
@@ -1059,14 +1040,19 @@ jobs:
       - name: Checkout scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          sparse-checkout: .github/scripts
+          # The commit this workflow was loaded from, so the static matrix matches the job names.
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .github/actions/collect-failed-suites
+            .github/scripts
+            .github/workflows/_test_matrix.yaml
           sparse-checkout-cone-mode: false
 
-      - name: Download failed-suite descriptors and build retry matrix
-        id: collect
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/collect_failed_suites.py
+      - id: collect
+        uses: ./.github/actions/collect-failed-suites
+        with:
+          args: collect
 
   # Pod-level retry: re-runs, on a brand-new runner pod, exactly the configs collect_failed_suites found failed (no changed-files gate, since these are already known to need running); a config that fails again here is a genuine failure.
   test_retry:
@@ -1099,8 +1085,8 @@ jobs:
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           test_type: ${{ inputs.test_type }}
-          # Survives the retry hop: the failed-suite descriptor is toJSON(matrix), so the whole
-          # entry -- test_types and runs_on included -- is rebuilt by collect_failed_suites.
+          # Survives the retry hop: collect_failed_suites copies the whole static matrix entry,
+          # test_types and runs_on included.
           test_types: ${{ matrix.test_types }}
           leg_arch: ${{ matrix.runs_on[0] }}
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
@@ -1118,28 +1104,38 @@ jobs:
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
           hf_token: ${{ secrets.HF_TOKEN }}
 
-  # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself) by inspecting the pod-level retry outcome; this job's own result is what determines the reusable workflow's overall conclusion.
+  # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself); this job's own result is what determines the reusable workflow's overall conclusion.
+  # Re-reads job conclusions instead of trusting test_retry.result, so a dropped leg still fails.
   test_result:
     name: Test matrix result
-    needs: [build_kernels, collect_failed_suites, test_retry]
+    needs: [build_kernels, test, collect_failed_suites, test_retry]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Evaluate combined result
+      - name: Check kernel build
         run: |
           # A failed kernel build skips every test job, which would otherwise read as a pass.
           if [[ "${{ needs.build_kernels.result }}" != "success" ]]; then
             echo "::error::Building the csrc/ sampling kernels failed (result: ${{ needs.build_kernels.result }})."
             exit 1
           fi
-          echo "Suites retried: ${{ needs.collect_failed_suites.outputs.has_failed }}"
-          echo "test_retry result: ${{ needs.test_retry.result }}"
-          if [[ "${{ needs.collect_failed_suites.outputs.has_failed }}" == "true" && \
-                "${{ needs.test_retry.result }}" != "success" ]]; then
-            echo "::error::One or more configs still failed after pod-level retry."
-            exit 1
-          fi
-          echo "All configs passed (directly or after pod-level retry)."
+
+      - name: Checkout scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The commit this workflow was loaded from, so the static matrix matches the job names.
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .github/actions/collect-failed-suites
+            .github/scripts
+            .github/workflows/_test_matrix.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Evaluate combined result
+        uses: ./.github/actions/collect-failed-suites
+        with:
+          args: verify
 
   # ---------------------------------------------------------------------------
   # Coverage fan-in: combine every job's data into one report. Stock runner

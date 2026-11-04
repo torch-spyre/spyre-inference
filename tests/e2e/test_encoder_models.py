@@ -122,6 +122,7 @@ def _rerank_generator() -> ModuleType:
 
 
 def _with_e2e_smoke(models: list[str], smoke_model: str) -> list:
+    assert smoke_model in models, f"{smoke_model} is no longer a parametrize row"
     return [pytest.param(m, marks=pytest.mark.e2e_smoke) if m == smoke_model else m for m in models]
 
 

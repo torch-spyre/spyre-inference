@@ -218,12 +218,12 @@ test-smoke-unit-shard-%:
 # Opt-in e2e subset for the integration tier (docs/contributing/integration-tier.md),
 # split by card count so the 1-card cases don't hold a second card.
 test-e2e-smoke: ## Run the whole e2e_smoke subset in one process (TP=2 cases skip on a 1-card host).
-	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke' JUNIT_XML=$(JUNIT_XML)
+	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and not distributed_tp4' JUNIT_XML=$(JUNIT_XML)
 
 E2E_SMOKE_SHARDS ?= 3
 E2E_SMOKE_SHARD_ID ?= 0
 test-e2e-smoke-shard: ## Run one 1-card e2e_smoke shard (E2E_SMOKE_SHARDS=N E2E_SMOKE_SHARD_ID=i).
-	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and not distributed' \
+	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and not (distributed or distributed_tp4)' \
 	  PYTEST_ARGS='$(PYTEST_ARGS) --e2e-smoke-shards=$(E2E_SMOKE_SHARDS) --e2e-smoke-shard-id=$(E2E_SMOKE_SHARD_ID)' \
 	  JUNIT_XML=$(JUNIT_XML)
 
@@ -233,7 +233,7 @@ test-e2e-smoke-shard-%:
 E2E_SMOKE_DIST_SHARDS ?= 2
 E2E_SMOKE_DIST_SHARD_ID ?= 0
 test-e2e-smoke-dist-shard: ## Run one 2-card e2e_smoke shard (E2E_SMOKE_DIST_SHARDS=N E2E_SMOKE_DIST_SHARD_ID=i). Needs 2 cards.
-	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and distributed' \
+	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and distributed and not distributed_tp4' \
 	  PYTEST_ARGS='$(PYTEST_ARGS) --e2e-smoke-dist-shards=$(E2E_SMOKE_DIST_SHARDS) --e2e-smoke-dist-shard-id=$(E2E_SMOKE_DIST_SHARD_ID)' \
 	  JUNIT_XML=$(JUNIT_XML)
 
@@ -385,7 +385,8 @@ tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shard
 	done; \
 	exit $$rc
 
-tests-integration: ## Run the integration tier: unit-level smoke, e2e_smoke, attention_smoke. TP=2 e2e_smoke cases need 2 cards.
+tests-integration: ## Run the integration tier: unit-level smoke, e2e_smoke, attention_smoke, one JUnit file each under RESULTS_DIR. TP=2 e2e_smoke cases need 2 cards.
+	$(if $(JUNIT_XML),@echo "warning: JUNIT_XML is ignored here; JUnit goes to $(RESULTS_DIR)/junit-test-*/" >&2;) \
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-smoke-unit" && $(MAKE) run-one TEST_TYPE=integration JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-unit/junit-test-smoke-unit.xml" || rc=1; \

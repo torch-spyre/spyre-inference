@@ -52,7 +52,6 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 # marker expression itself is parsed from that target so the Makefile stays the one
 # source of truth. `collect_upstream` marks the suite whose collection needs the
 # upstream tests cloned (the others exclude upstream, so must not pull them in).
-# `collect_args` mirrors any non-marker selection the target adds to PYTEST_ARGS.
 SUITES = [
     {"key": "smoke", "makefile_name": "smoke", "var": "SMOKE_SHARDS", "collect_upstream": False},
     {
@@ -60,7 +59,6 @@ SUITES = [
         "makefile_name": "smoke-unit",
         "var": "SMOKE_UNIT_SHARDS",
         "collect_upstream": False,
-        "collect_args": ["--ignore=tests/e2e"],
     },
     {
         "key": "e2e-smoke",
@@ -113,7 +111,14 @@ def parse_makefile() -> dict[str, dict]:
         )
         if not count or not expr:
             raise SystemExit(f"Makefile: could not parse {suite['var']} / test-{name}-shard marker")
-        out[suite["key"]] = {"current": int(count.group(1)), "expr": expr.group(1)}
+        # The target's --ignore flags narrow its selection beyond the marker expression.
+        recipe = re.search(rf"^test-{name}-shard:.*?(?=^\S|\Z)", text, re.DOTALL | re.MULTILINE)
+        ignores = re.findall(r"--ignore=\S+", recipe.group(0)) if recipe else []
+        out[suite["key"]] = {
+            "current": int(count.group(1)),
+            "expr": expr.group(1),
+            "collect_args": [a.rstrip("'") for a in ignores],
+        }
     return out
 
 
@@ -219,7 +224,7 @@ def main() -> None:
     for suite in SUITES:
         key = suite["key"]
         expr = makefile[key]["expr"]
-        nodeids = collect_nodeids(expr, suite["collect_upstream"], suite.get("collect_args", []))
+        nodeids = collect_nodeids(expr, suite["collect_upstream"], makefile[key]["collect_args"])
         weights = [durations[n] for n in nodeids if n in durations]
         unmeasured = len(nodeids) - len(weights)
         rec_n, busiest, over = recommend(weights, budget_s)

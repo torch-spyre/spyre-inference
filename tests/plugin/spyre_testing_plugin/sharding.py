@@ -328,7 +328,7 @@ def _apply_e2e_smoke_shard(config: pytest.Config, items: list[pytest.Item]) -> N
                 bool(item.get_closest_marker("e2e_smoke"))
                 and bool(item.get_closest_marker("distributed")) == d
             ),
-            weight=lambda item: 1,
+            weight=lambda item: 8 if item.get_closest_marker("uses_subprocess") else 1,
             label=label,
             durations=_load_durations(config),
         )

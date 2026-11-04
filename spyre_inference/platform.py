@@ -189,17 +189,20 @@ def _is_multimodal_config(model_config) -> bool:
 def _spyre_loader_supported(vllm_config) -> bool:
     """Return True when SpyreModelLoader is safe to use for this config.
 
-    Allow-list: only runner_type="generate", TP=1, unquantized, dense, non-MoE,
-    non-multimodal, non-transformers-backend models are supported. Any config
-    outside that set stays on the stock loader until explicitly validated.
+    Allow-list: only runner_type="generate", unquantized, dense, non-MoE,
+    non-transformers-backend models are supported. Any config outside that set
+    stays on the stock loader until explicitly validated.
     Excluded:
       - runner_type != "generate": pooling and any future runner types are
         excluded; their host-residency needs are not yet covered (torch-spyre#2971).
-      - TP > 1: weight sharding not tested with the direct-to-device path.
       - quantized: FP8 and other quant schemes have their own weight layout logic.
       - transformers backend: uses a different model class hierarchy.
       - MoE: dma_moe_expert_weight_to_spyre requires a CPU source tensor.
-      - multimodal: vision-tower param host-residency not yet covered.
+
+    Supported, and worth knowing about when touching the loader:
+      - TP > 1: linear weights are sharded on read (see
+        ``model_loader._iter_tp_sharded_weights``).
+      - multimodal: vision-tower weights stream through the same path.
     """
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -209,11 +212,12 @@ def _spyre_loader_supported(vllm_config) -> bool:
         return False
     if getattr(model_config, "runner_type", None) != "generate":
         return False
-    if hasattr(model_config, "using_transformers_backend") and model_config.using_transformers_backend():
+    if (
+        hasattr(model_config, "using_transformers_backend")
+        and model_config.using_transformers_backend()
+    ):
         return False
     if _hf_config_has_moe(getattr(model_config, "hf_config", None)):
-        return False
-    if _is_multimodal_config(model_config):
         return False
     return True
 
@@ -962,8 +966,8 @@ class TorchSpyrePlatform(CpuPlatform):
             if not _spyre_loader_supported(vllm_config):
                 raise ValueError(
                     "--load-format spyre is not supported for this configuration. "
-                    "Supported: TP=1, unquantized, dense, non-MoE, generate-only, "
-                    "non-multimodal, non-transformers-backend models. "
+                    "Supported: unquantized, dense, non-MoE, generate-only, "
+                    "non-transformers-backend models. "
                     "Use --load-format auto or --load-format safetensors instead."
                 )
 

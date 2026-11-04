@@ -130,9 +130,6 @@ def _generate(conversations, enforce_eager: bool, **llm_kwargs):
 def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
-
-    Compiled, the repo default. The tower's unbudgeted eager forward still runs: in the
-    profiling pass here, and per request in the eager two-image test below.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -195,9 +192,9 @@ def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
     rewrite on CPU, this checks that what it rewrites to actually lowers.
 
-    Compiled, the repo default, where the tower's rewrites (gathered position embeddings
-    and rope, permutation-matmul rope, the stick-aligned SDPA, the offset-group pool) have
-    to lower inside per-budget graphs. An image above every budget is rejected up front.
+    The tower's rewrites (gathered position embeddings and rope, permutation-matmul rope, the
+    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs. An
+    image above every budget is rejected up front.
     """
     _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")

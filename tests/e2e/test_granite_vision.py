@@ -19,11 +19,9 @@ Granite Vision path.  A synthetic image carries no meaningful semantics, so
 the tests only assert that the full pipeline (SigLIP encoder → BLIP-2
 Q-Former projector → Granite decoder) runs and produces non-empty text.
 
-The SigLIP tower is never compiled, so it runs the same way in both modes:
-InterpolateDownsampler and _pack_and_unpad_image_features offload to CPU, while
-Q-Former attention uses the patched SDPA path on Spyre. The single-image test runs
-compiled, the repo default, where the patches must survive the decoder's compile
-boundary; the multi-tile test runs eager.
+The SigLIP tower is never compiled: InterpolateDownsampler and
+_pack_and_unpad_image_features offload to CPU, while Q-Former attention uses the
+patched SDPA path on Spyre.
 """
 
 import io
@@ -106,8 +104,7 @@ def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole Granite Vision path (SigLIP encoder → InterpolateDownsampler
     → BLIP-2 Q-Former → _pack_and_unpad → Granite decoder) runs and decodes text.
 
-    Compiled: the CPU-offload and on-device attention patches must survive the
-    torch.compile boundary.
+    The CPU-offload and on-device attention patches must survive the torch.compile boundary.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").

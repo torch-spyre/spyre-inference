@@ -27,16 +27,7 @@ ID_ARTIFACTS = {"run-id", "artifact-id"}
 
 
 def safe_segment(name: str) -> bool:
-    """True iff `name` is a single, non-traversing path component.
-
-    Artifact names come from the GHA artifacts API and are attacker-controlled:
-    any run that uploads artifacts (including a contributor's pull_request run)
-    picks the name. `wanted()` only checks the `junit-` prefix, and
-    `junit-../../x` keeps that prefix, so without this guard `out_dir / name`
-    would escape `out_dir` and `unzip -d <dest>` would write attacker-chosen
-    files outside it — on a runner that holds ClickHouse credentials. Reject
-    anything that is not one plain segment.
-    """
+    # The name is attacker-chosen and `wanted()` keeps `junit-../x`.
     return (
         name not in ("", ".", "..")
         and "/" not in name
@@ -98,8 +89,6 @@ def main() -> None:
 
     all_artifacts = json.loads(args.artifacts)
     for a in all_artifacts:
-        # Surface — rather than silently drop — a name that would escape out_dir,
-        # so a traversal attempt leaves a trace in the ingest log.
         if a["name"].startswith("junit-") and not safe_segment(a["name"]):
             print(
                 f"::warning::Rejecting artifact {a['name']!r} (id={a['id']}): "
@@ -113,9 +102,6 @@ def main() -> None:
         print(f"Downloading: {a['name']} (id={a['id']})")
         # Own subdir per artifact so same-basename XMLs never clobber; ingest globs recursively.
         dest = args.out_dir / a["name"]
-        # Defence in depth: wanted() already requires a safe single segment, so
-        # this never fires for a benign name — but keep the containment check
-        # right next to the write so no future caller can slip a path out.
         resolved = dest.resolve()
         if resolved.parent != out_root:
             print(

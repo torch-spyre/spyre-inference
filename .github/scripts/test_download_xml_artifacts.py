@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""download_xml_artifacts.py: artifact names are attacker-controlled path inputs."""
-
 from __future__ import annotations
 
 import pathlib
@@ -44,7 +42,6 @@ def test_safe_segment_rejects_traversal_and_separators():
 
 
 def test_wanted_keeps_prefix_filter_but_rejects_traversing_prefix():
-    # A traversing name keeps the junit- prefix; wanted() must still refuse it.
     assert dxa.wanted({"name": "junit-shard-1", "id": 1})
     assert dxa.wanted({"name": "run-id", "id": 2})
     assert not dxa.wanted({"name": "junit-../../../../tmp/evil", "id": 3})
@@ -52,7 +49,6 @@ def test_wanted_keeps_prefix_filter_but_rejects_traversing_prefix():
 
 
 def test_wanted_destination_stays_within_out_dir(tmp_path):
-    # The guard's contract: every wanted name joins to a direct child of out_dir.
     out = tmp_path / "xml_artifacts"
     out_root = out.resolve()
     for name in ("junit-shard-1", "run-id", "artifact-id"):

@@ -12,15 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""aggregate_junit_summary.py must not expand entities from a crafted JUnit file.
-
-stdlib ElementTree/expat expands internal entities by default, so a <!DOCTYPE>
-with nested entities is a billion-laughs memory/CPU DoS against the aggregate
-step. Legitimate JUnit XML never declares a DTD, so parse_file refuses any
-document that does. These tests assert the payload is skipped and that clean
-JUnit still parses; they fail if the DTD guard is removed.
-"""
-
 from __future__ import annotations
 
 import pathlib
@@ -49,15 +40,12 @@ _CLEAN = """<testsuite name="s" time="1.5">
 
 
 def test_billion_laughs_dtd_is_refused(tmp_path):
-    # A DTD-bearing JUnit file is refused rather than expanded: parse_file
-    # returns None and leaves nothing behind for the report.
     path = tmp_path / "junit-evil.xml"
     path.write_text(_BILLION_LAUGHS)
     assert agg.parse_file(str(path)) is None
 
 
 def test_clean_junit_xml_still_parses(tmp_path):
-    # The guard must not reject legitimate, DTD-free JUnit XML.
     path = tmp_path / "junit-good.xml"
     path.write_text(_CLEAN)
     parsed = agg.parse_file(str(path))

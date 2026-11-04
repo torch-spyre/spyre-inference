@@ -31,20 +31,11 @@ from xml.parsers import expat
 
 
 class DTDRefused(ValueError):
-    """Raised when a JUnit file declares a DTD.
-
-    stdlib ElementTree/expat expands internal entities by default, so a crafted
-    <!DOCTYPE> with nested entities is a billion-laughs memory/CPU DoS against
-    this aggregation step. Legitimate JUnit XML never carries a DOCTYPE, so the
-    safe posture is to refuse any document that declares one.
-    """
+    pass
 
 
 def _parse_no_dtd(path: str) -> ET.Element:
-    """Parse one JUnit file like ``ET.parse(path).getroot()`` but refuse any
-    document that declares a DTD. A DOCTYPE is the only way to introduce the
-    entity definitions an entity-expansion DoS needs, and real JUnit XML has
-    none; refusing it closes that class without a new dependency."""
+    # Real JUnit XML has no DTD, and refusing one closes entity-expansion DoS.
     builder = ET.TreeBuilder()
     parser = expat.ParserCreate()
 

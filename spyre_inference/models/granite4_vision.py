@@ -314,16 +314,16 @@ class SpyreGranite4VisionForConditionalGeneration(
         """Each level's projector over its tap, packed on the last dimension: the deepstack
         levels, then the spatial offsets, in the order of upstream's ``_ds_layer_indices``."""
         project = getattr(self, "_spyre_project", self._project)
-        layerwise = len(self.layerwise_projectors)
+        spatial_tap = taps[len(self.layerwise_projectors)]
+        # (projector, tap, down): each deepstack level reads its own tap through the area mean;
+        # the spatial offsets all read the one spatial tap, each through its own offset.
         levels = [
-            project(proj, taps[i], self._down_mean)
-            for i, proj in enumerate(self.layerwise_projectors)
-        ]
-        levels += [
-            project(proj, taps[layerwise], cast(torch.Tensor, getattr(self, f"_down_offset{k}")))
+            (proj, taps[i], self._down_mean) for i, proj in enumerate(self.layerwise_projectors)
+        ] + [
+            (proj, spatial_tap, cast(torch.Tensor, getattr(self, f"_down_offset{k}")))
             for k, proj in enumerate(self.spatial_projectors)
         ]
-        return torch.cat(levels, dim=-1)
+        return torch.cat([project(*level) for level in levels], dim=-1)
 
     def _project(self, proj: nn.Module, tap: torch.Tensor, down: torch.Tensor) -> torch.Tensor:
         """``WindowQFormerDownsampler.forward`` on window-major patches, to ``[tokens, H]``.

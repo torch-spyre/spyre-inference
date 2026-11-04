@@ -181,6 +181,42 @@ def test_compile_vision_graphs_leaves_vision_project_uncompiled(monkeypatch):
     ]
 
 
+def test_vision_project_pairs_each_projector_with_its_tap_and_down():
+    """Deepstack projectors each read their own tap through the area mean; the four spatial
+    projectors all read the one tap after them, each through its own offset. The levels are
+    packed on the last dimension in that order."""
+    from spyre_inference.models.granite4_vision import (
+        SpyreGranite4VisionForConditionalGeneration as Spyre,
+    )
+
+    layerwise, spatial = 2, 4
+    calls = []
+
+    def project(proj, tap, down):
+        calls.append((proj, tap, down))
+        return torch.full((3, 2), float(len(calls)))
+
+    model = SimpleNamespace(
+        layerwise_projectors=[object() for _ in range(layerwise)],
+        spatial_projectors=[object() for _ in range(spatial)],
+        _down_mean=torch.zeros(1),
+        _project=project,
+        **{f"_down_offset{k}": torch.full((1,), float(k)) for k in range(spatial)},
+    )
+    taps = [torch.full((1,), float(i)) for i in range(layerwise + 1)]
+
+    got = Spyre.vision_project(model, torch.zeros(1), taps)
+
+    assert [c[0] for c in calls] == [*model.layerwise_projectors, *model.spatial_projectors]
+    assert all(c[1] is taps[i] for i, c in enumerate(calls[:layerwise]))
+    assert all(c[1] is taps[layerwise] for c in calls[layerwise:])
+    assert all(c[2] is model._down_mean for c in calls[:layerwise])
+    for k, c in enumerate(calls[layerwise:]):
+        assert c[2] is getattr(model, f"_down_offset{k}")
+    want = torch.cat([torch.full((3, 2), float(n)) for n in range(1, layerwise + spatial + 1)], -1)
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
 def _postprocess_model(levels: int = 5) -> SimpleNamespace:
     """The attributes ``postprocess_encoder_output`` reads, without a full model."""
     config = _config()

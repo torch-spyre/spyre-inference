@@ -21,8 +21,7 @@ import torch
 import torch.nn.functional as F
 
 
-# Each grid below covers every (num_tokens, use_bias) and every (shape, use_bias) pair once,
-# rather than their full product, plus a served model's shape.
+# Pairwise grids: every (num_tokens, use_bias) and (shape, use_bias) pair once, plus served shapes.
 @pytest.mark.mlp
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,intermediate_size,use_bias",

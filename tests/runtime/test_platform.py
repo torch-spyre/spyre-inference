@@ -862,10 +862,7 @@ def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, siz
 
 
 def test_engine_args_honors_a_user_max_model_len_above_the_derived_cap():
-    """``check_max_model_len`` caps only a derived length; a user's 128k passes through.
-
-    CPU stand-in for the on-card ``test_long_context_model_load``.
-    """
+    """``check_max_model_len`` caps only a derived length; a user's 128k passes through."""
     from vllm.engine.arg_utils import EngineArgs
 
     from spyre_inference.platform import TorchSpyrePlatform

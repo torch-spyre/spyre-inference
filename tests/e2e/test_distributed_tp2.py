@@ -96,8 +96,7 @@ def _assert_matches_tp1(
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 def test_tp2_llm_generate_matches_tp1(record_property) -> None:
-    """TP=1 vs TP=2 greedy-decode prefix match, eager, through the `MultiprocExecutor`
-    worker-spawn path that `vllm serve --tensor-parallel-size 2` uses."""
+    """TP=1 vs TP=2 greedy-decode prefix match, eager."""
     model = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
     record_serving_capability(
         record_property,

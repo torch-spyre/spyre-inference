@@ -60,8 +60,7 @@ def _assert_matches_tp1(tp1: list[list[int]], tp4: list[list[int]]) -> None:
     reason="needs >=4 Spyre cards; skipping TP=4 distributed test",
 )
 def test_tp4_llm_generate_matches_tp1() -> None:
-    """TP=1 vs TP=4 greedy-decode prefix-match test on ibm-ai-platform/micro-g3.3-8b-instruct-1b,
-    through the `MultiprocExecutor` worker-spawn path `vllm serve` uses.
+    """TP=1 vs TP=4 greedy-decode prefix-match test on ibm-ai-platform/micro-g3.3-8b-instruct-1b.
 
     Runs identical prompts at TP=1 and TP=4 with `temperature=0` and
     asserts the first 2 output tokens match per prompt. Later divergence

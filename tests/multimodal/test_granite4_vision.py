@@ -611,11 +611,7 @@ def test_patch_embed_input_ids_ds_buffers_migrated_to_correct_device():
 @pytest.mark.granite4_vision
 @pytest.mark.parametrize(("side", "tiles", "image_tokens"), [(336, 2, 300), (672, 5, 744)])
 def test_multi_tile_image_preprocessing(side, tiles, image_tokens):
-    """The processor's tiling and placeholder count for a one- and a multi-tile image.
-
-    CPU stand-in for the on-card multi-tile e2e test: 672px picks the 768x768 grid
-    pinpoint, i.e. the base image plus four 384px tiles.
-    """
+    """672px picks the 768x768 pinpoint: the base image plus four 384px tiles."""
     from PIL import Image
     from transformers import AutoProcessor
 

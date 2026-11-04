@@ -21,7 +21,7 @@ from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead as _Upstre
 
 
 def select_feedback(scores, embeddings, order, previous):
-    count = scores.shape[-1]
+    batch, slots, count = scores.shape
     valid = order >= 0
     maxima = torch.where(valid, scores, -torch.inf).amax(dim=-1, keepdim=True)
     choices = torch.where(scores == maxima, order, count)
@@ -31,7 +31,6 @@ def select_feedback(scores, embeddings, order, previous):
     first = choices.amin(dim=-1, keepdim=True)
     first = torch.where(first < 0, first + count, first)
     selected = (order == first).to(scores.dtype)
-    batch, slots, count = scores.shape
     # TODO: replace BMM and the candidate cache once torch-spyre supports
     # embedding gathers with device-generated INT32 indices.
     winners = torch.bmm(

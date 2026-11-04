@@ -932,10 +932,11 @@ jobs:
       # Runs the actual build+test for this leg via the shared composite action, so test_retry below can reuse the exact same steps for a fresh-pod retry instead of duplicating them.
       - name: Run matrix config
         if: ${{ steps.gate.outputs.run == 'true' }}
-        # Bounds the whole composite. Observed legs run 27-38min, so 90 is ~2.4x headroom.
+        # Bounds the whole composite. Warm legs run 27-38min; a cold compile cache (any
+        # lockfile change) pushes the gemma-4 vision shard to ~90min, so 150 leaves headroom.
         # NOTE: the runner's Linux kill is single-process, so this ends the job but does not
         # reap a double-forked leftover; the pod is torn down by ARC, which releases the card.
-        timeout-minutes: 90
+        timeout-minutes: 150
         uses: ./.github/actions/run-matrix-config
         with:
           cfg: ${{ matrix.cfg }}
@@ -1027,7 +1028,7 @@ jobs:
 
       # Same composite action the `test` job uses -- a pod-level retry runs the exact same steps, just on a fresh pod, so there is no separate copy to keep in sync here.
       - name: Run matrix config (pod-level retry)
-        timeout-minutes: 90
+        timeout-minutes: 150
         uses: ./.github/actions/run-matrix-config
         with:
           cfg: ${{ matrix.cfg }}

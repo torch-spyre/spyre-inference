@@ -22,6 +22,7 @@ from spyre_testing_plugin.attn_helpers import (
     _fused_qkv_kv_views,
     _padded_mask_metadata,
     assert_close_outliers,
+    random_block_tables,
     ref_attn,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -163,8 +164,9 @@ def _run_spyre_attn_test(
 
     # Widened to the recorder's num_blocks buckets, as a real engine's block
     # table is, so build()'s padding isn't suppressed by an exactly-sized table.
-    # The extra entries point at garbage pages on purpose: padded blocks are
-    # fully masked and must not affect the result.
+    # The extra entries point at pages no sequence owns, so they cannot alias
+    # live KV. An unmasked padded block mostly stays within tolerance, so this
+    # does not test the padding mask.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     # The num_blocks ladder is derived from block_size, so the bucketer needs this
     # test's value rather than the fixture default or it pads to the wrong width.
@@ -174,9 +176,7 @@ def _run_spyre_attn_test(
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-    )
+    block_tables = random_block_tables(kv_lens, max_num_blocks_per_seq, block_size, num_blocks)
 
     slot_mapping = []
     q_offset = 0

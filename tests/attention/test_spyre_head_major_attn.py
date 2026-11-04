@@ -158,6 +158,7 @@ def _run_head_major_attn_test(
         _build_metadata,
         _fused_qkv_kv_views,
         assert_close_outliers,
+        random_block_tables,
         ref_attn,
     )
 
@@ -183,7 +184,7 @@ def _run_head_major_attn_test(
     kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
 
     # Widened onto the recorder's buckets, as a real engine's block table is; the extra
-    # entries point at garbage pages on purpose (padded blocks must stay inert).
+    # entries point at pages no sequence owns.
     from vllm.config import get_current_vllm_config
 
     max_num_blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
@@ -194,9 +195,7 @@ def _run_head_major_attn_test(
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-    )
+    block_tables = random_block_tables(kv_lens, max_num_blocks_per_seq, block_size, num_blocks)
 
     k_expected = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=DTYPE)
     v_expected = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=DTYPE)

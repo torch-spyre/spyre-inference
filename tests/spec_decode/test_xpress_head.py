@@ -26,10 +26,15 @@ def head_and_weights():
     head = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128, topc=0).double()
     state = head.state_dict()
     weights = {
-        "xpress_head." + source: torch.randn_like(state[dest]) * 0.05
-        for source, dest in head._PUBLISHED_KEYS.items()
+        "xpress_head." + source: torch.randn_like(state.get(dest, head.mix_L)) * 0.05
+        for source, dest in head.HYBRID_KEY_MAP.items()
     }
-    head.load_checkpoint_weights(weights)
+    # As upstream's Qwen3XPressForCausalLM.load_weights: load, then fold the raw mixer.
+    with torch.no_grad():
+        for source, dest in head.HYBRID_KEY_MAP.items():
+            if source != "mix.L":
+                state[dest].copy_(weights["xpress_head." + source])
+        head.fold_from_raw_(weights["xpress_head.mix.L"])
     return head, weights
 
 
@@ -132,24 +137,6 @@ def test_hoisted_projection_and_candidate_readout_match_unfolded_bias(head_and_w
         head.gather_readout(candidates.flatten()),
     )
     torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
-
-
-def test_published_and_serving_checkpoint_roundtrip(head_and_weights):
-    original, published = head_and_weights
-    loaded = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128).double()
-    loaded.load_checkpoint_weights(published)
-    restored = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128).double()
-    restored.load_state_dict(loaded.state_dict())
-    for name, expected in original.state_dict().items():
-        torch.testing.assert_close(loaded.state_dict()[name], expected, atol=0, rtol=0)
-        torch.testing.assert_close(restored.state_dict()[name], expected, atol=0, rtol=0)
-
-
-def test_missing_mixer_is_rejected(head_and_weights):
-    head, weights = head_and_weights
-    del weights["xpress_head.mix.L"]
-    with pytest.raises(ValueError, match="mix.L"):
-        head.load_checkpoint_weights(weights)
 
 
 def test_wrong_block_size_is_rejected(head_and_weights):

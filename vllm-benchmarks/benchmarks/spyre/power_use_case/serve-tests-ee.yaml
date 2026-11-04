@@ -56,6 +56,8 @@ tests:
   - test_name: serve_ministral-3-14b_tp1_ee
     server_parameters:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+      tensor-parallel-size: 2
+      max-model-len: 8192
 
     # ---------------------------------------------------------------------------
   # Mistral-Small-3.2-24B
@@ -63,6 +65,8 @@ tests:
   - test_name: serve_mistral-3.2-24b_tp1_ee
     server_parameters:
       model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+      tensor-parallel-size: 2
+      max-model-len: 8192
 
     # ---------------------------------------------------------------------------
   # Granite 4.2 8B FP16

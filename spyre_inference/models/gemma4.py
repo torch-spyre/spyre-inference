@@ -27,13 +27,14 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
-from spyre_inference.models._prelaunch import disable_modalities, load_hf_config
+from spyre_inference.models._prelaunch import disable_modalities
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from torch import nn
+    from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
@@ -101,7 +102,7 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
-def force_text_backbone(engine_args: EngineArgs) -> None:
+def force_text_backbone(engine_args: EngineArgs, hf_config: PretrainedConfig | None) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
     Only a default: it is the same ``hf_overrides`` value ``GEMMA4_TEXT_BACKBONE_OVERRIDE``
@@ -115,7 +116,6 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
         return
     # Detect gemma-4 by config model_type, not the checkpoint name: derivatives such as
     # medgemma / translategemma carry a gemma4 config under an unrelated name.
-    hf_config = load_hf_config(engine_args)
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return
     has_audio = getattr(hf_config, "audio_config", None) is not None

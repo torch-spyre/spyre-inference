@@ -36,25 +36,26 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionType, subclass_
 from vllm.v1.attention.selector import get_attn_backend
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.models._prelaunch import load_hf_config
 from spyre_inference.v1.pool.spyre_pooler import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
 
 
-def force_disable_chunked_prefill(engine_args: EngineArgs) -> None:
+def force_disable_chunked_prefill(
+    engine_args: EngineArgs, hf_config: PretrainedConfig | None
+) -> None:
     """SpyreAllPool (CLIP's token-level pooler) rejects chunked prefill outright,
     but ModelConfig.is_chunked_prefill_supported doesn't exclude ALL-type token
     pooling, so it isn't disabled automatically.
     """
     if engine_args.enable_chunked_prefill is not None:
         return
-    hf_config = load_hf_config(engine_args)
     if getattr(hf_config, "model_type", None) != "clip":
         return
     engine_args.enable_chunked_prefill = False

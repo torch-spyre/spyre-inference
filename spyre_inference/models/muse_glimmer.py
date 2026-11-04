@@ -34,31 +34,35 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.models import muse_glimmer as mg
 
-from spyre_inference.models._prelaunch import disable_modalities, load_hf_config
+from spyre_inference.models._prelaunch import disable_modalities
 
 if TYPE_CHECKING:
     from torch import nn
+    from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
 
 
-def disable_vision(engine_args: EngineArgs) -> None:
-    """Cap a Muse Glimmer checkpoint's image and video input at 0, refusing either if asked.
+def disable_vision(engine_args: EngineArgs, hf_config: PretrainedConfig | None) -> None:
+    """Serve a Muse Glimmer checkpoint with a vision tower text only, refusing image or
+    video input asked for in ``limit_mm_per_prompt``.
 
-    Upstream then builds the vision tower as a placeholder, so its weights are neither
-    loaded nor moved to the card, and the frontend refuses image and video input per
-    request. Images are not supported on Spyre yet: the tower would run op by op, and its
-    host-built position tables have no device layout.
+    ``language_model_only`` makes upstream build the tower as a placeholder, so its weights
+    are neither loaded nor moved to the card, and the frontend refuses image and video input
+    per request. Images are not supported on Spyre yet: the tower would run op by op, and
+    its host-built position tables have no device layout.
     """
     if engine_args.language_model_only:
         return
-    hf_config = load_hf_config(engine_args)
     if getattr(hf_config, "model_type", None) != "muse_glimmer":
         return
+    if not mg._muse_glimmer_has_vision(hf_config):
+        return
     disable_modalities(engine_args, ("image", "video"), "Muse Glimmer")
-    logger.info("Muse Glimmer: serving text only (image and video limits set to 0).")
+    engine_args.language_model_only = True
+    logger.info("Muse Glimmer: serving text only (language_model_only=True).")
 
 
 def _spyre_rms_norm(

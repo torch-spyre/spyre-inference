@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
@@ -50,7 +49,7 @@ class SpyreModelLoader(BaseModelLoader):
         download_weights_from_hf(
             model_name_or_path=model_config.model,
             cache_dir=self.load_config.download_dir,
-            allow_patterns=["*.safetensors", "*.bin"],
+            allow_patterns=["*.safetensors"],
             revision=model_config.revision,
         )
 
@@ -81,25 +80,6 @@ class SpyreModelLoader(BaseModelLoader):
         _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
 
         for shard_path in shard_files:
-            if not shard_path.endswith(".safetensors"):
-                state_dict = torch.load(shard_path, map_location="cpu", weights_only=True)
-                for name, tensor in state_dict.items():
-                    # With TP>1 keep tensors on the host: the stock loader narrows
-                    # on CPU and the copy into the Spyre param is host->device.
-                    if name not in cpu_fallback_names and tp_size == 1:
-                        try:
-                            from torch_spyre._monkey_patch import (
-                                _spyre_tensor_from_safetensors,
-                            )
-
-                            tensor = _spyre_tensor_from_safetensors(
-                                tensor, name, "spyre", target_dtype=target_dtype
-                            )
-                        except (ImportError, AttributeError):
-                            pass
-                    yield name, tensor
-                continue
-
             with safe_open(
                 shard_path,
                 framework="pt",
@@ -138,30 +118,9 @@ class SpyreModelLoader(BaseModelLoader):
 
         # Delegate to model.load_weights() so fused parameters are scattered
         # by each layer's weight_loader.
-        weights = self.get_all_weights(model_config, model)
-        if callable(getattr(model, "load_weights", None)):
-            model.load_weights(weights)
-            logger.info("SpyreModelLoader: delegated weight loading to model.load_weights()")
-        else:
-            bound = 0
-            skipped: list[str] = []
-            for name, tensor in weights:
-                if _bind_weight(model, name, tensor):
-                    bound += 1
-                else:
-                    skipped.append(name)
-            logger.info(
-                "SpyreModelLoader: bound %d tensors to model parameters, skipped %d",
-                bound,
-                len(skipped),
-            )
-            if skipped:
-                logger.warning(
-                    "SpyreModelLoader: %d checkpoint keys matched no model parameter "
-                    "(first 10: %s)",
-                    len(skipped),
-                    skipped[:10],
-                )
+        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        logger.info("SpyreModelLoader: delegated weight loading to model.load_weights()")
+        _check_all_weights_loaded(model, loaded_weights)
 
     def load_model(
         self,
@@ -223,6 +182,28 @@ def _get_host_loaded_param_names(model: nn.Module) -> set[str]:
             for param_name in module._parameters:
                 names.add(f"{module_name}.{param_name}" if module_name else param_name)
     return names
+
+
+def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None) -> None:
+    """Fail if a parameter received no checkpoint tensor, as DefaultModelLoader does.
+
+    ``load_model`` swaps every non-host parameter for an uninitialized
+    ``torch.empty(..., device="spyre")`` placeholder, so a parameter the checkpoint never
+    fills (renamed key, WeightsMapper miss, skipped prefix) would otherwise serve garbage
+    silently. ``loaded_weights`` is what ``model.load_weights()`` returned; a model that
+    does not track it (None) cannot be checked.
+    """
+    if loaded_weights is None:
+        logger.warning(
+            "SpyreModelLoader: model.load_weights() did not report which weights it "
+            "loaded; skipping the uninitialized-parameter check."
+        )
+        return
+    weights_not_loaded = {name for name, _ in model.named_parameters()} - loaded_weights
+    if weights_not_loaded:
+        raise ValueError(
+            f"Following weights were not initialized from checkpoint: {sorted(weights_not_loaded)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -347,52 +328,18 @@ def _iter_tp_sharded_weights(
             param.tp_rank = saved_rank
 
 
-def _bind_weight(model: nn.Module, name: str, tensor: torch.Tensor) -> bool:
-    """Bind loaded tensor to model parameter via weight_loader or assignment.
-
-    Returns False when the key matches no model parameter.
-    """
-    parts = name.split(".")
-    try:
-        module = model
-        for part in parts[:-1]:
-            module = getattr(module, part)
-        param = getattr(module, parts[-1], None)
-    except AttributeError:
-        logger.debug("_bind_weight: key %s not found in model — skipping", name)
-        return False
-
-    if param is None:
-        logger.debug("_bind_weight: key %s resolved to None — skipping", name)
-        return False
-
-    if hasattr(param, "weight_loader"):
-        param.weight_loader(param, tensor)
-    else:
-        if isinstance(param, nn.Parameter):
-            if param.device == tensor.device:
-                param.data = tensor
-            else:
-                new_param = nn.Parameter(tensor, requires_grad=param.requires_grad)
-                new_param.__dict__.update(param.__dict__)
-                setattr(module, parts[-1], new_param)
-        else:
-            param.data.copy_(tensor)
-    return True
-
-
 def _resolve_checkpoint_files(
     model_config: ModelConfig,
     load_config,
 ) -> tuple[str, list[str]]:
     """Resolve and filter shard file paths for the checkpoint."""
     import glob as glob_mod
+
     from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
     from vllm.model_executor.model_loader.weight_utils import (
         download_safetensors_index_file_from_hf,
         download_weights_from_hf,
         filter_duplicate_safetensors_files,
-        filter_files_not_needed_for_inference,
     )
 
     model_path = model_config.model
@@ -403,29 +350,27 @@ def _resolve_checkpoint_files(
         model_path = download_weights_from_hf(
             model_name_or_path=model_path,
             cache_dir=load_config.download_dir,
-            allow_patterns=["*.safetensors", "*.bin"],
+            allow_patterns=["*.safetensors"],
             revision=revision,
             ignore_patterns=load_config.ignore_patterns,
         )
 
     shard_files = glob_mod.glob(os.path.join(model_path, "*.safetensors"))
-    if shard_files:
-        if not is_local and len(shard_files) > 1:
-            download_safetensors_index_file_from_hf(
-                model_config.model,
-                SAFE_WEIGHTS_INDEX_NAME,
-                cache_dir=load_config.download_dir,
-                revision=revision,
-            )
-        shard_files = filter_duplicate_safetensors_files(
-            shard_files, model_path, SAFE_WEIGHTS_INDEX_NAME
-        )
-    else:
-        shard_files = glob_mod.glob(os.path.join(model_path, "*.bin"))
-        shard_files = filter_files_not_needed_for_inference(shard_files)
-    shard_files = sorted(shard_files)
-
     if not shard_files:
-        raise FileNotFoundError(f"No checkpoint shards found in {model_path}")
+        raise FileNotFoundError(
+            f"No safetensors checkpoint shards found in {model_path}. SpyreModelLoader "
+            "reads safetensors only; for .bin checkpoints pass the necessary "
+            "--load-format pt."
+        )
+    if not is_local and len(shard_files) > 1:
+        download_safetensors_index_file_from_hf(
+            model_config.model,
+            SAFE_WEIGHTS_INDEX_NAME,
+            cache_dir=load_config.download_dir,
+            revision=revision,
+        )
+    shard_files = sorted(
+        filter_duplicate_safetensors_files(shard_files, model_path, SAFE_WEIGHTS_INDEX_NAME)
+    )
 
     return model_path, shard_files

@@ -2455,14 +2455,14 @@ are missing.</p>
 <td>Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors.</td>
 </tr>
 <tr>
-<td><code>spyre_inference/v1/spec_decode/{xpress_head,checkpoint,config}.py</code>, <code>spyre_inference/models/qwen3_dflash.py</code> and its registrations</td>
-<td><code>vllm/model_executor/models/{qwen3_xpress,qwen3_dflash}.py</code></td>
-<td>Temporary compatibility for vllm#54448 (<code>ce9467b757</code>), which postdates 0.32.0. Replace the DFlash bridge and configuration aliases with upstream XPress model/head subclasses when available; retain Spyre context-KV, layout and serving overrides.</td>
+<td><code>spyre_inference/v1/spec_decode/xpress_head.py</code>, <code>SpyreQwen3XPressForCausalLM</code> (<code>spyre_inference/models/qwen3_dflash.py</code>)</td>
+<td><code>XPressRefinerHead</code> and <code>Qwen3XPressForCausalLM</code> (<code>vllm/model_executor/models/qwen3_xpress.py</code>)</td>
+<td>Construction, key mapping and mixer folding are upstream's; Spyre checks required head weights and the raw mixer shape. <code>_spyre_xpress_classes()</code> swaps the two module-level class names upstream builds by, so a rename upstream fails <code>test_upstream_xpress_construction_builds_the_spyre_classes</code>. The head subclass only no-ops <code>build_fused_buffers()</code> and swaps the Triton Jacobi kernels for compiled step helpers and Spyre weight layouts. <code>tests/spec_decode/xpress_reference.py</code> drives upstream's own <code>hidden_cache</code>/<code>refine_bias</code> as the oracle, so a change to upstream's math fails <code>test_xpress_upstream.py</code>.</td>
 </tr>
 <tr>
 <td><code>csrc/cpu/spec_decode_utils.cpp</code>, <code>spyre_inference/v1/spec_decode/rejection_sampler.py</code> and the platform kernel hook</td>
-<td>The four rejection kernels in <code>csrc/cpu/spec_decode_utils.cpp</code> and their adapters in <code>vllm/utils/cpu_triton_utils.py</code> (v0.32.0, <code>5df63a7203</code>)</td>
-<td>Native kernels in <code>_spyre_C</code>, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels; #1417 tracks their independent cleanup condition.</td>
+<td>The four rejection kernels in <code>csrc/cpu/spec_decode_utils.cpp</code> and their adapters in <code>vllm/utils/cpu_triton_utils.py</code> (unchanged from v0.32.0 <code>5df63a7203</code> through v0.33.0)</td>
+<td>Native kernels in <code>_spyre_C</code>, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels. Upstream's opt-in FLy acceptance (<code>rejection_sample_method="fly"</code>, v0.33.0) is Triton-only and not ported.</td>
 </tr>
 <tr>
 <td><code>TorchSpyreModelRunner._sample</code> / <code>_bookkeeping_sync</code> (<code>spyre_inference/v1/worker/spyre_model_runner.py</code>)</td>
@@ -2475,17 +2475,17 @@ are missing.</p>
 <td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>
 </tr>
 <tr>
+<td><code>allow_xpress_on_v1()</code> (<code>spyre_inference/v1/spec_decode/config.py</code>)</td>
+<td><code>VllmConfig._get_v1_model_runner_unsupported_features</code> (<code>vllm/config/vllm.py</code>)</td>
+<td>Drops only the "xpress speculative decoding" entry, since upstream's XPress speculator is V2-only and Spyre drives XPress from its V1 DFlash proposer. Delete at the V2 runner flip (#906).</td>
+</tr>
+<tr>
 <td><code>use_spyre_dflash_proposer()</code> (<code>spyre_inference/v1/spec_decode/dflash.py</code>)</td>
 <td>The <code>DFlashProposer</code> import, construction and <code>isinstance</code> checks in <code>vllm/v1/worker/gpu_model_runner.py</code></td>
 <td>Temporarily replaces the module's constructor during runner initialization. The replacement remains an upstream <code>DFlashProposer</code> subclass so later checks in <code>_prepare_inputs</code> and <code>sample_tokens</code> still pass after restoration.</td>
 </tr>
 </tbody>
 </table>
-<p><code>tests/spec_decode/test_xpress_vendored.py</code> deliberately fails if the new vLLM
-ships the XPress module or registers either XPress architecture. Follow
-<a href="https://github.com/torch-spyre/spyre-inference/issues/1417">the cleanup issue</a>
-to migrate the temporary head, loader/config bridge and registrations before
-removing the canary. Keep the Spyre execution overrides and requalify the serving path.</p>
 <p>Diff the upstream side between the current pin and the target:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>&lt;vllm<span class="w"> </span>checkout&gt;<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>fetch<span class="w"> </span>--tags
 </span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>git<span class="w"> </span>diff<span class="w"> </span>v&lt;current&gt;<span class="w"> </span>v<span class="o">{</span>VERSION<span class="o">}</span><span class="w"> </span>--stat<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>

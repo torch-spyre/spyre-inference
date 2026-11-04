@@ -13,68 +13,93 @@
 # limitations under the License.
 
 """
-Downloads this run-attempt's failed-suite descriptor artifacts (uploaded by
-_test_matrix.yaml's `test` job on a failed matrix leg) and rebuilds the
-{"include": [...]} retry matrix that the `test_retry` job consumes via
-fromJSON.
+Pod-level retry for _test_matrix.yaml, driven by job conclusions so a leg whose runner died
+before uploading anything is still retried (#1454).
 
-Usage (called by the GHA workflow):
-    GH_TOKEN=... python3 collect_failed_suites.py
-Reads GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_OUTPUT
-from the environment (all set by default on GitHub-hosted/self-hosted runners).
+    collect -- write the retry matrix and has_failed to GITHUB_OUTPUT.
+    verify  -- fail unless every matrix leg passed directly or on retry.
 """
 
-import glob
 import json
 import os
+import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 
-FAILED_SUITES_DIR = Path("failed_suites")
+import yaml
+
+WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "_test_matrix.yaml"
+RETRY_SUFFIX = " (pod-level retry)"
+# The caller's job id prefixes the name ("test / ...", "run-tests / ..."); cfg itself has parens.
+LEG_NAME = re.compile(r"build and run tests \((?P<cfg>.+)\)$")
+PASSED = ("success", "skipped")
 
 
-def list_artifacts(repo: str, run_id: str, attempt: str) -> list[dict]:
-    # --paginate (30/page default); attempt-scoped so a rerun skips already-passed suites.
-    result = subprocess.run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
-            "--jq",
-            f'.artifacts[] | select(.name | startswith("failed-suite-{attempt}-")) '
-            "| {id: .id, name: .name}",
-        ],
-        capture_output=True,
-        check=True,
-        text=True,
-    )
-    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+def matrix_include() -> list[dict]:
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    return doc["jobs"]["test"]["strategy"]["matrix"]["include"]
 
 
-def download_and_extract(repo: str, artifacts: list[dict]) -> None:
-    FAILED_SUITES_DIR.mkdir(exist_ok=True)
-    for artifact in artifacts:
-        out_dir = FAILED_SUITES_DIR / artifact["name"]
-        out_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = out_dir.with_suffix(".zip")
-        result = subprocess.run(
-            ["gh", "api", f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip"],
-            capture_output=True,
-            check=True,
-        )
-        zip_path.write_bytes(result.stdout)
-        subprocess.run(["unzip", "-q", "-o", str(zip_path), "-d", str(out_dir)], check=True)
-    print(f"Downloaded {len(artifacts)} failed-suite descriptor(s).")
+def list_jobs(repo: str, run_id: str, attempt: str) -> list[dict]:
+    cmd = [
+        "gh",
+        "api",
+        "--paginate",
+        f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+        "--jq",
+        ".jobs[] | {name, status, conclusion}",
+    ]
+    for delay in (5, 15, 45, 0):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        print(result.stderr, file=sys.stderr)
+        time.sleep(delay)
+    raise SystemExit("::error::Could not list this run attempt's jobs.")
 
 
-def build_retry_matrix() -> dict:
-    suites = []
-    for path in sorted(glob.glob(str(FAILED_SUITES_DIR / "failed-suite-*/suite.json"))):
-        with open(path) as f:
-            suites.append(json.load(f))
-    print(f"Suites to retry: {[s.get('cfg') for s in suites]}")
-    return {"include": suites}
+def legs(jobs: list[dict]) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    test: dict[str, list[dict]] = {}
+    retry: dict[str, list[dict]] = {}
+    for job in jobs:
+        name = job["name"]
+        is_retry = name.endswith(RETRY_SUFFIX)
+        if is_retry:
+            name = name[: -len(RETRY_SUFFIX)]
+        m = LEG_NAME.search(name)
+        if m:
+            (retry if is_retry else test).setdefault(m["cfg"], []).append(job)
+    return test, retry
+
+
+def failed_cfgs(test: dict[str, list[dict]]) -> list[str]:
+    # No conclusion yet (runner lost, API lag) counts as failed.
+    return [cfg for cfg, jobs in test.items() if any(j["conclusion"] not in PASSED for j in jobs)]
+
+
+def build_retry_matrix(jobs: list[dict], include: list[dict]) -> dict:
+    test, _ = legs(jobs)
+    by_cfg = {entry["cfg"]: entry for entry in include}
+    failed = failed_cfgs(test)
+    unknown = [cfg for cfg in failed if cfg not in by_cfg]
+    if unknown:
+        raise SystemExit(f"::error::Failed legs not in the static matrix: {unknown}")
+    print(f"Suites to retry: {failed}")
+    return {"include": [by_cfg[cfg] for cfg in failed]}
+
+
+def verify(jobs: list[dict], include: list[dict]) -> list[str]:
+    test, retry = legs(jobs)
+    errors = [f"{e['cfg']}: no `test` leg ran" for e in include if e["cfg"] not in test]
+    for cfg in failed_cfgs(test):
+        conclusions = [j["conclusion"] for j in retry.get(cfg, [])]
+        if not conclusions:
+            errors.append(f"{cfg}: failed and was never retried")
+        elif any(c != "success" for c in conclusions):
+            errors.append(f"{cfg}: failed, and its pod-level retry ended {conclusions}")
+    return errors
 
 
 def set_output(name: str, value: str) -> None:
@@ -83,16 +108,39 @@ def set_output(name: str, value: str) -> None:
 
 
 def main() -> None:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "collect"
     repo = os.environ["GITHUB_REPOSITORY"]
     run_id = os.environ["GITHUB_RUN_ID"]
     attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+    include = matrix_include()
 
-    artifacts = list_artifacts(repo, run_id, attempt)
-    download_and_extract(repo, artifacts)
-    matrix = build_retry_matrix()
+    cfgs = {entry["cfg"] for entry in include}
+    # `needs` has already waited for these jobs; this only rides out API lag on their conclusions.
+    for _ in range(6):
+        jobs = list_jobs(repo, run_id, attempt)
+        pending = [
+            cfg
+            for side in legs(jobs)
+            for cfg, js in side.items()
+            if cfg in cfgs and any(j["status"] != "completed" for j in js)
+        ]
+        if not pending:
+            break
+        time.sleep(10)
 
-    set_output("matrix", json.dumps(matrix))
-    set_output("has_failed", "true" if matrix["include"] else "false")
+    if mode == "collect":
+        matrix = build_retry_matrix(jobs, include)
+        set_output("matrix", json.dumps(matrix))
+        set_output("has_failed", "true" if matrix["include"] else "false")
+    elif mode == "verify":
+        errors = verify(jobs, include)
+        for err in errors:
+            print(f"::error::{err}")
+        if errors:
+            sys.exit(1)
+        print(f"All {len(include)} matrix configs passed (directly or after pod-level retry).")
+    else:
+        raise SystemExit(f"unknown mode {mode!r}")
 
 
 if __name__ == "__main__":

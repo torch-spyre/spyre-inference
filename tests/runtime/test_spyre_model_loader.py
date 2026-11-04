@@ -28,7 +28,11 @@ from spyre_inference.model_loader import (
     _bind_weight,
     _get_host_loaded_param_names,
 )
-from spyre_inference.platform import TorchSpyrePlatform, _is_multimodal_config, _spyre_loader_supported
+from spyre_inference.platform import (
+    TorchSpyrePlatform,
+    _is_multimodal_config,
+    _spyre_loader_supported,
+)
 
 
 def test_spyre_model_loader_registration():
@@ -58,8 +62,10 @@ def _make_vllm_config(
     if transformers_backend:
         model_config.using_transformers_backend = lambda: True
     if moe:
+
         class FakeMoEConfig:
             num_experts = 8
+
         model_config.hf_config = FakeMoEConfig()
     return VllmConfig(
         model_config=model_config,
@@ -74,34 +80,34 @@ def test_platform_defaults_load_format_to_spyre():
     assert vllm_config.load_config.load_format == "spyre"
 
 
+def test_platform_defaults_load_format_to_spyre_tp2():
+    """TP>1 is supported: auto resolves to spyre (linear weights shard on read)."""
+    vllm_config = _make_vllm_config(tp_size=2)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "spyre"
+
+
+def test_platform_defaults_load_format_to_spyre_multimodal():
+    """Multimodal models are supported: auto resolves to spyre."""
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.multimodal_config = object()
+    vllm_config.load_config.load_format = "auto"
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "spyre"
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"tp_size": 2},           # TP > 1
         {"quantization": "fp8"},  # quantized
         {"runner_type": "pooling"},  # pooling
     ],
-    ids=["tp>1", "quantized", "pooling"],
+    ids=["quantized", "pooling"],
 )
 def test_platform_load_format_stays_auto(kwargs):
     """load_format stays 'auto' for configs SpyreModelLoader doesn't support."""
     vllm_config = _make_vllm_config(**kwargs)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    assert vllm_config.load_config.load_format == "auto"
-
-
-def test_platform_load_format_stays_auto_multimodal():
-    """load_format stays 'auto' for multimodal models.
-
-    Patches _is_multimodal_config (not _spyre_loader_supported) so the gate
-    wiring is exercised, and builds VllmConfig inside the patch so
-    apply_config_platform_defaults is intercepted during __init__ too.
-    """
-    import unittest.mock as mock
-    import spyre_inference.platform as plat_mod
-
-    with mock.patch.object(plat_mod, "_is_multimodal_config", return_value=True):
-        vllm_config = _make_vllm_config()
     assert vllm_config.load_config.load_format == "auto"
 
 
@@ -152,20 +158,28 @@ def _make_ns(
 
 
 def test_spyre_loader_supported_accepts_valid_config():
-    """Positive case: TP=1, generate, unquantized, dense, text-only is supported."""
+    """Positive case: generate, unquantized, dense, non-transformers-backend is supported."""
     assert _spyre_loader_supported(_make_ns())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"tp_size": 2}, {"tp_size": 4}, {"multimodal": True}, {"tp_size": 2, "multimodal": True}],
+    ids=["tp2", "tp4", "multimodal", "tp2-multimodal"],
+)
+def test_spyre_loader_supported_accepts_tp_and_multimodal(kwargs):
+    """TP > 1 and multimodal models are supported by the direct-to-device loader."""
+    assert _spyre_loader_supported(_make_ns(**kwargs))
 
 
 @pytest.mark.parametrize(
     ("kwargs", "description"),
     [
-        ({"tp_size": 2}, "TP > 1"),
         ({"runner_type": "pooling"}, "pooling runner"),
         ({"runner_type": "unknown_future_runner"}, "unknown runner type"),
         ({"quantization": "fp8"}, "quantized"),
         ({"transformers_backend": True}, "transformers backend"),
         ({"moe": True}, "MoE"),
-        ({"multimodal": True}, "multimodal"),
     ],
 )
 def test_spyre_loader_supported_rejects_unsupported(kwargs, description):

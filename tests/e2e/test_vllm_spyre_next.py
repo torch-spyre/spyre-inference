@@ -54,6 +54,7 @@ _PADDED_PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode())
 _PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
 
 
+@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
 def test_padded_head_dim_and_intermediate_size_generate() -> None:
     """Loading the model fires both pads; greedy decode matches the unpadded

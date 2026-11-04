@@ -17,10 +17,6 @@
 Reads the benchmark configs of one suite, builds the appropriate
 `vllm bench latency` / `vllm bench throughput` / `vllm bench serve` commands,
 and executes them.
-
-Config files are named `<bench type>-<model>-runs.yaml` and can sit in any
-subdirectory of the configs dir. Each entry lists the suites it belongs to in
-`labels`: at least one of minimal, base, reference.
 """
 
 import contextlib
@@ -601,9 +597,7 @@ def config_files(configs_path: Path) -> list[Path]:
 
 
 def _labels(config: dict, required: bool = True) -> list[str]:
-    """Suite labels of an entry. Exits on a malformed or unknown label, and, if
-    `required`, on missing or empty labels, since such an entry would run in no
-    suite."""
+    """Suite labels of an entry; exits on unknown labels, or missing ones if `required`."""
     labels = config.get("labels")
     if labels is None and not required:
         return []
@@ -619,12 +613,7 @@ def _labels(config: dict, required: bool = True) -> list[str]:
 
 
 def collect_configs(configs_path: Path, suite: str, bench_types: set[str]) -> dict[str, list]:
-    """Map each selected bench type to the configs of `suite`, in file order.
-
-    A single config file runs every entry, whatever the suite, so its entries
-    may omit `labels`. In a directory, an entry without labels is an error. So
-    is a test_name that appears twice: it names the result file.
-    """
+    """Map each selected bench type to the configs of `suite`; a single file runs unfiltered."""
     unfiltered = configs_path.is_file()
     selected: dict[str, list] = {b: [] for b in VALID_BENCH_TYPES if b in bench_types}
     seen: dict[str, Path] = {}

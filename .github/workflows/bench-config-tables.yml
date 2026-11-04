@@ -1,8 +1,7 @@
 name: Benchmark config tables
 
-# vllm-benchmarks/README.md carries generated tables of every benchmark config.
-# This fails a change that edits a config without regenerating them, and a
-# change that reuses a test_name.
+# Fails a change that edits a benchmark config without regenerating the README
+# tables, or that reuses a test_name.
 
 on:
   pull_request:

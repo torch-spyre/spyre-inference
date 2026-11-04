@@ -402,15 +402,13 @@ def test_matrix_follows_the_suite(tmp_path):
 
 # ── the checked-in config ──
 
-# Each trace is reached through its own env var. `all` at TP1 would replay the
-# trace truncated to the TP1 context.
+# Each trace is reached through its own env var.
 DATASET_PATH_VARS = {
     "aiops": "${SPYRE_AIOPS_DATASET}",
     "cics": "${SPYRE_CICS_DATASET}",
     "all": "${SPYRE_ALL_SEQUENCES_DATASET}",
     "vision": "${SPYRE_VISION_DATASET}",
 }
-TP1_DATASET_PATH_VARS = {**DATASET_PATH_VARS, "all": "${SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET}"}
 # One decoder setup per TP: (max-model-len, max-num-seqs).
 DECODER_SETUP = {4: (32768, 32), 1: (8192, 8)}
 
@@ -466,11 +464,10 @@ def test_serve_runs_yaml_derives_consistently(config_file):
             assert f"_conc{parameters['max-concurrency']}_" in name, name
             # The name's suffix has to say which trace the entry replays.
             trace = name.rsplit("_", 1)[1]
-            path_vars = TP1_DATASET_PATH_VARS if tp == 1 else DATASET_PATH_VARS
-            assert trace in path_vars, name
+            assert trace in DATASET_PATH_VARS, name
             # _select_configs expands the env var, so at load time it is still
             # the literal the entry names.
-            assert parameters["dataset-path"] == path_vars[trace], name
+            assert parameters["dataset-path"] == DATASET_PATH_VARS[trace], name
             assert (server["max-model-len"], server["max-num-seqs"]) == DECODER_SETUP[tp], name
         elif parameters["dataset-name"] == "random-mm":
             assert "dataset-path" not in parameters, name

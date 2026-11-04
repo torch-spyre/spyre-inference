@@ -12,23 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Write the benchmark config tables into vllm-benchmarks/README.md.
-
-Reads every *-runs.yaml under vllm-benchmarks/benchmarks and replaces the part
-of the README between the BEGIN/END markers with:
-
-- one matrix per bench family (decoder serve, pooling, latency/throughput),
-  showing each entry's labels; the decoder matrix groups its concurrency
-  columns under each dataset,
-- one list per suite (minimal, base, reference) with each entry's config.
-
-Fails with exit 2 if two entries share a test_name, since the name is the
-result file and the benchmark's identity downstream, or if an entry has no
-label, since it would run in no suite.
-
-    python3 .github/scripts/generate_bench_config_tables.py          # rewrite
-    python3 .github/scripts/generate_bench_config_tables.py --check  # verify only
-"""
+"""Write the benchmark config tables between the markers in vllm-benchmarks/README.md."""
 
 import importlib.util
 import sys
@@ -54,11 +38,7 @@ TRACE_DATASETS = ("aiops", "cics", "all")
 
 
 def load_entries() -> list[dict]:
-    """Every entry of every config file, with its file and bench type.
-
-    Exits on an entry without labels, and on a test_name used more than once,
-    listing every collision.
-    """
+    """Every entry of every config file; exits on missing labels or a reused test_name."""
     entries = []
     for config_file in runner.config_files(CONFIGS_DIR):
         configs = runner._load_configs(config_file)

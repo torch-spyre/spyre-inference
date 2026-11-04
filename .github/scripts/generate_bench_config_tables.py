@@ -45,6 +45,7 @@ def load_entries() -> list[dict]:
         if configs is None:
             sys.exit(2)
         for config in configs:
+            runner.test_name(config, config_file)
             entries.append(
                 {
                     "config": config,
@@ -80,6 +81,16 @@ def _tp(entry: dict) -> int:
 def _name_tail(entry: dict) -> str:
     """The part of the test_name after `_tp<N>_`, e.g. `conc5_aiops`."""
     return entry["config"]["test_name"].split(f"_tp{_tp(entry)}_", 1)[-1]
+
+
+def _decoder_column(entry: dict) -> tuple[str, str]:
+    """(dataset, concurrency) of a decoder tail `conc<C>_<dataset>`; a tail of
+    another shape is a dataset with no concurrency column, shown as `–`."""
+    tail = _name_tail(entry)
+    conc, sep, dataset = tail.partition("_")
+    if sep and conc.startswith("conc"):
+        return dataset, conc
+    return tail, "–"
 
 
 def _cell(entries: list[dict]) -> str:
@@ -234,13 +245,13 @@ def render(entries: list[dict]) -> str:
         # A decoder tail is `conc<C>_<dataset>`: datasets head the columns, each
         # over its concurrencies. Traces come first, in TRACE_DATASETS order.
         datasets = list(TRACE_DATASETS) + sorted(
-            {_name_tail(e).split("_", 1)[1] for e in decoder} - set(TRACE_DATASETS)
+            {_decoder_column(e)[0] for e in decoder} - set(TRACE_DATASETS)
         )
         lines += ["### Decoder serve", ""]
         lines += _grouped_matrix(
             decoder,
-            lambda e: _name_tail(e).split("_", 1)[1],
-            lambda e: _name_tail(e).split("_", 1)[0],
+            lambda e: _decoder_column(e)[0],
+            lambda e: _decoder_column(e)[1],
             datasets,
         )
         lines += [""]

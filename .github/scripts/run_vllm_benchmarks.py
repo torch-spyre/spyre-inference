@@ -590,10 +590,28 @@ def _bench_type(config_file: Path) -> str | None:
 
 
 def config_files(configs_path: Path) -> list[Path]:
-    """Config files under `configs_path`, or `configs_path` itself if it is a file."""
-    if configs_path.is_file():
-        return [configs_path]
-    return sorted(f for f in configs_path.rglob("*-runs.yaml") if _bench_type(f))
+    """Config files under `configs_path`, or `configs_path` itself if it is a file.
+
+    Exits when there is none, or when a file's prefix names no bench type.
+    """
+    files = [configs_path] if configs_path.is_file() else sorted(configs_path.rglob("*-runs.yaml"))
+    if not files:
+        log.error("No *-runs.yaml config file in %s", configs_path)
+        sys.exit(2)
+    for config_file in files:
+        if _bench_type(config_file) is None:
+            log.error("%s: name must start with one of %s", config_file, VALID_BENCH_TYPES)
+            sys.exit(2)
+    return files
+
+
+def test_name(config: dict, config_file: Path) -> str:
+    """The entry's test_name; exits when it is missing or not a string."""
+    name = config.get("test_name")
+    if not isinstance(name, str) or not name:
+        log.error("%s: an entry has no test_name", config_file)
+        sys.exit(2)
+    return name
 
 
 def _labels(config: dict, required: bool = True) -> list[str]:
@@ -601,7 +619,11 @@ def _labels(config: dict, required: bool = True) -> list[str]:
     labels = config.get("labels")
     if labels is None and not required:
         return []
-    if not isinstance(labels, list) or not set(labels) <= set(SUITES) or (required and not labels):
+    if (
+        not isinstance(labels, list)
+        or not all(isinstance(label, str) and label in SUITES for label in labels)
+        or (required and not labels)
+    ):
         log.error(
             "%s has labels %r; it needs a non-empty list of %s",
             config.get("test_name"),
@@ -619,14 +641,11 @@ def collect_configs(configs_path: Path, suite: str, bench_types: set[str]) -> di
     seen: dict[str, Path] = {}
     for config_file in config_files(configs_path):
         bench_type = _bench_type(config_file)
-        if bench_type is None:
-            log.error("%s: name must start with one of %s", config_file, VALID_BENCH_TYPES)
-            sys.exit(2)
         configs = _load_configs(config_file)
         if configs is None:
             sys.exit(2)
         for config in configs:
-            name = config.get("test_name")
+            name = test_name(config, config_file)
             if name in seen:
                 log.error("test_name %s is in both %s and %s", name, seen[name], config_file)
                 sys.exit(2)

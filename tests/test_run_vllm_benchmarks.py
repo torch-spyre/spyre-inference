@@ -349,7 +349,7 @@ def test_single_config_file_runs_unfiltered(tmp_path):
     assert _names(selected) == {"serve": ["a", "b"]}
 
 
-@pytest.mark.parametrize("labels", [None, [], ["smoke"], ["exhaustive"], "base"])
+@pytest.mark.parametrize("labels", [None, [], ["smoke"], ["exhaustive"], "base", [["base"]]])
 def test_missing_or_unknown_label_aborts_the_run(tmp_path, labels):
     """Such an entry would otherwise run in no suite without a word."""
     _write_runs(tmp_path, "serve-x-runs.yaml", {"a": labels})
@@ -363,6 +363,25 @@ def test_duplicate_test_name_aborts_the_run(tmp_path):
     """A test_name names the result file, so a duplicate would overwrite it."""
     _write_runs(tmp_path / "a", "serve-x-runs.yaml", {"t": ["base"]})
     _write_runs(tmp_path / "b", "serve-y-runs.yaml", {"t": ["reference"]})
+
+    with pytest.raises(SystemExit) as exc:
+        runner.collect_configs(tmp_path, "base", {"serve"})
+    assert exc.value.code == 2
+
+
+def test_entry_without_test_name_aborts_the_run(tmp_path):
+    path = _write_runs(tmp_path, "serve-x-runs.yaml", {"a": ["base"]})
+    path.write_text(path.read_text().replace("test_name: a", "test_name: null"))
+
+    with pytest.raises(SystemExit) as exc:
+        runner.collect_configs(tmp_path, "base", {"serve"})
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("name", ["serve-tests.yaml", "servings-x-runs.yaml"])
+def test_no_or_misnamed_config_file_aborts_the_run(tmp_path, name):
+    """Such a directory would otherwise run nothing and still exit 0."""
+    _write_runs(tmp_path, name, {"a": ["base"]})
 
     with pytest.raises(SystemExit) as exc:
         runner.collect_configs(tmp_path, "base", {"serve"})
@@ -396,8 +415,30 @@ def test_matrix_follows_the_suite(tmp_path):
     minimal = matrix.generate_benchmark_matrix(str(tmp_path), [], "minimal")
     base = matrix.generate_benchmark_matrix(str(tmp_path), [], "base")
 
-    assert minimal["include"] == [{"models": "m-small"}]
-    assert base["include"] == [{"models": "m-small"}, {"models": "m-big"}]
+    assert minimal["include"] == [{"models": "m-small", "suite": "minimal"}]
+    assert base["include"] == [
+        {"models": "m-small", "suite": "base"},
+        {"models": "m-big", "suite": "base"},
+    ]
+
+
+def test_matrix_model_falls_back_to_the_next_suite(tmp_path):
+    """A requested model runs in the first suite, from the default on, that has it."""
+    _write_runs(
+        tmp_path,
+        "latency-x-runs.yaml",
+        {"small": ["minimal", "base"], "big": ["base"], "huge": ["reference"]},
+    )
+
+    result = matrix.generate_benchmark_matrix(str(tmp_path), ["m-small", "m-big", "m-huge"])
+
+    assert result["include"] == [
+        {"models": "m-small", "suite": "minimal"},
+        {"models": "m-big", "suite": "base"},
+        {"models": "m-huge", "suite": "reference"},
+    ]
+    with pytest.raises(SystemExit):
+        matrix.generate_benchmark_matrix(str(tmp_path), ["m-unknown"])
 
 
 # ── the checked-in config ──

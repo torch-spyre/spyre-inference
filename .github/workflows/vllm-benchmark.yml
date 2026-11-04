@@ -20,7 +20,9 @@ on:
         type: string
       models:
         description: >
-          Comma-separated list of models to benchmark (optional, default all)
+          Comma-separated list of models to benchmark (optional, default the
+          minimal suite). Each runs in the first of minimal, base, reference
+          that has a config for it.
         required: false
         type: string
       skip_uv_for_benchmarking:
@@ -194,10 +196,12 @@ jobs:
         env:
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
           MATRIX_MODELS: ${{ matrix.models }}
+          MATRIX_SUITE: ${{ matrix.suite }}
         run: |
           mkdir -p benchmark-results
           make perf-tests RESULTS_DIR=benchmark-results \
             MODELS="${MATRIX_MODELS}" \
+            BENCH_SUITE="${MATRIX_SUITE}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
 
       # !cancelled(): a later benchmark failing must not discard the ones that completed.
@@ -269,6 +273,7 @@ jobs:
         env:
           INPUT_VLLM_BRANCH: ${{ inputs.vllm_branch || 'main' }}
           MATRIX_MODELS: ${{ matrix.models }}
+          MATRIX_SUITE: ${{ matrix.suite }}
           RUN_ID: ${{ github.run_id }}
         run: |
           RESULT_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" 2>/dev/null | wc -l)
@@ -281,6 +286,7 @@ jobs:
             echo "| vLLM Branch | ${INPUT_VLLM_BRANCH} |"
             echo "| vLLM Commit | ${HEAD_SHA:-unknown} |"
             echo "| Models | ${MATRIX_MODELS} |"
+            echo "| Suite | ${MATRIX_SUITE} |"
             echo "| Result Files | ${RESULT_COUNT} |"
             echo "| Run ID | ${RUN_ID} |"
           } >> "$GITHUB_STEP_SUMMARY"

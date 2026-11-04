@@ -415,7 +415,7 @@ endif
 # here so each job benches a single model. TPS narrows to a comma-separated set
 # of tensor-parallel sizes, e.g. TPS=1,4. BENCH_TYPES narrows to a subset of
 # latency,throughput,serve for quick local iteration. BENCH_SUITE picks the
-# suite: minimal (default), base or reference. An entry runs in the suites its
+# suite: minimal, base (default) or reference. An entry runs in the suites its
 # `labels` name, and needs at least one.
 MODELS ?=
 TPS ?=
@@ -423,7 +423,7 @@ BENCH_TYPES ?=
 # Directory searched for *-runs.yaml config files, or a single config file,
 # which runs every entry whatever BENCH_SUITE says.
 BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks
-BENCH_SUITE ?= minimal
+BENCH_SUITE ?= base
 
 # The serve configs replay trace files that are not in the repo, so the fetch is
 # what makes a serve config runnable at all and is on by default. Set
@@ -444,7 +444,7 @@ else
 BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_SUITE=minimal|base|reference to pick the suite (default minimal). Set BENCH_CONFIGS_DIR=<dir or file> to run custom config files; a single file runs unfiltered. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_SUITE=minimal|base|reference to pick the suite (default base). Set BENCH_CONFIGS_DIR=<dir or file> to run custom config files; a single file runs unfiltered. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
 	mkdir -p "$(RESULTS_DIR)"
 	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \

@@ -433,7 +433,7 @@ def test_matrix_model_falls_back_to_the_next_suite(tmp_path):
     result = matrix.generate_benchmark_matrix(str(tmp_path), ["m-small", "m-big", "m-huge"])
 
     assert result["include"] == [
-        {"models": "m-small", "suite": "minimal"},
+        {"models": "m-small", "suite": "base"},
         {"models": "m-big", "suite": "base"},
         {"models": "m-huge", "suite": "reference"},
     ]

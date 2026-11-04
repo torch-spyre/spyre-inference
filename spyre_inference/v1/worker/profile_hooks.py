@@ -16,12 +16,14 @@
 
 Installed in every vLLM process by the general plugin when ``SPYRE_PROFILE_DIR`` is set.
 While a torch profiler runs in the EngineCore process (the worker is in-process at TP1),
-each step that schedules tokens is a ``spyre::step`` region holding one
-``spyre::<prefill|decode|mixed>:<num_tokens>`` region, opened once scheduling has decided
-the batch. TP>1 workers trace in their own processes and carry only vLLM's per-step
-``execute_context_*`` annotation. Phase changes go to ``<dir>/phases.<pid>.jsonl`` and,
-with ``SPYRE_PROFILE_MEMORY_INTERVAL``, device memory to ``<dir>/devmem.<pid>.jsonl``;
-both carry wall-clock ``t`` so the processes merge by time.
+each step with unfinished requests is a ``ttft`` region (requests were waiting) or
+``itl_NNNN``, the names spyre-perf-suite's analysers key on, and holds one
+``spyre::<prefill|decode|mixed>:<num_tokens>`` region opened once scheduling has decided the
+batch. TP>1 workers trace in their own processes and carry only vLLM's per-step
+``execute_context_*`` annotation. The engine's resolved limits go to
+``<dir>/engine.<pid>.json``, phase changes to ``<dir>/phases.<pid>.jsonl`` and,
+with ``SPYRE_PROFILE_MEMORY_INTERVAL``, device memory to ``<dir>/devmem.<pid>.jsonl``; the
+last two carry wall-clock ``t`` so the processes merge by time.
 """
 
 import contextlib
@@ -34,7 +36,7 @@ import torch
 
 from spyre_inference import envs
 
-_state: dict = {"phase": None, "profiling": False, "seen_profile": False}
+_state: dict = {"phase": None, "profiling": False, "seen_profile": False, "itl": 0}
 _lock = threading.Lock()
 
 
@@ -90,13 +92,37 @@ def _wrap_schedule(engine) -> None:
     engine.scheduler.schedule = wrapped
 
 
+def _write_engine_limits(engine) -> None:
+    """The limits the engine resolved (platform defaults included), once per process."""
+    out_dir = envs.SPYRE_PROFILE_DIR
+    if not out_dir:
+        return
+    with contextlib.suppress(Exception):
+        sched, model = engine.vllm_config.scheduler_config, engine.vllm_config.model_config
+        limits = {
+            "max_num_batched_tokens": sched.max_num_batched_tokens,
+            "max_num_seqs": sched.max_num_seqs,
+            "max_model_len": model.max_model_len,
+        }
+        path = os.path.join(out_dir, f"engine.{os.getpid()}.json")
+        with open(path, "w") as f:
+            json.dump(limits, f)
+
+
 def _wrap_step(step):
     def wrapped(self, *args, **kwargs):
         if not hasattr(self, "_spyre_spans"):
             self._spyre_spans = []
             _wrap_schedule(self)
-        if _profiling():
-            span = torch.profiler.record_function("spyre::step")
+            _write_engine_limits(self)
+        sched = self.scheduler
+        if _profiling() and sched.get_num_unfinished_requests():
+            if len(sched.waiting):
+                name = "ttft"
+            else:
+                _state["itl"] += 1
+                name = f"itl_{_state['itl']:04d}"
+            span = torch.profiler.record_function(name)
             span.__enter__()
             self._spyre_spans.append(span)
         try:
@@ -112,6 +138,7 @@ def _wrap_profile(profile):
     def wrapped(self, is_start: bool = True, *args, **kwargs):
         _state["profiling"] = is_start
         _state["seen_profile"] = True
+        _state["itl"] = 0
         mark("profiled" if is_start else "post")
         return profile(self, is_start, *args, **kwargs)
 

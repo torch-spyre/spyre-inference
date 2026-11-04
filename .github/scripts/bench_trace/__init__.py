@@ -17,6 +17,9 @@
 The bundle, `<results-dir>/<test_name>/trace/`, is what torch-spyre's `vllm-trace` ingest
 reads: manifest.json (label, artifact, env), e2e.json (workload), phases.jsonl, and the
 analysed res.json / roof.json / host.json, beside the raw traces they came from.
+profile_report.json holds the same analysis in spyre-perf-suite
+`spsprofile.profile_report()`'s shape; steps.py and roofline.py mirror spsprofile's keys
+until that package can be depended on here.
 A profiled run writes nothing to `<results-dir>/*.json`: it is never a regression input.
 """
 
@@ -36,6 +39,9 @@ LEVELS = ("off", "light", "full")
 DEVMEM_INTERVAL_S = 0.1
 # One per run, written by each worker: across TP ranks only the first counts.
 LIFECYCLE = ("weight_load", "compile_warmup", "ready")
+# Harness bookkeeping, not phases of the traced run: kept in phases.jsonl, not in res.json.
+NOT_TRACE_PHASES = ("startup", "ready", "profiled", "post")
+ENGINE_LIMITS = ("max_num_batched_tokens", "max_num_seqs", "max_model_len")
 
 
 def profiler_config(trace_dir: Path, level: str) -> dict:
@@ -131,6 +137,8 @@ def resource_report(label, spans, samples, devmem) -> dict:
             dev_by.setdefault(_phase_at(spans, d["t"]), []).append(d)
     phases = {}
     for name, ss in by.items():
+        if name in NOT_TRACE_PHASES:
+            continue
         the = [s["throttled_cum_s"] for s in ss if s.get("throttled_cum_s") is not None]
         nthr = [s["nr_throttled"] for s in ss if s.get("nr_throttled") is not None]
         cores = [s["cpu_cores"] for s in ss]
@@ -238,8 +246,29 @@ def _analyse(trace_dir, manifest, bench_type, parameters, samples) -> None:
         err = next((d["err"] for d in devmem if "err" in d), "no devmem samples from the workers")
         absent["device_memory"] = err
 
-    e2e = {"args": workload(bench_type, parameters), "profile_level": manifest["profile_level"]}
-    _write(trace_dir / "res.json", resource_report(manifest["label"], spans, samples, devmem))
+    args = workload(bench_type, parameters)
+    engine = _jsonl(sorted(glob.glob(str(trace_dir / "markers" / "engine.*.json"))))
+    if engine:
+        # The engine's resolved limits win over the flags: they include platform defaults.
+        args.update({k: engine[0][k] for k in ENGINE_LIMITS if engine[0].get(k)})
+        args["budget"] = args.get("max_num_batched_tokens") or args["budget"]
+    else:
+        absent["engine_limits"] = "no engine.<pid>.json: the plugin did not load"
+    e2e = {"args": args, "profile_level": manifest["profile_level"]}
+    res = resource_report(manifest["label"], spans, samples, devmem)
+    summary = trace_dir / "compile_summary.json"
+    if summary.is_file():
+        with contextlib.suppress(OSError, ValueError):
+            res["compile_summary"] = json.loads(summary.read_text())
+    _write(trace_dir / "res.json", res)
+    report = {
+        "schema": 1, "trace": None, "audit": None, "steps": {"decode": {}, "prefill": {}},
+        "roofline": None,
+        "resources": {
+            "phases": res["phases"], "device_memory": res["device_memory"], "compile": None,
+            "compile_summary": res.get("compile_summary"),
+        },
+    }  # fmt: skip
 
     cost_files = sorted(Path(p) for p in glob.glob(str(trace_dir / "kernel_cost" / "*.jsonl")))
     costs = roofline.load_costs(cost_files)
@@ -253,23 +282,33 @@ def _analyse(trace_dir, manifest, bench_type, parameters, samples) -> None:
         key=lambda p: ("_rank0." not in os.path.basename(p), p),
     )
     manifest["traces"] = [os.path.relpath(t, trace_dir) for t in traces]
-    if not traces:
-        absent["trace"] = "vLLM wrote no torch profiler trace"
-        _write(trace_dir / "e2e.json", e2e)
-        return
     host = []
     for i, t in enumerate(traces):
         ev = steps.load(t)
         win = steps.windows(ev)
-        host.append(steps.host_report(os.path.relpath(t, trace_dir), ev, win))
-        if i == 0:
-            if win:
-                # First step start to last step end of the profiled window, in the trace's clock.
-                e2e["e2e_s"] = round((win[-1]["ts"] + win[-1]["dur"] - win[0]["ts"]) / 1e6, 6)
-            else:
-                absent["steps"] = f"{os.path.basename(t)}: no spyre:: or execute_context_ regions"
-            if not any(e.get("cat") in steps.DEVICE_CATS for e in ev):
-                absent["device_events"] = "no device rows: torch-spyre built without AIUPTI?"
-            _write(trace_dir / "roof.json", roofline.build(ev, win, costs))
-    _write(trace_dir / "host.json", host)
+        h = steps.analyse(ev, win)
+        rel = os.path.relpath(t, trace_dir)
+        host.append(steps.host_report(rel, h))
+        if i:
+            continue
+        if win:
+            # First step start to last step end of the profiled window, in the trace's clock.
+            e2e["e2e_s"] = round((win[-1]["ts"] + win[-1]["dur"] - win[0]["ts"]) / 1e6, 6)
+        else:
+            absent["steps"] = f"{os.path.basename(t)}: no ttft/itl_* or execute_context_ regions"
+        if not any(e.get("cat") in steps.DEVICE_CATS for e in ev):
+            absent["device_events"] = "no device rows: torch-spyre built without AIUPTI?"
+        roof = roofline.build(ev, win, costs)
+        _write(trace_dir / "roof.json", roof)
+        report.update(
+            trace=rel,
+            audit=h["audit"],
+            steps={"decode": host[0]["decode_summary"], "prefill": host[0]["prefill_summary"]},
+            roofline=roof if costs else None,
+        )
+    if not traces:
+        absent["trace"] = "vLLM wrote no torch profiler trace"
+    else:
+        _write(trace_dir / "host.json", host)
     _write(trace_dir / "e2e.json", e2e)
+    _write(trace_dir / "profile_report.json", report)

@@ -766,6 +766,14 @@ def test_no_compile_summary_without_sidecar_files(tmp_path, monkeypatch):
 
 
 bench_trace = importlib.import_module("bench_trace")
+# spsprofile.host.summarize keys (spyre-perf-suite); the port must keep producing each.
+SPSPROFILE_SUMMARY_KEYS = (
+    "n", "fallback_per_step", "fallback_ms_per_step", "fallback_ops", "wall_ms", "busy_ms",
+    "host_exposed_ms", "busy_pct", "collective_ms", "gaps_per_step", "launches_per_step",
+    "launch_marker_us_per_launch", "jobplan_us_per_launch", "h2d_per_step", "h2d_kb_per_step",
+    "corr_per_step", "corr_kb_per_step", "d2h_per_step", "d2h_kb_per_step", "sync_n_per_step",
+    "sync_ms_per_step", "waterfall_ms_per_step", "runtime_threads_in_gaps_ms_per_step",
+)  # fmt: skip
 _STEP_REGIONS = (("prefill", 512), ("decode", 4), ("decode", 4), ("decode", 4))
 
 
@@ -774,7 +782,8 @@ def _synthetic_trace(path, regions=_STEP_REGIONS, spyre_tags=True):
     ev, t = [], 1000.0
     for i, (kind, tokens) in enumerate(regions):
         if spyre_tags:
-            ev.append({"ph": "X", "cat": "user_annotation", "name": "spyre::step",
+            name = "ttft" if kind == "prefill" else f"itl_{i:04d}"
+            ev.append({"ph": "X", "cat": "user_annotation", "name": name,
                        "ts": t, "dur": 1000.0, "tid": 1, "pid": 1})  # fmt: skip
             ev.append({"ph": "X", "cat": "user_annotation", "name": f"spyre::{kind}:{tokens}",
                        "ts": t + 50, "dur": 900.0, "tid": 1, "pid": 1})  # fmt: skip
@@ -814,11 +823,12 @@ def test_profiler_config_levels(tmp_path):
     assert float(full_env["SPYRE_PROFILE_MEMORY_INTERVAL"]) > 0
 
 
-def test_step_windows_prefer_spyre_tags_and_fall_back_to_vllm(tmp_path):
+def test_step_windows_are_ttft_itl_regions_and_fall_back_to_vllm(tmp_path):
     _synthetic_trace(tmp_path / "a.json")
     win = bench_trace.steps.windows(bench_trace.steps.load(str(tmp_path / "a.json")))
+    assert [w["name"] for w in win] == ["ttft", "itl_0001", "itl_0002", "itl_0003"]
     assert [(w["kind"], w["tokens"]) for w in win] == list(_STEP_REGIONS)
-    assert win[0]["dur"] == 1000.0  # the outer spyre::step, not the inner tag
+    assert win[0]["dur"] == 1000.0  # the outer step region, not the inner tag
     _synthetic_trace(tmp_path / "b.json", spyre_tags=False)
     win = bench_trace.steps.windows(bench_trace.steps.load(str(tmp_path / "b.json")))
     assert [(w["kind"], w["tokens"]) for w in win] == [(k, n) for k, n in _STEP_REGIONS]
@@ -827,13 +837,18 @@ def test_step_windows_prefer_spyre_tags_and_fall_back_to_vllm(tmp_path):
 def test_host_report_splits_busy_and_exposed(tmp_path):
     _synthetic_trace(tmp_path / "t.json")
     ev = bench_trace.steps.load(str(tmp_path / "t.json"))
-    rep = bench_trace.steps.host_report("t.json", ev, bench_trace.steps.windows(ev))
+    rep = bench_trace.steps.host_report(
+        "t.json", bench_trace.steps.analyse(ev, bench_trace.steps.windows(ev))
+    )
     dec = rep["decode_summary"]
     assert dec["n"] == 2  # first decode step dropped as the shape transition
     assert dec["wall_ms"] == pytest.approx(1.0) and dec["busy_ms"] == pytest.approx(0.4)
     assert dec["host_exposed_ms"] == pytest.approx(0.6) and dec["launches_per_step"] == 1
     assert sum(dec["waterfall_ms_per_step"].values()) == pytest.approx(0.6)
     assert rep["prefill_summary"]["n"] == 1 and rep["mixed_summary"] == {}
+    assert rep["audit"]["kernel_ms"] == pytest.approx(1.6)
+    # spsprofile.host.summarize's keys, so the two analysers' JSON compares key for key.
+    assert set(SPSPROFILE_SUMMARY_KEYS) <= set(dec)
 
 
 def test_roofline_joins_the_kernel_cost_sidecar(tmp_path):
@@ -853,8 +868,10 @@ def test_roofline_joins_the_kernel_cost_sidecar(tmp_path):
     )
     by = {(k["key"], k["phase"]): k for k in roof["kernels"]}
     dec = by[("k_decode", "decode")]
-    assert dec["calls"] == 2 and dec["median_us"] == 400.0
+    assert dec["calls"] == 2 and dec["median_us"] == 400.0 and dec["predicted_us"] == 300.0
     assert dec["floor_us"] == 0.6 and dec["bound"] == "memory" and dec["ratio"] == 666.67
+    assert dec["kernel"] is None and [t["step"] for t in roof["timeline"]][0] == "ttft"
+    assert roof["timeline"][1]["skipped"] and not roof["timeline"][2]["skipped"]
     assert "floor_us" not in by[("k_prefill", "prefill")]
     assert roof["unjoined_keys"] == ["k_prefill"]
 
@@ -878,6 +895,9 @@ def _fake_vllm_bench(trace_dir_level):
             )
             markers = Path(env["SPYRE_PROFILE_DIR"])
             markers.mkdir(parents=True, exist_ok=True)
+            (markers / "engine.7.json").write_text(
+                json.dumps({"max_num_batched_tokens": 256, "max_num_seqs": 4, "max_model_len": 256})
+            )
             now = time.time()
             (markers / "phases.7.jsonl").write_text(
                 "".join(
@@ -940,8 +960,14 @@ def test_profiled_run_writes_the_bundle_and_nothing_ingest_reads(tmp_path, monke
     args = e2e["args"]
     assert (args["model"], args["tp"], args["batch_size"]) == ("org/m", 1, 4)
     assert (args["input_len"], args["output_len"], args["max_model_len"]) == (128, 64, 256)
+    assert (args["max_num_batched_tokens"], args["max_num_seqs"], args["budget"]) == (256, 4, 256)
     res = json.loads((trace / "res.json").read_text())
-    assert {"weight_load", "compile_warmup", "profiled", "decode"} <= set(res["phases"])
+    assert {"weight_load", "compile_warmup", "warmup", "prefill", "decode"} <= set(res["phases"])
+    assert not set(res["phases"]) & set(bench_trace.NOT_TRACE_PHASES)
+    report = json.loads((trace / "profile_report.json").read_text())
+    assert set(report) == {"schema", "trace", "audit", "steps", "roofline", "resources"}
+    assert report["steps"]["decode"]["n"] == 2 and report["roofline"] is None
+    assert report["resources"]["phases"] == res["phases"]
     host = json.loads((trace / "host.json").read_text())
     assert host[0]["decode_summary"]["n"] == 2
     roof = json.loads((trace / "roof.json").read_text())

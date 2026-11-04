@@ -159,7 +159,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
     # Directory for profiled benchmark runs (set by run_vllm_benchmarks.py --profile-level).
     # When set, each process writes its phase changes there and, while a torch profiler
-    # runs, wraps each EngineCore step in a spyre::<prefill|decode|mixed>:<tokens> region.
+    # runs, wraps each EngineCore step in a ttft / itl_NNNN region tagged with its batch.
     # Unset (default) installs nothing.
     "SPYRE_PROFILE_DIR": lambda: os.getenv("SPYRE_PROFILE_DIR") or None,
     # Seconds between device-memory samples written under SPYRE_PROFILE_DIR by each worker.

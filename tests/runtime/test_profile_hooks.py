@@ -70,10 +70,19 @@ def profile_dir(tmp_path, monkeypatch):
 
 
 class _Engine:
-    """EngineCore's step shape: schedule, run, return; profile toggles the profiler."""
+    """EngineCore's step shape: schedule, run, return. A step with waiting requests admits one."""
 
-    def __init__(self, outputs):
-        self.scheduler = SimpleNamespace(schedule=lambda *a: outputs.pop(0))
+    def __init__(self, outputs, waiting):
+        self._outputs = outputs
+        self.scheduler = SimpleNamespace(
+            schedule=self._schedule, waiting=list(range(waiting)),
+            get_num_unfinished_requests=lambda: 1,
+        )  # fmt: skip
+
+    def _schedule(self, *a):
+        if self.scheduler.waiting:
+            self.scheduler.waiting.pop()
+        return self._outputs.pop(0)
 
     def step(self):
         self.scheduler.schedule()
@@ -85,7 +94,10 @@ class _Engine:
 
 
 def test_steps_get_regions_only_while_profiling(profile_dir):
-    eng = _Engine([_out(gen=["w"]), _out(new=["a"], tokens={"a": 16}), _out(gen=["a"])])
+    eng = _Engine(
+        [_out(new=["w"], tokens={"w": 8}), _out(new=["a"], tokens={"a": 16}), _out(gen=["a"])],
+        waiting=2,
+    )
     step = profile_hooks._wrap_step(_Engine.step)
     prof_fn = profile_hooks._wrap_profile(_Engine.profile)
 
@@ -96,8 +108,8 @@ def test_steps_get_regions_only_while_profiling(profile_dir):
         step(eng)
     prof_fn(eng, False)
 
-    names = [e.name for e in p.events() if e.name.startswith("spyre::")]
-    assert names.count("spyre::step") == 2
+    names = [e.name for e in p.events() if e.name.startswith(("spyre::", "ttft", "itl_"))]
+    assert names.count("ttft") == 1 and names.count("itl_0001") == 1
     assert {"spyre::prefill:16", "spyre::decode:1"} <= set(names)
     assert not eng._spyre_spans
 

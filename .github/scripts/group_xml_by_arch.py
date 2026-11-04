@@ -16,15 +16,25 @@
 
 import argparse
 import os
+import re
 from pathlib import Path
 
 DEFAULT_ARCH = "x86_64"
 KNOWN_ARCHES = ("x86_64", "ppc64le", "s390x")
 
+# The arch label becomes a filesystem path segment (dest / arch), but it is read
+# from a leg-arch-*.txt sidecar that ships inside the untrusted junit-* CI
+# artifacts. An arch carrying path separators or ".." would escape the
+# destination tree (and mkdir(parents=True) would create attacker-chosen dirs on
+# a runner that holds ClickHouse credentials). Legitimate arches are a flat
+# lowercase/digit/underscore token, so anything else falls back to the default.
+_SAFE_ARCH = re.compile(r"[a-z0-9_]+")
+
 
 def canonical(arch: str) -> str:
     a = arch.strip().lower()
-    return "x86_64" if a in ("amd64", "x86", "x86-64", "x86_64") else a
+    a = "x86_64" if a in ("amd64", "x86", "x86-64", "x86_64") else a
+    return a if _SAFE_ARCH.fullmatch(a) else DEFAULT_ARCH
 
 
 def leg_arch(xml_path: Path) -> str:

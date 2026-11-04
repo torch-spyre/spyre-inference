@@ -52,6 +52,28 @@ def test_grouping_by_sidecar_with_default_and_flattened_names(tmp_path):
     assert link.is_symlink() and link.resolve() == (src / "junit-p" / "junit-p.xml").resolve()
 
 
+def test_traversing_arch_falls_back_to_default(tmp_path):
+    # The arch comes from an untrusted CI artifact sidecar; a value carrying
+    # path separators or ".." must not become a path segment that escapes dest.
+    src, dest = tmp_path / "xml_artifacts", tmp_path / "xml_by_arch"
+    _xml(src / "junit-x" / "junit-x.xml")
+    (src / "junit-x" / "leg-arch-x.txt").write_text("../../../../escaped")
+
+    assert gxa.canonical("../../../../escaped") == gxa.DEFAULT_ARCH
+    assert gxa.canonical("/etc/cron.d/x") == gxa.DEFAULT_ARCH
+    assert gxa.group(src, dest) == {gxa.DEFAULT_ARCH: 1}
+    # Nothing was created outside the destination tree.
+    assert not (tmp_path / "escaped").exists()
+    link = dest / gxa.DEFAULT_ARCH / "junit-x__junit-x.xml"
+    assert link.is_symlink() and link.resolve() == (src / "junit-x" / "junit-x.xml").resolve()
+
+
+def test_benign_unknown_arch_still_grouped_under_its_name(tmp_path):
+    # A recognisable-but-not-known arch stays itself (the warning path), only
+    # unsafe labels fall back to the default.
+    assert gxa.canonical("riscv64") == "riscv64"
+
+
 def test_outputs_and_unknown_arch_warning(tmp_path):
     src = tmp_path / "xml_artifacts"
     _xml(src / "junit-r" / "junit-r.xml")

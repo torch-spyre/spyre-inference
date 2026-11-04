@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``SpyreCLIPEncoderLayer`` against upstream's ``CLIPEncoderLayer`` with the same weights,
-on CPU: packed images under the same-image mask each match their own unpacked run."""
+"""``SpyreCLIPEncoderLayer`` against upstream's ``CLIPEncoderLayer`` with the same weights:
+packed images under the same-image mask each match their own unpacked run. The on-card
+twin at the bottom skips without a device."""
 
+import pytest
 import torch
 import torch.nn as nn
+from spyre_testing_plugin.pytest_plugin import spyre_available
 from transformers import CLIPVisionConfig
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.models.clip import CLIPEncoderLayer
@@ -69,7 +72,9 @@ def _layers() -> tuple[CLIPEncoderLayer, SpyreCLIPEncoderLayer]:
     return upstream.float(), spyre.float()
 
 
-def _packed(images: list[torch.Tensor], pad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _packed(
+    images: list[torch.Tensor], pad: torch.Tensor, dtype: torch.dtype = torch.float32
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``[1, ROWS, D]`` rows of ``images`` back to back, ``pad`` in the tail, and their mask."""
     tail = ROWS - sum(img.shape[0] for img in images)
     ids = torch.cat(
@@ -77,7 +82,7 @@ def _packed(images: list[torch.Tensor], pad: torch.Tensor) -> tuple[torch.Tensor
         + [torch.full((tail,), SEGMENT_ITEMS)]
     )
     x = torch.cat([*images, pad[:tail]])
-    return x[None], segment_mask(one_hot_segments(ids), torch.float32)
+    return x[None].to(dtype), segment_mask(one_hot_segments(ids), dtype)
 
 
 def _images(hidden: int) -> list[torch.Tensor]:
@@ -88,6 +93,7 @@ def _images(hidden: int) -> list[torch.Tensor]:
 def test_swaps_in_the_spyre_attention_with_upstream_weight_names(tp_group):
     upstream, spyre = _layers()
     assert type(spyre.self_attn) is SpyreCLIPAttention
+    assert not hasattr(spyre.self_attn, "attn")
     assert spyre.state_dict().keys() == upstream.state_dict().keys()
 
 
@@ -128,3 +134,35 @@ def test_padding_rows_never_change_real_rows(tp_group):
         zeros = spyre(*_packed(images, torch.zeros(ROWS, hidden)))[0, :real]
         noise = spyre(*_packed(images, 100 * torch.randn(ROWS, hidden)))[0, :real]
     torch.testing.assert_close(zeros, noise, atol=0, rtol=0)
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_packed_images_match_upstream_on_spyre(tp_group, compiled):
+    """The packed comparison in fp16 on the card, compiled as ``compile_vision_graphs`` does."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.custom_ops.utils import convert
+
+    upstream, spyre = _layers()
+    spyre = spyre.half().to("spyre")
+    if compiled:
+        spyre.compile(backend="inductor", fullgraph=True, dynamic=False)
+    hidden = _config().hidden_size
+    images = _images(hidden)
+    x, mask = _packed(images, torch.zeros(ROWS, hidden), torch.float16)
+
+    with torch.inference_mode():
+        out = spyre(convert(x, device="spyre"), convert(mask, device="spyre"))
+        out = convert(out, device="cpu")[0]
+        start = 0
+        for img in images:
+            want = upstream(img[None])[0]
+            assert _cosine(out[start : start + img.shape[0]], want) > 0.995
+            start += img.shape[0]

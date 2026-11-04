@@ -129,6 +129,12 @@ class SpyreCLIPAttention(CLIPAttention):
     one takes the same-image mask built once per encoder call in ``vision_embed``.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Unused by forward, and weightless: dropped so nothing mistakes it for this layer's
+        # attention (``patch_vision_tower`` gates compilation on it).
+        del self.attn
+
     def forward(  # ty: ignore[invalid-method-override]
         self, x: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:

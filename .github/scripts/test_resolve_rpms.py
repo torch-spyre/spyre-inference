@@ -71,3 +71,31 @@ def test_injection_in_name_is_rejected(name):
 def test_injection_in_version_is_rejected(version):
     with pytest.raises(SystemExit):
         rr.resolve_specs(_data(version=version), "x86_64")
+
+
+def test_package_sha1_returns_pinned_digest():
+    data = _data()
+    data["packages"]["ibm-flex"]["sha1"] = "0" * 40
+    assert rr.package_sha1(data, "ibm-flex") == "0" * 40
+
+
+def test_package_sha1_absent_is_none():
+    # An override-arch entry (or a lock predating digests) pins no sha1.
+    assert rr.package_sha1(_data(), "ibm-flex") is None
+
+
+@pytest.mark.parametrize(
+    "sha1",
+    [
+        "not-hex",
+        "0" * 39,  # too short
+        "0" * 41,  # too long
+        "A" * 40,  # uppercase is not Artifactory's actual_sha1 form
+        '0" $(touch pwned) "',  # shell-special must never reach the installer
+    ],
+)
+def test_malformed_sha1_is_rejected(sha1):
+    data = _data()
+    data["packages"]["ibm-flex"]["sha1"] = sha1
+    with pytest.raises(SystemExit):
+        rr.package_sha1(data, "ibm-flex")

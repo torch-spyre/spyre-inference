@@ -54,6 +54,26 @@ needs_value() {
     return 0
 }
 
+# Verify a downloaded RPM against the sha1 the lock pinned. A lock written
+# before digests existed carries an empty expectation: warn and continue rather
+# than fail, so the installer keeps working against an old lock (regenerating it
+# with scripts/lock_spyre_rpms.py restores the check).
+verify_sha1() {
+    local path=$1 expected=$2 label=$3
+    if [[ -z "$expected" ]]; then
+        echo "WARNING: ${label} has no pinned sha1 in the lock; download not verified" >&2
+        echo "         regenerate spyre-rpms.lock to pin its digest" >&2
+        return 0
+    fi
+    local actual
+    actual="$(sha1sum "$path" | cut -d' ' -f1)"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "ERROR: ${label} sha1 ${actual} does not match pinned ${expected}" >&2
+        return 1
+    fi
+    return 0
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -l|--lock) needs_value "$1" $#; LOCK="$2"; shift 2 ;;
@@ -99,21 +119,37 @@ else
 
     # The lock names commits, not filenames: [overrides.<arch>] wildcards the
     # build number, so resolving needs the same Artifactory query CI uses.
-    RESOLVED="$(python3 "$RESOLVER" --lock "$LOCK" resolve --arch "$ARCH")"
+    # --with-digest appends the pinned x86_64 sha1 so each download is verified.
+    RESOLVED="$(python3 "$RESOLVER" --lock "$LOCK" resolve --arch "$ARCH" --with-digest)"
     [[ -n "$RESOLVED" ]] || { echo "no packages resolved from $LOCK" >&2; exit 1; }
-    mapfile -t RPMS <<< "$RESOLVED"
+    RPMS=()
+    declare -A RPM_SHA1=()
+    while IFS=$'\t' read -r relpath sha1; do
+        [[ -n "$relpath" ]] || continue
+        RPMS+=("$relpath")
+        RPM_SHA1["$(basename "$relpath")"]="$sha1"
+    done <<< "$RESOLVED"
     COUNT=${#RPMS[@]}
 
     mkdir -p "$CACHE"
     for relpath in "${RPMS[@]}"; do
         filename="$(basename "$relpath")"
+        expected_sha1="${RPM_SHA1[$filename]}"
         if [[ -s "${CACHE}/${filename}" ]]; then
             echo "cached   ${filename}"
+            # A cached file with the wrong digest is the tamper case too; drop
+            # it and stop rather than unpack it.
+            verify_sha1 "${CACHE}/${filename}" "$expected_sha1" "$filename" \
+                || { rm -f "${CACHE}/${filename}"; exit 1; }
             continue
         fi
         echo "download ${filename}"
         curl -fsSL -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
             -o "${CACHE}/${filename}.part" "${LOCATION}/${relpath}"
+        # Verify before publishing into the cache: a mismatched or tampered
+        # build must never reach the unpack step or a later cached run.
+        verify_sha1 "${CACHE}/${filename}.part" "$expected_sha1" "$filename" \
+            || { rm -f "${CACHE}/${filename}.part"; exit 1; }
         mv "${CACHE}/${filename}.part" "${CACHE}/${filename}"
     done
 

@@ -20,6 +20,7 @@
 from unittest.mock import Mock
 
 import torch
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
@@ -42,6 +43,36 @@ def _fused_qkv_kv_views(
         k_view.view(num_tokens, key.shape[1], key.shape[2]),
         v_view.view(num_tokens, value.shape[1], value.shape[2]),
     )
+
+
+def random_block_tables(
+    kv_lens: list[int], width: int, block_size: int, num_blocks: int
+) -> torch.Tensor:
+    """Random block tables whose real blocks are distinct across all sequences.
+
+    Padding points only at pages no sequence owns, so it never aliases live KV. The
+    global stream sees only the plain ``randint`` table the tests drew before, so the
+    K/V data drawn after this call is unchanged.
+    """
+    real = [cdiv(kv_len, block_size) for kv_len in kv_lens]
+    assert all(n <= width for n in real), (
+        f"a sequence needs {max(real)} blocks, more than the table width {width}"
+    )
+    num_real = sum(real)
+    needs_spare = any(n < width for n in real)
+    assert num_real + needs_spare <= num_blocks, (
+        f"{num_real} real blocks{' plus a padding page' if needs_spare else ''} "
+        f"do not fit in {num_blocks} pages"
+    )
+    draw = torch.randint(0, num_blocks, (len(kv_lens), width), dtype=torch.int32)
+    pages = torch.randperm(
+        num_blocks, generator=torch.Generator().manual_seed(0), dtype=torch.int32
+    )
+    spare = pages[num_real:] if needs_spare else pages
+    block_tables = spare[draw % spare.numel()]
+    for row, own in zip(block_tables, torch.split(pages[:num_real], real)):
+        row[: own.numel()] = own
+    return block_tables
 
 
 def _build_metadata(
@@ -214,8 +245,13 @@ def ref_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reference implementation of attention for validation."""
+    """Reference implementation of attention for validation.
+
+    ``sinks`` ([num_query_heads]) adds one logit per head to the softmax denominator, as
+    an extra column that contributes no value (gpt-oss, upstream ``sinks``).
+    """
     num_seqs = len(query_lens)
     block_tables_np = block_tables.cpu().numpy()
 
@@ -253,7 +289,12 @@ def ref_attn(
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
         attn.masked_fill_(mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        if sinks is not None:
+            sink_col = sinks.float().view(-1, 1, 1).expand(-1, query_len, 1)
+            attn = torch.softmax(torch.cat([attn, sink_col], dim=-1), dim=-1)[..., :-1]
+        else:
+            attn = torch.softmax(attn, dim=-1)
+        attn = attn.to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
 
         outputs.append(out)

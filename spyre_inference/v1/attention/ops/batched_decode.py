@@ -16,6 +16,7 @@
 
 import torch
 
+from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -37,6 +38,18 @@ def gather_query(
         .permute(0, 2, 1, 3, 4)
         .contiguous()
         .reshape(entries, num_kv_heads, verify_len * num_queries_per_kv, head_size)
+    )
+
+
+def fold_sinks(sinks, verify_len):
+    """Per-head sinks [KV, qpk, 1] tiled to ``gather_query``'s [KV, verify_len * qpk, 1]."""
+    if sinks is None or verify_len == 1:
+        return sinks
+    num_kv_heads, num_queries_per_kv, _ = sinks.shape
+    return (
+        sinks.unsqueeze(1)
+        .expand(num_kv_heads, verify_len, num_queries_per_kv, 1)
+        .reshape(num_kv_heads, verify_len * num_queries_per_kv, 1)
     )
 
 
@@ -73,6 +86,7 @@ def batched_decode_kernel(
     logits_soft_cap=0.0,
     out=None,
     verify_len=1,
+    sinks=None,
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
@@ -92,7 +106,8 @@ def batched_decode_kernel(
     and across KV heads too unless the tiled walk materialized that axis. rep_row_ids:
     [entries * verify_len] int32, every query row repeated once per block slot.
     ``out`` None returns the result, [num_seqs * verify_len, num_heads, head_size],
-    instead of storing it.
+    instead of storing it. sinks: [num_kv_heads, num_queries_per_kv, 1] per-head
+    sink logits, or None.
     """
     entries = num_seqs * blocks_per_chunk
     m = verify_len * num_queries_per_kv
@@ -165,7 +180,7 @@ def batched_decode_kernel(
 
     state_shape = (1, num_seqs, num_kv_heads, m, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = walk_tiles(
+    (tile_max, tile_sum, tile_output), _ = walk_tiles(
         chunk_body,
         (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
         dims=(0, 0, None, None, None),
@@ -177,7 +192,11 @@ def batched_decode_kernel(
         ),
     )
     attn = token_major_output(
-        tile_output / tile_sum, num_seqs, num_kv_heads, num_queries_per_kv, verify_len
+        normalize(tile_max, tile_sum, tile_output, fold_sinks(sinks, verify_len)),
+        num_seqs,
+        num_kv_heads,
+        num_queries_per_kv,
+        verify_len,
     )
     if out is not None:
         # The destination prefix starts at offset 0, so torch-spyre#3770 does not

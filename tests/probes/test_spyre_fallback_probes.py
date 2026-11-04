@@ -1289,3 +1289,31 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 14. Parameter identity across model.to("spyre")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#5976: model.to('spyre') installs a new Parameter for each moved one "
+        "instead of keeping the object, as nn.Module.to does. When this XPASS-es, drop "
+        "_sink_owners and the moe_quant_config rebuild from move_model_to_spyre."
+    ),
+)
+def test_spyre_module_to_keeps_parameter_objects(spyre_device):
+    """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
+    must see the device tensor after the move, and a reload's in-place write."""
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    held = model.sinks
+
+    model.to(spyre_device)
+
+    assert model.sinks is held
+    new = torch.full((8,), 3.0, dtype=torch.float16)
+    model.sinks.data.copy_(new.to(spyre_device))
+    torch.testing.assert_close(held.cpu(), new)

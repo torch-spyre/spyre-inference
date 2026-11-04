@@ -6,8 +6,10 @@ the published `UIUC-SSAIL/Qwen3-8B-XPress-b16` checkpoint directly with
 `Qwen/Qwen3-8B`; checkpoint conversion is not required.
 
 Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
-the V1 runner, one active request, and prefix caching
+the V1 runner, up to four active requests, and prefix caching
 disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+The four-request cap reflects the batches validated on Spyre so far. Larger
+batches require additional device validation before raising this limit.
 
 ## Run Qwen3-8B
 
@@ -33,6 +35,25 @@ checkpoint revisions as this example; update all three together. A full
 verification round needs at least 31 budgeted tokens because vLLM reserves
 additional drafting slots; the adapter rejects a smaller budget.
 
+For four concurrent requests, set `--max-num-seqs 4`,
+`--max-num-batched-tokens 128`, and
+`--compilation-config '{"compile_sizes": [1, 16, 32, 64, 128]}'`.
+Set `SPYRE_ATTN_QUERY_BUCKETS=1,16,64,128` for this token budget.
+Set `SPYRE_MAX_NUM_PARTIAL_PREFILLS=4` to allow four partial prefills.
+The draft body uses batches of 1, 2, or 4; three active requests pad to four.
+Each request retains its own accepted context, page table, and output limit.
+
+The batch-four test also covers default attention buckets, compilation sizes
+and the default single partial prefill. The settings above reduce query padding
+and allow more concurrent partial prefills.
+
+| Maximum requests | Minimum token budget |
+| --- | --- |
+| 1 | 31 |
+| 2 | 62 |
+| 3 | 93 |
+| 4 | 124 |
+
 ## Refinement and compatibility
 
 The refiner follows [merged vLLM XPress](https://github.com/vllm-project/vllm/pull/54448):
@@ -50,10 +71,10 @@ Replaying a seeded request with the same configuration is deterministic.
 Changing between ordinary decoding, DFlash and XPress changes RNG consumption;
 the same seed need not produce identical tokens across these modes.
 
-The pinned vLLM 0.32 lacks native XPress registration, so this adapter uses its V1
-DFlash classes with a configuration bridge. The merged GPU speculator uses V2.
-Initial selection and per-pass argmax run on CPU; readout and refinement run on
-Spyre. Batched XPress and device candidate selection are follow-up work.
+Upstream serves XPress only on the V2 runner, so Spyre subclasses its XPress model
+and drives refinement from the V1 DFlash proposer. Initial selection and per-pass
+argmax run on CPU; readout and refinement run on Spyre. Device candidate selection
+is follow-up work.
 
 Spyre's V2 runner still lacks model loading, compilation and warmup. After that
 runner is operational, XPress needs its auxiliary-state, draft-context and
@@ -65,7 +86,7 @@ CPU-sampling hooks ported to V2's speculator interface. See
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
 SPYRE_XPRESS_TEST_TOPC=128 uv run --no-sync pytest \
-  tests/e2e/test_speculative_decoding.py -m model_quality -s
+  tests/e2e/test_speculative_decoding.py tests/e2e/test_xpress_batch.py -m model_quality -s
 ```
 
 PR regression jobs prefetch both pinned models before running the quality gate.
@@ -91,3 +112,7 @@ The 503-token case starts too close to the context limit to draft. A separate
 495-token case verifies that a previously nonempty draft is cleared at the limit
 and that the next target step has no scheduled draft tokens. Validation timings
 are collected by the test worker; the serving loop has no timing counters.
+
+The batch-four test enables `SPYRE_COMPILE_GUARD=error`, including for partial
+prefill and shrinking batches. Warmup compiles the draft context KV stores at
+each target row bucket using the reserved null page.

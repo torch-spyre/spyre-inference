@@ -15,10 +15,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM 0.32.0 dispatcher adapters for the vendored csrc/cpu/spec_decode_utils.cpp.
+"""vLLM 0.33.0 dispatcher adapters for the vendored csrc/cpu/spec_decode_utils.cpp.
 
-Adapted from vllm/utils/cpu_triton_utils.py at 5df63a7203. The native kernels
-accept the caller's dtypes directly and implement synthetic acceptance.
+Adapted from vllm/utils/cpu_triton_utils.py at 5df63a7203 (unchanged through v0.33.0).
+The native kernels accept the caller's dtypes directly and implement synthetic acceptance.
 
 ``install`` additionally swaps upstream's ``rejection_sample`` for a copy that takes the
 target argmax with ``greedy_argmax`` and, for drafts without probabilities, draws recovered
@@ -206,14 +206,19 @@ def rejection_sample(
     synthetic_mode: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64_gumbel: bool = False,
+    fly_window_size: int | None = None,
+    fly_entropy_threshold: float | None = None,
+    fly_entropy_top_k: int = 3,
 ) -> torch.Tensor:
-    """vLLM 0.32.0's ``rejection_sample``, taking the target argmax with ``greedy_argmax``.
+    """vLLM 0.33.0's ``rejection_sample``, taking the target argmax with ``greedy_argmax``.
 
     Random requests whose drafts carry no probabilities skip the full-vocabulary softmax:
     acceptance needs only each draft's target probability, and the recovered token is a
     ``fused_gumbel_argmax`` draw. Draft probabilities, synthetic acceptance and
-    ``use_fp64_gumbel`` keep upstream's path.
+    ``use_fp64_gumbel`` keep upstream's path. FLy verification is Triton-only.
     """
+    if fly_window_size is not None:
+        raise NotImplementedError("FLy verification is not supported on Spyre.")
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1

@@ -1082,7 +1082,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for name in group.layer_names
         }
         # A model-free proposer (suffix) has no draft attention layers.
-        if self.speculative_config is not None and self.speculative_config.uses_draft_kv_cache():
+        if self.speculative_config is not None and hasattr(self.drafter, "model"):
             draft_model = cast(_DraftAttentionModel, self.drafter.model)
             # vLLM resolves the draft's per-layer causality from its model config.
             causal_by_layer.update(

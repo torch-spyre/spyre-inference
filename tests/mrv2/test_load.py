@@ -80,9 +80,14 @@ class _Loader:
         return self.model
 
 
+def _wrap(loader: "_Loader", runner: SimpleNamespace) -> "load._SpyreModelLoaderWrapper":
+    """The wrapper over a fake loader and runner, which stand in for the typed ones."""
+    return load._SpyreModelLoaderWrapper(loader, runner)  # ty: ignore[invalid-argument-type]
+
+
 @pytest.fixture
 def steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record the shared load steps _SpyreModelLoader runs, in order."""
+    """Record the shared load steps _SpyreModelLoaderWrapper runs, in order."""
     calls: list[str] = []
 
     def record(name, result=None):
@@ -112,7 +117,7 @@ def test_the_loader_runs_the_shared_steps_and_returns_the_wrapper(steps) -> None
     runner = _runner()
     config = _vllm_config()
 
-    wrapper = load._SpyreModelLoader(_Loader(model), runner).load_model(
+    wrapper = _wrap(_Loader(model), runner).load_model(
         vllm_config=config, model_config=config.model_config
     )
 
@@ -134,7 +139,7 @@ def test_a_pooling_model_keeps_its_outputs_on_spyre(steps) -> None:
     runner = _runner()
     config = _vllm_config("pooling")
 
-    wrapper = load._SpyreModelLoader(_Loader(FakeModel()), runner).load_model(
+    wrapper = _wrap(_Loader(FakeModel()), runner).load_model(
         vllm_config=config, model_config=config.model_config
     )
 
@@ -160,15 +165,15 @@ def test_row_buckets_cover_the_prompt_logprobs_chunk(
     monkeypatch.setattr(load.SpyreShapeBucketer, "for_config", staticmethod(lambda c: bucketer))
     config = _vllm_config(runner_type, max_logprobs)
 
-    wrapper = load._SpyreModelLoader(
-        _Loader(FakeModel()), _runner(max_num_tokens=max_num_tokens)
-    ).load_model(vllm_config=config, model_config=config.model_config)
+    wrapper = _wrap(_Loader(FakeModel()), _runner(max_num_tokens=max_num_tokens)).load_model(
+        vllm_config=config, model_config=config.model_config
+    )
 
     assert wrapper._logits_row_buckets == want
 
 
 def test_the_loader_forwards_everything_else() -> None:
-    loader = load._SpyreModelLoader(_Loader(FakeModel()), _runner())
+    loader = _wrap(_Loader(FakeModel()), _runner())
     assert loader.load_config == "load-config"
 
 
@@ -198,7 +203,7 @@ def _load_through(runner, reached: set[str]) -> None:
 def stub_targets(monkeypatch):
     """The swapped-in callables' own work, which this check doesn't need."""
     monkeypatch.setattr(upstream, "get_model_loader", lambda load_config: None)
-    monkeypatch.setattr(load, "_SpyreModelLoader", lambda loader, runner: None)
+    monkeypatch.setattr(load, "_SpyreModelLoaderWrapper", lambda loader, runner: None)
     monkeypatch.setattr(load, "resolve_spyre_model_state", lambda *args: None)
     monkeypatch.setattr(SpyrePoolingRunner, "__init__", lambda self, *args: None)
 

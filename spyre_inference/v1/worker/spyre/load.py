@@ -28,8 +28,9 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
-from vllm.config import CompilationMode, ModelConfig, VllmConfig
+from vllm.config import CompilationMode, LoadConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -63,10 +64,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class _SpyreModelLoader:
-    """Upstream's model loader, returning the Spyre wrapper from load_model."""
+class _SpyreModelLoaderWrapper:
+    """Wraps the BaseModelLoader that vLLM's get_model_loader picked for the load
+    format, and adds the Spyre steps to its load_model, which returns the
+    _SpyreModelWrapper. Holds the instance rather than subclassing, so every load
+    format keeps its own loader; everything else forwards to it."""
 
-    def __init__(self, loader: Any, runner: "SpyreModelRunnerV2") -> None:
+    def __init__(self, loader: BaseModelLoader, runner: "SpyreModelRunnerV2") -> None:
         self._loader = loader
         self._runner = runner
 
@@ -140,9 +144,9 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
     original = {name: getattr(upstream_model_runner, name) for name in required}
     called: set[str] = set()
 
-    def spyre_model_loader(load_config: Any) -> _SpyreModelLoader:
+    def wrapped_model_loader(load_config: LoadConfig) -> _SpyreModelLoaderWrapper:
         called.add("get_model_loader")
-        return _SpyreModelLoader(original["get_model_loader"](load_config), runner)
+        return _SpyreModelLoaderWrapper(original["get_model_loader"](load_config), runner)
 
     def spyre_init_model_state(vllm_config, model, encoder_cache, device):
         called.add("init_model_state")
@@ -161,7 +165,7 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
         called.add("compile_model_with_stock_torch")
 
     replacements = {
-        "get_model_loader": spyre_model_loader,
+        "get_model_loader": wrapped_model_loader,
         "init_model_state": spyre_init_model_state,
         "PoolingRunner": _SpyrePoolingRunner,
         "compile_model_with_stock_torch": no_stock_compile,

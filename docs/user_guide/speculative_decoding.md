@@ -72,21 +72,36 @@ Changing between ordinary decoding, DFlash and XPress changes RNG consumption;
 the same seed need not produce identical tokens across these modes.
 
 Upstream serves XPress only on the V2 runner, so Spyre subclasses its XPress model
-and drives refinement from the V1 DFlash proposer. Initial selection and per-pass
-argmax run on CPU; readout and refinement run on Spyre. Device candidate selection
-is follow-up work.
+and drives refinement from the V1 DFlash proposer. By default, initial selection
+and per-pass argmax run on CPU; readout and refinement run on Spyre.
 
 Spyre's V2 runner still lacks model loading, compilation and warmup. After that
 runner is operational, XPress needs its auxiliary-state, draft-context and
 CPU-sampling hooks ported to V2's speculator interface. See
 [the V2 migration issue](https://github.com/torch-spyre/spyre-inference/issues/906).
 
+## Optional device feedback
+
+`SPYRE_XPRESS_DEVICE_FEEDBACK=1` keeps per-pass selection and proposal feedback
+on Spyre for block size 16 and `xpress_topc` 128 or 512. It defaults to zero.
+The initial vocabulary top-k still runs on CPU. Each refinement pass selects
+the next token embeddings directly from the shortlist; only the final shortlist
+positions return to CPU to recover token IDs.
+
+This caches an additional input embedding per candidate for the current draft
+block. Selecting those embeddings avoids the device integer-layout conversions
+needed to feed token IDs back into an embedding lookup. Full-vocabulary device
+selection remains follow-up work.
+
 ## Validation
 
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
+uv run --no-sync pytest tests/e2e/test_xpress_feedback.py -m model_quality -s
 SPYRE_XPRESS_TEST_TOPC=128 uv run --no-sync pytest \
   tests/e2e/test_speculative_decoding.py tests/e2e/test_xpress_batch.py -m model_quality -s
+SPYRE_XPRESS_DEVICE_FEEDBACK=1 uv run --no-sync pytest \
+  tests/e2e/test_xpress_batch.py -m model_quality -s
 ```
 
 PR regression jobs prefetch both pinned models before running the quality gate.

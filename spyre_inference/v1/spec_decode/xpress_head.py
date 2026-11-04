@@ -20,6 +20,19 @@ from torch.nn import functional as F
 from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead as _UpstreamHead
 
 
+def select_feedback(scores, embeddings, order, previous):
+    maxima = scores.amax(dim=-1, keepdim=True)
+    first = torch.where(scores == maxima, order, scores.shape[-1]).amin(dim=-1, keepdim=True)
+    selected = (order == first).to(scores.dtype)
+    batch, slots, count = scores.shape
+    # Select embeddings in FP16: device-generated INT32 IDs cannot index a
+    # standard-layout embedding table on the current torch-spyre pin.
+    winners = torch.bmm(
+        selected.view(batch * slots, 1, count), embeddings.view(batch * slots, count, -1)
+    ).view(batch, slots, -1)
+    return first.squeeze(-1), torch.cat((previous[:, :2], winners[:, :-1]), dim=1)
+
+
 class XPressRefinerHead(_UpstreamHead):
     """Upstream's head, construction and loading included, with Spyre step helpers."""
 
@@ -73,7 +86,9 @@ class XPressRefinerHead(_UpstreamHead):
         return F.linear(cache, self.in_proj.weight[:, : 2 * self.rank])
 
     def refine_latent(self, previous_ids, projected_cache):
-        embeddings = self.w1(previous_ids)
+        return self._latent_from_embeddings(self.w1(previous_ids), projected_cache)
+
+    def _latent_from_embeddings(self, embeddings, projected_cache):
         token_projection = (
             embeddings @ self._token_proj_t
             if self._token_proj_t is not None
@@ -85,6 +100,9 @@ class XPressRefinerHead(_UpstreamHead):
         """Candidate IDs must be flat for Spyre's embedding kernel."""
         return F.embedding(candidates, self.w2.weight)
 
+    def prepare_feedback(self, candidates, previous_ids):
+        return self.w1(candidates), self.w1(previous_ids), self.gather_readout(candidates)
+
     def refine_full(self, base, previous_ids, projected_cache):
         latent = self.refine_latent(previous_ids, projected_cache)
         if self._readout_t is not None:
@@ -95,6 +113,13 @@ class XPressRefinerHead(_UpstreamHead):
 
     def refine_candidates(self, base, previous_ids, projected_cache, readout):
         latent = self.refine_latent(previous_ids, projected_cache)
+        return self._candidate_logits(base, latent, readout)
+
+    def refine_feedback(self, base, previous_embeddings, projected_cache, readout):
+        latent = self._latent_from_embeddings(previous_embeddings, projected_cache)
+        return self._candidate_logits(base, latent, readout)
+
+    def _candidate_logits(self, base, latent, readout):
         batch, slots, candidates = base.shape
         bias = torch.bmm(
             readout.reshape(batch * slots, candidates, self.rank),

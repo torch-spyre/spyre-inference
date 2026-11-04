@@ -27,11 +27,13 @@ from vllm.model_executor.models.qwen3_dflash import (
 )
 from vllm.model_executor.models.qwen3_xpress import Qwen3XPressForCausalLM, Qwen3XPressModel
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
 from spyre_inference.v1.spec_decode.checkpoint import validate_dflash_weights
-from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead
+from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead, select_feedback
+from spyre_inference.v1.worker import compile_guard
 
 
 def _project_context(attention, context, positions):
@@ -126,6 +128,7 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         super().load_weights(weights.items())
 
     def prepare_for_spyre(self) -> None:
+        self._device_feedback_enabled = False
         self.model.prepare_for_spyre()
         self._combine = torch.compile(self.model.fc, fullgraph=True, dynamic=False)
         for layer in self.model.layers:
@@ -141,6 +144,26 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             self._refine_candidates = torch.compile(
                 head.refine_candidates, fullgraph=True, dynamic=False
             )
+            if envs.SPYRE_XPRESS_DEVICE_FEEDBACK:
+                if head.block_size != 16 or self.xpress_topc not in (128, 512):
+                    raise ValueError(
+                        "Device XPress feedback requires block size 16 and topc 128 or 512"
+                    )
+                self._device_feedback_enabled = True
+                self._feedback_order = torch.arange(
+                    min(self.xpress_topc, self.config.vocab_size), dtype=torch.float16
+                ).to(head.w1.weight.device)
+                self._prepare_feedback = torch.compile(
+                    head.prepare_feedback, fullgraph=True, dynamic=False
+                )
+                self._refine_feedback = torch.compile(
+                    head.refine_feedback, fullgraph=True, dynamic=False
+                )
+                self._select_feedback = torch.compile(
+                    select_feedback, fullgraph=True, dynamic=False
+                )
+                for function in (head.prepare_feedback, head.refine_feedback, select_feedback):
+                    compile_guard.watch(function, f"XPress {function.__name__}")
 
     def combine_hidden_states(self, hidden_states):
         return self._combine(hidden_states)
@@ -166,7 +189,9 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         base = self.compute_device_logits(hidden_states).view(batch, hidden_blocks.shape[1], -1)
         host_base = self._copy_logits_to_cpu(base)[:, 1:]
         draft = self._argmax_on_cpu(host_base)
+        device_feedback = False
         if self.xpress_head is not None and self.xpress_num_passes:
+            device_feedback = getattr(self, "_device_feedback_enabled", False)
             cache = self._hidden_cache(hidden_blocks)
             candidates = readout = None
             base = base[:, 1:]
@@ -177,19 +202,36 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 # Flat indices avoid gather page splits across request axes.
                 candidate_ids = convert(candidates.flatten(), device=hidden_states.device)
                 base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
-                readout = self._gather_readout(candidate_ids)
-            for _ in range(self.xpress_num_passes):
-                # The anchor is its own predecessor, as in upstream's XPressSpeculator.
+                if not device_feedback:
+                    readout = self._gather_readout(candidate_ids)
+            if device_feedback:
+                assert candidates is not None
                 previous = torch.cat(
                     (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
                 )
-                previous = convert(previous, device=hidden_states.device)
-                logits = (
-                    self._refine(base, previous, cache)
-                    if candidates is None
-                    else self._refine_candidates(base, previous, cache, readout)
+                embeddings, feedback, readout = self._prepare_feedback(
+                    candidate_ids, convert(previous, device=hidden_states.device)
                 )
-                draft = self._argmax_on_cpu(self._copy_logits_to_cpu(logits), candidates)
+            for _ in range(self.xpress_num_passes):
+                if device_feedback:
+                    logits = self._refine_feedback(base, feedback, cache, readout)
+                    indices, feedback = self._select_feedback(
+                        logits, embeddings, self._feedback_order, feedback
+                    )
+                else:
+                    # The anchor is its own predecessor, as in upstream's XPressSpeculator.
+                    previous = torch.cat(
+                        (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
+                    )
+                    previous = convert(previous, device=hidden_states.device)
+                    logits = (
+                        self._refine(base, previous, cache)
+                        if candidates is None
+                        else self._refine_candidates(base, previous, cache, readout)
+                    )
+                    draft = self._argmax_on_cpu(self._copy_logits_to_cpu(logits), candidates)
+        if device_feedback:
+            draft = candidates.gather(-1, indices.cpu().long().unsqueeze(-1)).squeeze(-1)
         return draft.tolist()
 
 

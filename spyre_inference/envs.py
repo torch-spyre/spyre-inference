@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
-    SPYRE_XPRESS_DEVICE_FEEDBACK: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
@@ -57,9 +56,6 @@ _cache: dict[str, Any] = {}
 
 # --8<-- [start:env-vars-definition]
 environment_variables: dict[str, Callable[[], Any]] = {
-    "SPYRE_XPRESS_DEVICE_FEEDBACK": lambda: bool(
-        int(os.getenv("SPYRE_XPRESS_DEVICE_FEEDBACK", "0"))
-    ),
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),

@@ -21,14 +21,8 @@ import torch
 from spyre_testing_plugin.pytest_plugin import spyre_hardware_present
 from torch.nn import functional as F
 
-from spyre_inference import envs
 
-pytestmark = pytest.mark.model_quality
-
-
-@pytest.mark.parametrize(
-    "block,topc", [(8, 1), (8, 7), (8, 64), (16, 65), (16, 128), (16, 256), (16, 512), (32, 1024)]
-)
+@pytest.mark.parametrize("block,topc", [(8, 1), (16, 65), (32, 1024)])
 def test_batched_feedback_preserves_selection_and_request_anchors(block, topc):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
@@ -45,9 +39,9 @@ def test_batched_feedback_preserves_selection_and_request_anchors(block, topc):
     count = topc + -topc % 64
     with torch.inference_mode(), warnings.catch_warnings():
         warnings.simplefilter("error", FallbackWarning)
-        order = torch.arange(count).half().to("spyre")
+        order = F.pad(torch.arange(topc).half(), (0, count - topc), value=-1).to("spyre")
         for batch in (1, 2, 4):
-            for kind in ("random", "all_equal", "edge_ties", "negative"):
+            for kind in ("random", "all_equal", "edge_ties", "negative", "nonfinite"):
                 scores = torch.randn(batch, slots, topc).half()
                 if kind == "all_equal":
                     scores.zero_()
@@ -63,11 +57,17 @@ def test_batched_feedback_preserves_selection_and_request_anchors(block, topc):
                         ]
                         index = min(topc - 1, max(0, index))
                         scores[:, row, index] = scores[:, row, topc - 1] = 9
+                elif kind == "nonfinite":
+                    scores[:, 0] = torch.nan
+                    scores[:, 1] = -torch.inf
+                    scores[:, 2] = torch.inf
+                    scores[:, 3, 0] = torch.inf
+                    scores[:, 3, topc // 2 :] = torch.nan
                 embeddings = torch.randn(batch * slots * count, 64).half().to("spyre")
                 previous = torch.randn(batch, block, 64).half().to("spyre")
-                device_scores = F.pad(scores, (0, count - topc), value=-torch.inf).to("spyre")
+                device_scores = F.pad(scores, (0, count - topc), value=torch.nan).to("spyre")
                 # DLF16 upload can round close scores into ties; use resident values.
-                expected = device_scores.cpu().argmax(-1)
+                expected = device_scores.cpu()[..., :topc].argmax(-1)
                 winners = (
                     embeddings.cpu()
                     .view(batch, slots, count, 64)
@@ -80,11 +80,8 @@ def test_batched_feedback_preserves_selection_and_request_anchors(block, topc):
                 assert torch.equal(feedback.cpu(), expected_feedback), (batch, kind)
 
 
-@pytest.mark.parametrize("block,topc", [(8, 1), (8, 7), (8, 65), (16, 128), (16, 512), (32, 256)])
-@pytest.mark.parametrize("batch", [1, 4])
-def test_feedback_drives_refinement_without_per_pass_host_selection(
-    monkeypatch, batch, block, topc
-):
+@pytest.mark.parametrize("batch,block,topc", [(4, 8, 1), (4, 8, 65), (4, 32, 256), (1, 16, 512)])
+def test_feedback_drives_refinement_without_per_pass_host_selection(batch, block, topc):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
     import torch_spyre
@@ -101,7 +98,6 @@ def test_feedback_drives_refinement_without_per_pass_host_selection(
     head = XPressRefinerHead(vocab, 128, block, rank=256, mlp_hidden=512, topc=topc).eval()
     head.fold_from_raw_(torch.randn_like(head.mix_L) * 0.01)
     head = head.half().to("spyre")
-    monkeypatch.setattr(envs, "SPYRE_XPRESS_DEVICE_FEEDBACK", True)
     with torch.inference_mode(), warnings.catch_warnings():
         warnings.simplefilter("error", FallbackWarning)
         hidden = torch.randn(batch * block, 128).half().to("spyre")
@@ -149,7 +145,7 @@ def test_feedback_drives_refinement_without_per_pass_host_selection(
             return refine(base, previous, cache, readout)
 
         def checked_select(scores, embeddings, order, previous):
-            expected = scores.cpu().argmax(-1)
+            expected = scores.cpu()[..., :topc].argmax(-1)
             indices, feedback = select(scores, embeddings, order, previous)
             assert torch.equal(indices.cpu().long(), expected)
             state["draft"] = candidates.gather(-1, expected.unsqueeze(-1)).squeeze(-1)

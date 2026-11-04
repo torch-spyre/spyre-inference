@@ -17,20 +17,19 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.nn import functional as F
 from xpress_reference import merged_refine
 
-from spyre_inference import envs
 from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
 from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead, select_feedback
 from spyre_inference.v1.worker import compile_guard
 
 
-@pytest.mark.parametrize("feedback", [False, True])
 @pytest.mark.parametrize(
     "block,topc,vocab",
-    [(8, 1, 1031), (8, 7, 1031), (16, 65, 1031), (16, 256, 1031), (32, 1024, 2049), (32, 2048, 73)],
+    [(8, 1, 1031), (8, 7, 1031), (16, 65, 1031), (16, 256, 1031), (32, 1024, 2049), (32, 73, 73)],
 )
-def test_feedback_compilation_requires_opt_in(monkeypatch, feedback, block, topc, vocab):
+def test_feedback_warmup_compiles_and_watches_every_helper(monkeypatch, block, topc, vocab):
     head = XPressRefinerHead(vocab, 128, block, rank=64, mlp_hidden=128, topc=topc)
     model = SimpleNamespace(
         model=SimpleNamespace(prepare_for_spyre=lambda: None, fc=torch.nn.Identity(), layers=[]),
@@ -46,35 +45,18 @@ def test_feedback_compilation_requires_opt_in(monkeypatch, feedback, block, topc
 
     monkeypatch.setattr(head, "prepare_for_spyre", lambda: None)
     monkeypatch.setattr(torch, "compile", compile)
-    monkeypatch.setattr(envs, "SPYRE_XPRESS_DEVICE_FEEDBACK", feedback)
     monkeypatch.setattr(compile_guard, "watch", lambda function, label: watched.append(function))
     SpyreDFlashQwen3ForCausalLM.prepare_for_spyre(model)
-    assert model._device_feedback_enabled is feedback
-    if feedback:
-        count = min(topc, vocab)
-        assert torch.equal(model._feedback_order, torch.arange(count + -count % 64).half())
+    expected_order = F.pad(torch.arange(topc).half(), (0, -topc % 64), value=-1)
+    assert torch.equal(model._feedback_order, expected_order)
     for function in (head.prepare_feedback, head.refine_feedback, select_feedback):
-        assert (function in compiled) is feedback
-        assert (function in watched) is feedback
+        assert function in compiled
+        assert function in watched
 
 
-@pytest.mark.parametrize("topc", [0, 1025, 2048])
-def test_feedback_rejects_unsupported_configuration(monkeypatch, topc):
-    head = XPressRefinerHead(2049, 128, 16, rank=64, mlp_hidden=128, topc=topc)
-    model = SimpleNamespace(
-        model=SimpleNamespace(prepare_for_spyre=lambda: None, fc=torch.nn.Identity(), layers=[]),
-        xpress_head=head,
-        xpress_topc=topc,
-        config=SimpleNamespace(vocab_size=2049),
-    )
-    monkeypatch.setattr(head, "prepare_for_spyre", lambda: None)
-    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
-    monkeypatch.setattr(envs, "SPYRE_XPRESS_DEVICE_FEEDBACK", True)
-    with pytest.raises(ValueError, match="requires a shortlist of 1 to 1024 candidates"):
-        SpyreDFlashQwen3ForCausalLM.prepare_for_spyre(model)
-
-
-@pytest.mark.parametrize("kind", ["random", "all_equal", "negative", "edge_ties"])
+@pytest.mark.parametrize(
+    "kind", ["random", "all_equal", "negative", "edge_ties", "nonfinite", "precision_ties"]
+)
 @pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize(
     "block,topc", [(8, 1), (8, 7), (8, 64), (16, 65), (16, 128), (16, 256), (16, 512), (32, 1024)]
@@ -93,13 +75,26 @@ def test_feedback_keeps_first_ties_and_request_anchors(kind, batch, block, topc)
             index = (31, 32, 63, 64, topc // 2 - 1, topc // 2, topc - 2, topc - 1)[row % 8]
             index = min(topc - 1, max(0, index))
             scores[:, row, index] = scores[:, row, topc - 1] = 9
-    embeddings = torch.randn(batch * slots * topc, 64).half()
-    previous = torch.randn(batch, block, 64).half()
-    indices, feedback = select_feedback(scores, embeddings, torch.arange(topc).half(), previous)
+    elif kind == "nonfinite":
+        scores[:, 0] = torch.nan
+        scores[:, 1] = -torch.inf
+        scores[:, 2] = torch.inf
+        scores[:, 3, 0] = torch.inf
+        scores[:, 3, topc // 2 :] = torch.nan
+    elif kind == "precision_ties":
+        scores.fill_(-4)
+        scores[:, :, 0] = torch.tensor(1.0001).half()
+        scores[:, :, -1] = torch.tensor(1.0002).half()
     expected = scores.argmax(-1)
+    count = topc + -topc % 64
+    scores = F.pad(scores, (0, count - topc), value=torch.nan)
+    order = F.pad(torch.arange(topc).half(), (0, count - topc), value=-1)
+    embeddings = torch.randn(batch * slots * count, 64).half()
+    previous = torch.randn(batch, block, 64).half()
+    indices, feedback = select_feedback(scores, embeddings, order, previous)
     assert torch.equal(indices.long(), expected)
     winners = (
-        embeddings.view(batch, slots, topc, 64)
+        embeddings.view(batch, slots, count, 64)
         .gather(2, expected[..., None, None].expand(-1, -1, 1, 64))
         .squeeze(2)
     )
@@ -118,11 +113,11 @@ def test_feedback_serving_loop_matches_upstream_without_per_pass_logit_copies(
     hidden, base = torch.randn(batch * block, 128), torch.randn(batch * block, 1031)
     anchor = torch.arange(batch) + 1025
     model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=1031),
         xpress_head=head,
         xpress_num_passes=passes,
         xpress_topc=topc,
-        _device_feedback_enabled=True,
-        _feedback_order=torch.arange(topc + -topc % 64).half(),
+        _feedback_order=F.pad(torch.arange(topc).half(), (0, -topc % 64), value=-1),
         compute_device_logits=lambda _: base,
         _hidden_cache=head.project_hidden_cache,
         _prepare_feedback=Mock(wraps=head.prepare_feedback),

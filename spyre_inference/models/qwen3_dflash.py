@@ -28,7 +28,6 @@ from vllm.model_executor.models.qwen3_dflash import (
 )
 from vllm.model_executor.models.qwen3_xpress import Qwen3XPressForCausalLM, Qwen3XPressModel
 
-from spyre_inference import envs
 from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
@@ -129,7 +128,6 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         super().load_weights(weights.items())
 
     def prepare_for_spyre(self) -> None:
-        self._device_feedback_enabled = False
         self.model.prepare_for_spyre()
         self._combine = torch.compile(self.model.fc, fullgraph=True, dynamic=False)
         for layer in self.model.layers:
@@ -140,35 +138,20 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             self._hidden_cache = torch.compile(
                 head.project_hidden_cache, fullgraph=True, dynamic=False
             )
-            self._refine = torch.compile(head.refine_full, fullgraph=True, dynamic=False)
-            self._gather_readout = torch.compile(head.gather_readout, fullgraph=True, dynamic=False)
-            self._refine_candidates = torch.compile(
-                head.refine_candidates, fullgraph=True, dynamic=False
+            # DL16 represents shortlist positions and the sentinel exactly through 1024.
+            order = torch.arange(self.xpress_topc, dtype=torch.float16)
+            self._feedback_order = F.pad(order, (0, -self.xpress_topc % 64), value=-1).to(
+                head.w1.weight.device
             )
-            if envs.SPYRE_XPRESS_DEVICE_FEEDBACK:
-                count = min(self.xpress_topc, self.config.vocab_size)
-                # DL16 represents every integer through 1024 exactly, including
-                # the sentinel used to choose the first tied shortlist position.
-                if not 1 <= count <= 1024:
-                    raise ValueError(
-                        "Device XPress feedback requires a shortlist of 1 to 1024 candidates"
-                    )
-                self._device_feedback_enabled = True
-                count += -count % 64
-                self._feedback_order = torch.arange(count, dtype=torch.float16).to(
-                    head.w1.weight.device
-                )
-                self._prepare_feedback = torch.compile(
-                    head.prepare_feedback, fullgraph=True, dynamic=False
-                )
-                self._refine_feedback = torch.compile(
-                    head.refine_feedback, fullgraph=True, dynamic=False
-                )
-                self._select_feedback = torch.compile(
-                    select_feedback, fullgraph=True, dynamic=False
-                )
-                for function in (head.prepare_feedback, head.refine_feedback, select_feedback):
-                    compile_guard.watch(function, f"XPress {function.__name__}")
+            self._prepare_feedback = torch.compile(
+                head.prepare_feedback, fullgraph=True, dynamic=False
+            )
+            self._refine_feedback = torch.compile(
+                head.refine_feedback, fullgraph=True, dynamic=False
+            )
+            self._select_feedback = torch.compile(select_feedback, fullgraph=True, dynamic=False)
+            for function in (head.prepare_feedback, head.refine_feedback, select_feedback):
+                compile_guard.watch(function, f"XPress {function.__name__}")
 
     def combine_hidden_states(self, hidden_states):
         return self._combine(hidden_states)
@@ -182,67 +165,37 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         # Cast during D2H: device widening produces a nonstandard lane arrangement.
         return logits.to(device="cpu", dtype=torch.float32)
 
-    def _argmax_on_cpu(self, host_logits, candidates=None):
-        result = host_logits.argmax(-1)
-        if candidates is not None:
-            result = candidates.gather(-1, result.unsqueeze(-1)).squeeze(-1)
-        return result
+    def _argmax_on_cpu(self, host_logits):
+        return host_logits.argmax(-1)
 
     def propose_block(self, hidden_states, anchor_ids):
         batch = anchor_ids.numel()
         hidden_blocks = hidden_states.view(batch, -1, hidden_states.shape[-1])
         base = self.compute_device_logits(hidden_states).view(batch, hidden_blocks.shape[1], -1)
-        host_base = self._copy_logits_to_cpu(base)[:, 1:]
+        host_base = self._copy_logits_to_cpu(base)[:, 1:, : self.config.vocab_size]
         draft = self._argmax_on_cpu(host_base)
-        device_feedback = False
-        if self.xpress_head is not None and self.xpress_num_passes:
-            device_feedback = getattr(self, "_device_feedback_enabled", False)
-            cache = self._hidden_cache(hidden_blocks)
-            candidates = readout = None
-            base = base[:, 1:]
-            if self.xpress_topc:
-                base_c, candidates = host_base.topk(
-                    min(self.xpress_topc, host_base.shape[-1]), dim=-1
-                )
-                candidate_ids = candidates
-                if device_feedback and (padding := -candidates.shape[-1] % 64):
-                    # BMM padding cannot split flattened candidate embedding rows.
-                    candidate_ids = F.pad(candidate_ids, (0, padding))
-                    base_c = F.pad(base_c, (0, padding), value=-torch.inf)
-                # Flat indices avoid gather page splits across request axes.
-                candidate_ids = convert(candidate_ids.flatten(), device=hidden_states.device)
-                base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
-                if not device_feedback:
-                    readout = self._gather_readout(candidate_ids)
-            if device_feedback:
-                assert candidates is not None
-                previous = torch.cat(
-                    (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
-                )
-                embeddings, feedback, readout = self._prepare_feedback(
-                    candidate_ids, convert(previous, device=hidden_states.device)
-                )
-            for _ in range(self.xpress_num_passes):
-                if device_feedback:
-                    logits = self._refine_feedback(base, feedback, cache, readout)
-                    indices, feedback = self._select_feedback(
-                        logits, embeddings, self._feedback_order, feedback
-                    )
-                else:
-                    # The anchor is its own predecessor, as in upstream's XPressSpeculator.
-                    previous = torch.cat(
-                        (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
-                    )
-                    previous = convert(previous, device=hidden_states.device)
-                    logits = (
-                        self._refine(base, previous, cache)
-                        if candidates is None
-                        else self._refine_candidates(base, previous, cache, readout)
-                    )
-                    draft = self._argmax_on_cpu(self._copy_logits_to_cpu(logits), candidates)
-        if device_feedback:
-            draft = candidates.gather(-1, indices.cpu().long().unsqueeze(-1)).squeeze(-1)
-        return draft.tolist()
+        if self.xpress_head is None or not self.xpress_num_passes:
+            return draft.tolist()
+        cache = self._hidden_cache(hidden_blocks)
+        base_c, candidates = host_base.topk(self.xpress_topc, dim=-1)
+        # BMM padding cannot split flattened candidate embedding rows.
+        padding = -self.xpress_topc % 64
+        candidate_ids = F.pad(candidates, (0, padding))
+        base_c = F.pad(base_c, (0, padding), value=-torch.inf)
+        # Flat indices avoid gather page splits across request axes.
+        candidate_ids = convert(candidate_ids.flatten(), device=hidden_states.device)
+        base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
+        # The anchor is its own predecessor, as in upstream's XPressSpeculator.
+        previous = torch.cat((anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1)
+        embeddings, feedback, readout = self._prepare_feedback(
+            candidate_ids, convert(previous, device=hidden_states.device)
+        )
+        for _ in range(self.xpress_num_passes):
+            logits = self._refine_feedback(base, feedback, cache, readout)
+            indices, feedback = self._select_feedback(
+                logits, embeddings, self._feedback_order, feedback
+            )
+        return candidates.gather(-1, indices.cpu().long().unsqueeze(-1)).squeeze(-1).tolist()
 
 
 class SpyreQwen3XPressModel(SpyreDFlashQwen3Model, Qwen3XPressModel):

@@ -125,6 +125,10 @@ override-dependencies = [
     # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
     # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.
     "pyzmq>=27.2.0",
+
+    # orjson dropped its ppc64le/s390x wheels at 3.12.0 and its sdist wants rustc >=1.95 against UBI10's 1.92, so cap p/z below 3.12; the second entry is NOT optional -- an override REPLACES vllm's requirement (a gated entry alone drops orjson elsewhere) and its >=3.12 floor is what makes uv fork instead of unifying both branches on 3.11.9.
+    "orjson>=3.11.6,<3.12; platform_machine in 's390x, ppc64le'",
+    "orjson>=3.12; platform_machine not in 's390x, ppc64le'",
 ]
 
 constraint-dependencies = [

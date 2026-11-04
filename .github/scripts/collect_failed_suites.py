@@ -16,8 +16,9 @@
 Pod-level retry for _test_matrix.yaml, driven by job conclusions so a leg whose runner died
 before uploading anything is still retried (#1454).
 
-    collect -- write the retry matrix and has_failed to GITHUB_OUTPUT.
-    verify  -- fail unless every matrix leg passed directly or on retry.
+    collect 1 -- retry matrix of every `test` leg that did not pass.
+    collect 2 -- retry matrix of round-1 retries that died on infra, not on a test failure.
+    verify    -- fail unless every matrix leg passed directly or on a retry.
 """
 
 import json
@@ -26,14 +27,17 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "_test_matrix.yaml"
-RETRY_SUFFIX = " (pod-level retry)"
+ROUNDS = 2
 # The caller's job id prefixes the name ("test / ...", "run-tests / ..."); cfg itself has parens.
-LEG_NAME = re.compile(r"build and run tests \((?P<cfg>.+)\)$")
+LEG_NAME = re.compile(
+    r"build and run tests \((?P<cfg>.+?)\)(?P<retry> \(pod-level retry(?: (?P<round>\d+))?\))?$"
+)
 PASSED = ("success", "skipped")
 
 
@@ -42,64 +46,128 @@ def matrix_include() -> list[dict]:
     return doc["jobs"]["test"]["strategy"]["matrix"]["include"]
 
 
-def list_jobs(repo: str, run_id: str, attempt: str) -> list[dict]:
+def list_jobs(repo: str, run_id: str, attempt: int) -> list[dict]:
     cmd = [
         "gh",
         "api",
         "--paginate",
         f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
         "--jq",
-        ".jobs[] | {name, status, conclusion}",
+        ".jobs[] | {name, status, conclusion, steps: [.steps[]? | {name, conclusion}]}",
     ]
-    for delay in (5, 15, 45, 0):
+    delays = (5, 15, 30, 60, 120)
+    for i in range(len(delays) + 1):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         print(result.stderr, file=sys.stderr)
-        time.sleep(delay)
-    raise SystemExit("::error::Could not list this run attempt's jobs.")
+        if i < len(delays):
+            time.sleep(delays[i])
+    raise SystemExit(f"::error::Could not list the jobs of run attempt {attempt}.")
 
 
-def legs(jobs: list[dict]) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
-    test: dict[str, list[dict]] = {}
-    retry: dict[str, list[dict]] = {}
+@dataclass
+class Legs:
+    """Matrix jobs keyed by cfg: `test` legs, and retry legs per round (0 = the `test` leg)."""
+
+    rounds: list[dict[str, dict]] = field(default_factory=lambda: [{} for _ in range(ROUNDS + 1)])
+
+    @property
+    def test(self) -> dict[str, dict]:
+        return self.rounds[0]
+
+    def add(self, job: dict) -> None:
+        m = LEG_NAME.search(job["name"])
+        # An unexpanded matrix reports one job literally named "... (${{ matrix.cfg }})".
+        if m and "${{" not in m["cfg"]:
+            rnd = int(m["round"] or 1) if m["retry"] else 0
+            self.rounds[rnd][m["cfg"]] = job
+
+
+def parse(jobs: list[dict]) -> Legs:
+    legs = Legs()
     for job in jobs:
-        name = job["name"]
-        is_retry = name.endswith(RETRY_SUFFIX)
-        if is_retry:
-            name = name[: -len(RETRY_SUFFIX)]
-        m = LEG_NAME.search(name)
-        if m:
-            (retry if is_retry else test).setdefault(m["cfg"], []).append(job)
-    return test, retry
+        legs.add(job)
+    return legs
 
 
-def failed_cfgs(test: dict[str, list[dict]]) -> list[str]:
-    # No conclusion yet (runner lost, API lag) counts as failed.
-    return [cfg for cfg, jobs in test.items() if any(j["conclusion"] not in PASSED for j in jobs)]
+def died_on_infra(job: dict) -> bool:
+    """Did not pass, but its test step never concluded with a failure (runner lost, setup)."""
+    if job["conclusion"] in PASSED:
+        return False
+    return not any(
+        s["name"].startswith("Run matrix config") and s["conclusion"] == "failure"
+        for s in job.get("steps", [])
+    )
 
 
-def build_retry_matrix(jobs: list[dict], include: list[dict]) -> dict:
-    test, _ = legs(jobs)
-    by_cfg = {entry["cfg"]: entry for entry in include}
-    failed = failed_cfgs(test)
-    unknown = [cfg for cfg in failed if cfg not in by_cfg]
+def needs_round(legs: Legs, cfgs: list[str], rnd: int) -> list[str]:
+    if not legs.test:
+        return []
+    if rnd == 1:
+        # A cfg missing from the job list, or with no conclusion yet, counts as failed.
+        return [c for c in cfgs if legs.test.get(c, {}).get("conclusion") not in PASSED]
+    prev = legs.rounds[rnd - 1]
+    return [c for c in needs_round(legs, cfgs, rnd - 1) if c not in prev or died_on_infra(prev[c])]
+
+
+def retry_matrix(legs: Legs, include: list[dict], rnd: int) -> dict:
+    cfgs = [e["cfg"] for e in include]
+    unknown = sorted(
+        c for c, j in legs.test.items() if c not in cfgs and j["conclusion"] not in PASSED
+    )
     if unknown:
-        raise SystemExit(f"::error::Failed legs not in the static matrix: {unknown}")
-    print(f"Suites to retry: {failed}")
-    return {"include": [by_cfg[cfg] for cfg in failed]}
+        print(f"::warning::Failed legs not in the static matrix, not retried: {unknown}")
+    if not legs.test:
+        print("::warning::The `test` matrix never expanded; nothing to retry.")
+    retry = needs_round(legs, cfgs, rnd)
+    print(f"Round {rnd} suites to retry: {retry}")
+    return {"include": [e for e in include if e["cfg"] in retry]}
 
 
-def verify(jobs: list[dict], include: list[dict]) -> list[str]:
-    test, retry = legs(jobs)
-    errors = [f"{e['cfg']}: no `test` leg ran" for e in include if e["cfg"] not in test]
-    for cfg in failed_cfgs(test):
-        conclusions = [j["conclusion"] for j in retry.get(cfg, [])]
-        if not conclusions:
-            errors.append(f"{cfg}: failed and was never retried")
-        elif any(c != "success" for c in conclusions):
-            errors.append(f"{cfg}: failed, and its pod-level retry ended {conclusions}")
+def verify(legs: Legs, include: list[dict]) -> list[str]:
+    if not legs.test:
+        return ["the `test` matrix never expanded, so no suite ran"]
+    cfgs = [e["cfg"] for e in include]
+    errors = [
+        f"{c}: failed, and is not in the static matrix"
+        for c, j in sorted(legs.test.items())
+        if c not in cfgs and j["conclusion"] not in PASSED
+    ]
+    for cfg in cfgs:
+        history = [r[cfg]["conclusion"] if cfg in r else "missing" for r in legs.rounds]
+        while history and history[-1] == "missing":
+            history.pop()
+        if not history or history[-1] not in PASSED:
+            errors.append(f"{cfg}: did not pass (test, then each retry round: {history})")
     return errors
+
+
+def load(repo: str, run_id: str, attempt: int, cfgs: set[str]) -> Legs:
+    # `needs` has already waited for these jobs; this only rides out API lag on their conclusions.
+    polls = 18
+    for i in range(polls):
+        legs = parse(list_jobs(repo, run_id, attempt))
+        pending = sorted(
+            c for r in legs.rounds for c, j in r.items() if c in cfgs and j["status"] != "completed"
+        )
+        if not pending:
+            break
+        if i < polls - 1:
+            time.sleep(10)
+    else:
+        print(f"::warning::Still not completed after waiting, counted as failed: {pending}")
+
+    # A partial re-run lists carried-over jobs today; fall back to earlier attempts if it stops.
+    for earlier in range(attempt - 1, 0, -1):
+        missing = cfgs - legs.test.keys()
+        if not missing or not legs.test:
+            break
+        for cfg, job in parse(list_jobs(repo, run_id, earlier)).test.items():
+            if cfg in missing:
+                print(f"{cfg}: not listed in attempt {attempt}, using attempt {earlier}")
+                legs.test[cfg] = job
+    return legs
 
 
 def set_output(name: str, value: str) -> None:
@@ -108,32 +176,21 @@ def set_output(name: str, value: str) -> None:
 
 
 def main() -> None:
-    mode = sys.argv[1] if len(sys.argv) > 1 else "collect"
-    repo = os.environ["GITHUB_REPOSITORY"]
-    run_id = os.environ["GITHUB_RUN_ID"]
-    attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+    mode, *rest = sys.argv[1:] or ["collect"]
     include = matrix_include()
-
-    cfgs = {entry["cfg"] for entry in include}
-    # `needs` has already waited for these jobs; this only rides out API lag on their conclusions.
-    for _ in range(6):
-        jobs = list_jobs(repo, run_id, attempt)
-        pending = [
-            cfg
-            for side in legs(jobs)
-            for cfg, js in side.items()
-            if cfg in cfgs and any(j["status"] != "completed" for j in js)
-        ]
-        if not pending:
-            break
-        time.sleep(10)
+    legs = load(
+        os.environ["GITHUB_REPOSITORY"],
+        os.environ["GITHUB_RUN_ID"],
+        int(os.environ["GITHUB_RUN_ATTEMPT"]),
+        {e["cfg"] for e in include},
+    )
 
     if mode == "collect":
-        matrix = build_retry_matrix(jobs, include)
+        matrix = retry_matrix(legs, include, int(rest[0]) if rest else 1)
         set_output("matrix", json.dumps(matrix))
         set_output("has_failed", "true" if matrix["include"] else "false")
     elif mode == "verify":
-        errors = verify(jobs, include)
+        errors = verify(legs, include)
         for err in errors:
             print(f"::error::{err}")
         if errors:

@@ -976,20 +976,21 @@ jobs:
       - name: Checkout scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          # The commit this workflow was loaded from, so the static matrix matches the job names.
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
           sparse-checkout: |
+            .github/actions/collect-failed-suites
             .github/scripts
             .github/workflows/_test_matrix.yaml
           sparse-checkout-cone-mode: false
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - id: collect
+        uses: ./.github/actions/collect-failed-suites
+        with:
+          args: collect 1
 
-      - name: Build retry matrix from failed test legs
-        id: collect
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: uv run --no-project --with pyyaml python -I .github/scripts/collect_failed_suites.py collect
-
-  # Pod-level retry: re-runs, on a brand-new runner pod, exactly the configs collect_failed_suites found failed (no changed-files gate, since these are already known to need running); a config that fails again here is a genuine failure.
+  # Pod-level retry: re-runs, on a brand-new runner pod, exactly the configs collect_failed_suites found failed (no changed-files gate, since these are already known to need running).
   test_retry:
     name: 'build and run tests (${{ matrix.cfg }}) (pod-level retry)'
     needs: [collect_failed_suites, resolve_durations]
@@ -1039,11 +1040,89 @@ jobs:
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
           hf_token: ${{ secrets.HF_TOKEN }}
 
+  collect_failed_suites_2:
+    name: Collect suites for second pod-level retry
+    needs: [collect_failed_suites, test_retry]
+    if: ${{ !cancelled() && needs.collect_failed_suites.outputs.has_failed == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+      has_failed: ${{ steps.collect.outputs.has_failed }}
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The commit this workflow was loaded from, so the static matrix matches the job names.
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .github/actions/collect-failed-suites
+            .github/scripts
+            .github/workflows/_test_matrix.yaml
+          sparse-checkout-cone-mode: false
+
+      - id: collect
+        uses: ./.github/actions/collect-failed-suites
+        with:
+          args: collect 2
+
+  # Second pod-level retry, only for round-1 retries that died before their tests failed
+  # (runner lost, setup error): a test failure on the retry is genuine and is not re-run.
+  # A copy of test_retry rather than a YAML anchor, which the runner may not parse.
+  test_retry_2:
+    name: 'build and run tests (${{ matrix.cfg }}) (pod-level retry 2)'
+    needs: [collect_failed_suites_2, resolve_durations]
+    if: ${{ !cancelled() && needs.collect_failed_suites_2.outputs.has_failed == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.collect_failed_suites_2.outputs.matrix) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label)) }}
+    timeout-minutes: 720
+    env:
+      CI: ''
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+      HF_HUB_OFFLINE: '1'
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      # Same composite action the `test` job uses -- a pod-level retry runs the exact same steps, just on a fresh pod, so there is no separate copy to keep in sync here.
+      - name: Run matrix config (pod-level retry 2)
+        timeout-minutes: 150
+        uses: ./.github/actions/run-matrix-config
+        with:
+          cfg: ${{ matrix.cfg }}
+          test_target: ${{ matrix.test_target }}
+          durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
+          test_type: ${{ inputs.test_type }}
+          # Survives the retry hop: collect_failed_suites copies the whole static matrix entry,
+          # test_types and runs_on included.
+          test_types: ${{ matrix.test_types }}
+          leg_arch: ${{ matrix.runs_on[0] }}
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
+          job_slot: retry2-${{ strategy.job-index }}
+          retry: 'true'
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+
   # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself); this job's own result is what determines the reusable workflow's overall conclusion.
-  # Re-reads job conclusions instead of trusting test_retry.result, so a dropped leg still fails.
+  # Re-reads job conclusions instead of trusting the retry jobs' results, so a dropped leg still fails.
   test_result:
     name: Test matrix result
-    needs: [build_kernels, test, collect_failed_suites, test_retry]
+    needs: [build_kernels, test, collect_failed_suites, test_retry, collect_failed_suites_2, test_retry_2]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -1058,24 +1137,19 @@ jobs:
       - name: Checkout scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          # The commit this workflow was loaded from, so the static matrix matches the job names.
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
           sparse-checkout: |
+            .github/actions/collect-failed-suites
             .github/scripts
             .github/workflows/_test_matrix.yaml
           sparse-checkout-cone-mode: false
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-
       - name: Evaluate combined result
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Suites retried: ${{ needs.collect_failed_suites.outputs.has_failed }}"
-          echo "test_retry result: ${{ needs.test_retry.result }}"
-          if [[ "${{ needs.collect_failed_suites.result }}" != "success" ]]; then
-            echo "::error::Collecting suites for pod-level retry failed (result: ${{ needs.collect_failed_suites.result }})."
-            exit 1
-          fi
-          uv run --no-project --with pyyaml python -I .github/scripts/collect_failed_suites.py verify
+        uses: ./.github/actions/collect-failed-suites
+        with:
+          args: verify
 
   # ---------------------------------------------------------------------------
   # Coverage fan-in: combine every job's data into one report. Stock runner
@@ -1085,7 +1159,7 @@ jobs:
   # ---------------------------------------------------------------------------
   coverage:
     name: Aggregate coverage
-    needs: [test, test_retry]
+    needs: [test, test_retry, test_retry_2]
     if: always()
     # Informational -- must never fail the reusable workflow (and thus the
     # callers' required-check gate).
@@ -1162,7 +1236,7 @@ jobs:
   # ---------------------------------------------------------------------------
   durations:
     name: Aggregate test durations
-    needs: [test, test_retry]
+    needs: [test, test_retry, test_retry_2]
     if: always()
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -1216,7 +1290,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-report:
     name: Aggregate test report
-    needs: [test, test_retry]
+    needs: [test, test_retry, test_retry_2]
     if: always()
     continue-on-error: true
     runs-on: ubuntu-latest

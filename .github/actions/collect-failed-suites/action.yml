@@ -1,0 +1,27 @@
+name: Collect failed suites
+description: >-
+  Runs .github/scripts/collect_failed_suites.py on this run attempt's job list. Checks out the
+  script and _test_matrix.yaml at github.sha, the commit the running workflow was loaded from,
+  so the static matrix it reads always matches the job names (not inputs.ref, which the legs test).
+inputs:
+  args:
+    description: Arguments for collect_failed_suites.py, e.g. "collect 1" or "verify"
+    required: true
+outputs:
+  matrix:
+    description: Retry matrix (collect only)
+    value: ${{ steps.run.outputs.matrix }}
+  has_failed:
+    description: Whether the retry matrix is non-empty (collect only)
+    value: ${{ steps.run.outputs.has_failed }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+    - id: run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ARGS: ${{ inputs.args }}
+      # ARGS is a fixed, space-separated word list from the workflow, so it splits unquoted.
+      run: uv run --no-project --with pyyaml python -I .github/scripts/collect_failed_suites.py $ARGS

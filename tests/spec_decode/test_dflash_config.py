@@ -53,22 +53,14 @@ def test_context_excludes_rejected_rows_and_uncomputed_correction(
     assert accepted_context_length(scheduled, drafts, sampled) == expected
 
 
-def test_xpress_bridge_preserves_checkpoint_and_disables_only_default_prefix_cache():
-    original = dict(
-        method="xpress", model="checkpoint", num_speculative_tokens=15, xpress_num_passes=0
-    )
-    args = NS(
-        speculative_config=original, additional_config={"unrelated": 1}, enable_prefix_caching=None
-    )
+def test_dflash_bridge_disables_padding_and_only_the_default_prefix_cache():
+    original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=0)
+    args = NS(speculative_config=original, enable_prefix_caching=None)
     normalize_speculative_config(args)
-    assert original["method"] == "xpress"
-    assert args.speculative_config == dict(
-        method="dflash",
-        model="checkpoint",
-        num_speculative_tokens=15,
-        disable_padded_drafter_batch=True,
+    assert original == dict(
+        method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=0
     )
-    assert args.additional_config == {"unrelated": 1, "spyre_xpress": {"num_passes": 0}}
+    assert args.speculative_config == original | {"disable_padded_drafter_batch": True}
     assert args.enable_prefix_caching is False
     args.speculative_config = original
     args.enable_prefix_caching = True
@@ -76,35 +68,22 @@ def test_xpress_bridge_preserves_checkpoint_and_disables_only_default_prefix_cac
     assert args.enable_prefix_caching is True
 
 
-def test_upstream_dflash_spelling_and_shortlist_override_are_preserved():
-    args = NS(
-        speculative_config=dict(method="dflash", model="checkpoint", xpress_topc=256),
-        additional_config={"unrelated": 1},
-        enable_prefix_caching=None,
-    )
+def test_other_methods_pass_through():
+    args = NS(speculative_config=dict(method="ngram"), enable_prefix_caching=None)
     normalize_speculative_config(args)
-    normalize_speculative_config(args)
-    assert args.speculative_config == dict(
-        method="dflash", model="checkpoint", disable_padded_drafter_batch=True
-    )
-    assert args.additional_config == {"unrelated": 1, "spyre_xpress": {"topc": 256}}
-    assert args.enable_prefix_caching is False
+    assert args.speculative_config == dict(method="ngram")
+    assert args.enable_prefix_caching is None
 
 
 @pytest.mark.parametrize("method", [{}, {"method": None}])
 @pytest.mark.parametrize("prefix_cache", [None, False, True])
 def test_inferred_dflash_normalizes_before_vllm_cache_defaults(method, prefix_cache):
     original = dict(model="z-lab/Qwen3-8B-DFlash", **method)
-    args = NS(
-        speculative_config=original,
-        additional_config=None,
-        enable_prefix_caching=prefix_cache,
-    )
+    args = NS(speculative_config=original, enable_prefix_caching=prefix_cache)
     normalize_speculative_config(args)
     assert args.speculative_config == dict(
         model=original["model"], method="dflash", disable_padded_drafter_batch=True
     )
-    assert args.additional_config is None
     assert args.enable_prefix_caching is (prefix_cache is True)
     assert original == dict(model="z-lab/Qwen3-8B-DFlash", **method)
 
@@ -121,23 +100,10 @@ def test_inferred_dflash_normalizes_before_vllm_cache_defaults(method, prefix_ca
     ],
 )
 def test_dflash_inference_preserves_other_methods(spec):
-    args = NS(speculative_config=spec, additional_config=None, enable_prefix_caching=None)
+    args = NS(speculative_config=spec, enable_prefix_caching=None)
     normalize_speculative_config(args)
     assert args.speculative_config is spec
     assert args.enable_prefix_caching is None
-    assert args.additional_config is None
-
-
-@pytest.mark.parametrize("name", ["xpress_topc", "xpress_num_passes"])
-@pytest.mark.parametrize("value", [-1, True, 1.5, "512"])
-def test_invalid_cli_refiner_options_fail_before_vllm(name, value):
-    args = NS(
-        speculative_config={"method": "dflash", name: value},
-        additional_config=None,
-        enable_prefix_caching=None,
-    )
-    with pytest.raises(ValueError, match=name):
-        normalize_speculative_config(args)
 
 
 @pytest.fixture
@@ -176,7 +142,6 @@ def config():
         parallel_config=NS(tensor_parallel_size=1, pipeline_parallel_size=1),
         scheduler_config=NS(max_num_seqs=1, max_num_batched_tokens=64),
         cache_config=NS(enable_prefix_caching=False),
-        additional_config={"spyre_xpress": {}},
     )
 
 
@@ -189,50 +154,29 @@ def test_published_contract_is_accepted(config, batch):
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
 
-@pytest.mark.parametrize("architecture", ["Qwen3XPressModel", "DFlashQwen3XPressModel"])
-@pytest.mark.parametrize(
-    "checkpoint,override,expected",
-    [(None, None, 128), (512, None, 512), (512, 128, 128), (128, 0, 0), (0, 256, 256)],
-)
-def test_checkpoint_detection_and_topc_precedence(
-    config, architecture, checkpoint, override, expected
-):
+@pytest.mark.parametrize("checkpoint,expected", [(None, 128), (512, 512), (0, 0)])
+def test_spyre_topc_default_applies_only_when_unset(config, checkpoint, expected):
+    # Upstream writes --xpress-topc onto the draft config before this runs.
     draft = config.speculative_config.draft_model_config.hf_config
-    draft.architectures = [architecture]
-    config.speculative_config.draft_model_config.architecture = architecture
     draft.xpress_topc = checkpoint
-    config.additional_config = {} if override is None else {"spyre_xpress": {"topc": override}}
     validate_dflash_config(config)
     assert draft.xpress_topc == expected
 
 
-@pytest.mark.parametrize("value", [-1, True, 1.5, 151937])
-def test_invalid_checkpoint_topc_is_rejected(config, value):
-    config.speculative_config.draft_model_config.hf_config.xpress_topc = value
-    with pytest.raises(ValueError, match="xpress_topc"):
-        validate_dflash_config(config)
-
-
-@pytest.mark.parametrize("source", ["checkpoint", "additional_config"])
 @pytest.mark.parametrize("value", [-1, True, 1.5])
-def test_invalid_refinement_passes_fail_before_model_loading(config, source, value):
-    if source == "checkpoint":
-        config.speculative_config.draft_model_config.hf_config.xpress_num_passes = value
-    else:
-        config.additional_config["spyre_xpress"]["num_passes"] = value
+def test_invalid_refinement_passes_fail_before_model_loading(config, value):
+    config.speculative_config.draft_model_config.hf_config.xpress_num_passes = value
     with pytest.raises(ValueError, match="xpress_num_passes must be a nonnegative integer"):
         validate_dflash_config(config)
 
 
-def test_plain_dflash_does_not_accept_xpress_options(config):
+def test_plain_dflash_is_not_given_refiner_defaults(config):
     draft = config.speculative_config.draft_model_config.hf_config
     draft.architectures = ["DFlashDraftModel"]
     config.speculative_config.draft_model_config.architecture = "DFlashDraftModel"
     del draft.xpress_rank
-    with pytest.raises(ValueError, match="XPress options"):
-        validate_dflash_config(config)
-    config.additional_config = {}
     validate_dflash_config(config)
+    assert not hasattr(draft, "xpress_topc")
 
 
 @pytest.mark.parametrize("architecture", [None, "DFlash2DraftModel", "MuseGlimmerAssistantModel"])
@@ -247,7 +191,6 @@ def test_draft_validation_uses_the_architecture_vllm_selected(config):
     draft = config.speculative_config.draft_model_config.hf_config
     draft.architectures = ["UnknownDraftModel", "DFlashDraftModel", "Qwen3XPressModel"]
     config.speculative_config.draft_model_config.architecture = "DFlashDraftModel"
-    config.additional_config = {}
     del draft.xpress_rank
     validate_dflash_config(config)
 
@@ -325,3 +268,20 @@ def test_token_budget_includes_the_vllm_drafting_reservation(config, batch, budg
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget
     validate_dflash_config(config)
+
+
+def test_v1_keeps_upstreams_other_refusals_but_allows_xpress(monkeypatch):
+    from vllm.config.vllm import VllmConfig
+
+    from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "_get_v1_model_runner_unsupported_features",
+        lambda self: ["prefill context parallel", "xpress speculative decoding"],
+    )
+    allow_xpress_on_v1()
+    allow_xpress_on_v1()
+    assert VllmConfig._get_v1_model_runner_unsupported_features(None) == [
+        "prefill context parallel"
+    ]

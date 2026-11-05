@@ -16,33 +16,37 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from torch.nn import functional as F
 from xpress_reference import merged_refine
 
 from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
-from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead
+from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead, select_feedback
 
 
 @pytest.mark.parametrize(
-    "topc,vocab", [(0, 73), (1, 73), (7, 73), (73, 73), (128, 1031), (512, 1031)]
+    "topc,vocab,padded_vocab",
+    [(1, 73, 128), (7, 73, 128), (73, 73, 128), (128, 1031, 2048), (512, 1031, 2048)],
 )
 @pytest.mark.parametrize("passes", [0, 2, 6])
 @pytest.mark.parametrize("batch", [1, 2, 3, 4])
-def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_scores(
-    topc, vocab, passes, batch
+def test_serving_selection_ignores_padded_vocabulary_and_copies_only_initial_logits(
+    topc, vocab, padded_vocab, passes, batch
 ):
     torch.manual_seed(81)
     head = XPressRefinerHead(vocab, 128, 16, rank=64, mlp_hidden=128, topc=topc).eval()
     hidden, base = torch.randn(batch * 16, 128), torch.randn(batch * 16, vocab)
     anchor = torch.arange(batch) + 3
     model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=vocab),
         xpress_head=head,
         xpress_num_passes=passes,
         xpress_topc=topc,
-        compute_device_logits=lambda _: base,
+        compute_device_logits=lambda _: F.pad(base, (0, padded_vocab - vocab), value=100),
         _hidden_cache=head.project_hidden_cache,
-        _refine=head.refine_full,
-        _gather_readout=head.gather_readout,
-        _refine_candidates=head.refine_candidates,
+        _prepare_feedback=head.prepare_feedback,
+        _refine_feedback=head.refine_feedback,
+        _select_feedback=select_feedback,
+        _feedback_order=F.pad(torch.arange(topc).half(), (0, -topc % 64), value=-1),
     )
     transferred_bytes = []
 
@@ -66,7 +70,7 @@ def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_s
         ]
         actual = SpyreDFlashQwen3ForCausalLM.propose_block(model, hidden, anchor)
     assert actual == expected
-    assert sum(transferred_bytes) == batch * (16 * vocab + passes * 15 * (topc or vocab)) * 4
+    assert transferred_bytes == [batch * 16 * padded_vocab * 4]
 
 
 @pytest.fixture

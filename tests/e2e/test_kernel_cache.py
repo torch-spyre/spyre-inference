@@ -172,8 +172,8 @@ _TP2 = [
 @pytest.mark.parametrize(
     ("tp", "fresh_lowering"),
     [
-        pytest.param(1, False, id="tp1-shared"),
-        pytest.param(2, False, id="tp2-shared", marks=_TP2),
+        pytest.param(1, False, id="tp1-shared", marks=pytest.mark.e2e_smoke),
+        pytest.param(2, False, id="tp2-shared", marks=[*_TP2, pytest.mark.e2e_smoke]),
         pytest.param(1, True, id="tp1-fresh", marks=_XFAIL_FRESH_LOWERING),
     ],
 )

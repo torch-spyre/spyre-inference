@@ -128,6 +128,13 @@ override-dependencies = [
     # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
     # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.
     "pyzmq>=27.2.0",
+
+    # orjson dropped its ppc64le/s390x wheels at 3.12.0 and its sdist wants rustc >=1.95
+    # against UBI10's 1.92. Capped unconditionally rather than per-arch: a marker-gated
+    # pair forks the resolution, so the lock carries two orjson versions and every
+    # downstream marker grows an arch term. One version everywhere keeps x86_64 resolving
+    # the same as the Power/Z builds.
+    "orjson>=3.11.6,<3.12",
 ]
 
 constraint-dependencies = [
@@ -164,7 +171,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f8a09bb0e96870ab30fa69e209b8915ac88bd130" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "752115ab288506bc327aa0870bbdddb93f583cc2" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -361,6 +368,7 @@ markers = [
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
     "attention_smoke: small representative decoder-attention subset (also marked attention); its own 1-card job carries attention coverage into the integration tier, which the full attention suite is excluded from",
+    "e2e_smoke: small representative e2e subset (tests/e2e/); its own integration-only jobs carry e2e coverage into the integration tier, which the full e2e suite is excluded from; admission: see docs/contributing/integration-tier.md",
     "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
     "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
     "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",

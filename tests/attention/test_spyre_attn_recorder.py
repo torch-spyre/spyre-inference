@@ -44,8 +44,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _mirror_mask_stack,
 )
 from spyre_inference.v1.attention.ops import tile_loop
-from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
-    page_attn_head_major_prefill_kernel,
+from spyre_inference.v1.attention.ops.page_attn_prefill import (
+    page_attn_prefill_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
@@ -232,7 +232,7 @@ def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
     v_pages[0, :, -1] = 1
     for metadata, expected in ((bidirectional, 1 / BLOCK_SIZE), (causal, 0.0)):
         padded_query_len = metadata.aligned_query_lens[0]
-        result = page_attn_head_major_prefill_kernel(
+        result = page_attn_prefill_kernel(
             query=torch.zeros(padded_query_len, NUM_HEADS, HEAD_SIZE, dtype=torch.float16),
             query_row_index=torch.arange(padded_query_len, dtype=torch.int32),
             k_pages=k_pages,

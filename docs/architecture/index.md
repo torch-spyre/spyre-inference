@@ -416,10 +416,10 @@ rollback path. The flag is read once at import, so set it before importing
 
 ### LX-resident pages
 
-The per-sequence decode kernel (`page_attn_head_major_decode`, one query row) keeps a
+The per-sequence decode kernel (`page_attn_decode`, one query row) keeps a
 gathered page in the LX scratchpad from its gather to its last use instead of
 round-tripping through HBM. A query wider than one row amortises the page transfer over
-every row, so it takes `page_attn_head_major_prefill` instead: batched GQA over the unfolded
+every row, so it takes `page_attn_prefill` instead: batched GQA over the unfolded
 cache, one whole page per gather. Two shape choices get the decode kernel to LX residency. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
 gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query

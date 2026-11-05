@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from spyre_inference.v1.attention.ops import batched_decode_head_major as bdhm
+from spyre_inference.v1.attention.ops import batched_decode as bdhm
 from spyre_inference.v1.attention.ops import tile_loop
 
 BLOCK, HEAD, SCALE = 4, 8, 0.3
@@ -62,7 +62,7 @@ def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap, 
 
 
 def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None):
-    return bdhm.batched_decode_head_major_kernel(
+    return bdhm.batched_decode_kernel(
         query=query,
         rep_row_ids=rep,
         k_pages=k_pages,

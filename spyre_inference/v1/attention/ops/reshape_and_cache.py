@@ -29,9 +29,7 @@ def quantize_kv(x, scale, dtype):
     return x.to(dtype)
 
 
-def reshape_and_cache_head_major_kernel(
-    key, value, k_rows, v_rows, row_index, *, k_scale=None, v_scale=None
-):
+def reshape_and_cache_kernel(key, value, k_rows, v_rows, row_index, *, k_scale=None, v_scale=None):
     """Store one head at a time: head-major puts a token's heads block_size rows apart.
 
     k/v_rows are [num_blocks * num_kv_heads * block_size, head_size] views; row_index is

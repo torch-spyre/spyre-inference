@@ -94,7 +94,7 @@ def _merge_entry_local(
     )
 
 
-def batched_decode_head_major_kernel(
+def batched_decode_kernel(
     *,
     query,
     rep_row_ids,

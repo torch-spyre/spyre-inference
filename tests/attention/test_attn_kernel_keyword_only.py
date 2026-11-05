@@ -16,27 +16,27 @@
 
 import pytest
 
-from spyre_inference.v1.attention.ops.batched_decode_head_major import (
+from spyre_inference.v1.attention.ops.batched_decode import (
     _merge_entry_local,
-    batched_decode_head_major_kernel,
+    batched_decode_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
-    page_attn_head_major_decode_kernel,
+from spyre_inference.v1.attention.ops.page_attn_decode import (
+    page_attn_decode_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
-    page_attn_head_major_prefill_kernel,
+from spyre_inference.v1.attention.ops.page_attn_prefill import (
+    page_attn_prefill_kernel,
 )
-from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
-    reshape_and_cache_head_major_kernel,
+from spyre_inference.v1.attention.ops.reshape_and_cache import (
+    reshape_and_cache_kernel,
 )
 
 
 @pytest.mark.parametrize(
     "kernel",
     [
-        page_attn_head_major_prefill_kernel,
-        page_attn_head_major_decode_kernel,
-        batched_decode_head_major_kernel,
+        page_attn_prefill_kernel,
+        page_attn_decode_kernel,
+        batched_decode_kernel,
         _merge_entry_local,
     ],
 )
@@ -47,4 +47,4 @@ def test_kernel_rejects_positional_arguments(kernel):
 
 def test_store_takes_kv_scales_by_keyword_only():
     with pytest.raises(TypeError, match="positional argument"):
-        reshape_and_cache_head_major_kernel(None, None, None, None, None, 0.25, 0.5)
+        reshape_and_cache_kernel(None, None, None, None, None, 0.25, 0.5)

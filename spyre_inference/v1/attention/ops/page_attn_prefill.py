@@ -14,7 +14,7 @@
 
 """Paged attention over a head-major KV cache for a query wider than one token.
 
-``page_attn_head_major_decode`` buys LX page residency by shaping the gather and the query
+``page_attn_decode`` buys LX page residency by shaping the gather and the query
 around the folded cache. Past one query token the page transfer that buys is amortised over
 every query row, so this kernel spends it instead: batched GQA over
 ``[kv_head, group, query, D]``, one accumulator, store fuses.
@@ -26,7 +26,7 @@ from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
-def page_attn_head_major_prefill_kernel(
+def page_attn_prefill_kernel(
     *,
     query,
     query_row_index,
@@ -48,7 +48,7 @@ def page_attn_head_major_prefill_kernel(
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
     The page walk goes through `walk_tiles`. Shapes are
-    ``page_attn_head_major_decode``'s, except:
+    ``page_attn_decode``'s, except:
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor, row i
             holding the i-th active block's page index at column 0, indexing
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.

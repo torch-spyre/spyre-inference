@@ -17,9 +17,9 @@
 A page is stored as ``[num_kv_heads, block_size, head_size]``, which needs no permute before
 the matmuls and pays for it in the KV write, whose per-token destinations are one head apart
 rather than contiguous. The cache is decomposed so a gathered page stays LX-resident; see
-``page_attn_head_major_decode``. Past one query token that residency stops paying, and
-``page_attn_head_major_prefill`` runs instead; across sequences at decode,
-``batched_decode_head_major`` gathers whole pages, which are LX-resident too, so it needs
+``page_attn_decode``. Past one query token that residency stops paying, and
+``page_attn_prefill`` runs instead; across sequences at decode,
+``batched_decode`` gathers whole pages, which are LX-resident too, so it needs
 none of the per-sequence kernel's ``(page, kv_head)`` fold.
 """
 
@@ -53,22 +53,22 @@ from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops import tile_loop
-from spyre_inference.v1.attention.ops.batched_decode_head_major import (
-    batched_decode_head_major_kernel,
+from spyre_inference.v1.attention.ops.batched_decode import (
+    batched_decode_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
     head_major_kv_layout,
     temporary_chunk_major_page_index_layout,
 )
-from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
-    page_attn_head_major_decode_kernel,
+from spyre_inference.v1.attention.ops.page_attn_decode import (
+    page_attn_decode_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
-    page_attn_head_major_prefill_kernel,
+from spyre_inference.v1.attention.ops.page_attn_prefill import (
+    page_attn_prefill_kernel,
 )
-from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
-    reshape_and_cache_head_major_kernel,
+from spyre_inference.v1.attention.ops.reshape_and_cache import (
+    reshape_and_cache_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBatchedDecodeBucket,
@@ -214,13 +214,13 @@ def _build_query_row_tables(
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
 _page_attn_prefill_compiled = torch.compile(
-    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
+    page_attn_prefill_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
 _page_attn_decode_compiled = torch.compile(
-    page_attn_head_major_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
+    page_attn_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
 _batched_decode_compiled = torch.compile(
-    batched_decode_head_major_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
+    batched_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
 
 
@@ -233,11 +233,11 @@ def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tenso
 _scatter_rows_compiled = torch.compile(_scatter_rows_kernel, dynamic=False)
 
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
-compile_guard.watch(page_attn_head_major_prefill_kernel, "page attention prefill kernel")
-compile_guard.watch(page_attn_head_major_decode_kernel, "page attention decode kernel")
-compile_guard.watch(batched_decode_head_major_kernel, "batched decode kernel")
+compile_guard.watch(page_attn_prefill_kernel, "page attention prefill kernel")
+compile_guard.watch(page_attn_decode_kernel, "page attention decode kernel")
+compile_guard.watch(batched_decode_kernel, "batched decode kernel")
 compile_guard.watch(_scatter_rows_kernel, "grouped decode store")
-compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kernel")
+compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
 # Stored as float8_e4m3fn with one per-tensor (k_scale, v_scale) pair per layer.
 FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
@@ -1434,7 +1434,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
-        self._reshape_fn = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
+        self._reshape_fn = torch.compile(reshape_and_cache_kernel, dynamic=False)
         # Only reached compiled: _batched_decode_preconditions_met declines the whole
         # path when self._compile_attn is False.
         self._decode_fn = _batched_decode_compiled
@@ -1460,7 +1460,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """The per-sequence (prefill, decode) kernels: compiled unless eager off Spyre."""
         if self._compile_attn or device.type == "spyre":
             return _page_attn_prefill_compiled, _page_attn_decode_compiled
-        return page_attn_head_major_prefill_kernel, page_attn_head_major_decode_kernel
+        return page_attn_prefill_kernel, page_attn_decode_kernel
 
     def _staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Constant-shaped query and output buffers the kernel is called on.

@@ -21,7 +21,7 @@ In addition to the generic table in `SKILL.md`:
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
 | The page gather is a 2-D subscript (`aten.index`), which fails eager on Spyre (torch-spyre#4334) | Attention always compiles on Spyre, even under `--enforce-eager`; off Spyre an eager run calls the kernels uncompiled. Batched decode still requires `STOCK_TORCH_COMPILE` mode |
 
-MHA and MQA (`test_head_major_attn_head_configs`), GQA, sliding window and soft-capping all have committed parametrizations.
+MHA and MQA (`test_spyre_attn_head_configs`), GQA, sliding window and soft-capping all have committed parametrizations.
 
 ## Useful test selectors (orientation only — not for `-k`)
 

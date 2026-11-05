@@ -42,19 +42,19 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
 from spyre_inference.v1.attention.ops import tile_loop
-from spyre_inference.v1.attention.ops.batched_decode_head_major import (
-    batched_decode_head_major_kernel,
+from spyre_inference.v1.attention.ops.batched_decode import (
+    batched_decode_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
-from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
-    page_attn_head_major_decode_kernel,
+from spyre_inference.v1.attention.ops.page_attn_decode import (
+    page_attn_decode_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
-    page_attn_head_major_prefill_kernel,
+from spyre_inference.v1.attention.ops.page_attn_prefill import (
+    page_attn_prefill_kernel,
 )
-from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
+from spyre_inference.v1.attention.ops.reshape_and_cache import (
     quantize_kv,
-    reshape_and_cache_head_major_kernel,
+    reshape_and_cache_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -1693,7 +1693,7 @@ def test_sliding_window_is_left_unpadded(default_vllm_config):
     assert metadata.padded_num_blocks is None
 
 
-def test_head_major_write_index(default_vllm_config):
+def test_spyre_attn_write_index(default_vllm_config):
     """kv_write_index maps a slot to the row holding each of that token's heads."""
     from vllm.config import get_current_vllm_config
 
@@ -1932,19 +1932,19 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     )
     scale = head_size**-0.5
 
-    got = page_attn_head_major_prefill_kernel(
+    got = page_attn_prefill_kernel(
         **common, k_pages=k8, v_pages=v8, scale=scale * k_scale, v_scale=v_scale
     )
-    want = page_attn_head_major_prefill_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
+    want = page_attn_prefill_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
 # Named clear of the conftest batched-decode skip: this is the untiled walk on CPU.
 def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
-    from spyre_inference.v1.attention.ops import batched_decode_head_major
+    from spyre_inference.v1.attention.ops import batched_decode
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
     num_seqs, bpc, num_chunks = 2, 2, 3
@@ -1970,10 +1970,10 @@ def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
         head_size=head_size,
     )
 
-    got = batched_decode_head_major_kernel(
+    got = batched_decode_kernel(
         **common, k_pages=k8, v_pages=v8, scale=scale * k_scale, v_scale=v_scale
     )
-    want = batched_decode_head_major_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
+    want = batched_decode_kernel(**common, k_pages=k_dq, v_pages=v_dq, scale=scale)
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
@@ -1999,7 +1999,7 @@ _SLOT_CASES = [
     "label,block_indices,block_offsets", _SLOT_CASES, ids=[c[0] for c in _SLOT_CASES]
 )
 @pytest.mark.parametrize("source_layout", ["contiguous", "qkv_split"])
-def test_head_major_scatter(
+def test_spyre_attn_scatter(
     default_vllm_config, configure_device, label, block_indices, block_offsets, source_layout
 ):
     """The store writes exactly the mapped rows and leaves every other row zero.
@@ -2068,7 +2068,7 @@ def test_head_major_scatter(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads, configure_device):
+def test_spyre_attn_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads, configure_device):
     """A partial fusion would leave the V writes and later heads outside the returned K
     view ``attn_layer`` orders the read against: a race, not a slowdown."""
     import torch._inductor.metrics as inductor_metrics
@@ -2090,7 +2090,7 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
     # Its own compile, so the count covers this store alone rather than an artifact a
     # previous test already built.
     torch._dynamo.reset()
-    store = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
+    store = torch.compile(reshape_and_cache_kernel, dynamic=False)
     inductor_metrics.reset()
     store(key, value, k_pages.view(-1, head_size), v_pages.view(-1, head_size), rows)
 
@@ -2116,7 +2116,7 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_attn_fp8_kv_cache(
+def test_spyre_attn_fp8_kv_cache(
     default_vllm_config, seq_lens, kv_scales, configure_compilation, configure_device
 ):
     _run_spyre_attn_test(
@@ -2138,7 +2138,7 @@ def test_head_major_attn_fp8_kv_cache(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_dispatches_by_query_width(
+def test_spyre_attn_dispatches_by_query_width(
     default_vllm_config, monkeypatch, configure_compilation, configure_device
 ):
     """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
@@ -2201,7 +2201,7 @@ def test_head_major_dispatches_by_query_width(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_grouped_decode_matches_reference(
+def test_spyre_attn_grouped_decode_matches_reference(
     default_vllm_config, monkeypatch, seq_lens, use_sinks, configure_compilation, configure_device
 ):
     from vllm.config import get_current_vllm_config
@@ -2243,7 +2243,7 @@ def test_head_major_grouped_decode_matches_reference(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_attn_block_sizes(
+def test_spyre_attn_block_sizes(
     default_vllm_config, block_size, configure_compilation, configure_device
 ):
     """block_size sets the row stride between a token's heads, so the store's index
@@ -2267,7 +2267,7 @@ def test_head_major_attn_block_sizes(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_attn_sliding_window(
+def test_spyre_attn_sliding_window(
     default_vllm_config, seq_lens, sliding_window, configure_compilation, configure_device
 ):
     _run_spyre_attn_test(
@@ -2289,7 +2289,7 @@ def test_head_major_attn_sliding_window(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_attn_soft_cap(
+def test_spyre_attn_soft_cap(
     default_vllm_config, seq_lens, soft_cap, configure_compilation, configure_device
 ):
     _run_spyre_attn_test(
@@ -2326,7 +2326,7 @@ def test_head_major_attn_soft_cap(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_attn_sinks(
+def test_spyre_attn_sinks(
     default_vllm_config,
     monkeypatch,
     seq_lens,
@@ -2377,7 +2377,7 @@ def test_head_major_attn_sinks(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_attn_head_configs(
+def test_spyre_attn_head_configs(
     default_vllm_config, num_query_heads, num_kv_heads, configure_compilation, configure_device
 ):
     _run_spyre_attn_test(
@@ -2462,7 +2462,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     gc.collect()
 
 
-def test_page_attn_head_major_matches_fp32_reference():
+def test_page_attn_decode_matches_fp32_reference():
     """The per-sequence decode kernel matches the suite's CPU reference."""
     from spyre_testing_plugin.attn_helpers import ref_attn
 
@@ -2489,7 +2489,7 @@ def test_page_attn_head_major_matches_fp32_reference():
     masks = torch.where(allow, 0.0, torch.finfo(torch.float32).min)
 
     for soft_cap in (0.0, 30.0):
-        got = page_attn_head_major_decode_kernel(
+        got = page_attn_decode_kernel(
             query=query,
             query_row_index=rows,
             k_pages=k,
@@ -2534,7 +2534,7 @@ def test_page_attn_head_major_matches_fp32_reference():
         pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
     ],
 )
-def test_head_major_decode_body_matches_fp32_reference(
+def test_multi_seq_decode_matches_fp32_reference(
     num_seqs: int,
     b_seqs: int,
     num_blocks: int,
@@ -2549,10 +2549,10 @@ def test_head_major_decode_body_matches_fp32_reference(
     Card-free and fp32, so it pins the reduction, the read and the entry-major, kv-minor
     row order the mask is broadcast in, rather than the fp16 tolerances.
     """
-    from spyre_inference.v1.attention.ops import batched_decode_head_major
+    from spyre_inference.v1.attention.ops import batched_decode
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -2595,7 +2595,7 @@ def test_head_major_decode_body_matches_fp32_reference(
     query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
     query_padded[:num_seqs] = query
 
-    actual = batched_decode_head_major_kernel(
+    actual = batched_decode_kernel(
         query=query_padded,
         rep_row_ids=rep_row_ids,
         k_pages=k_pages,
@@ -2631,7 +2631,7 @@ def test_head_major_decode_body_matches_fp32_reference(
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
 )
-def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, configure_compilation):
+def test_spyre_attn_batched_decode_uses_plain_page_ids(default_vllm_config, configure_compilation):
     """The batched kernel gathers whole pages, so its index is the builder's page ids.
 
     Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
@@ -2764,7 +2764,7 @@ def batched_decode_calls(monkeypatch):
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_batched_decode_correctness(
+def test_spyre_attn_batched_decode_correctness(
     default_vllm_config,
     batched_decode_calls,
     seq_lens,
@@ -2796,7 +2796,7 @@ def test_head_major_batched_decode_correctness(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
-def test_head_major_warmup_records_a_batched_decode_variant(
+def test_spyre_attn_warmup_records_a_batched_decode_variant(
     default_vllm_config, batched_decode_calls, configure_compilation, configure_device
 ):
     """Warmup can trace this layout's batched kernel, so serving does not compile it.

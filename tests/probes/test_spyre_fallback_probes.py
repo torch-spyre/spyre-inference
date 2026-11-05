@@ -907,7 +907,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     An index that is a row of a 2-D table argument loses all but its first stick
     (test_spyre_scatter_index_row_of_2d_table); an in-graph slice of a
     stacked table is a different mechanism and holds at this shape, which is what
-    ``page_attn_head_major_prefill`` reads.
+    ``page_attn_prefill`` reads.
     """
     blocks, block_size, head_size = 4, 64, 64
     pages_cpu, pages = _stacked_index_pages(blocks, 1, block_size, head_size, spyre_device)
@@ -935,7 +935,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     ),
 )
 def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
-    """The same idea at the [KV, 1] entry shape ``page_attn_head_major`` gathers with.
+    """The same idea at the [KV, 1] entry shape ``page_attn_decode`` gathers with.
 
     A 2-D entry cannot go through index_select, hence the subscript.
     """

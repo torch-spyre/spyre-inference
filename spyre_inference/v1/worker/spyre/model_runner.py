@@ -22,6 +22,7 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -30,9 +31,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
+from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
 class SpyreModelRunnerV2(GPUModelRunner):
@@ -43,9 +46,17 @@ class SpyreModelRunnerV2(GPUModelRunner):
         self.spyre_device = device
         # Filled by initialize_kv_cache; warmup records the attention kernels against them.
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+        # Set by load_model.
+        self.pooling_on_spyre = False
+        self.compiled_tower_blocks = 0
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
+
+    def get_model(self) -> nn.Module:
+        model = unwrap_model(self.model)
+        assert isinstance(model, nn.Module), type(model)
+        return model
 
     def initialize_kv_cache(
         self,
@@ -60,6 +71,10 @@ class SpyreModelRunnerV2(GPUModelRunner):
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
         self.cudagraph_manager = bucketing.SpyreBucketManager.from_runner(self)
+
+    def reload_weights(self, *args: Any, **kwargs: Any) -> None:
+        super().reload_weights(*args, **kwargs)
+        rewarm_after_reload(self)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         # Upstream asks PoolingRunner about self.model, the wrapper, which fails

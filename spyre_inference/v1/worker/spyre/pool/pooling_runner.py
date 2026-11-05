@@ -36,6 +36,7 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.encoder_grid import pool_rows_for, unpad_encoder_grid
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata
 from spyre_inference.v1.worker.spyre.model_states.encoder_plan import EncoderPlan
+from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 _HOST = torch.device("cpu")
 
@@ -52,8 +53,7 @@ class SpyrePoolingRunner(PoolingRunner):
     @staticmethod
     def get_supported_tasks(model: nn.Module) -> list[PoolingTask]:
         # The _SpyreModelWrapper fails is_vllm_model: its __init__ takes no vllm_config.
-        bare = getattr(model, "_model", model)
-        return PoolingRunner.get_supported_tasks(getattr(bare, "_orig_mod", bare))
+        return PoolingRunner.get_supported_tasks(unwrap_model(model))
 
     def pool(
         self,

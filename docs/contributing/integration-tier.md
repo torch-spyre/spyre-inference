@@ -95,6 +95,6 @@ not removed for that alone; it is still the cheap guard on its path.
 ## Shard counts
 
 `SMOKE_UNIT_SHARDS`, `E2E_SMOKE_SHARDS` and `E2E_SMOKE_DIST_SHARDS` in the `Makefile` set
-the counts, and `.github/workflows/_test_matrix.yaml` declares one job per shard. Resize
+the counts, and `.github/test-matrix.yaml` declares one job per shard. Resize
 them with the `rebalance-test-shards` skill; `tests/test_sharding.py` checks that the two
 files agree.

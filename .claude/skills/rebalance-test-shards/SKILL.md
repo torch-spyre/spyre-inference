@@ -1,6 +1,6 @@
 ---
 name: rebalance-test-shards
-description: Recompute the CI shard count per test suite from recorded durations and apply it to the Makefile and the CI matrix. Use when a test suite has grown or shrunk and a shard job now runs too long (or wastefully short), when someone asks to rebalance/resize the test shards, or after a large batch of tests is added or removed. Keeps the Makefile *_SHARDS counts and the _test_matrix.yaml job entries in lockstep (guarded by tests/test_sharding.py).
+description: Recompute the CI shard count per test suite from recorded durations and apply it to the Makefile and the CI matrix. Use when a test suite has grown or shrunk and a shard job now runs too long (or wastefully short), when someone asks to rebalance/resize the test shards, or after a large batch of tests is added or removed. Keeps the Makefile *_SHARDS counts and the .github/test-matrix.yaml job entries in lockstep (guarded by tests/test_sharding.py).
 ---
 
 # Rebalance test shards
@@ -11,7 +11,7 @@ under the wall-clock budget (default 10 min) without over-sharding. It touches C
 only — no production code.
 
 The count lives in **two** places that a cross-check test forces to agree: the Makefile
-`*_SHARDS` default and the per-shard job blocks in `.github/workflows/_test_matrix.yaml`.
+`*_SHARDS` default and the per-shard job blocks in `.github/test-matrix.yaml`.
 Change both together or the suite silently loses (or duplicates) shards.
 
 ## 1. Get the recommendation
@@ -51,7 +51,7 @@ For every suite whose `REC` differs from its current count, set N = REC and edit
 | dist | `DIST_SHARDS` |
 | probe | `PROBE_SHARDS` |
 
-**`.github/workflows/_test_matrix.yaml`** — under the `test:` job's `matrix.include:`, each
+**`.github/test-matrix.yaml`** — a top-level list; each
 suite has N consecutive `- cfg:` blocks keyed by `test_target: test-<name>-shard-<i>`
 (`<name>` = smoke / smoke-unit / e2e-smoke / e2e-smoke-dist / attention / upstream /
 distributed / probes / quality):

@@ -582,7 +582,7 @@ def _makefile_shard_counts() -> dict[str, int]:
 
 
 def _matrix_shard_ids() -> dict[str, list[int]]:
-    text = (_REPO_ROOT / ".github/workflows/_test_matrix.yaml").read_text()
+    text = (_REPO_ROOT / ".github/test-matrix.yaml").read_text()
     return {
         suite: sorted({int(n) for n in re.findall(rf"test-{suite}-shard-(\d+)\b", text)})
         for suite in (
@@ -620,8 +620,18 @@ def test_matrix_shard_entries_match_makefile_counts():
 def _matrix_include() -> list[dict]:
     import yaml
 
-    doc = yaml.safe_load((_REPO_ROOT / ".github/workflows/_test_matrix.yaml").read_text())
-    return doc["jobs"]["test"]["strategy"]["matrix"]["include"]
+    return yaml.safe_load((_REPO_ROOT / ".github/test-matrix.yaml").read_text())
+
+
+def test_every_pytest_tier_plans_at_least_one_leg():
+    """A tier that selects nothing would schedule no job and report green."""
+    entries = _matrix_include()
+    makefile = (_REPO_ROOT / "Makefile").read_text()
+    tiers = re.search(r"^VALID_TEST_TYPES := (.+)$", makefile, re.MULTILINE).group(1).split()
+    for tier in set(tiers) - {"perf"}:
+        assert any(tier in e["test_types"].split() for e in entries), tier
+    declared = {t for e in entries for t in e["test_types"].split()}
+    assert declared <= set(tiers), f"unknown tiers in test-matrix.yaml: {declared - set(tiers)}"
 
 
 def test_matrix_shard_blocks_within_a_suite_are_uniform():

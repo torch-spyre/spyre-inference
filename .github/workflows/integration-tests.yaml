@@ -92,7 +92,7 @@ on:
         type: string
         default: ''
       use_prebaked_image:
-        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        description: When true, use the runner image's RPMs and venv as they are instead of installing spyre-rpms.lock and syncing a venv.
         required: false
         type: boolean
         default: false
@@ -115,6 +115,18 @@ on:
           - perf
           - trunk
         default: integration
+      models:
+        description: test_type=perf only. Comma-separated subset of the benchmarked models (empty = all).
+        required: false
+        type: string
+        default: ''
+      skip_uv_for_benchmarking:
+        description: >-
+          test_type=perf only. Bypass `uv run` and use the active venv's python3 directly.
+          Needed on s390x, where uv cannot resolve a torch/vllm wheel.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # PR-context runs (native pull_request, or workflow_dispatch carrying a
@@ -202,6 +214,8 @@ jobs:
       rpm_names: ${{ inputs.rpm_names || '' }}
       runner_label: ${{ inputs.runner_label || '' }}
       test_type: ${{ inputs.test_type || 'integration' }}
+      models: ${{ inputs.models || '' }}
+      skip_uv_for_benchmarking: ${{ inputs.skip_uv_for_benchmarking || false }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job so callers can poll a single stable job name for pass/fail.

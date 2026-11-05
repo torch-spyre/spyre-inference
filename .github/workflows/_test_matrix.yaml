@@ -1,19 +1,9 @@
 name: Test matrix (reusable)
 
 # ---------------------------------------------------------------------------
-# Reusable workflow — not triggered directly. Defines the build + the 6-config
-# test matrix once; two entrypoints call it with the same tests but slightly
-# different setup:
-#
-#   test_each_commit.yaml (push/PR/merge_group): skip_if_no_changes=true, so the
-#     build/test only runs when source files changed. Installs the locked
-#     baseline RPMs (spyre-rpm-install) on the standing image, so every PR
-#     builds against the pinned spyre-rpms.lock set.
-#
-#   integration-tests.yaml (upstream-dependency dispatch): skip_if_no_changes=
-#     false (always run). May pass runner_label to pick a per-PR image, rpm_*
-#     to layer override RPMs, torch_spyre_ref to build a specific torch-spyre
-#     from source, and use_prebaked_image=true to skip the baseline RPM install.
+# Reusable workflow, called by test_each_commit.yaml (push/PR/merge_group) and
+# integration-tests.yaml (dispatch, the only perf entrypoint). The plan job schedules
+# only the legs the tier selects; every leg gets its stack from setup-test-env.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -39,9 +29,7 @@ on:
         type: string
         default: ''
       use_prebaked_image:
-        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
-        # action). It does not change the override step or any other step.
-        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        description: When true, use the runner image's RPMs and venv as they are (see setup-test-env).
         required: false
         type: boolean
         default: false
@@ -103,11 +91,16 @@ on:
           and defaulted (empty -> regression) once in the "Decide whether to
           run" step below, so every caller (Jenkins, config.yaml) sees the
           same behavior.
-          The perf value runs the dedicated perf job below (the vLLM benchmark
-          suite), not any of the pytest matrix configs.
+          The perf value runs the vLLM benchmark suite (the perf job below)
+          instead of any pytest config.
         required: false
         type: string
         default: regression
+      models:
+        description: Perf only. Comma-separated subset of the benchmarked models (empty = all).
+        required: false
+        type: string
+        default: ''
       skip_uv_for_benchmarking:
         description: |
           Perf job only. When true, the benchmark runner bypasses `uv run` and
@@ -166,31 +159,66 @@ permissions:
   actions: read
 
 jobs:
-  # Resolve the user-facing tier alias once, at the job level, so the perf job
-  # (which is not one of the matrix configs) can gate on it. Mirrors the sibling
-  # torch-spyre workflow's generate_matrix.resolved_test_type output.
-  resolve:
-    name: Resolve test type
+  plan:
+    name: Plan test legs
     runs-on: ubuntu-latest
     outputs:
-      resolved_test_type: ${{ steps.resolve.outputs.resolved_test_type }}
+      test_matrix: ${{ steps.plan.outputs.test_matrix }}
+      perf_matrix: ${{ steps.plan.outputs.perf_matrix }}
+      has_tests: ${{ steps.plan.outputs.has_tests }}
+      has_perf: ${{ steps.plan.outputs.has_perf }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
-      - name: Resolve
-        id: resolve
+
+      - name: Get changed source files
+        id: changed-src-files
+        if: ${{ inputs.skip_if_no_changes }}
+        uses: tj-actions/changed-files@ed68ef82c095e0d48ec87eccea555d944a631a4c # v46.0.5
+        with:
+          # Avoid using single or double quotes for multiline patterns.
+          files: |
+            .github/workflows/test_each_commit.yaml
+            .github/workflows/_test_matrix.yaml
+            .github/test-matrix.yaml
+            .github/actions/override-spyre-rpms/action.yml
+            .github/actions/run-matrix-config/action.yml
+            .github/actions/setup-test-env/action.yml
+            .github/actions/spyre-rpm-install/action.yml
+            .github/scripts/plan_test_matrix.py
+            pyproject.toml
+            uv.lock
+            spyre-rpms.lock
+            tests/**/*.py
+            tests/**/*.yaml
+            tests/data/**
+            spyre_inference/**/*.py
+            spyre_inference/**/*.yaml
+            csrc/**
+            cmake/**
+            CMakeLists.txt
+            setup.py
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pyyaml
+        run: python -m pip install --quiet pyyaml
+
+      - name: Plan
+        id: plan
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type }}
+          MODELS: ${{ inputs.models }}
         run: |
-          # `make print-test-type` applies the Makefile's default (empty ->
-          # regression) and validates the result: it exits non-zero with an
-          # ::error:: line if the type is unknown, so this step does not
-          # re-check the valid set. Single source of truth for the
-          # vocabulary is the Makefile.
+          # Rejects an unknown type, which would otherwise plan nothing and pass.
           RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
-          echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/plan_test_matrix.py \
+            --test-type "${RESOLVED_TEST_TYPE}" --models "${MODELS}" \
+            ${{ (inputs.skip_if_no_changes && steps.changed-src-files.outputs.any_changed != 'true') && '--no-changes' || '' }}
 
       # The threaded run_id has to reach push-to-clickhouse.yaml, which runs on workflow_run
       # AFTER this workflow and so cannot take a dispatch input. An artifact is the channel that
@@ -240,11 +268,11 @@ jobs:
 
   # One `artifact-id` record per run for push-to-clickhouse's v2 ingest; every matrix leg shares
   # the image and install inputs. Must run on the image under test: the base id lives in its
-  # filesystem, but no card, so it takes the cardless pool. The perf job links its own artifact, so it is skipped there.
+  # filesystem, but no card, so it takes the cardless pool. The perf legs link their own artifact.
   artifact_identity:
     name: Derive artifact identity
-    needs: resolve
-    if: ${{ needs.resolve.outputs.resolved_test_type != 'perf' }}
+    needs: plan
+    if: ${{ needs.plan.outputs.has_tests == 'true' }}
     continue-on-error: true
     runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x0","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
     timeout-minutes: 10
@@ -299,65 +327,25 @@ jobs:
           installed: ${{ steps.delta.outputs.installed }}
           library-dir: ${{ github.workspace }}/.torch-spyre-identity
 
-  # Builds the csrc/ sampling kernels once, before any test job: a broken build fails CI here
-  # instead of every test job silently falling back to PyTorch sampling, and the test jobs
-  # (and their pod-level retries) download this build instead of compiling their own copy.
-  # It also owns the changed-files detection the test jobs gate on.
+  # Built once so a broken build fails here instead of every leg silently falling back to
+  # PyTorch sampling. Prebaked images sync no workspace venv, so they skip it.
   build_kernels:
     name: Build csrc/ sampling kernels
+    needs: plan
+    if: ${{ !inputs.use_prebaked_image && (needs.plan.outputs.has_tests == 'true' || needs.plan.outputs.has_perf == 'true') }}
     # Same image as the x86_64 test configs, so compiler, glibc and Python match. A compile needs
     # no card, so it takes the card-less pool, which only carries the standing image label.
     runs-on: ${{ fromJSON(format('["x86_64","{0}","linux","{1}"]', (inputs.runner_label || github.event_name == 'merge_group') && 'spyre_pf_x1' || 'spyre_pf_x0', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
     timeout-minutes: 30
     env:
       STORAGE_1_DIR: /storage-1/spyre-inference
-    outputs:
-      src_changed: ${{ steps.changed-src-files.outputs.any_changed }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Get changed source files
-        id: changed-src-files
-        uses: tj-actions/changed-files@ed68ef82c095e0d48ec87eccea555d944a631a4c # v46.0.5
-        with:
-          # Avoid using single or double quotes for multiline patterns.
-          files: |
-            .github/workflows/test_each_commit.yaml
-            .github/workflows/_test_matrix.yaml
-            .github/actions/override-spyre-rpms/action.yml
-            .github/actions/run-matrix-config/action.yml
-            .github/actions/spyre-rpm-install/action.yml
-            pyproject.toml
-            uv.lock
-            spyre-rpms.lock
-            tests/**/*.py
-            tests/**/*.yaml
-            tests/data/**
-            spyre_inference/**/*.py
-            spyre_inference/**/*.yaml
-            csrc/**
-            cmake/**
-            CMakeLists.txt
-            setup.py
-
-      # Build whenever any test job may run: skipped only for a prebaked image (no workspace build)
-      # or a PR that changed no source files (every test job skips too).
-      - name: Decide whether to build
-        id: gate
-        run: |
-          if [[ "${{ inputs.use_prebaked_image }}" != "true" ]] \
-             && [[ "${{ inputs.skip_if_no_changes }}" == "false" \
-                   || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Key the kernels ccache on this machine's arch
-        if: ${{ steps.gate.outputs.run == 'true' }}
         id: arch
         run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
 
@@ -366,7 +354,6 @@ jobs:
       # run-unique key never exact-matches, so the prefix restores the newest entry and the save
       # below can publish a refreshed one (cache entries are immutable).
       - name: Restore kernels ccache
-        if: ${{ steps.gate.outputs.run == 'true' }}
         id: ccache-restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -376,7 +363,6 @@ jobs:
             spyre-kernels-ccache-${{ steps.arch.outputs.arch }}-
 
       - name: Set up uv
-        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: false
@@ -384,7 +370,6 @@ jobs:
       # Own root, keyed on pyproject.toml ([build-system] requires): this job runs before every
       # test job, so saving into .cache/uv would publish its slimmer cache under their key first.
       - name: uv cache (NFS)
-        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: ./.github/actions/uv-nfs-cache
         with:
           storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv-kernels
@@ -393,7 +378,6 @@ jobs:
       # setup.py only warns on a failed build (the samplers fall back to PyTorch), so check
       # the wheel actually carries the extensions and fail here.
       - name: Build kernels wheel
-        if: ${{ steps.gate.outputs.run == 'true' }}
         id: build
         shell: bash
         run: |
@@ -447,7 +431,6 @@ jobs:
           key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
 
       - name: Upload kernels wheel
-        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sampling-kernels-wheel
@@ -457,469 +440,11 @@ jobs:
 
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
-    needs: [resolve_durations, build_kernels]
+    needs: [plan, resolve_durations, build_kernels]
+    if: ${{ !cancelled() && needs.plan.outputs.has_tests == 'true' && (needs.build_kernels.result == 'success' || needs.build_kernels.result == 'skipped') }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Smoke set, sharded across parallel jobs. This carries the compiled
-          # (enforce_eager=False) tests/e2e/test_compile.py cases -- once a
-          # separate "Spyre compile tests" job -- which the plugin's weighted
-          # partition (e2e paths weighted heavy) spreads across the shards so no
-          # single shard eats the ~20 min the compile job used to.
-          # Not `integration`: that tier runs the smoke-unit and e2e_smoke shards below.
-          # Adding/removing a shard = add/remove an entry here and bump
-          # SMOKE_SHARDS (Makefile default). Marker expression owned by the
-          # Makefile (test-<name> target); see that target's comment.
-          - cfg: Non-distributed spyre tests (shard 1/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-0
-          - cfg: Non-distributed spyre tests (shard 2/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-1
-          - cfg: Non-distributed spyre tests (shard 3/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-2
-          - cfg: Non-distributed spyre tests (shard 4/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-3
-          - cfg: Non-distributed spyre tests (shard 5/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-4
-          - cfg: Non-distributed spyre tests (shard 6/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-5
-          - cfg: Non-distributed spyre tests (shard 7/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-6
-          - cfg: Non-distributed spyre tests (shard 8/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-7
-          - cfg: Non-distributed spyre tests (shard 9/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-8
-          - cfg: Non-distributed spyre tests (shard 10/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-9
-          - cfg: Non-distributed spyre tests (shard 11/11)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-shard-10
-          # Integration tier: tests/e2e enters only via the opt-in e2e_smoke marker
-          # (docs/contributing/integration-tier.md); other tiers run the full shards.
-          - cfg: Unit-level spyre tests (shard 1/3)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-unit-shard-0
-          - cfg: Unit-level spyre tests (shard 2/3)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-unit-shard-1
-          - cfg: Unit-level spyre tests (shard 3/3)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-smoke-unit-shard-2
-          - cfg: Spyre e2e smoke (shard 1/3)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-e2e-smoke-shard-0
-          - cfg: Spyre e2e smoke (shard 2/3)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-e2e-smoke-shard-1
-          - cfg: Spyre e2e smoke (shard 3/3)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-e2e-smoke-shard-2
-          - cfg: Spyre e2e smoke TP=2 (shard 1/2)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-e2e-smoke-dist-shard-0
-          - cfg: Spyre e2e smoke TP=2 (shard 2/2)
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-e2e-smoke-dist-shard-1
-          # Model-output quality gate: the product-model output checks (model_quality)
-          # plus the GSM8K accuracy evals (gsm8k). Its own jobs and not in `integration`,
-          # since every case compiles a product model or starts a vLLM server. Sharded
-          # across parallel 1-card jobs like smoke/attention, bounded by the slowest single
-          # case. The plugin owns the weighted partition; QUALITY_SHARDS (Makefile default)
-          # is the count. Adding/removing a shard = add/remove an entry here and bump that
-          # default. (The gsm8k evals need the upstream vLLM checkout; the combo's marker
-          # expression pulls it in automatically, no --upstream flag.)
-          - cfg: Spyre quality gate (shard 1/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-0
-          - cfg: Spyre quality gate (shard 2/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-1
-          - cfg: Spyre quality gate (shard 3/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-2
-          - cfg: Spyre quality gate (shard 4/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-3
-          - cfg: Spyre quality gate (shard 5/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-4
-          - cfg: Spyre quality gate (shard 6/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-5
-          - cfg: Spyre quality gate (shard 7/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-6
-          - cfg: Spyre quality gate (shard 8/8)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-quality-shard-7
-          # Decoder attention, sharded across parallel jobs. The compiled
-          # (STOCK on device) cases dominate runtime and grow HBM within a
-          # process, so each shard is its own job on its own card: wall-clock
-          # drops to the slowest shard and per-process HBM growth stays bounded
-          # (each shard holds only ~1/N of the compiled cases). The plugin owns
-          # the weighted partition; ATTN_SHARDS (Makefile default) is the count.
-          # Adding/removing a shard = add/remove an entry here and bump that
-          # default. The encoder split runs below.
-          - cfg: Spyre attention tests (shard 1/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-0
-          - cfg: Spyre attention tests (shard 2/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-1
-          - cfg: Spyre attention tests (shard 3/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-2
-          - cfg: Spyre attention tests (shard 4/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-3
-          - cfg: Spyre attention tests (shard 5/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-4
-          - cfg: Spyre attention tests (shard 6/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-5
-          - cfg: Spyre attention tests (shard 7/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-6
-          - cfg: Spyre attention tests (shard 8/8)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-shard-7
-          - cfg: Encoder attention tests
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-encoder-attention
-          # Small decoder-attention subset carrying attention coverage into the integration
-          # tier, which the full test-attention-shard-* suite above is excluded from. Hence
-          # integration-only: regression/trunk/unit already run the full shards.
-          - cfg: Spyre attention smoke
-            test_types: integration
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-smoke
-          # Distributed (TP=2) suite, sharded across parallel 2-card jobs. Each
-          # case spawns a TP=2 subprocess pair, so the model-run cases dominate;
-          # the plugin's weighted partition balances by recorded runtime.
-          # Not `integration` (it uses the e2e_smoke TP=2 shards). Probes are excluded (dedicated probe job below). Adding/
-          # removing a shard = add/remove an entry here and bump DIST_SHARDS.
-          - cfg: Distributed spyre tests (shard 1/3)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-distributed-shard-0
-          - cfg: Distributed spyre tests (shard 2/3)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-distributed-shard-1
-          - cfg: Distributed spyre tests (shard 3/3)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-distributed-shard-2
-          # TP=4 distributed suite. Runs on the 4-card runner (spyre_pf_x4).
-          # A distinct marker (distributed_tp4) keeps these out of the 2-card
-          # distributed job, which would silently skip them.
-          - cfg: Distributed TP4 spyre tests
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x4
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-distributed-tp4
-          # torch-spyre backend probes (strict-xfail signals for backend readiness),
-          # sharded across parallel 2-card jobs. Deliberately NOT in `integration`: a
-          # strict-xfail flipping to xpass means the backend team shipped support and must
-          # not block integration runs. Shares the 2-card runner (some probes are TP=2
-          # native-collective probes). Adding/removing a shard = add/remove an entry here
-          # and bump PROBE_SHARDS (Makefile default).
-          - cfg: Spyre probe tests (shard 1/2)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-probes-shard-0
-          - cfg: Spyre probe tests (shard 2/2)
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-probes-shard-1
-          # Non-distributed upstream-vLLM suites, sharded across parallel jobs.
-          # The heavy model tests (under a models/ path) were once a separate
-          # "Upstream model vLLM tests" job; the plugin's weighted partition
-          # (models/ paths weighted heavy) now balances them across the shards.
-          # Excluded from integration/unit (heavy). Adding/removing a shard =
-          # add/remove an entry here and bump UPSTREAM_SHARDS (Makefile default).
-          - cfg: Upstream vLLM tests (shard 1/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-0
-          - cfg: Upstream vLLM tests (shard 2/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-1
-          - cfg: Upstream vLLM tests (shard 3/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-2
-          - cfg: Upstream vLLM tests (shard 4/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-3
-          - cfg: Upstream vLLM tests (shard 5/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-4
-          - cfg: Upstream vLLM tests (shard 6/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-5
-          - cfg: Upstream vLLM tests (shard 7/7)
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-shard-6
-          - cfg: Upstream distributed vLLM tests
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x2
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-distributed
+      matrix: ${{ fromJSON(needs.plan.outputs.test_matrix) }}
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label; on merge_group the
@@ -948,54 +473,8 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      # Single run/skip decision for every build+test step below. A job runs
-      # only when BOTH hold:
-      #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
-      #      flow passes only when source files changed;
-      #   2. this config's test_types set contains the requested test_type
-      #      (so test_type selects a subset of the matrix; regression = every
-      #      config).
-      - name: Decide whether to run
-        id: gate
-        env:
-          RAW_TEST_TYPE: ${{ inputs.test_type }}
-        run: |
-          # Apply the shared default (empty -> regression) and validate via
-          # `make print-test-type` -- the Makefile is the single source of
-          # truth for TEST_TYPE resolution, the single choke point every
-          # caller (Jenkins, config.yaml) passes through. It also rejects an
-          # unknown type (non-zero exit with an ::error:: line): type: choice
-          # guards the workflow_dispatch entrypoint, but this reusable
-          # workflow_call path accepts any string, and an unknown value would
-          # match no config and silently skip every job -> a green run that
-          # tested nothing.
-          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
-          # Expose the resolved type so the perf job (which is NOT one of the
-          # matrix.cfg entries) can gate itself on it -- same pattern as the
-          # sibling torch-spyre workflow's generate_matrix.resolved_test_type.
-          echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
-          if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
-             || "${{ needs.build_kernels.outputs.src_changed }}" == "true" ]]; then
-            changed=true
-          else
-            changed=false
-          fi
-          # perf is NOT part of the pytest matrix: it runs in the dedicated perf
-          # job below, not as any matrix.cfg. So every matrix config skips when
-          # test_type=perf (selected=false for all), and only the perf job runs.
-          case " ${{ matrix.test_types }} " in
-            *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
-            *) selected=false ;;
-          esac
-          if [[ "$changed" == "true" && "$selected" == "true" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
       # Runs the actual build+test for this leg via the shared composite action, so test_retry below can reuse the exact same steps for a fresh-pod retry instead of duplicating them.
       - name: Run matrix config
-        if: ${{ steps.gate.outputs.run == 'true' }}
         # Bounds the whole composite. Warm legs run 27-38min; a cold compile cache (any
         # lockfile change) pushes the gemma-4 vision shard to ~90min, so 150 leaves headroom.
         # NOTE: the runner's Linux kill is single-process, so this ends the job but does not
@@ -1049,8 +528,8 @@ jobs:
   # Collect suites that need a pod-level retry: reads the failed-suite-* artifacts uploaded above and rebuilds a retry matrix for test_retry below to consume via fromJSON.
   collect_failed_suites:
     name: Collect suites for pod-level retry
-    needs: test
-    if: always()
+    needs: [plan, test]
+    if: ${{ always() && needs.plan.outputs.has_tests == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.collect.outputs.matrix }}
@@ -1121,14 +600,18 @@ jobs:
   # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself) by inspecting the pod-level retry outcome; this job's own result is what determines the reusable workflow's overall conclusion.
   test_result:
     name: Test matrix result
-    needs: [build_kernels, collect_failed_suites, test_retry]
+    needs: [plan, build_kernels, collect_failed_suites, test_retry, perf]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate combined result
         run: |
-          # A failed kernel build skips every test job, which would otherwise read as a pass.
-          if [[ "${{ needs.build_kernels.result }}" != "success" ]]; then
+          if [[ "${{ needs.plan.result }}" != "success" ]]; then
+            echo "::error::Planning the test legs failed (result: ${{ needs.plan.result }})."
+            exit 1
+          fi
+          # A failed kernel build skips every leg, which would otherwise read as a pass.
+          if [[ "${{ needs.build_kernels.result }}" != "success" && "${{ needs.build_kernels.result }}" != "skipped" ]]; then
             echo "::error::Building the csrc/ sampling kernels failed (result: ${{ needs.build_kernels.result }})."
             exit 1
           fi
@@ -1139,7 +622,11 @@ jobs:
             echo "::error::One or more configs still failed after pod-level retry."
             exit 1
           fi
-          echo "All configs passed (directly or after pod-level retry)."
+          if [[ "${{ needs.perf.result }}" != "success" && "${{ needs.perf.result }}" != "skipped" ]]; then
+            echo "::error::One or more perf benchmark legs failed (result: ${{ needs.perf.result }})."
+            exit 1
+          fi
+          echo "All planned legs passed (directly or after pod-level retry)."
 
   # ---------------------------------------------------------------------------
   # Coverage fan-in: combine every job's data into one report. Stock runner
@@ -1149,8 +636,8 @@ jobs:
   # ---------------------------------------------------------------------------
   coverage:
     name: Aggregate coverage
-    needs: [test, test_retry]
-    if: always()
+    needs: [plan, test, test_retry]
+    if: ${{ always() && needs.plan.outputs.has_tests == 'true' }}
     # Informational -- must never fail the reusable workflow (and thus the
     # callers' required-check gate).
     continue-on-error: true
@@ -1226,8 +713,8 @@ jobs:
   # ---------------------------------------------------------------------------
   durations:
     name: Aggregate test durations
-    needs: [test, test_retry]
-    if: always()
+    needs: [plan, test, test_retry]
+    if: ${{ always() && needs.plan.outputs.has_tests == 'true' }}
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -1280,8 +767,8 @@ jobs:
   # ---------------------------------------------------------------------------
   test-report:
     name: Aggregate test report
-    needs: [test, test_retry]
-    if: always()
+    needs: [plan, test, test_retry]
+    if: ${{ always() && needs.plan.outputs.has_tests == 'true' }}
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -1309,31 +796,21 @@ jobs:
           fi
           python3 .github/scripts/aggregate_junit_summary.py junit/*.xml
 
-  # ---------------------------------------------------------------------------
-  # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
-  # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
-  # one of the matrix configs above: perf runs benchmarks, not pytest markers,
-  # so it lives in its own job and every matrix config skips when
-  # test_type=perf. Weekly-only, like the sibling torch-spyre perf job:
-  # benchmarks are long and hardware-contended, never gated on a PR.
-  # ---------------------------------------------------------------------------
   perf:
-    name: Perf benchmarks (vLLM)
-    needs: resolve
-    if: >-
-      ${{ !cancelled()
-          && github.event_name != 'pull_request'
-          && needs.resolve.outputs.resolved_test_type == 'perf' }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
-    timeout-minutes: 720
+    name: Perf benchmarks (${{ matrix.model }})
+    needs: [plan, build_kernels]
+    if: ${{ !cancelled() && needs.plan.outputs.has_perf == 'true' && (needs.build_kernels.result == 'success' || needs.build_kernels.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.perf_matrix) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || 'image_torch_spyre')) }}
+    timeout-minutes: 240
     env:
       CI: ''
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
       RESULTS_DIR: benchmark-results
-      # The dev image's editable spyre-inference tree (keeps .git), installed into its $VIRTUAL_ENV.
-      PREBAKED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
       # The serve configs replay trace files that are not in the repo. Cache
       # them on the same RWX volume as the HuggingFace cache above: it outlives
       # the pod, so the first job to need a trace fetches it and every later job
@@ -1349,76 +826,22 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
-      # use_prebaked_image is true, so the run uses the image's Spyre stack
-      # as-is. See issue #543.
-      - name: Install Spyre RPMs
-        if: ${{ !inputs.use_prebaked_image }}
-        uses: ./.github/actions/spyre-rpm-install
-
-      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
-      # steps. See .github/scripts/nfs_uv_cache.py.
-      - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Set up the test environment
+        id: env
+        uses: ./.github/actions/setup-test-env
         with:
-          enable-cache: false
-
-      # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
-      - name: uv cache (NFS)
-        if: ${{ !inputs.use_prebaked_image }}
-        uses: ./.github/actions/uv-nfs-cache
-        with:
-          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
-
-      - name: Install override Spyre RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/override-spyre-rpms
-        with:
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          uv_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || 'image_torch_spyre') }}
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
           artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
           artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Gather runner info
-        uses: ./.github/actions/gather-runner-info
-        with:
-          # Echo the exact runner-label selectors this job's runs-on used
-          # (mirrors the perf runs-on expression: the fixed pool labels plus
-          # the per-PR runner_label override, or the standing image label).
-          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
-
-      # Prebaked runs use the image's venv: a cached torch-spyre wheel may be built against other RPMs.
-      - name: Build spyre-inference
-        if: ${{ !inputs.use_prebaked_image }}
-        env:
-          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
-            # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
-            # `uv run` reuses the shared venv instead of re-resolving), but uv rejects
-            # UV_NO_SYNC together with `--frozen` on `uv add` ("cannot be used with
-            # --frozen"). Shadow it to a false value for this one call so the add
-            # succeeds; the surrounding UV_NO_SYNC=1 is unchanged for every other uv run.
-            UV_NO_SYNC=0 uv add --frozen \
-              "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
-            uv sync --verbose --group dev
-          else
-            uv sync --frozen --verbose --group dev
-          fi
-          uv pip show torch
-          uv pip freeze
-
-      - name: Ensure public HF models cached
-        env:
-          HF_HUB_OFFLINE: '0'
-          # Authenticated cache-miss downloads; anonymous Hub requests get rate-limited.
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: uv run .github/cache_config/manage_cache.py --public
+          hf_token: ${{ secrets.HF_TOKEN }}
 
       - name: Run vLLM benchmarks
         id: bench
@@ -1428,26 +851,24 @@ jobs:
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
           # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
           SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
-          # Prebaked runs use the image's tree: an unbuilt checkout would shadow its spyre_inference._C kernels.
-          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
+          MODEL: ${{ matrix.model }}
+          SRC_DIR: ${{ steps.env.outputs.src_dir }}
         run: |
-          echo "Running vLLM benchmark suite (TEST_TYPE=perf) from ${SRC_DIR}..."
-          make -C "${SRC_DIR}" tests TEST_TYPE=perf RESULTS_DIR="${GITHUB_WORKSPACE}/${RESULTS_DIR}" \
+          make -C "${SRC_DIR}" perf-tests RESULTS_DIR="${GITHUB_WORKSPACE}/${RESULTS_DIR}" MODELS="${MODEL}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
-          echo "benchmarks done"
 
       # A dispatch by SHA names no branch; claim the dispatch ref only when it contains the
       # commit, rather than recording the SHA as a branch. curl, not `gh`: the runner image has no
       # gh, and a silent failure here recorded every dispatched run with an empty branch.
       - name: Resolve the tested commit and branch
         id: tested
-        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           REF_IN: ${{ inputs.ref }}
           REF_NAME: ${{ github.ref_name }}
           REPO: ${{ inputs.repository || github.repository }}
-          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
+          SRC_DIR: ${{ steps.env.outputs.src_dir }}
         run: |
           SHA="$(git -C "${SRC_DIR}" rev-parse HEAD)" || { echo "::warning::could not read the commit of ${SRC_DIR}; recording the checkout's"; SHA="$(git rev-parse HEAD)"; }
           BRANCH="${REF_IN:-${REF_NAME}}"
@@ -1469,7 +890,7 @@ jobs:
       # action no-ops without a host or JSON. !cancelled(): a later benchmark failing must not
       # discard the ones that completed.
       - name: Ingest benchmark results into ClickHouse
-        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        if: ${{ !cancelled() }}
         uses: ./.github/actions/ingest-vllm-benchmarks
         with:
           results-dir: ${{ env.RESULTS_DIR }}

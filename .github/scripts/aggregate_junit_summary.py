@@ -27,31 +27,20 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from xml.parsers import expat
 
 
 class DTDRefused(ValueError):
     pass
 
 
-def _parse_no_dtd(path: str) -> ET.Element:
+class _NoDTD(ET.TreeBuilder):
     # Real JUnit XML has no DTD, and refusing one closes entity-expansion DoS.
-    builder = ET.TreeBuilder()
-    parser = expat.ParserCreate()
-
-    def _forbid_doctype(name, sysid, pubid, has_internal_subset):
+    # ElementTree calls doctype() on the target the moment it sees a <!DOCTYPE>,
+    # so raising here refuses the document before any entity is expanded.
+    def doctype(self, name, pubid, system):
         raise DTDRefused(
-            f"Refusing {Path(path).name}: JUnit XML must not declare a DTD "
-            "(entity-expansion DoS guard)"
+            f"JUnit XML must not declare a DTD: {name} (entity-expansion DoS guard)"
         )
-
-    parser.StartDoctypeDeclHandler = _forbid_doctype
-    parser.StartElementHandler = builder.start
-    parser.EndElementHandler = builder.end
-    parser.CharacterDataHandler = builder.data
-    with open(path, "rb") as f:
-        parser.ParseFile(f)
-    return builder.close()
 
 
 # emoji, word (word is plain text so a browser ctrl+f for "xpass" hits the row).
@@ -128,8 +117,8 @@ def _case_id(case: ET.Element) -> str:
 
 def parse_file(path: str) -> tuple[str, float, list[Case]] | None:
     try:
-        root = _parse_no_dtd(path)
-    except (OSError, expat.ExpatError, DTDRefused) as e:
+        root = ET.parse(path, ET.XMLParser(target=_NoDTD())).getroot()
+    except (OSError, ET.ParseError, DTDRefused) as e:
         print(f"Skipping unreadable {path}: {e}", file=sys.stderr)
         return None
 

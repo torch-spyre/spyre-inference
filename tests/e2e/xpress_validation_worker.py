@@ -55,9 +55,11 @@ class ValidationWorker(TorchSpyreWorker):
             ),
             "model": dict.fromkeys(
                 (
+                    "host_argmax_calls",
                     "selection_calls",
                     "device_to_host_seconds",
                     "host_argmax_seconds",
+                    "device_selection_seconds",
                     "candidate_gather_seconds",
                     "refiner_seconds",
                     "logits_seconds",
@@ -83,13 +85,15 @@ class ValidationWorker(TorchSpyreWorker):
             transferred="logits_transfer_bytes",
         )
         self._time_call(
-            model, "_argmax_on_cpu", "model", "host_argmax_seconds", count="selection_calls"
+            model, "_argmax_on_cpu", "model", "host_argmax_seconds", count="host_argmax_calls"
+        )
+        self._time_call(
+            model, "_select_feedback", "model", "device_selection_seconds", count="selection_calls"
         )
         for name, metric in (
             ("_hidden_cache", "refiner_seconds"),
-            ("_refine", "refiner_seconds"),
-            ("_refine_candidates", "refiner_seconds"),
-            ("_gather_readout", "candidate_gather_seconds"),
+            ("_refine_feedback", "refiner_seconds"),
+            ("_prepare_feedback", "candidate_gather_seconds"),
         ):
             if hasattr(model, name):
                 self._time_call(model, name, "model", metric)
@@ -114,6 +118,9 @@ class ValidationWorker(TorchSpyreWorker):
         setattr(owner, name, timed)
 
     def configure_proposer(self, mode, references=None, reject_at=-1, passes=None, tail_salt=0):
+        for counters in self._stats.values():
+            for name in counters:
+                counters[name] = 0
         self.mode = mode
         self.references = references or []
         self.reject_at = reject_at

@@ -21,11 +21,11 @@ module must not import the vision model; that lives in ``gemma4_mm.py``.
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4Router
 
 from spyre_inference.models._prelaunch import disable_modalities
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
@@ -153,7 +153,8 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
                 activation="gelu_tanh",
                 routing="full_softmax",
                 prepare_down_weight=partial(
-                    _fold_gemma4_expert_scale, scale=decoder.router.per_expert_scale
+                    _fold_gemma4_expert_scale,
+                    scale=cast(Gemma4Router, decoder.router).per_expert_scale,
                 ),
             ),
         )

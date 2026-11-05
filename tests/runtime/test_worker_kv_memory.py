@@ -37,14 +37,15 @@ GiB = 1 << 30
 TOTAL = 96 * GiB
 BLOCK_BYTES = 2 * 2 * 4 * 128 * 128  # K+V, fp16, 4 kv heads, head 128, block 128
 BATCH_BLOCKS = 4 * (1024 // 128) + 1  # _worker's default max_num_seqs at max_model_len
+NUM_LAYERS = 32
 
 
 def _full(dtype: torch.dtype = torch.float16) -> FullAttentionSpec:
     return FullAttentionSpec(block_size=128, num_kv_heads=4, head_size=128, dtype=dtype)
 
 
-def _two_full_layers(dtype: torch.dtype = torch.float16) -> dict:
-    return {f"layers.{i}.attn": _full(dtype) for i in range(2)}
+def _full_layers(dtype: torch.dtype = torch.float16, num_layers: int = NUM_LAYERS) -> dict:
+    return {f"layers.{i}.attn": _full(dtype) for i in range(num_layers)}
 
 
 def _worker(
@@ -65,7 +66,7 @@ def _worker(
     monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda *_: 0)
     monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda *_: None)
 
-    specs = kv_cache_spec if kv_cache_spec is not None else _two_full_layers(dtype)
+    specs = kv_cache_spec if kv_cache_spec is not None else _full_layers(dtype)
     vllm_config = VllmConfig()
     vllm_config.model_config = SimpleNamespace(
         max_model_len=max_model_len, multimodal_config=None, supports_kv_cache_grouping=False
@@ -98,9 +99,9 @@ def test_the_budget_is_the_requested_share_minus_what_loading_consumed(monkeypat
     past what a full batch needs: the prefix cache keeps the rest for reuse."""
     worker = _worker(monkeypatch, free_after_load=60 * GiB)
 
-    blocks = worker.determine_available_memory() // (2 * BLOCK_BYTES)
+    blocks = worker.determine_available_memory() // (NUM_LAYERS * BLOCK_BYTES)
 
-    assert blocks == (worker.requested_memory - 36 * GiB) // (2 * BLOCK_BYTES)
+    assert blocks == (worker.requested_memory - 36 * GiB) // (NUM_LAYERS * BLOCK_BYTES)
     assert blocks > BATCH_BLOCKS
 
 
@@ -124,9 +125,38 @@ def test_an_fp8_cache_fits_twice_the_blocks(monkeypatch):
     for dtype in (torch.float16, torch.uint8):
         worker = _worker(monkeypatch, free_after_load=60 * GiB, dtype=dtype)
         page = next(iter(worker.model_runner.get_kv_cache_spec().values())).page_size_bytes
-        blocks[dtype] = worker.determine_available_memory() // (2 * page)
+        blocks[dtype] = worker.determine_available_memory() // (NUM_LAYERS * page)
 
     assert blocks[torch.uint8] == 2 * blocks[torch.float16]
+
+
+def _pack(tensor_bytes: list[int], free_regions: list[int]) -> bool:
+    """Place each tensor in the region with the most room, as the allocator does."""
+    for nbytes in sorted(tensor_bytes, reverse=True):
+        i = max(range(len(free_regions)), key=free_regions.__getitem__)
+        if free_regions[i] < nbytes:
+            return False
+        free_regions[i] -= nbytes
+    return True
+
+
+@pytest.mark.parametrize("weights_region", [0, 5])
+def test_a_shallow_models_kv_tensors_fit_the_16_gib_regions(monkeypatch, weights_region):
+    """A tensor never spans two of the card's six 16 GiB regions. Four layers at the
+    default budget would make eight 10.75 GiB K/V tensors, of which only six fit."""
+    worker = _worker(
+        monkeypatch, free_after_load=95 * GiB, kv_cache_spec=_full_layers(num_layers=4)
+    )
+    worker.cache_config.gpu_memory_utilization = 0.92
+    worker.requested_memory = request_memory(worker.init_snapshot, worker.cache_config)
+    region = 16 * GiB
+    regions = [region] * 6
+    regions[weights_region] -= 1 * GiB
+
+    blocks = worker.determine_available_memory() // (4 * BLOCK_BYTES)
+
+    assert blocks * 4 * BLOCK_BYTES < worker.requested_memory - 1 * GiB
+    assert _pack([blocks * BLOCK_BYTES // 2] * 8, regions)
 
 
 def _mamba_hybrid(num_mamba: int = 6) -> dict:
@@ -147,14 +177,14 @@ def test_a_mamba_hybrid_is_sized_by_its_per_layer_device_cost(monkeypatch):
     Spyre's cost, so they fit on the card."""
     specs = _mamba_hybrid()
     worker = _worker(
-        monkeypatch, free_after_load=40 * GiB, kv_cache_spec=specs, hybrid_kv_cache_manager=True
+        monkeypatch, free_after_load=20 * GiB, kv_cache_spec=specs, hybrid_kv_cache_manager=True
     )
     mamba_bytes = specs["layers.0.mixer"].real_page_size_bytes
     spyre_bytes_per_block = 6 * mamba_bytes + BLOCK_BYTES
 
     blocks = worker.determine_available_memory() // BLOCK_BYTES
 
-    measured = worker.requested_memory - (TOTAL - 40 * GiB)
+    measured = worker.requested_memory - (TOTAL - 20 * GiB)
     assert blocks == measured // spyre_bytes_per_block
     assert blocks * spyre_bytes_per_block <= measured
 
@@ -164,11 +194,11 @@ def test_requests_queue_for_pages_only_below_the_batch_area(
     monkeypatch, caplog, spare_blocks, warns
 ):
     worker = _worker(monkeypatch, free_after_load=TOTAL)
-    worker.requested_memory = (BATCH_BLOCKS + spare_blocks) * 2 * BLOCK_BYTES
+    worker.requested_memory = (BATCH_BLOCKS + spare_blocks) * NUM_LAYERS * BLOCK_BYTES
 
     with caplog.at_level(logging.WARNING, logger="spyre_inference.v1.worker.spyre_worker"):
         caplog.clear()
-        blocks = worker.determine_available_memory() // (2 * BLOCK_BYTES)
+        blocks = worker.determine_available_memory() // (NUM_LAYERS * BLOCK_BYTES)
 
     assert blocks == BATCH_BLOCKS + spare_blocks
     assert any("queue for pages" in r.getMessage() for r in caplog.records) == warns
@@ -181,7 +211,7 @@ def test_the_batch_area_warning_checks_num_gpu_blocks_override(
     """vLLM replaces the measured block count with the override later, so the override,
     not the card, decides whether a full batch fits."""
     worker = _worker(monkeypatch, free_after_load=TOTAL)
-    worker.requested_memory = 2 * BATCH_BLOCKS * 2 * BLOCK_BYTES
+    worker.requested_memory = 2 * BATCH_BLOCKS * NUM_LAYERS * BLOCK_BYTES
     worker.cache_config.num_gpu_blocks_override = override
 
     with caplog.at_level(logging.WARNING, logger="spyre_inference.v1.worker.spyre_worker"):

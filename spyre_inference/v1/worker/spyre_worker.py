@@ -21,6 +21,7 @@ from contextlib import AbstractContextManager, nullcontext
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import MemorySnapshot
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
@@ -29,7 +30,12 @@ from vllm.v1.core.kv_cache_planning import (
     _pool_bytes_per_block_from_builder,
     get_kv_cache_groups_from_builder,
 )
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.worker_base import CompilationTimes
@@ -45,15 +51,20 @@ from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 logger = init_logger(__name__)
 
 
+# flex's MAX_REGION_SIZE: the allocator splits device memory into regions of this size
+# (six on a 96 GiB card), and never splits a tensor across two.
+_SPYRE_REGION_BYTES = 16 << 30
+
+
 def _kv_block_layout(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
-) -> tuple[int, int, int] | None:
-    """``(pool bytes per block, Spyre bytes per block, blocks per full request)``, or
-    None without a KV cache.
+) -> tuple[int, list[int], int] | None:
+    """``(pool bytes per block, bytes per block of each Spyre KV tensor, blocks per full
+    request)``, or None without a KV cache.
 
-    With ``disable_hybrid_kv_cache_manager`` every layer lands in one group and the two
-    byte counts agree. They differ for a Mamba hybrid, which keeps the hybrid manager:
-    upstream overlays its groups on one buffer and needs ``pool bytes`` per block, while
+    With ``disable_hybrid_kv_cache_manager`` every layer lands in one group and the pool
+    bytes match the tensors' sum. They differ for a Mamba hybrid, which keeps the hybrid
+    manager: upstream overlays its groups on one buffer and needs ``pool bytes`` per block, while
     Spyre allocates every layer's own page per block, unpadded where upstream pads (a
     Mamba state). The per-request count is upstream's grouping, so a Mamba group holds
     one block and a sliding-window group its window.
@@ -74,13 +85,15 @@ def _kv_block_layout(
         return None
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
     # Attention and Mamba specs pad their page to a shared size; Spyre's pages do not.
-    spyre_bytes = 0
+    tensors: list[int] = []
     for group in groups:
         for name in group.layer_names:
             spec = _layer_spec(group, name)
-            spyre_bytes += getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
+            page = getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
+            # An attention page holds K and V, which allocate_pages allocates apart.
+            tensors += [page // 2] * 2 if isinstance(spec, AttentionSpec) else [page]
     per_request = _max_memory_usage_bytes_from_groups(builder, vllm_config, groups) // pool_bytes
-    return pool_bytes, spyre_bytes, per_request
+    return pool_bytes, tensors, per_request
 
 
 def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
@@ -240,8 +253,10 @@ class TorchSpyreWorker(Worker):
         layout = _kv_block_layout(self.vllm_config, self.model_runner.get_kv_cache_spec())
         if layout is None or available <= 0:
             return available
-        pool_bytes, spyre_bytes, per_request = layout
-        blocks = available // spyre_bytes
+        pool_bytes, tensor_bytes, per_request = layout
+        blocks = available // sum(tensor_bytes)
+        if not self.cache_config.kv_cache_memory_bytes:
+            blocks = min(blocks, self._region_safe_blocks(tensor_bytes))
         batch_blocks = self.scheduler_config.max_num_seqs * per_request + 1
         # Upstream replaces the measured count with the override in get_kv_cache_configs.
         override = self.cache_config.num_gpu_blocks_override
@@ -258,6 +273,21 @@ class TorchSpyreWorker(Worker):
                 "--gpu-memory-utilization" if override is None else "--num-gpu-blocks-override",
             )
         return blocks * pool_bytes
+
+    def _region_safe_blocks(self, tensor_bytes: list[int]) -> int:
+        """The most blocks whose KV tensors fit the allocator's regions, wherever the
+        weights sit in them.
+
+        A tensor fails only once every region has less room than it, so it is placed
+        while the free bytes left reach num_regions times its size; one largest tensor
+        spared per other region guarantees that for the last. A deep model's many small
+        tensors stay within the budget anyway; a shallow one's few large ones do not:
+        four layers at an 86 GiB budget make eight 10.75 GiB tensors, one per region, of
+        which six fit.
+        """
+        free, total = torch.accelerator.get_memory_info(self.init_snapshot.device_)
+        num_regions = cdiv(total, _SPYRE_REGION_BYTES)
+        return free // (sum(tensor_bytes) + (num_regions - 1) * max(tensor_bytes))
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420

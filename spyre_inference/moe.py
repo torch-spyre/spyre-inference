@@ -128,10 +128,11 @@ class SpyreMoERecipe:
     activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
-    # Reorders ``w13``'s output rows (dim 1) into ``[gate | up]`` halves. gpt-oss interleaves
-    # them, ``[gate0, up0, gate1, ...]``; the gate/up split below takes the first half as gate.
-    # Also applied to ``w13_bias``, whose output axis is dim 1 too.
-    prepare_gate_up_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+
+# vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
+# gate and up rows interleaved, [gate0, up0, gate1, ...], as in gpt-oss checkpoints.
+_SWIGLUOAI_LIMIT, _SWIGLUOAI_ALPHA = 7.0, 1.702
 
 
 def deinterleave_gate_up(weight: torch.Tensor) -> torch.Tensor:
@@ -279,9 +280,6 @@ def _routing_weights(
         selected_logits, indices = _topk(router_logits, top_k)
         weights = torch.softmax(selected_logits, dim=-1)
     return weights, indices
-
-
-_SWIGLUOAI_LIMIT, _SWIGLUOAI_ALPHA = 7.0, 1.702
 
 
 def _activation(x: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
@@ -745,9 +743,8 @@ def _prepare_biases(
     if not hasattr(layer, "w13_bias"):
         return None
     w13_bias = layer.get_parameter("w13_bias").data
-    prepare_gate_up = layer.spyre_moe_recipe.prepare_gate_up_weight
-    if prepare_gate_up is not None:
-        w13_bias = prepare_gate_up(w13_bias)
+    if layer.spyre_moe_recipe.activation == "swigluoai":
+        w13_bias = deinterleave_gate_up(w13_bias)
     w2_bias = layer.get_parameter("w2_bias").data
     experts, hidden = w2_bias.shape
     # Every rank adds this full down bias before MoERunner's all-reduce, as upstream's
@@ -804,9 +801,8 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # activation lanes multiply zero rows in the down stack. A gate/up bias pads with zeros
     # too, and its padded activation lanes still meet those zero rows.
     pad = -inter % stick
-    recipe = layer.spyre_moe_recipe
-    if recipe.prepare_gate_up_weight is not None:
-        w13 = recipe.prepare_gate_up_weight(w13)
+    if layer.spyre_moe_recipe.activation == "swigluoai":
+        w13 = deinterleave_gate_up(w13)
     # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
@@ -815,7 +811,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
-    transform_down = recipe.prepare_down_weight
+    transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
     # Keep the complete stack for persistent compute and expose a view for gathered decode.

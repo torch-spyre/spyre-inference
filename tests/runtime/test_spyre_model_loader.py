@@ -279,3 +279,39 @@ def test_explicit_spyre_load_format_rejected_for_padded_config():
     vllm_config.load_config.load_format = "spyre"
     with pytest.raises(ValueError, match="--load-format spyre is not supported"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+class _FakeMultimodal(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Linear(2, 2)
+        self.vision_tower = nn.Linear(2, 2)
+        self.projector = nn.Linear(2, 2)
+
+
+_NON_TEXT = {"vision_tower.weight", "vision_tower.bias", "projector.weight", "projector.bias"}
+
+
+def test_host_loaded_names_include_vision_tower(monkeypatch):
+    from spyre_inference.custom_ops import text_backbone
+
+    model = _FakeMultimodal()
+    monkeypatch.setattr(
+        text_backbone, "_language_backbones", lambda m: [("language_model", m.language_model)]
+    )
+    assert _get_host_loaded_param_names(model) == _NON_TEXT
+
+
+def test_non_text_parameter_names_text_only_model(monkeypatch):
+    from spyre_inference.custom_ops import text_backbone
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    monkeypatch.setattr(text_backbone, "_language_backbones", lambda m: [("", m)])
+    assert text_backbone.non_text_parameter_names(model) == set()
+
+
+def test_non_text_parameter_names_unisolatable_backbone_is_conservative(monkeypatch):
+    from spyre_inference.custom_ops import text_backbone
+
+    model = _FakeMultimodal()
+    monkeypatch.setattr(text_backbone, "_language_backbones", lambda m: None)
+    assert text_backbone.non_text_parameter_names(model) == {n for n, _ in model.named_parameters()}

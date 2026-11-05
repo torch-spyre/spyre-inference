@@ -208,7 +208,8 @@ def _spyre_loader_supported(vllm_config) -> bool:
     Supported, and worth knowing about when touching the loader:
       - TP > 1: linear weights are sharded on read (see
         ``model_loader._iter_tp_sharded_weights``).
-      - multimodal: vision-tower weights stream through the same path.
+      - multimodal: the language backbone streams direct-to-device; vision-tower and
+        projector parameters stay host-loaded (see ``_get_host_loaded_param_names``).
     """
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None:

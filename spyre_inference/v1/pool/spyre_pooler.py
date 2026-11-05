@@ -133,7 +133,7 @@ def pad_row_count_to_bucket(row_indices: torch.Tensor) -> tuple[torch.Tensor, in
     ``max_num_seqs``. Left alone that is up to 64 graphs per body bucket, each
     compiling the first time its request count appears mid-serve. Rounding the
     count to a power of two caps it at a handful of widths that warmup can
-    afford to sweep (see ``_warm_pooler_row_widths``).
+    afford to sweep (see ``warm_pooler_row_widths``).
 
     Padding lanes repeat the last real row, so the extra rows are duplicates
     the caller drops; they never introduce a row that was not already pooled.

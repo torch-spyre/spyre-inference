@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import warnings
 from unittest.mock import Mock
 
@@ -23,6 +22,7 @@ from spyre_testing_plugin.attn_helpers import (
     _fused_qkv_kv_views,
     _padded_mask_metadata,
     assert_close_outliers,
+    random_block_tables,
     ref_attn,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -38,6 +38,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
+from spyre_inference.v1.attention.backends.spyre_head_major_attn import SpyreHeadMajorAttentionImpl
 from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
@@ -102,23 +104,6 @@ def configure_compilation(request, monkeypatch):
     torch._dynamo.reset()
 
 
-def _alibi_slopes(num_heads: int) -> list[float]:
-    """Standard ALiBi slope generator (Press et al. 2022).
-
-    For power-of-two head counts, uses the geometric sequence from the paper.
-    For non-power-of-two counts, interleaves the next power-of-two sequence.
-    """
-
-    def _pow2(n: int) -> list[float]:
-        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-        return [start * (start**i) for i in range(n)]
-
-    if math.log2(num_heads).is_integer():
-        return _pow2(num_heads)
-    closest = 2 ** math.floor(math.log2(num_heads))
-    return _pow2(closest) + _pow2(2 * closest)[0::2][: num_heads - closest]
-
-
 @torch.inference_mode()
 def _run_spyre_attn_test(
     seq_lens: list[tuple[int, int]],
@@ -126,8 +111,9 @@ def _run_spyre_attn_test(
     sliding_window: int | None,
     configure_compilation: str,
     configure_device: str,
-    use_alibi: bool = False,
     soft_cap: float | None = None,
+    use_sinks: bool = False,
+    tolerance: tuple[float, float] | None = None,
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
@@ -153,7 +139,8 @@ def _run_spyre_attn_test(
     torch.set_default_device("cpu")
     set_random_seed(0)
 
-    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
+    # gpt-oss-20b's sinks span -2.45..8.19: from negligible to most of the softmax mass.
+    sinks = torch.linspace(-2.5, 8.5, num_query_heads).to(dtype) if use_sinks else None
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -177,8 +164,9 @@ def _run_spyre_attn_test(
 
     # Widened to the recorder's num_blocks buckets, as a real engine's block
     # table is, so build()'s padding isn't suppressed by an exactly-sized table.
-    # The extra entries point at garbage pages on purpose: padded blocks are
-    # fully masked and must not affect the result.
+    # The extra entries point at pages no sequence owns, so they cannot alias
+    # live KV. An unmasked padded block mostly stays within tolerance, so this
+    # does not test the padding mask.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     # The num_blocks ladder is derived from block_size, so the bucketer needs this
     # test's value rather than the fixture default or it pads to the wrong width.
@@ -188,9 +176,7 @@ def _run_spyre_attn_test(
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-    )
+    block_tables = random_block_tables(kv_lens, max_num_blocks_per_seq, block_size, num_blocks)
 
     slot_mapping = []
     q_offset = 0
@@ -237,10 +223,10 @@ def _run_spyre_attn_test(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
+        sinks=sinks,
     )
 
     # The fused store is just whether the kernel was handed an `out` buffer.
@@ -249,10 +235,10 @@ def _run_spyre_attn_test(
     if expect_fused_store is not None or expect_query_widths is not None:
         _real_attn_fn = attn_impl._attn_fn
 
-        def _spy_attn_fn(*a, **kw):
-            fused_calls.append(a[-1] is not None)
-            dispatched_widths.add(a[8])  # padded_query_len
-            return _real_attn_fn(*a, **kw)
+        def _spy_attn_fn(**kw):
+            fused_calls.append(kw["out"] is not None)
+            dispatched_widths.add(kw["padded_query_len"])
+            return _real_attn_fn(**kw)
 
         attn_impl._attn_fn = _spy_attn_fn
 
@@ -304,17 +290,15 @@ def _run_spyre_attn_test(
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
-        alibi_slopes=alibi_slopes,
+        sinks=sinks,
     )
 
-    if max(query_lens) >= 32:
+    if tolerance is not None:
+        atol, rtol = tolerance
+    elif max(query_lens) >= 32:
         atol, rtol = 0.3, 0.2
     else:
         atol, rtol = 0.2, 0.2
-    if dtype is torch.bfloat16 and alibi_slopes is not None:
-        # The reference builds the ALiBi bias in fp32, the impl at model dtype: bf16 costs
-        # up to 0.5 of a logit at kv=512. Non-ALiBi bf16 holds the fp16 tolerance.
-        atol, rtol = atol * 4, rtol * 2
 
     assert_close_outliers(
         output.to("cpu"),
@@ -628,47 +612,6 @@ def test_spyre_attn_sliding_window(
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
     ],
 )
-def test_spyre_attn_alibi(
-    default_vllm_config,
-    seq_lens: list[tuple[int, int]],
-    configure_compilation: str,
-    configure_device: str,
-) -> None:
-    """ALiBi positional bias correctness."""
-    _run_spyre_attn_test(
-        seq_lens=seq_lens,
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        use_alibi=True,
-    )
-
-
-@pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [
-        pytest.param("NONE", id="compilation_NONE"),
-        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
-        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
-        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
-    ],
-)
 @pytest.mark.parametrize(
     "soft_cap",
     [
@@ -690,6 +633,60 @@ def test_spyre_attn_soft_cap(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         soft_cap=soft_cap,
+    )
+
+
+# Every sink case measured within 0.015 of the reference on Spyre; dropping the sinks
+# moves the output by up to 0.3 at these shapes, which the default 0.2 + 20% bound absorbs.
+SINK_TOLERANCE = (0.05, 0.05)
+
+
+# Compiled attention on CPU always skips, so the matrix leaves that pair out.
+@pytest.mark.parametrize(
+    ("configure_device", "configure_compilation"),
+    [
+        pytest.param("cpu", "NONE", id="device_cpu-compilation_NONE"),
+        pytest.param("spyre", "NONE", id="device_spyre-compilation_NONE"),
+        pytest.param("spyre", "STOCK_TORCH_COMPILE", id="device_spyre-compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "sliding_window"),
+    [
+        pytest.param([(1, 256)], None, id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], None, id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (32, 200)], None, id="mixed(2seqs)"),
+        # gpt-oss puts sinks on its sliding-window layers too. One sequence each until #1462:
+        # the helper's random block tables can give two sequences the same page.
+        pytest.param([(1, 300)], 128, id="decode_sliding_window(128)"),
+        pytest.param([(32, 200)], 128, id="prefill_sliding_window(128)"),
+    ],
+)
+# One KV head cannot tell the kv-major sink order from a transposed one; two can.
+@pytest.mark.parametrize(
+    "num_kv_heads", [pytest.param(1, id="8q_1kv"), pytest.param(2, id="8q_2kv")]
+)
+def test_spyre_attn_sinks(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    sliding_window: int | None,
+    num_kv_heads: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Attention sinks (gpt-oss): one logit per head joins the softmax denominator."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=64,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_sinks=True,
+        tolerance=SINK_TOLERANCE,
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        head_size=64,
     )
 
 
@@ -1173,21 +1170,85 @@ def test_kv_cache_dtype_that_disagrees_with_the_model_is_rejected(default_vllm_c
         SpyreAttentionImpl(kv_cache_dtype="bfloat16", **kwargs)
 
 
-def test_attention_sinks_are_rejected(default_vllm_config):
-    """Sink models (gpt-oss natively, and the Transformers backend) pass
-    sinks to the impl, and nothing screens sink models out before this constructor:
-    upstream consults `supports_sink()` only from
-    `AttentionBackendEnum.validate_configuration`, called from the CUDA and ROCm
-    platforms, while `TorchSpyrePlatform.get_attn_backend_cls` registers this backend
-    under `CUSTOM` and never calls it. The raise is the only thing standing between a
-    sink model and silently computing plain attention, so pin it."""
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_e5m2", "fp8_inc", "nvfp4", "fp8_per_token_head"])
+def test_unsupported_quantized_kv_cache_dtype_is_named(default_vllm_config, kv_cache_dtype):
+    """Upstream sizes these as uint8 bytes like fp8, so the constructor is the only guard
+    against storing them as e4m3; the message names the dtypes Spyre does take."""
+    from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+        SpyreHeadMajorAttentionImpl,
+    )
+
+    with pytest.raises(ValueError, match=f"{kv_cache_dtype} is not supported on Spyre.*fp8_e4m3"):
+        SpyreHeadMajorAttentionImpl(
+            num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype=kv_cache_dtype
+        )
+
+
+def test_attention_sinks_are_held_kv_major(default_vllm_config):
+    """gpt-oss passes one sink logit per query head. The kernels index heads kv-major,
+    ``[num_kv_heads, num_queries_per_kv]``, which is upstream's flat head order reshaped;
+    a transposed reshape would pair each sink with another head and fail no shape check.
+    Values are read only when first used, after the weight loader has filled them."""
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 
-    kwargs = dict(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8)
-    assert SpyreAttentionImpl(sinks=None, **kwargs) is not None
+    kwargs = dict(num_heads=8, head_size=64, scale=0.125, num_kv_heads=2)
+    assert SpyreAttentionImpl(sinks=None, **kwargs)._device_sinks(torch.device("cpu")) is None
 
-    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
-        SpyreAttentionImpl(sinks=torch.zeros(8, dtype=torch.float16), **kwargs)
+    sinks = torch.nn.Parameter(torch.empty(8, dtype=torch.float32), requires_grad=False)
+    impl = SpyreAttentionImpl(sinks=sinks, **kwargs)
+    sinks.data.copy_(torch.arange(8, dtype=torch.float32))
+    held = impl._device_sinks(torch.device("cpu"))
+    assert held.dtype == torch.float16
+    torch.testing.assert_close(held, torch.arange(8, dtype=torch.float16).reshape(2, 4, 1))
+
+    with pytest.raises(ValueError, match="one logit per query head"):
+        SpyreAttentionImpl(sinks=torch.zeros(2, dtype=torch.float16), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+def test_attention_sinks_follow_the_parameter_moved_to_spyre(
+    default_vllm_config, monkeypatch, configure_device
+):
+    """gpt-oss and granite register the sinks on their own attention module, so
+    ``model.to("spyre")`` replaces that Parameter and a reload writes the replacement. A
+    host-only test cannot see this: on CPU the move keeps the original."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    from spyre_inference.v1.worker.model_load import move_model_to_spyre
+
+    # move_model_to_spyre patches the class for good; restore it after the test.
+    monkeypatch.setattr(Attention, "_apply", Attention._apply)
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    model.attn = torch.nn.Module()
+    model.attn.impl = SpyreAttentionImpl(
+        num_heads=8, head_size=64, scale=0.125, num_kv_heads=2, sinks=model.sinks
+    )
+    device = torch.device("spyre")
+
+    move_model_to_spyre(model, device)
+    assert model.sinks.device.type == "spyre"
+
+    model.sinks.data.copy_(torch.full((8,), 3.0, dtype=torch.float16))
+    model.attn.impl.process_weights_after_loading(torch.float16)
+    torch.testing.assert_close(
+        model.attn.impl._device_sinks(device).cpu(),
+        torch.full((2, 4, 1), 3.0, dtype=torch.float16),
+    )
+
+
+@pytest.mark.parametrize(
+    "impl_cls", [SpyreAttentionImpl, SpyreHeadMajorAttentionImpl, SpyreEncoderAttentionImpl]
+)
+def test_alibi_is_rejected(default_vllm_config, impl_cls):
+    """The backstop behind the platform's `uses_alibi` check, which is a heuristic over HF
+    config fields; without the raise a model it misses would run without its positional bias."""
+    with pytest.raises(NotImplementedError, match="ALiBi is not supported"):
+        impl_cls(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8, alibi_slopes=[0.5] * 8)
 
 
 @pytest.mark.parametrize(
@@ -1204,24 +1265,22 @@ def test_attention_sinks_are_rejected(default_vllm_config):
     indirect=True,
 )
 @pytest.mark.parametrize(
-    ("seq_lens", "sliding_window", "use_alibi"),
+    ("seq_lens", "sliding_window"),
     [
-        pytest.param([(1, 512)], None, False, id="decode(q=1,kv=512)"),
-        pytest.param([(32, 256)], None, False, id="prefill(q=32,kv=256)"),
-        pytest.param([(1, 256), (32, 256)], None, False, id="mixed(decode+prefill)"),
-        pytest.param([(32, 256)], 64, False, id="sliding_window(q=32,kv=256)"),
-        pytest.param([(1, 512)], None, True, id="alibi_decode(q=1,kv=512)"),
+        pytest.param([(1, 512)], None, id="decode(q=1,kv=512)"),
+        pytest.param([(32, 256)], None, id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (32, 256)], None, id="mixed(decode+prefill)"),
+        pytest.param([(32, 256)], 64, id="sliding_window(q=32,kv=256)"),
     ],
 )
 def test_spyre_attn_bfloat16(
     default_vllm_config,
     seq_lens: list[tuple[int, int]],
     sliding_window: int | None,
-    use_alibi: bool,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Run the kernels at bf16: KV cache, masks and ALiBi slopes all follow model dtype.
+    """Run the kernels at bf16: KV cache and masks follow model dtype.
 
     TP1 only, matching the platform — bf16 with TP>1 is rejected as all_reduce is fp16-only.
     """
@@ -1231,7 +1290,6 @@ def test_spyre_attn_bfloat16(
         sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
-        use_alibi=use_alibi,
         dtype=torch.bfloat16,
     )
 
@@ -1457,25 +1515,72 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
     suffix = {
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (2, 3)
     }
-    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    torch.testing.assert_close(calls, [stacks_cpu[2], stacks_cpu[3]], rtol=0, atol=0)
     assert sum(t.numel() * t.element_size() for t in calls) == sum(
         stacks_cpu[i].numel() * stacks_cpu[i].element_size() for i in (2, 3)
     )
     for seq_idx in (2, 3):
         assert _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) is suffix[seq_idx]
-    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    torch.testing.assert_close(calls, [stacks_cpu[2], stacks_cpu[3]], rtol=0, atol=0)
 
     # A later layer that cannot use batched decode fills only the missing prefix.
     prefix = {
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (0, 1)
     }
-    assert calls == [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]]
+    torch.testing.assert_close(
+        calls, [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]], rtol=0, atol=0
+    )
     assert metadata.attention_mask_stacks_device is not None
     for seq_idx, stack_device in (prefix | suffix).items():
         assert metadata.attention_mask_stacks_device[seq_idx] is stack_device
         assert torch.equal(stack_device, stacks_cpu[seq_idx])
         assert stack_device.is_contiguous()
         assert stack_device.storage_offset() == 0
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "builds_tables"),
+    [
+        pytest.param([(1, 256)] * 4, False, id="all_decode"),
+        pytest.param([(1, 256), (1, 256), (7, 256)], True, id="mixed"),
+    ],
+)
+def test_page_index_tables_skipped_on_a_fully_batched_step(
+    default_vllm_config, monkeypatch, seq_lens, builds_tables
+):
+    """A step the batched kernel fully serves uploads no per-sequence index table."""
+    torch.set_default_device("cpu")
+    # Not the enable_batched_decode fixture: conftest skips its users, and no kernel runs here.
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    metadata = _padded_mask_metadata(seq_lens, block_size=64)
+    assert metadata.padded_num_seqs is not None
+    assert metadata.num_decode_seqs == sum(q == 1 for q, _ in seq_lens)
+
+    attn_impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
+    dispatched: list[int] = []
+    monkeypatch.setattr(attn_impl, "_batched_decode_preconditions_met", lambda *a: True)
+    monkeypatch.setattr(attn_impl, "_run_batched_decode_dispatch", lambda *a: dispatched.append(1))
+
+    class _TablesBuilt(Exception):
+        pass
+
+    def built(*args):
+        # Stop before the per-sequence kernels, which this CPU test cannot run.
+        raise _TablesBuilt
+
+    monkeypatch.setattr(attn_impl, "build_index_tables", built)
+
+    query = torch.zeros(len(seq_lens), 32, 128, dtype=torch.float16)
+    output = torch.empty_like(query)
+    pages = torch.empty(0)
+    args = (query, pages, pages, metadata, output, torch.device("cpu"))
+    if builds_tables:
+        with pytest.raises(_TablesBuilt):
+            attn_impl._online_softmax_attention(*args)
+    else:
+        assert attn_impl._online_softmax_attention(*args) is output
+        assert metadata.kernel_index_tables is None
+    assert dispatched == [1]
 
 
 def test_empty_mask_stack_cannot_be_mirrored(default_vllm_config):
@@ -1775,6 +1880,57 @@ def test_spyre_attn_batched_decode_correctness(
     indirect=True,
 )
 @pytest.mark.parametrize(
+    "num_kv_heads", [pytest.param(1, id="8q_1kv"), pytest.param(2, id="8q_2kv")]
+)
+def test_spyre_attn_multi_seq_decode_sinks(
+    default_vllm_config,
+    monkeypatch,
+    num_kv_heads: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """The token-major multi-sequence decode kernel adds the sinks once per sequence.
+
+    Named and set up clear of the conftest batched-decode skip. The kernel serves only the
+    untiled walk, so this pins that walk and counts the kernel's calls.
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    calls: list[bool] = []
+    real_decode_fn = spyre_attn._batched_decode_compiled
+
+    def spy(*args, **kwargs):
+        calls.append(True)
+        return real_decode_fn(*args, **kwargs)
+
+    # Patched before the impl is built: __init__ reads this global into the impl.
+    monkeypatch.setattr(spyre_attn, "_batched_decode_compiled", spy)
+    _run_spyre_attn_test(
+        seq_lens=[(1, 256), (1, 512), (1, 128), (1, 384)],
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_sinks=True,
+        tolerance=SINK_TOLERANCE,
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        head_size=64,
+    )
+    assert calls, "the multi-sequence decode kernel never ran"
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
     "seq_lens",
     [
         pytest.param(
@@ -1845,19 +2001,19 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
 
     def run(cap: float):
         return batched_decode_kernel(
-            query,
-            rep_row_ids,
-            k_pages,
-            v_pages,
-            block_ids,
-            mask_by_chunk,
-            1.0,
-            num_seqs,
-            bpc,
-            num_kv_heads,
-            qpk,
-            block_size,
-            head_size,
+            query=query,
+            rep_row_ids=rep_row_ids,
+            k_pages=k_pages,
+            v_pages=v_pages,
+            chunk_page_ids=block_ids,
+            mask_by_chunk=mask_by_chunk,
+            scale=1.0,
+            num_seqs=num_seqs,
+            blocks_per_chunk=bpc,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=qpk,
+            block_size=block_size,
+            head_size=head_size,
             logits_soft_cap=cap,
         )
 
@@ -2131,19 +2287,19 @@ def test_batched_decode_matches_fp32_reference(
     query_padded[:num_seqs] = query
 
     actual = batched_decode_kernel(
-        query_padded,
-        rep_row_ids,
-        k_pages,
-        v_pages,
-        chunk_page_ids,
-        mask_by_chunk,
-        scale,
-        b_seqs,
-        bpc,
-        num_kv_heads,
-        qpk,
-        block_size,
-        head_size,
+        query=query_padded,
+        rep_row_ids=rep_row_ids,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        chunk_page_ids=chunk_page_ids,
+        mask_by_chunk=mask_by_chunk,
+        scale=scale,
+        num_seqs=b_seqs,
+        blocks_per_chunk=bpc,
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=qpk,
+        block_size=block_size,
+        head_size=head_size,
     )
 
     expected = _decode_reference_fp32(
@@ -2163,12 +2319,11 @@ def test_batched_decode_matches_fp32_reference(
 
 
 @pytest.mark.parametrize(
-    "num_blocks,padded_query_len,num_kv_heads,qpk,use_alibi",
+    "num_blocks,padded_query_len,num_kv_heads,qpk",
     [
-        pytest.param(1, 4, 2, 1, False, id="one_block"),
-        pytest.param(4, 4, 2, 1, False, id="four_blocks"),
-        pytest.param(3, 8, 2, 2, False, id="gqa"),
-        pytest.param(4, 8, 2, 2, True, id="alibi"),
+        pytest.param(1, 4, 2, 1, id="one_block"),
+        pytest.param(4, 4, 2, 1, id="four_blocks"),
+        pytest.param(3, 8, 2, 2, id="gqa"),
     ],
 )
 def test_page_attn_matches_fp32_reference(
@@ -2176,7 +2331,6 @@ def test_page_attn_matches_fp32_reference(
     padded_query_len: int,
     num_kv_heads: int,
     qpk: int,
-    use_alibi: bool,
 ) -> None:
     """Prefill's online softmax equals one softmax over the whole KV window.
 
@@ -2213,39 +2367,27 @@ def test_page_attn_matches_fp32_reference(
     mask = torch.full((padded_query_len, kv_len), mask_min, dtype=torch.float32)
     mask.masked_fill_(torch.arange(kv_len).unsqueeze(0) <= q_pos.unsqueeze(1), 0.0)
     mask_tiles = mask.reshape(padded_query_len, num_blocks, block_size).transpose(0, 1).contiguous()
-    alibi_stack = None
-    alibi = torch.zeros(num_kv_heads, qpk, 1, kv_len, dtype=torch.float32)
-    if use_alibi:
-        slopes = torch.linspace(0.01, 0.08, num_heads).reshape(num_kv_heads, qpk, 1, 1)
-        alibi_stack = torch.stack(
-            [
-                slopes * torch.arange(b * block_size, (b + 1) * block_size).reshape(1, 1, 1, -1)
-                for b in range(num_blocks)
-            ]
-        )
-        alibi = alibi_stack.permute(1, 2, 3, 0, 4).reshape(num_kv_heads, qpk, 1, kv_len)
 
     actual = page_attn_kernel(
-        query,
-        query_row_index,
-        k_pages,
-        v_pages,
-        page_index_table,
-        mask_tiles,
-        scale,
-        num_blocks,
-        padded_query_len,
-        num_heads,
-        num_kv_heads,
-        head_size,
-        alibi_stack=alibi_stack,
+        query=query,
+        query_row_index=query_row_index,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        page_index_table=page_index_table,
+        mask_stack=mask_tiles,
+        scale=scale,
+        num_blocks=num_blocks,
+        padded_query_len=padded_query_len,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
     )
 
     q_rows = query.index_select(0, query_row_index)
     q = q_rows.transpose(0, 1).reshape(num_kv_heads, qpk, padded_query_len, head_size)
     k = k_pages[page_ids].reshape(kv_len, num_kv_heads, head_size)
     v = v_pages[page_ids].reshape(kv_len, num_kv_heads, head_size)
-    scores = torch.einsum("hgid,thd->hgit", q, k) * scale + alibi + mask
+    scores = torch.einsum("hgid,thd->hgit", q, k) * scale + mask
     probs = torch.softmax(scores, dim=-1)
     expected = (
         torch.einsum("hgit,thd->hgid", probs, v)

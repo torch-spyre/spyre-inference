@@ -41,13 +41,22 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
+    "DFlashDraftModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
+    "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
+    "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM builds
-    # its language model through the registry as Gemma4ForCausalLM, which resolves here,
-    # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
+    # Vision tower only: upstream builds its language model through the registry, as
+    # Gemma4ForCausalLM below.
+    "Gemma4ForConditionalGeneration": (
+        "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
+    ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
+    "MuseGlimmerForConditionalGeneration": (
+        "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM"
+    ),
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (
         "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"
@@ -117,6 +126,14 @@ def register_models() -> None:
         ModelRegistry.register_model(arch, model_cls)
 
 
+def spyre_model_cls(architecture: str) -> type | None:
+    target = spyre_models().get(architecture)
+    if target is None:
+        return None
+    module_name, _, cls_name = target.partition(":")
+    return getattr(importlib.import_module(module_name), cls_name)
+
+
 def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
     """Fail if ``architecture`` has a Spyre adaptation that ``model`` was not built as.
 
@@ -129,14 +146,12 @@ def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
     Raises:
         RuntimeError: if ``model`` is not an instance of the Spyre class.
     """
-    target = spyre_models().get(architecture)
-    if target is None:
+    spyre_cls = spyre_model_cls(architecture)
+    if spyre_cls is None:
         return
-    module_name, _, cls_name = target.partition(":")
-    spyre_cls = getattr(importlib.import_module(module_name), cls_name)
     if not isinstance(model, spyre_cls):
         raise RuntimeError(
-            f"{architecture} was built as {type(model).__name__}, not {cls_name}: vLLM "
+            f"{architecture} was built as {type(model).__name__}, not {spyre_cls.__name__}: vLLM "
             "resolved it before the Spyre model adaptations were registered. Make sure "
             "VLLM_PLUGINS allows the spyre_inference general plugin."
         )
@@ -150,8 +165,9 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     plugin leaves that to the worker, too late for an in-process engine, which by then
     has cached the upstream class of a multimodal architecture such as CLIP.
     """
-    from spyre_inference.models import clip, gemma4
+    from spyre_inference.models import clip, gemma4, muse_glimmer
 
     register_models()
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
+    muse_glimmer.force_language_model_only(engine_args)

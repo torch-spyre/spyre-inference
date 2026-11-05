@@ -77,7 +77,6 @@ def _impl(config, *, head_size=64, num_heads=4, num_kv_heads=1, compiled=True):
             head_size=head_size,
             scale=head_size**-0.5,
             num_kv_heads=num_kv_heads,
-            alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="auto",
             logits_soft_cap=None,
@@ -437,7 +436,7 @@ class TestBuildAttentionMetadata:
         runner.model_config = SimpleNamespace(runner_type="pooling", dtype=torch.float16)
         runner.compilation_config = SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE)
         runner._encoder_rectangles = encoder_rectangles(config)
-        runner._encoder_width_caps = {}
+        runner._encoder_width_caps_by_rows = {}
         runner._encoder_budget = encoder_shape_tables(config).budget
         runner._encoder_buffer_rows = 0
         runner._encoder_grid = None

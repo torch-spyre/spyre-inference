@@ -16,35 +16,27 @@
 
 from __future__ import annotations
 
-import types
-
 import pytest
 import torch
 
-from spyre_inference.v1.worker import spyre_model_runner
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+from spyre_inference.v1.pool import warmup
+from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
 
 ROWS = 64
 HIDDEN = 8
 
 
 def _swept_widths(monkeypatch, max_num_seqs: int) -> list[int]:
-    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner._pooling_on_spyre = True
-    runner.scheduler_config = types.SimpleNamespace(max_num_seqs=max_num_seqs)
-    # No classifier/embed head, so _warm_pooler_row_widths's real-width sweep
-    # (which needs one to warm) stays a no-op and only the plain gather below runs.
-    runner.model = torch.nn.Module()
-    runner.model.pooler = torch.nn.Module()
-
     widths: list[int] = []
     monkeypatch.setattr(
-        spyre_model_runner,
+        warmup,
         "select_rows",
         lambda hidden_states, row_indices: widths.append(int(row_indices.numel())),
     )
-    TorchSpyreModelRunner._warm_pooler_row_widths(
-        runner, torch.zeros(ROWS, HIDDEN, dtype=torch.float16)
+    # No classifier/embed head, so the real-width sweep (which needs one to warm)
+    # stays a no-op and only the plain gather below runs.
+    warm_pooler_row_widths(
+        torch.nn.Module(), torch.zeros(ROWS, HIDDEN, dtype=torch.float16), [], max_num_seqs
     )
     return widths
 

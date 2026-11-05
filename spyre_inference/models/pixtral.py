@@ -41,14 +41,19 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
+    SEGMENT_ITEMS,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
     offset_major,
+    one_hot_segments,
+    segment_buffer,
+    segment_mask,
+    unbind_items,
 )
 from spyre_inference.multimodal.utils import (
-    STICK,
     align_up,
+    linear_weight,
     padded_sdpa,
     rope_perm_matrix,
     rope_rotate_matmul,
@@ -56,9 +61,6 @@ from spyre_inference.multimodal.utils import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-# Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
-_MASK_MIN = torch.finfo(torch.float16).min / 2
 
 
 class SpyrePixtralAttention(pixtral.Attention):
@@ -147,22 +149,10 @@ def offset_major_merge_weight(weight: torch.Tensor, merge: int) -> torch.Tensor:
     return weight.reshape(out_dim, in_dim // merge**2, merge**2).permute(2, 1, 0).contiguous()
 
 
-def _linear_weight(layer: nn.Module) -> torch.Tensor:
-    """``[out, in]``, undoing the Spyre linear's post-load transpose and row padding."""
-    weight = cast(torch.Tensor, layer.weight).detach()
-    padding = getattr(layer, "spyre_row_padding", None)
-    if padding is None:
-        return weight
-    weight = weight.t()
-    return weight[: weight.shape[0] - padding]
-
-
 def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
     """The ``[C, H, W]`` images in ``mm_kwargs``, whether batched in one tensor or a list."""
     images = mm_kwargs.get("images")
-    if images is None:
-        return []
-    return list(images.unbind(0)) if isinstance(images, torch.Tensor) else list(images)
+    return [] if images is None else unbind_items(images)
 
 
 class SpyrePixtralForConditionalGeneration(
@@ -170,8 +160,7 @@ class SpyrePixtralForConditionalGeneration(
 ):
     """Upstream Pixtral with its vision encoder compiled per token budget."""
 
-    # The one-hot image matrix is 64 wide, and its last column belongs to the padding.
-    vision_max_items_per_call = STICK - 1
+    vision_max_items_per_call = SEGMENT_ITEMS
 
     # --- construction ---
 
@@ -191,7 +180,7 @@ class SpyrePixtralForConditionalGeneration(
         self._patch_width = align_up(args.num_channels * args.patch_size**2)
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
-            "segments": VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half()),
+            "segments": segment_buffer(),
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
         # [cos | sin] per position, gathered on the card in vision_embed.
@@ -225,7 +214,7 @@ class SpyrePixtralForConditionalGeneration(
         tower.patch_conv.weight = nn.Parameter(weight_t, requires_grad=False)
         if self.patch_merger is not None:
             layer = self.patch_merger.merging_layer
-            merge_weight = offset_major_merge_weight(_linear_weight(layer), self._merge)
+            merge_weight = offset_major_merge_weight(linear_weight(layer), self._merge)
             layer.weight = nn.Parameter(merge_weight, requires_grad=False)
 
     # --- protocol methods upstream Pixtral does not provide ---
@@ -269,7 +258,7 @@ class SpyrePixtralForConditionalGeneration(
         flat = torch.cat(flat_patches, dim=1).flatten(0, 1).to(torch.float16)
         return {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
-            "segments": F.one_hot(torch.cat(seg, dim=1).flatten(), STICK).to(torch.float16),
+            "segments": one_hot_segments(torch.cat(seg, dim=1).flatten()),
             "positions": torch.cat(pos, dim=1).flatten().to(torch.int64),
         }
 
@@ -278,9 +267,7 @@ class SpyrePixtralForConditionalGeneration(
         # [patch width, D] since process_weights_after_loading.
         patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
-        # Same-image mask as a matmul: Spyre cannot lay out a column-minus-row broadcast.
-        segments = values["segments"].to(x.dtype)
-        mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
+        mask = segment_mask(values["segments"], x.dtype)
         rope = self.spyre_rope_table.gather(values["positions"])
         freqs_cis = (rope[:, : self._head_dim], rope[:, self._head_dim :])
         return x, {"mask": mask, "freqs_cis": freqs_cis}

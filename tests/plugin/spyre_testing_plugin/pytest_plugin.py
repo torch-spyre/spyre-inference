@@ -744,7 +744,23 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
 
+    _signal_timeout_for_subprocess_tests(items)
     _reorder_tests_by_name(items)
+
+
+def _signal_timeout_for_subprocess_tests(items: list[pytest.Item]) -> None:
+    # "thread" os._exit()s the whole run on expiry. These tests block only in an interruptible
+    # zmq poll (they keep the main process off the card), so SIGALRM fails just the one test.
+    for item in items:
+        if item.get_closest_marker("uses_subprocess") is None:
+            continue
+        existing = item.get_closest_marker("timeout")
+        args = existing.args if existing else ()
+        kwargs = dict(existing.kwargs) if existing else {}
+        if len(args) >= 2 or "method" in kwargs:
+            continue
+        timeout = args[0] if args else kwargs.pop("timeout", None)
+        item.add_marker(pytest.mark.timeout(timeout, method="signal", **kwargs), append=False)
 
 
 def _reorder_tests_by_name(items: list[pytest.Item]) -> None:

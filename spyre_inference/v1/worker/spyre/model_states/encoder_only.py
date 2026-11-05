@@ -51,9 +51,9 @@ from spyre_inference.v1.worker.encoder_grid import (
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
 from spyre_inference.v1.worker.spyre.model_states.encoder_plan import EncoderPlan
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    encoder_group_width_caps,
     encoder_shape_tables,
     expand_packed_token_types,
+    group_width_caps,
 )
 
 
@@ -71,8 +71,11 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         super().__init__(vllm_config, model, encoder_cache, device, spyre_device)
         tables = encoder_shape_tables(vllm_config)
         self._rectangles = list(tables.rectangles)
-        self._width_caps = encoder_group_width_caps(vllm_config)
-        self._budget = tables.budget
+        # Per body, ascending. A step padded to 2048 must not use the 8192 caps.
+        self._width_caps_by_rows = {
+            body: group_width_caps(groups) for body, groups in tables.tier_groups
+        }
+        self._bodies = tuple(body for body, _groups in tables.tier_groups)
         # Grouping only pays off through the compiled kernels.
         self._batched = vllm_config.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE
         # The platform sets float16 for every engine run; the field is typed wider.
@@ -110,6 +113,23 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         finally:
             self._forced_rect, self._force_ragged = previous
 
+    def _width_caps_for(self, rows: int) -> dict[int, int]:
+        """Caps of the body this step belongs to.
+
+        A rectangle's row count is its body, so that key is exact. A ragged step's
+        row count is the packed token count, which is not itself a body: 192 tokens
+        against a 512-row body still use that body's caps, or same-extent requests
+        stop grouping.
+        """
+        if rows in self._width_caps_by_rows:
+            return self._width_caps_by_rows[rows]
+        for body in self._bodies:
+            if body >= rows:
+                return self._width_caps_by_rows[body]
+        if self._bodies:
+            return self._width_caps_by_rows[self._bodies[-1]]
+        return {}
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -136,16 +156,25 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         )
         rows = input_batch.num_tokens_after_padding
         # The expansion is an identity only over a body exactly the forced size.
-        if self._forced_rect is not None and rows != self._budget:
-            raise RuntimeError(f"forced {self._forced_rect} needs {self._budget} rows, got {rows}")
-        # A rectangle is the whole body buffer. Multimodal stays packed until #1242:
-        # its body arrives as inputs_embeds, which prepare_inputs never sees.
-        use_rectangles = rows == self._budget and not self._force_ragged
-        use_rectangles = use_rectangles and not self.supports_mm_inputs
+        # That size is the rectangle's own grid, not the largest tier.
+        if self._forced_rect is not None:
+            extent, width = self._forced_rect
+            body = extent * width
+            if rows != body:
+                raise RuntimeError(f"forced {self._forced_rect} needs {body} rows, got {rows}")
+        # A rectangle is its body. A 2048 or 4096 step on an 8K model still has one;
+        # offering the whole ladder would lay a short grid over a longer buffer.
+        # Multimodal stays packed until #1242: its body arrives as inputs_embeds,
+        # which prepare_inputs never sees.
+        rectangles = (
+            []
+            if self._force_ragged or self.supports_mm_inputs
+            else [(length, batch) for length, batch in self._rectangles if length * batch == rows]
+        )
         attn_plan = plan_encoder_step(
             attn_metadata.values(),
-            rectangles=self._rectangles if use_rectangles else (),
-            width_cap_for=self._width_caps,
+            rectangles=rectangles,
+            width_cap_for=self._width_caps_for(rows),
             device=self.spyre_device,
             dtype=self._mask_dtype,
             batched=self._batched,

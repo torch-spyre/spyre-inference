@@ -10,4 +10,9 @@ If `$ARGUMENTS` is empty, ask the user which target version before doing anythin
 
 **Follow the complete procedure in `docs/contributing/vllm-upgrade-procedure.md`.**
 
+The vendored-code review includes `csrc/cpu/`, `SpyreTopKTopPSampler`, and the
+Spyre subclasses of upstream's XPress model and head. Re-check their device
+layouts, compiled refinement helpers, checkpoint validation and CPU sampling
+adapters against the pinned release.
+
 When you see `{VERSION}` in that document, replace it with `$ARGUMENTS` (the version provided by the user or requested from them).

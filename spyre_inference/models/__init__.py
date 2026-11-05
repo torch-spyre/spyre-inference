@@ -50,6 +50,7 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
     ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "GptOssForCausalLM": "spyre_inference.models.gpt_oss:SpyreGptOssForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",

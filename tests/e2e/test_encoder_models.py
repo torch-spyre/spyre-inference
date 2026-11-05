@@ -121,9 +121,9 @@ def _rerank_generator() -> ModuleType:
     return module
 
 
-def _with_e2e_smoke(models: list[str], smoke_model: str) -> list:
-    assert smoke_model in models, f"{smoke_model} is no longer a parametrize row"
-    return [pytest.param(m, marks=pytest.mark.e2e_smoke) if m == smoke_model else m for m in models]
+def _mark_one(models: list[str], model: str, mark: pytest.MarkDecorator) -> list:
+    assert model in models, f"{model} is no longer a parametrize row"
+    return [pytest.param(m, marks=mark) if m == model else m for m in models]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -158,7 +158,8 @@ def _hf_last_token_embeddings(model: str, revision: str, prompts: list[str]) -> 
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize(
-    "model", _with_e2e_smoke(EMBEDDING_MODELS, "ibm-granite/granite-embedding-30m-english")
+    "model",
+    _mark_one(EMBEDDING_MODELS, "ibm-granite/granite-embedding-30m-english", pytest.mark.e2e_smoke),
 )
 def test_encoder_embed_models(model: str, record_property) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
@@ -167,7 +168,14 @@ def test_encoder_embed_models(model: str, record_property) -> None:
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("model", EMBEDDING_MODELS)
+@pytest.mark.parametrize(
+    "model",
+    _mark_one(
+        EMBEDDING_MODELS,
+        "ibm-granite/granite-embedding-278m-multilingual",
+        pytest.mark.regression_extra,
+    ),
+)
 def test_encoder_embed_models_compiled(model: str, record_property) -> None:
     """Same models and references, compiled rather than eager."""
     _assert_embeddings_match_refs(model, enforce_eager=False, record_property=record_property)
@@ -309,7 +317,9 @@ def test_encoder_embed_last_pooling() -> None:
 
 
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("model", _with_e2e_smoke(RERANKER_MODELS, "BAAI/bge-reranker-v2-m3"))
+@pytest.mark.parametrize(
+    "model", _mark_one(RERANKER_MODELS, "BAAI/bge-reranker-v2-m3", pytest.mark.e2e_smoke)
+)
 def test_encoder_rerank_models(model: str, record_property) -> None:
     """Spyre reranker scores match the cached HF references within tolerance."""
     _assert_rerank_scores_match_refs(model, enforce_eager=True, record_property=record_property)
@@ -317,7 +327,9 @@ def test_encoder_rerank_models(model: str, record_property) -> None:
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("model", RERANKER_MODELS)
+@pytest.mark.parametrize(
+    "model", _mark_one(RERANKER_MODELS, "BAAI/bge-reranker-v2-m3", pytest.mark.regression_extra)
+)
 def test_encoder_rerank_models_compiled(model: str, record_property) -> None:
     """Same models and references, compiled rather than eager."""
     _assert_rerank_scores_match_refs(model, enforce_eager=False, record_property=record_property)

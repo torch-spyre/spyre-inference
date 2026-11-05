@@ -366,6 +366,7 @@ markers = [
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
     "attention_smoke: small representative decoder-attention subset (also marked attention); its own 1-card job carries attention coverage into the integration tier, which the full attention suite is excluded from",
     "e2e_smoke: small representative e2e subset (tests/e2e/); its own integration-only jobs carry e2e coverage into the integration tier, which the full e2e suite is excluded from; admission: see docs/contributing/integration-tier.md",
+    "regression_extra: opt-in set the regression tier adds on top of integration (tests/e2e/); its own regression-only jobs, trunk runs everything; admission: see docs/contributing/integration-tier.md",
     "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
     "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
     "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",

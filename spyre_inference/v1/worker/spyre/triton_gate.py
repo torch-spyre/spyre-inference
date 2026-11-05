@@ -100,7 +100,7 @@ def has_triton_cpu() -> bool:
 
 def check(runner: str) -> None:
     """Raise unless HAS_TRITON matches runner. On Power and Z, V2 gets past vLLM's
-    "requires Triton" check; x86 V2 without triton-cpu still fails it."""
+    "requires Triton" check in Worker.__init__; x86 V2 without triton-cpu fails here."""
     from vllm.triton_utils import HAS_TRITON
 
     # importing.py has bound HAS_TRITON, so the patches have done their job.
@@ -113,24 +113,26 @@ def check(runner: str) -> None:
             f"{HAS_TRITON}: set SPYRE_MODEL_RUNNER before vLLM is imported, and the same "
             "in every process."
         )
-    if runner == "v2" and not HAS_TRITON and platform.machine() in _NO_TRITON_MACHINES:
+    if runner == "v2" and not HAS_TRITON:
+        if platform.machine() not in _NO_TRITON_MACHINES:
+            raise ValueError("Model Runner V2 requires Triton.")
         _allow_v2_without_triton()
 
 
 def _allow_v2_without_triton() -> None:
-    import vllm.config.vllm as config_module
+    import vllm.v1.worker.gpu_worker as worker_module
 
-    validate = config_module.VllmConfig._validate_v2_model_runner
-    if hasattr(validate, _MARK):
+    init = worker_module.Worker.__init__
+    if hasattr(init, _MARK):
         return
 
-    def without_triton(self: Any) -> None:
-        # Upstream's own check, with its HAS_TRITON read made true.
-        with _has_triton(config_module):
-            validate(self)
+    def without_triton(self: Any, *args: Any, **kwargs: Any) -> None:
+        # Upstream's own __init__, with its HAS_TRITON read made true.
+        with _has_triton(worker_module):
+            init(self, *args, **kwargs)
 
-    setattr(without_triton, _MARK, validate)
-    config_module.VllmConfig._validate_v2_model_runner = without_triton  # ty: ignore[invalid-assignment]
+    setattr(without_triton, _MARK, init)
+    worker_module.Worker.__init__ = without_triton  # ty: ignore[invalid-assignment]
 
 
 @contextlib.contextmanager

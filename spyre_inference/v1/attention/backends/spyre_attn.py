@@ -158,6 +158,11 @@ def _mirror_mask_stack(
 
     stack_device = stacks_device[seq_idx]
     if stack_device is None:
+        _, query_rows, block_size = stack_cpu.shape
+        # Singleton strides must match between recorded and serving masks.
+        stack_cpu = stack_cpu.contiguous().as_strided(
+            stack_cpu.shape, (query_rows * block_size, block_size, 1)
+        )
         # `convert` copies, so even a nonzero-offset host view arrives contiguous at
         # offset 0, ready for an in-graph dim-0 slice.
         stack_device = convert(stack_cpu, device=device)
@@ -197,7 +202,7 @@ _batched_decode_compiled = torch.compile(
 )
 
 
-# Compiled: eager index_copy_ falls back to CPU and segfaults on vLLM output buffers.
+# Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
 def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     dst.index_copy_(0, rows, src[: rows.shape[0]])
     return dst
@@ -1299,10 +1304,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
-        # The only guard against sink models (gpt-oss, Transformers-backend sinks):
-        # upstream checks supports_sink() on CUDA/ROCm only.
-        if sinks is not None:
-            raise NotImplementedError("Spyre attention does not support attention sinks")
+        if sinks is not None and sinks.shape != (num_heads,):
+            raise ValueError(
+                f"attention sinks must have one logit per query head ({num_heads}), "
+                f"got shape {tuple(sinks.shape)}"
+            )
+        self._sinks_source = sinks
+        self._sinks_device: torch.Tensor | None = None
         # Backstop for the platform's `uses_alibi` check, which is a heuristic over HF config.
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi is not supported by the Spyre attention backends.")
@@ -1430,6 +1438,26 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
 
+    def _device_sinks(self, device: torch.device) -> torch.Tensor | None:
+        """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
+
+        Kv-major, matching the kernels' head order. Built on first use and dropped by
+        ``process_weights_after_loading``. ``move_model_to_spyre`` points the source at the
+        parameter the model holds on Spyre, which is the one a reload writes.
+        """
+        if self._sinks_source is None:
+            return None
+        if self._sinks_device is None:
+            sinks = convert(self._sinks_source, device="cpu", dtype=self.model_dtype)
+            self._sinks_device = convert(
+                sinks.reshape(self.num_kv_heads, self.num_queries_per_kv, 1), device
+            )
+        return self._sinks_device
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # Loaded (or reloaded) weights replace the sink values; rebuild on next use.
+        self._sinks_device = None
+
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (
             f"padded_query_len={padded_query_len} needs a query buffer wider than "
@@ -1520,7 +1548,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def graph_key(self) -> tuple:
         """The kernel arguments that may differ between layers of one attention group."""
-        return (self.num_heads, self.scale, self.logits_soft_cap, self._kv_scales)
+        return (
+            self.num_heads,
+            self.scale,
+            self.logits_soft_cap,
+            self._kv_scales,
+            self._sinks_source is not None,
+        )
 
     def record_graphs(
         self,
@@ -1897,8 +1931,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The decode prefix's query rows are range(num_decode_seqs), so the scatter
         # is a contiguous prefix write at (0, 0). Neither per-row
         # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
-        # via @compile_once and can return a stale binary) nor index_copy_
-        # (CPU-fallback segfaults on vLLM output buffers) is safe here.
+        # via @compile_once and can return a stale binary) nor eager index_copy_
+        # (rejects the int32 row index) is safe here.
         result_flat = result.reshape(b_seqs, num_heads, head_size)
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
@@ -2003,6 +2037,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             head_size=self.head_size,
             logits_soft_cap=self.logits_soft_cap,
             out=out,
+            sinks=self._device_sinks(query_dev.device),
         )
 
     def build_index_tables(
@@ -2054,6 +2089,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             head_size=self.head_size,
             logits_soft_cap=self.logits_soft_cap,
             out=out,
+            sinks=self._device_sinks(query.device),
         )
 
     @_record_function("spyre_attn::online_softmax")

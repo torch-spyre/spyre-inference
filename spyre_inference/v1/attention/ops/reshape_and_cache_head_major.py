@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""KV store into the head-major paged cache. See ``SpyreHeadMajorAttentionImpl``."""
+"""KV store into the head-major paged cache. See ``SpyreAttentionImpl``."""
 
 import torch
 

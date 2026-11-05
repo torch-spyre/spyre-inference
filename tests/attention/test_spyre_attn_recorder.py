@@ -43,11 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
-from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
-    SpyreHeadMajorAttentionBackend,
-)
 from spyre_inference.v1.attention.ops import tile_loop
-from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
     page_attn_head_major_prefill_kernel,
 )
@@ -82,6 +78,8 @@ def impl(default_vllm_config, monkeypatch):
     # The fixture's bare CompilationConfig leaves mode unset, which resolves to
     # eager. __init__ reads the mode to pick its kernel, so set it before building.
     get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    # __init__ also reads the block size, which the decode kernel's page reshape bakes in.
+    get_current_vllm_config().cache_config.block_size = BLOCK_SIZE
     return SpyreAttentionImpl(
         num_heads=NUM_HEADS,
         head_size=HEAD_SIZE,
@@ -93,7 +91,7 @@ def impl(default_vllm_config, monkeypatch):
 
 @pytest.fixture()
 def kv_cache():
-    shape = (NUM_PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    shape = (NUM_PAGES, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
     return SpyrePagedKVCache(
         k_pages=torch.zeros(shape, dtype=torch.float16),
         v_pages=torch.zeros(shape, dtype=torch.float16),
@@ -202,17 +200,10 @@ def test_mask_mirror_normalizes_singleton_strides_and_keeps_its_cached_copy(shap
     assert _mirror_mask_stack(metadata, 0, torch.device("cpu")) is mirrored
 
 
-@pytest.mark.parametrize(
-    "layout,backend,kernel",
-    [
-        ("token_major", SpyreAttentionBackend, page_attn_kernel),
-        ("head_major", SpyreHeadMajorAttentionBackend, page_attn_head_major_prefill_kernel),
-    ],
-)
 def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
-    default_vllm_config, monkeypatch, layout, backend, kernel
+    default_vllm_config, monkeypatch
 ):
-    monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", layout)
+    backend = SpyreAttentionBackend
     assert backend.supports_non_causal()
     builder = _make_builder(
         AttentionSpec(
@@ -238,13 +229,10 @@ def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     shape = backend.get_kv_cache_shape(1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
     k_pages, v_pages = (torch.zeros(shape, dtype=torch.float16) for _ in range(2))
-    if layout == "head_major":
-        v_pages[0, :, -1] = 1
-    else:
-        v_pages[0, -1] = 1
+    v_pages[0, :, -1] = 1
     for metadata, expected in ((bidirectional, 1 / BLOCK_SIZE), (causal, 0.0)):
         padded_query_len = metadata.aligned_query_lens[0]
-        result = kernel(
+        result = page_attn_head_major_prefill_kernel(
             query=torch.zeros(padded_query_len, NUM_HEADS, HEAD_SIZE, dtype=torch.float16),
             query_row_index=torch.arange(padded_query_len, dtype=torch.int32),
             k_pages=k_pages,
@@ -728,7 +716,7 @@ class TestRecordBatchedDecode:
 
     @pytest.fixture()
     def wide_cache(self):
-        shape = (self.PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        shape = (self.PAGES, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
         return SpyrePagedKVCache(
             k_pages=torch.zeros(shape, dtype=torch.float16),
             v_pages=torch.zeros(shape, dtype=torch.float16),
@@ -788,7 +776,7 @@ class TestRecordBatchedDecode:
         # ask for. NUM_PAGES no longer straddles any variant once padding lifts the
         # realized axis back to the bucket maximum.
         pages = 12
-        shape = (pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        shape = (pages, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
         cache = SpyrePagedKVCache(
             k_pages=torch.zeros(shape, dtype=torch.float16),
             v_pages=torch.zeros(shape, dtype=torch.float16),

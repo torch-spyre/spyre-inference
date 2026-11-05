@@ -266,15 +266,12 @@ def build_inputs_from_requests(
     num_blocks,
     device,
     seed=0,
-    kv_layout="slot_major_devfill",
-    attn_kv_layout="token_major",
     sliding_window=None,
 ):
     """Varlen multi-sequence inputs from explicit per-request lengths."""
     from vllm.utils.torch_utils import set_random_seed
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
     assert len(query_lens) == len(seq_lens)
     for ql, sl in zip(query_lens, seq_lens):
@@ -348,45 +345,12 @@ def build_inputs_from_requests(
 
     cache_device = torch.device(device)
 
-    def to_device(cache):
-        # plain: host-populated cache, plain transfer. Matches
-        # tests/attention/test_spyre_attn.py, correct at these shapes.
-        # _reshape_and_cache views pages as [-1, H, D] and requires the
-        # slot-outermost device layout, which host conversion cannot reproduce.
-        # slot_major is therefore wrong; slot_major_devfill uses production's
-        # device-side history write.
-        if cache_device.type != "spyre" or kv_layout == "plain":
-            return cache.to(cache_device)
-        nb, bsz, h, d = cache.shape
-        if kv_layout == "page_major":
-            from torch_spyre._C import SpyreTensorLayout
-
-            # device axes: [page, kv_head, D-stick, token, D-element]
-            return cache.to(
-                cache_device,
-                device_layout=SpyreTensorLayout(
-                    [nb, bsz, h, d],
-                    [bsz * h * d, h * d, d, 1],
-                    cache.dtype,
-                    [1, 0, 2, 3],
-                ),
-            )
-        layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
-        if kv_layout == "slot_major":
-            return cache.to(cache_device, device_layout=layout)
-        return torch.zeros_like(cache).to(cache_device, device_layout=layout)
-
-    if attn_kv_layout == "head_major":
-        # kv_layout is a token-major device-layout knob and does not apply here.
-        k_pages, v_pages = _head_major_pages(k_pages_cpu, v_pages_cpu, cache_device)
-    else:
-        k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
+    k_pages, v_pages = _head_major_pages(k_pages_cpu, v_pages_cpu, cache_device)
 
     # Eager index_copy_ takes an int64 index, which falls back to CPU and lands the rows in
     # the wrong place, so make_forward writes the history through the impl's compiled store.
-    devfill = cache_device.type == "spyre" and bool(hist_slots)
     hist_seed = None
-    if devfill and (attn_kv_layout == "head_major" or kv_layout == "slot_major_devfill"):
+    if cache_device.type == "spyre" and hist_slots:
         hist_seed = {
             "key": convert(torch.cat(hist_k), cache_device),
             "value": convert(torch.cat(hist_v), cache_device),
@@ -536,7 +500,6 @@ def make_forward(
     num_kv_heads,
     head_size,
     kv_write=False,
-    attn_kv_layout="token_major",
 ):
     """One emulated attention layer, in the order ``attn_layer`` runs it.
 
@@ -551,15 +514,7 @@ def make_forward(
         SpyrePagedKVCache,
     )
 
-    impl_cls = SpyreAttentionImpl
-    if attn_kv_layout == "head_major":
-        from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
-            SpyreHeadMajorAttentionImpl,
-        )
-
-        impl_cls = SpyreHeadMajorAttentionImpl
-
-    impl = impl_cls(
+    impl = SpyreAttentionImpl(
         num_heads=num_query_heads,
         head_size=head_size,
         scale=inputs["scale"],
@@ -713,16 +668,15 @@ def expected_kernels(row, span):
 
     The loop runs one kernel per sequence; the batched path collapses the decode
     prefix's into one. Staging copies count as memory ops, so they are excluded.
-    Head-major's decode kernel emits its store as a second kernel per call, where
-    token-major and head-major's batched-GQA prefill kernel both fuse it into the
-    attention one.
+    The decode kernel emits its store as a second kernel per call, where the
+    batched-GQA prefill kernel fuses it into the attention one.
     """
     num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
     if row["attn_path"].startswith("batched"):
         attn = 1 + (num_seqs - num_decode)
     else:
         attn = num_seqs
-    if row.get("attn_kv_layout") == "head_major" and row["padded_query_len"] == 1:
+    if row["padded_query_len"] == 1:
         attn *= 2
     write = 1 if row["kv_write"] else 0
     if span == SPANS["reshape_and_cache"]:
@@ -744,7 +698,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
     max_kv = max(seq_lens)
     num_blocks = max(cfg["num_blocks"], (max_kv + block_size - 1) // block_size)
 
-    attn_kv_layout = cfg.get("attn_kv_layout", "token_major")
     span = SPANS[cfg.get("span", "layer")]
     print(
         f"  {variant:26} bs={block_size:<4} {name:24} nreqs={len(query_lens)} "
@@ -765,8 +718,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "head_size": head_size,
         "block_size": block_size,
         "num_blocks": num_blocks,
-        "kv_layout": cfg.get("kv_layout", "slot_major_devfill"),
-        "attn_kv_layout": attn_kv_layout,
         "num_kv_blocks_iterated": -1,
         "padded_query_len": -1,
         "dtype": str(DTYPE),
@@ -818,8 +769,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             num_blocks,
             cfg.get("device", "spyre"),
             seed=cfg.get("seed", 0),
-            kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
-            attn_kv_layout=attn_kv_layout,
             sliding_window=cfg.get("sliding_window"),
         )
         if inputs is None:
@@ -847,7 +796,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             num_kv,
             head_size,
             kv_write=row["kv_write"],
-            attn_kv_layout=attn_kv_layout,
         )
 
         with warnings.catch_warnings(record=True) as caught:
@@ -861,14 +809,13 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
 
         # Correctness gate before timing, same semantics as
         # tests/attention/test_spyre_attn.py. The reference reads KV pages back
-        # off the device, not the host copy: under slot-major the on-device
-        # contents are what the kernel actually read.
+        # off the device, not the host copy: the on-device contents are what the
+        # kernel actually read.
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
-        k_ref, v_ref = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
-        if attn_kv_layout == "head_major":
-            k_ref, v_ref = k_ref.permute(0, 2, 1, 3), v_ref.permute(0, 2, 1, 3)
+        k_ref = inputs["k_pages"].to("cpu").permute(0, 2, 1, 3)
+        v_ref = inputs["v_pages"].to("cpu").permute(0, 2, 1, 3)
         ref = ref_attn(
             inputs["query_cpu"],
             k_ref,
@@ -948,7 +895,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
                         [
                             {
                                 "capture_name": name,
-                                "attn_kv_layout": attn_kv_layout,
                                 "max_seq_len": max_kv,
                                 "op": op_name,
                                 "device_us": op_us,
@@ -957,7 +903,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
                             for op_name, (op_us, op_n) in ops
                         ]
                     ).to_csv(
-                        Path(csv_path).with_name(f"ops_{attn_kv_layout}_{name}_{max_kv}.tsv"),
+                        Path(csv_path).with_name(f"ops_{name}_{max_kv}.tsv"),
                         sep="\t",
                         index=False,
                     )
@@ -1084,8 +1030,6 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         block_size,
         num_blocks,
         cfg["device"],
-        kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
-        attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
         sliding_window=cfg.get("sliding_window"),
     )
     probe_run, _, _ = make_forward(
@@ -1094,7 +1038,6 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         cfg["num_kv_heads"],
         cfg["head_size"],
         kv_write=bool(cfg.get("kv_write", False)),
-        attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
     )
     probe_run()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
@@ -1116,25 +1059,6 @@ def main():
     ap.add_argument("--iterations", type=int, default=None)
     ap.add_argument("--warmup", type=int, default=None)
     ap.add_argument("--device", default=None)
-    ap.add_argument(
-        "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill", "page_major"],
-        default=None,
-        help="KV page device layout. 'slot_major_devfill' (default) matches the "
-        "worker: zeroed slot-major alloc, history written on device. 'plain' is "
-        "correct for a host-populated cache. 'slot_major' pins the worker layout "
-        "on a host-populated cache and is numerically wrong. 'page_major' is an "
-        "index_select layout/SDSC probe.",
-    )
-    ap.add_argument(
-        "--attn-kv-layout",
-        choices=["token_major", "head_major"],
-        default=None,
-        help="KV cache decomposition the backend reads (SPYRE_ATTN_KV_LAYOUT). "
-        "'head_major' (default) stores a page as [KV, block_size, head_size] and selects "
-        "the head-major backend, the only one whose batched decode kernel runs under the "
-        "default tiled walk.",
-    )
     ap.add_argument(
         "--span",
         choices=sorted(SPANS),
@@ -1174,8 +1098,6 @@ def main():
         ("warmup", args.warmup),
         ("device", args.device),
         ("span", args.span),
-        ("kv_layout", args.kv_layout),
-        ("attn_kv_layout", args.attn_kv_layout),
         ("kv_write", args.kv_write or None),
     ):
         if val is not None:
@@ -1226,20 +1148,6 @@ def main():
             "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
         )
     os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
-    # Selects the backend via the platform, and is cached on first envs read like the rest.
-    attn_kv_layout = cfg.setdefault("attn_kv_layout", "head_major")
-    os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
-    from spyre_inference import envs
-
-    if (
-        attn_kv_layout == "token_major"
-        and next(iter(batched_modes))
-        and envs.SPYRE_ATTN_FOR_EACH_TILE
-    ):
-        raise SystemExit(
-            "token-major batched decode is declined under the tiled walk; run the batched "
-            "variant on head_major, or set SPYRE_ATTN_FOR_EACH_TILE=0."
-        )
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries, cfg["max_num_batched_tokens"])
@@ -1262,7 +1170,6 @@ def main():
         f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}"
     )
     print(f"  span       : {sel_span}")
-    print(f"  kv layout  : {attn_kv_layout}")
     print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")

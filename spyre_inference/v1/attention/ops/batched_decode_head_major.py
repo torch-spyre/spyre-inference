@@ -15,8 +15,8 @@
 """Batched multi-sequence decode over a head-major KV cache.
 
 Each index selects a whole page containing all KV heads. The page is already
-head-major, so the token-major kernel's per-chunk permutation is unnecessary, and the
-gathered page is LX-resident as it stands. The per-sequence kernel's ``(page, kv_head)``
+head-major, so it needs no per-chunk permutation, and the gathered page is LX-resident
+as it stands. The per-sequence kernel's ``(page, kv_head)``
 fold exists to win that residency, so there is nothing for it to buy here: folding anyway
 measured roughly 1.5-2x slower.
 

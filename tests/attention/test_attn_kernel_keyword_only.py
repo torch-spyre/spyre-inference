@@ -16,12 +16,10 @@
 
 import pytest
 
-from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     _merge_entry_local,
     batched_decode_head_major_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
@@ -36,8 +34,6 @@ from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
 @pytest.mark.parametrize(
     "kernel",
     [
-        page_attn_kernel,
-        batched_decode_kernel,
         page_attn_head_major_prefill_kernel,
         page_attn_head_major_decode_kernel,
         batched_decode_head_major_kernel,

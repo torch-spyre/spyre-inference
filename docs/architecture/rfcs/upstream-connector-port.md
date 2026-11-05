@@ -39,8 +39,8 @@ no relative performance claim about the memory kinds.
 - Select `SpyreOffloadingConnector` and `SpyreOffloadingSpec` through existing vLLM configuration.
 - Reuse upstream `CPUOffloadingManager` for local admission, eviction and block bookkeeping.
 - Offload and restore the device representation byte-for-byte, without converting through host floats.
-- Support dense head-major and token-major model-dtype caches; validate each layout's physical page
-  mapping separately. FP8 acceptance is a separate gate (§6.1, §12), not implied by FP16 success.
+- Support the dense head-major model-dtype cache; validate its physical page mapping.
+  FP8 acceptance is a separate gate (§6.1, §12), not implied by FP16 success.
 - Preserve the no-connector serving path and avoid an upstream vLLM patch.
 
 ### M2 — shared host memory
@@ -76,12 +76,11 @@ of that dependency combination.
 
 `SpyrePagedKVCache` is a named tuple with **two dense tensors**, `key` and `value`, per layer.
 It is not two Python lists of separately allocated pages. Each tensor's leading dimension is
-`num_blocks`, and its remaining dimensions come from the selected attention backend:
+`num_blocks`, and its remaining dimensions come from the attention backend:
 
-| Backend | Shape of each K or V tensor | Selection |
-|---|---|---|
-| `SpyreHeadMajorAttentionBackend` | `[num_blocks, num_kv_heads, block_size, head_size]` | Default |
-| `SpyreAttentionBackend` | `[num_blocks, block_size, num_kv_heads, head_size]` | `SPYRE_ATTN_KV_LAYOUT=token_major` |
+| Backend | Shape of each K or V tensor |
+|---|---|
+| `SpyreAttentionBackend` | `[num_blocks, num_kv_heads, block_size, head_size]` |
 
 `allocate_spyre_kv_caches` in `spyre_inference/v1/worker/kv_cache_setup.py` delegates to each
 attention implementation's `allocate_pages`. It uses `kv_cache_config.num_blocks` directly and
@@ -254,8 +253,7 @@ request cleanup. Changing only pool construction in the M1 spec is not enough to
 ### 6.1 `SpyreKvDmaCopier`: layout and physical capacity
 
 The copier takes dense K/V tensors plus page identities and validated pool destinations. It must
-preserve the selected backend layout; head-major and token-major pages are not interchangeable even
-when their logical byte counts match. No per-transfer host transpose or float conversion is allowed.
+preserve the backend's head-major layout. No per-transfer host transpose or float conversion is allowed.
 
 Capacity is based on **physical transfer extents**, not blindly on
 `numel() * element_size()`, and not on the size of the entire dense layer divided by block count
@@ -621,8 +619,8 @@ for restart/reuse tests. Concurrent device tests require separately assigned har
 - [ ] Mock-safe tests cover spec loading, constructor/API drift, manager metrics, dense K/V identity,
   shared-layer aliases, selected groups, per-layer geometry and chunk-factor dispatch. The adapter
   does not call `untyped_storage().set_()` or copy the device cache to a new buffer.
-- [ ] A known-pattern raw page is stored and restored into another page byte-for-byte. Cover both
-  head-major and token-major model-dtype layouts, first/middle/last pages, nonzero view offsets,
+- [ ] A known-pattern raw page is stored and restored into another page byte-for-byte. Cover the
+  head-major model-dtype layout, first/middle/last pages, nonzero view offsets,
   padding, multiple K/V heads and adjacent-page canaries. Unsupported extents fail before DMA.
 - [ ] Store ordering is tested with pending KV writes; load ordering is tested before attention reads.
   Failure/cancellation, preemption, waits and shutdown do not publish or reuse unfinished transfers.
@@ -686,12 +684,9 @@ for restart/reuse tests. Concurrent device tests require separately assigned har
 
 **Main-branch source at the version basis in §3:**
 
-- `spyre_inference/v1/attention/backends/spyre_attn.py`: `SpyrePagedKVCache`, model-dtype allocation,
-  FP8 eligibility checks.
-- `spyre_inference/v1/attention/backends/spyre_head_major_attn.py`: default cache shape, E4M3 allocation
-  and per-layer scale usage.
+- `spyre_inference/v1/attention/backends/spyre_attn.py`: `SpyrePagedKVCache`, cache shape,
+  model-dtype and E4M3 allocation, FP8 eligibility checks and per-layer scale usage.
 - `spyre_inference/v1/worker/kv_cache_setup.py`: `allocate_spyre_kv_caches`.
-- `spyre_inference/envs.py`: head-major default and token-major override.
 
 **vLLM [v0.32.0](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be):**
 

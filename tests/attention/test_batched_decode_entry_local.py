@@ -229,7 +229,7 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
     boundaries, including the split-index shape branch; this does not test
     compiled for_each_tile execution or the device's physical index layout.
     """
-    from spyre_inference.v1.attention.backends import spyre_head_major_attn as backend
+    from spyre_inference.v1.attention.backends import spyre_attn as backend
 
     b, bpc, kv, q = 2, 2, 2, 4
     query, rep = _meta(b, bpc, kv, q)
@@ -256,9 +256,9 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", cpu_transfer)
-    monkeypatch.setattr(backend, "USE_FOR_EACH_TILE", split_index)
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", split_index)
     monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", split_index)
-    impl = object.__new__(backend.SpyreHeadMajorAttentionImpl)
+    impl = object.__new__(backend.SpyreAttentionImpl)
     impl._mirror_batched_decode_indices(metadata, torch.device("cpu"))
     assert len(layouts) == int(split_index)
     if split_index:

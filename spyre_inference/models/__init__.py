@@ -50,6 +50,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
     ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    # Vision tower only: upstream builds its Llama text model itself.
+    "Idefics3ForConditionalGeneration": (
+        "spyre_inference.models.idefics3:SpyreIdefics3ForConditionalGeneration"
+    ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",

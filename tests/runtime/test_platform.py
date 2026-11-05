@@ -690,20 +690,32 @@ def test_bfloat16_is_accepted_at_tp1():
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize(("kv_buckets", "raises"), [(None, True), ("256,1024", False)])
-def test_an_unknown_kv_ladder_fails_at_startup(monkeypatch, kv_buckets, raises):
+@pytest.mark.parametrize(
+    ("var", "value", "kv_buckets", "match"),
+    [
+        ("SPYRE_ATTN_KV_LADDER", "7_4", None, "SPYRE_ATTN_KV_LADDER='7_4'"),
+        ("SPYRE_ATTN_KV_LADDER", "7_4", "256,1024", None),
+        ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "7_4", None, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH='7_4'"),
+        ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8", "256,1024", "cannot be combined"),
+        ("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "0", None, "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
+        ("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "0", "256,1024", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
+    ],
+)
+def test_a_bad_kv_ladder_setting_fails_at_startup(monkeypatch, var, value, kv_buckets, match):
+    """SPYRE_ATTN_KV_BUCKETS replaces the base ladder, so its name is not read then, and the
+    large-batch ladder that extends it is rejected."""
     from spyre_inference import envs
     from spyre_inference.platform import TorchSpyrePlatform
 
     # Built first: VllmConfig runs this hook on construction too.
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
-    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "7_4")
+    monkeypatch.setenv(var, value)
     if kv_buckets:
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", kv_buckets)
     envs.clear_env_cache()
 
-    if raises:
-        with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER='7_4'"):
+    if match:
+        with pytest.raises(ValueError, match=match):
             TorchSpyrePlatform.check_and_update_config(vllm_config)
     else:
         TorchSpyrePlatform.check_and_update_config(vllm_config)
@@ -870,6 +882,20 @@ def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, siz
 
     assert vllm_config.scheduler_config.max_num_batched_tokens == budget
     assert vllm_config.compilation_config.compile_sizes[-len(sizes) :] == sizes
+
+
+def test_engine_args_honors_a_user_max_model_len_above_the_derived_cap():
+    """``check_max_model_len`` caps only a derived length; a user's 128k passes through."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = EngineArgs(
+        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b", max_model_len=131072, max_num_seqs=8
+    ).create_engine_config()
+
+    assert vllm_config.model_config.max_model_len == 131072
+    assert TorchSpyrePlatform._DEFAULT_DERIVED_MAX_MODEL_LEN < 131072
 
 
 def test_compile_sizes_empty_list_opts_out():

@@ -241,7 +241,6 @@ def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
     _assert_matches_tp1(_generate_image(tp=1), _generate_image(tp=2))
 
 
-@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.multimodal
@@ -261,6 +260,7 @@ def test_tp2_fp8_image_prompt_matches_bf16(monkeypatch) -> None:
     )
 
 
+@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(

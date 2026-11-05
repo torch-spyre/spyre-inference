@@ -41,10 +41,14 @@ def shard_scales_to_kernel_scale(
     """Per-shard scales -> ``[1]``, or ``[N, 1]`` if they differ."""
     if weight_scale.ndim == 0:
         return weight_scale.reshape(1)
-    # A slot left at the float32-min sentinel was never loaded: the module is fused on disk.
+    # weight_loader_v2 fills every slot from a fused-on-disk scale, so a slot left at the
+    # float32-min sentinel means the checkpoint has no scale for that shard.
     unloaded = weight_scale <= torch.finfo(torch.float32).min
-    if bool(unloaded.any()) or bool((weight_scale == weight_scale[0]).all()):
-        return weight_scale.max().reshape(1)
+    if bool(unloaded.any()):
+        missing = unloaded.nonzero().flatten().tolist()
+        raise ValueError(f"FP8 checkpoint has no weight scale for shard(s) {missing}")
+    if bool((weight_scale == weight_scale[0]).all()):
+        return weight_scale[:1].clone()
     # Upstream annotates a tuple; it returns the [N, 1] tensor.
     return cast(torch.Tensor, convert_to_channelwise(weight_scale, logical_widths))
 

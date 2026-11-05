@@ -32,28 +32,21 @@ defaults:
 
 tests:
   # TP4 · aiops
-  - test_name: serve_gemma4-26b-a4b_tp4_conc5_aiops
-    labels: [minimal, base, reference]
+  - test_name: serve_gemma4-26b-a4b_tp4_c5_aiops
+    labels: [reference]
     parameters:
       dataset-path: ${SPYRE_AIOPS_DATASET}
       max-concurrency: 5
 
-  # TP4 · cics
-  - test_name: serve_gemma4-26b-a4b_tp4_conc5_cics
-    labels: [base]
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-      max-concurrency: 5
-
   # TP4 · all
-  - test_name: serve_gemma4-26b-a4b_tp4_conc5_all
-    labels: [base]
+  - test_name: serve_gemma4-26b-a4b_tp4_c5_all
+    labels: [minimal, base]
     parameters:
       dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
       max-concurrency: 5
 
   # TP4 · vision
-  - test_name: serve_gemma4-26b-a4b_tp4_conc4_vision
+  - test_name: serve_gemma4-26b-a4b_tp4_c4_vision
     labels: [reference]
     parameters:
       dataset-name: custom_image
@@ -65,7 +58,7 @@ tests:
       max-concurrency: 4
 
   # TP1 · cics
-  - test_name: serve_gemma4-26b-a4b_tp1_conc5_cics
+  - test_name: serve_gemma4-26b-a4b_tp1_c5_cics
     labels: [base]
     server_parameters:
       tensor-parallel-size: 1

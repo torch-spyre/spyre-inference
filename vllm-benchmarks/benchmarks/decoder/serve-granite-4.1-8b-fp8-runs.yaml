@@ -29,15 +29,8 @@ defaults:
 
 tests:
   # TP4 · aiops
-  - test_name: serve_granite41-8b-fp8_tp4_conc5_aiops
-    labels: [base, reference]
+  - test_name: serve_granite41-8b-fp8_tp4_c5_aiops
+    labels: [reference]
     parameters:
       dataset-path: ${SPYRE_AIOPS_DATASET}
-      max-concurrency: 5
-
-  # TP4 · all
-  - test_name: serve_granite41-8b-fp8_tp4_conc5_all
-    labels: [base]
-    parameters:
-      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
       max-concurrency: 5

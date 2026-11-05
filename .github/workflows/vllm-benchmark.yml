@@ -21,8 +21,8 @@ on:
       models:
         description: >
           Comma-separated list of models to benchmark (optional, default the
-          base suite). Each runs in the first of base, reference that has a
-          config for it.
+          base suite). Each runs in the first of base, reference,
+          power-applications that has a config for it.
         required: false
         type: string
       skip_uv_for_benchmarking:

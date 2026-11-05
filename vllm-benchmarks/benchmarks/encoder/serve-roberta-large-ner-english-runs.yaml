@@ -32,17 +32,17 @@ defaults:
 
 tests:
   # 10 000 random prompts and 100 warmups, at conc 16 / 32 / 64.
-  - test_name: serve_roberta-large-ner-english_tp1_conc16
+  - test_name: serve_roberta-large-ner-english_tp1_c16
     labels: [reference]
     parameters:
       max-concurrency: 16
 
-  - test_name: serve_roberta-large-ner-english_tp1_conc32
+  - test_name: serve_roberta-large-ner-english_tp1_c32
     labels: [reference]
     parameters:
       max-concurrency: 32
 
-  - test_name: serve_roberta-large-ner-english_tp1_conc64
-    labels: [reference]
+  - test_name: serve_roberta-large-ner-english_tp1_c64
+    labels: [base, reference]
     parameters:
       max-concurrency: 64

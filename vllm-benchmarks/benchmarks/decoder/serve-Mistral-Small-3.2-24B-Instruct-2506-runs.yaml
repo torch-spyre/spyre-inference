@@ -29,14 +29,14 @@ defaults:
 
 tests:
   # TP4 · aiops
-  - test_name: serve_mistral-small32-24b_tp4_conc5_aiops
+  - test_name: serve_mistral-small32-24b_tp4_c5_aiops
     labels: [reference]
     parameters:
       dataset-path: ${SPYRE_AIOPS_DATASET}
       max-concurrency: 5
 
   # TP4 · vision
-  - test_name: serve_mistral-small32-24b_tp4_conc4_vision
+  - test_name: serve_mistral-small32-24b_tp4_c4_vision
     labels: [reference]
     parameters:
       dataset-name: custom_image

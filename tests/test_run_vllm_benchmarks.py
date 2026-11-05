@@ -449,8 +449,11 @@ DATASET_PATH_VARS = {
     "cics": "${SPYRE_CICS_DATASET}",
     "all": "${SPYRE_ALL_SEQUENCES_DATASET}",
     "vision": "${SPYRE_VISION_DATASET}",
+    "ee": "${SPYRE_EE_DATASET}",
+    "rag": "${SPYRE_RAG_DATASET}",
 }
-# One decoder setup per TP: (max-model-len, max-num-seqs).
+# One decoder setup per TP: (max-model-len, max-num-seqs). The power_use_case
+# files follow their own workloads' setups.
 DECODER_SETUP = {4: (32768, 32), 1: (8192, 8)}
 
 
@@ -502,14 +505,16 @@ def test_serve_runs_yaml_derives_consistently(config_file):
         # concurrency the entry runs at.
         assert f"_tp{tp}_" in name, name
         if not parameters["dataset-name"].startswith("random"):
-            assert f"_conc{parameters['max-concurrency']}_" in name, name
+            assert f"_c{parameters['max-concurrency']}_" in name, name
             # The name's suffix has to say which trace the entry replays.
             trace = name.rsplit("_", 1)[1]
             assert trace in DATASET_PATH_VARS, name
             # _select_configs expands the env var, so at load time it is still
             # the literal the entry names.
             assert parameters["dataset-path"] == DATASET_PATH_VARS[trace], name
-            assert (server["max-model-len"], server["max-num-seqs"]) == DECODER_SETUP[tp], name
+            if config_file.parent.name == "decoder":
+                setup = (server["max-model-len"], server["max-num-seqs"])
+                assert setup == DECODER_SETUP[tp], name
         elif parameters["dataset-name"] == "random-mm":
             assert "dataset-path" not in parameters, name
             assert parameters["input-len"] <= server["max-model-len"], name

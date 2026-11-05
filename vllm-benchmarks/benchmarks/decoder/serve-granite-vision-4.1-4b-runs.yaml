@@ -29,7 +29,7 @@ defaults:
 
 tests:
   # TP4 · vision
-  - test_name: serve_granite-vision41-4b_tp4_conc4_vision
+  - test_name: serve_granite-vision41-4b_tp4_c4_vision
     labels: [reference]
     parameters:
       dataset-name: custom_image

@@ -29,7 +29,7 @@ defaults:
 
 tests:
   # TP4 · aiops
-  - test_name: serve_llama31-8b_tp4_conc5_aiops
+  - test_name: serve_llama31-8b_tp4_c5_aiops
     labels: [reference]
     parameters:
       dataset-path: ${SPYRE_AIOPS_DATASET}

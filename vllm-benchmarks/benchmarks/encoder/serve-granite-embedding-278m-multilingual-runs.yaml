@@ -24,8 +24,8 @@ defaults:
 
 tests:
   # _ci: 200 random prompts, conc 64.
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_conc64_ci
-    labels: [minimal, base]
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c64_ci
+    labels: [minimal]
     environment_variables:
       VLLM_CPU_KVCACHE_SPACE: 64
       DTLOG_LEVEL: error
@@ -44,7 +44,7 @@ tests:
       num-warmups: 8
 
   # 10 000 random prompts and 100 warmups, at conc 16 / 32 / 64.
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_conc16
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c16
     labels: [reference]
     server_parameters:
       enable-prefix-caching: false
@@ -57,7 +57,7 @@ tests:
       container_shm_size: 1G
       container_memory: 16g
 
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_conc32
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c32
     labels: [reference]
     server_parameters:
       enable-prefix-caching: false
@@ -70,8 +70,8 @@ tests:
       container_shm_size: 1G
       container_memory: 16g
 
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_conc64
-    labels: [reference]
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c64
+    labels: [base, reference]
     server_parameters:
       enable-prefix-caching: false
     parameters:

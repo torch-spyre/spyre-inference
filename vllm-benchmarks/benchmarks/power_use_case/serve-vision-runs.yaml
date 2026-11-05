@@ -8,8 +8,11 @@
 #   TP=1: max-model-len 8192,  max-num-seqs 16
 #   TP=2: max-model-len 16384, max-num-seqs 16
 #   TP=4: max-model-len 32768, max-num-seqs 32
+#
+# Every entry is in the `power-applications` suite. See vllm-benchmarks/README.md.
 
 defaults:
+  labels: [power-applications]
   server_health_timeout: 3600
   server_parameters:
     load-format: auto
@@ -35,14 +38,14 @@ tests:
   # ---------------------------------------------------------------------------
   # Granite Vision 4.1 4B
   # ---------------------------------------------------------------------------
-  - test_name: serve_granite-vision41-4b_tp1_vision
+  - test_name: serve_granite-vision41-4b_tp1_c1_vision
     server_parameters:
       model: ibm-granite/granite-vision-4.1-4b
       tensor-parallel-size: 1
       max-model-len: 8192
       max-num-seqs: 16
 
-  - test_name: serve_granite-vision41-4b_tp2_vision
+  - test_name: serve_granite-vision41-4b_tp2_c1_vision
     server_parameters:
       model: ibm-granite/granite-vision-4.1-4b
       tensor-parallel-size: 2
@@ -52,14 +55,14 @@ tests:
   # ---------------------------------------------------------------------------
   # Ministral-3-14B-Instruct
   # ---------------------------------------------------------------------------
-  - test_name: serve_ministral-3-14b_tp2_vision
+  - test_name: serve_ministral3-14b_tp2_c1_vision
     server_parameters:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
       tensor-parallel-size: 2
       max-model-len: 16384
       max-num-seqs: 16
 
-  - test_name: serve_ministral-3-14b_tp4_vision
+  - test_name: serve_ministral3-14b_tp4_c1_vision
     server_parameters:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
       tensor-parallel-size: 4
@@ -69,14 +72,14 @@ tests:
   # ---------------------------------------------------------------------------
   # Mistral-Small-3.2-24B
   # ---------------------------------------------------------------------------
-  - test_name: serve_mistral-3.2-24b_tp2_vision
+  - test_name: serve_mistral-small32-24b_tp2_c1_vision
     server_parameters:
       model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
       tensor-parallel-size: 2
       max-model-len: 16384
       max-num-seqs: 16
 
-  - test_name: serve_mistral-3.2-24b_tp4_vision
+  - test_name: serve_mistral-small32-24b_tp4_c1_vision
     server_parameters:
       model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
       tensor-parallel-size: 4
@@ -86,7 +89,7 @@ tests:
   # ---------------------------------------------------------------------------
   # Gemma 4 26B A4B-it
   # ---------------------------------------------------------------------------
-  - test_name: serve_gemma4-26b-a4b-it_tp4_vision
+  - test_name: serve_gemma4-26b-a4b-it_tp4_c1_vision
     server_parameters:
       model: google/gemma-4-26B-A4B-it
       tensor-parallel-size: 4

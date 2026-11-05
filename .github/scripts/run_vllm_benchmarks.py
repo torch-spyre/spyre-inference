@@ -58,7 +58,7 @@ def _dataset_path_defaults() -> dict[str, str]:
 
 
 VALID_BENCH_TYPES = ("latency", "throughput", "serve")
-SUITES = ("minimal", "base", "reference")
+SUITES = ("minimal", "base", "reference", "power-applications")
 DEFAULT_SUITE = "base"
 
 

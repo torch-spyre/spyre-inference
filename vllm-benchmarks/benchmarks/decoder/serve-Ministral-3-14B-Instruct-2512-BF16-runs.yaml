@@ -29,15 +29,15 @@ defaults:
 
 tests:
   # TP4 · aiops
-  - test_name: serve_ministral3-14b_tp4_conc5_aiops
+  - test_name: serve_ministral3-14b_tp4_c5_aiops
     labels: [reference]
     parameters:
       dataset-path: ${SPYRE_AIOPS_DATASET}
       max-concurrency: 5
 
   # TP4 · vision
-  - test_name: serve_ministral3-14b_tp4_conc4_vision
-    labels: [reference]
+  - test_name: serve_ministral3-14b_tp4_c4_vision
+    labels: [base, reference]
     parameters:
       dataset-name: custom_image
       dataset-path: ${SPYRE_VISION_DATASET}
@@ -45,17 +45,4 @@ tests:
       endpoint: /v1/chat/completions
       num-prompts: 166
       output-len: 256
-      max-concurrency: 4
-
-  # TP4 · random-mm: 8192 input tokens plus one 2048x2048 image
-  - test_name: serve_ministral3-14b_tp4_conc4_mm_random
-    labels: [base]
-    parameters:
-      dataset-name: random-mm
-      backend: openai-chat
-      endpoint: /v1/chat/completions
-      input-len: 8192
-      output-len: 128
-      random-mm-limit-mm-per-prompt: '{"image": 1, "video": 0}'
-      random-mm-bucket-config: '{(2048, 2048, 1): 1}'
       max-concurrency: 4

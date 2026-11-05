@@ -33,7 +33,7 @@ assert _runner_spec and _runner_spec.loader
 runner = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(runner)
 
-SHORT_LABEL = {"minimal": "min", "base": "base", "reference": "ref"}
+SHORT_LABEL = {"minimal": "min", "base": "base", "reference": "ref", "power-applications": "pwr"}
 TRACE_DATASETS = ("aiops", "cics", "all")
 
 
@@ -79,16 +79,16 @@ def _tp(entry: dict) -> int:
 
 
 def _name_tail(entry: dict) -> str:
-    """The part of the test_name after `_tp<N>_`, e.g. `conc5_aiops`."""
+    """The part of the test_name after `_tp<N>_`, e.g. `c5_aiops`."""
     return entry["config"]["test_name"].split(f"_tp{_tp(entry)}_", 1)[-1]
 
 
 def _decoder_column(entry: dict) -> tuple[str, str]:
-    """(dataset, concurrency) of a decoder tail `conc<C>_<dataset>`; a tail of
+    """(dataset, concurrency) of a decoder tail `c<C>_<dataset>`; a tail of
     another shape is a dataset with no concurrency column, shown as `–`."""
     tail = _name_tail(entry)
     conc, sep, dataset = tail.partition("_")
-    if sep and conc.startswith("conc"):
+    if sep and conc[:1] == "c" and conc[1:].isdigit():
         return dataset, conc
     return tail, "–"
 
@@ -158,7 +158,7 @@ def _grouped_matrix(entries: list[dict], group_of, column_of, groups: list[str])
 
 
 def _sorted_columns(values) -> list[str]:
-    """Column names in numeric order, e.g. conc4 before conc16."""
+    """Column names in numeric order, e.g. c4 before c16."""
 
     def key(value: str):
         digits = "".join(ch if ch.isdigit() else " " for ch in value).split()
@@ -225,7 +225,8 @@ def _suite_list(entries: list[dict], suite: str) -> list[str]:
 def render(entries: list[dict]) -> str:
     serve = [e for e in entries if e["bench_type"] == "serve"]
     decoder = [e for e in serve if e["file"].startswith("benchmarks/decoder/")]
-    encoder = [e for e in serve if e not in decoder]
+    power = [e for e in serve if e["file"].startswith("benchmarks/power_use_case/")]
+    encoder = [e for e in serve if e not in decoder and e not in power]
     offline = [e for e in entries if e["bench_type"] != "serve"]
 
     counts = {suite: sum(suite in e["labels"] for e in entries) for suite in SHORT_LABEL}
@@ -237,12 +238,14 @@ def render(entries: list[dict]) -> str:
         "## Config tables",
         "",
         f"{len(entries)} entries: {counts['minimal']} `minimal`, {counts['base']} `base`, "
-        f"{counts['reference']} `reference`. Each cell gives the labels of one entry: "
-        "`min` = minimal, `base` = base, `ref` = reference. An empty cell has no entry.",
+        f"{counts['reference']} `reference`, {counts['power-applications']} "
+        "`power-applications`. Each cell gives the labels of one entry: `min` = minimal, "
+        "`base` = base, `ref` = reference, `pwr` = power-applications. An empty cell has "
+        "no entry.",
         "",
     ]
     if decoder:
-        # A decoder tail is `conc<C>_<dataset>`: datasets head the columns, each
+        # A decoder tail is `c<C>_<dataset>`: datasets head the columns, each
         # over its concurrencies. Traces come first, in TRACE_DATASETS order.
         datasets = list(TRACE_DATASETS) + sorted(
             {_decoder_column(e)[0] for e in decoder} - set(TRACE_DATASETS)
@@ -259,6 +262,22 @@ def render(entries: list[dict]) -> str:
         columns = _sorted_columns(_name_tail(e) for e in encoder)
         lines += ["### Pooling serve", ""]
         lines += _matrix(encoder, columns, _name_tail) + [""]
+    if power:
+        # Power decoder tails are `c<C>_<dataset>`; the pooling ones are `c<C>_seqs<S>`.
+        pooling = [e for e in power if _setting(e, "runner") == "pooling"]
+        generative = [e for e in power if e not in pooling]
+        lines += ["### Power applications serve", ""]
+        if generative:
+            lines += _grouped_matrix(
+                generative,
+                lambda e: _decoder_column(e)[0],
+                lambda e: _decoder_column(e)[1],
+                sorted({_decoder_column(e)[0] for e in generative}),
+            )
+            lines += [""]
+        if pooling:
+            columns = _sorted_columns(_name_tail(e) for e in pooling)
+            lines += _matrix(pooling, columns, _name_tail) + [""]
     if offline:
         columns = _sorted_columns(_name_tail(e) for e in offline)
         lines += [

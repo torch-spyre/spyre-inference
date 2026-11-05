@@ -49,6 +49,32 @@ That is also the configuration the tensor-parallel and compile e2e tests run the
 checkpoints under. A repository with no vision tower gets the override by default, so
 this is only needed for the multimodal ones.
 
+## Gemma-4: per-request image sizes
+
+The vision tower is compiled per token budget at warmup, for the image size the engine runs
+at: `max_soft_tokens` from `--mm-processor-kwargs`, default 280. A request can ask for a
+larger size (560 or 1120) in its own `mm_processor_kwargs`: offline through `LLM.chat` or
+`LLM.generate`, and online only when the server runs with `--trust-request-mm-kwargs`.
+
+Each larger size needs its own budget, compiled at warmup, so they are opt-in through
+`encoder_cudagraph_token_budgets`. To serve requests up to 1120:
+
+```bash
+vllm serve google/gemma-4-26B-A4B-it --tensor-parallel-size 4 \
+  --trust-request-mm-kwargs \
+  -cc '{"encoder_cudagraph_token_budgets": [64, 128, 256, 280, 576, 1152]}'
+```
+
+The list replaces the default budgets, so keep the small ones in it: 64 to 280 cover the
+engine's own 280, 576 covers 560 and 1152 covers 1120. Each budget is rounded up to a whole
+patch group. An image larger than the largest entry, as listed, is rejected with a 400
+(`VLLMValidationError` offline) rather than compiled mid-request, and the encoder cache is
+raised to hold one at that size. An entry above `max_num_batched_tokens` (512 unless
+`--max-num-batched-tokens` sets it) needs chunked MM input, so `--disable-chunked-mm-input`
+with it fails at startup.
+Raising the engine-wide `--mm-processor-kwargs '{"max_soft_tokens": 560}'` instead makes
+every image that size.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup
@@ -215,6 +241,21 @@ warmup time does not matter, and `pow2` the default because it has the shortest 
 If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every preset: put the
 buckets where the lengths actually are. A workload that sits on one power of two gains nothing
 from any preset.
+
+#### A denser ladder for large batches only
+
+A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
+concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
+batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`
+(default 16, which with the default buckets means 9 or more sequences), while the per-sequence
+path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the dense buckets
+cost warmup without a measured gain. The second ladder is unioned with the first, so no length
+rounds up further.
+It is off by default, rejected at startup together with `SPYRE_ATTN_KV_BUCKETS`, which replaces
+the ladder it extends, and ignored with a warning when the threshold is above the largest
+num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
+`SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
+less warmup.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps

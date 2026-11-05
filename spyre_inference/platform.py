@@ -19,7 +19,7 @@ import multiprocessing
 import os
 import sys
 from string import Template
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
     from vllm.config import VllmConfig
+    from vllm.inputs import EngineInput
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 else:
     VllmConfig = None
 
@@ -176,6 +179,9 @@ class TorchSpyrePlatform(CpuPlatform):
     )
     _KV_LAYOUTS = ("token_major", "head_major")
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
+
+    # Largest item a request may carry per vision modality, in tokens.
+    _vision_token_limits: ClassVar[dict[str, int]] = {}
 
     @classmethod
     def _decoder_backend_path(cls) -> str:
@@ -713,6 +719,78 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
     @classmethod
+    def _set_vision_token_limit(cls, vllm_config: VllmConfig) -> None:
+        from spyre_inference.models import spyre_model_cls
+        from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
+
+        cls._vision_token_limits = {}
+        model_config = vllm_config.model_config
+        if model_config.enforce_eager or not model_config.is_multimodal_model:
+            return
+        model_cls = spyre_model_cls(model_config.architecture)
+        if model_cls is None or not issubclass(model_cls, SpyreVisionEncoderMixin):
+            return
+        modalities = model_cls.vision_modalities
+        user_budgets = vllm_config.compilation_config.encoder_cudagraph_token_budgets
+        if user_budgets:
+            limit = max(user_budgets)
+        else:
+            from vllm.multimodal import MULTIMODAL_REGISTRY
+
+            max_tokens = MULTIMODAL_REGISTRY.get_processing_info(
+                model_config
+            ).get_mm_max_tokens_per_item(model_config.max_model_len, dict.fromkeys(modalities, 1))
+            if max_tokens is None:
+                return
+            limit = max(max_tokens[m] for m in modalities)
+        from vllm.v1.core.encoder_cache_manager import compute_mm_encoder_budget
+
+        logger.info("Requests may carry images of up to %d tokens.", limit)
+        cls._vision_token_limits = dict.fromkeys(modalities, limit)
+        scheduler_config = vllm_config.scheduler_config
+        # Upstream's own error here names neither the list nor the 512 default cap.
+        if (
+            user_budgets
+            and scheduler_config.disable_chunked_mm_input
+            and limit > scheduler_config.max_num_batched_tokens
+        ):
+            raise ValueError(
+                f"encoder_cudagraph_token_budgets allows {limit}-token images, but with "
+                "--disable-chunked-mm-input an image must fit in max_num_batched_tokens "
+                f"({scheduler_config.max_num_batched_tokens}). Drop "
+                "--disable-chunked-mm-input, raise --max-num-batched-tokens, or keep the "
+                "list's largest entry within it."
+            )
+        # Upstream sizes the encoder cache and compute budget for the engine's own largest
+        # item and rejects or never schedules a larger one.
+        (
+            scheduler_config.max_num_encoder_input_tokens,
+            scheduler_config.encoder_cache_size,
+        ) = compute_mm_encoder_budget(scheduler_config, cls._vision_token_limits)
+
+    @classmethod
+    def validate_request(
+        cls, processed_inputs: "EngineInput", params: "SamplingParams | PoolingParams"
+    ) -> None:
+        if processed_inputs["type"] != "multimodal":
+            return
+        from vllm.exceptions import VLLMValidationError
+
+        for modality, limit in cls._vision_token_limits.items():
+            for placeholder in processed_inputs["mm_placeholders"].get(modality, ()):
+                tokens = placeholder.get_num_embeds()
+                if tokens > limit:
+                    raise VLLMValidationError(
+                        f"An {modality} item of {tokens} tokens is larger than the {limit} this "
+                        "server compiled its vision encoder for. Lower max_soft_tokens in the "
+                        "request's mm_processor_kwargs, or restart the server with a larger "
+                        "--mm-processor-kwargs or "
+                        "compilation_config.encoder_cudagraph_token_budgets.",
+                        parameter="mm_processor_kwargs",
+                        value=tokens,
+                    )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -733,6 +811,14 @@ class TorchSpyrePlatform(CpuPlatform):
                 raise ValueError(
                     f"The model dtype needs to be one of {supported} for spyre, but "
                     f"was specified to be {vllm_config.model_config.dtype}"
+                )
+
+            # Neither attention layout implements ALiBi; reject before the worker builds the
+            # model. The attention impl constructor keeps a backstop, since this is a heuristic.
+            if vllm_config.model_config.uses_alibi:
+                raise ValueError(
+                    f"Spyre does not support ALiBi attention, which "
+                    f"{vllm_config.model_config.model} uses."
                 )
 
             # SpyreFp8LinearKernel is float16 end to end, its scales included.
@@ -786,11 +872,10 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
-        # Validate the ladder name now; the bucketer only reads it in the worker, after model load.
-        if not envs.SPYRE_ATTN_KV_BUCKETS:
-            from spyre_inference.v1.attention.spyre_attn_bucketer import kv_ladder
+        # Validate the ladder settings now; the bucketer only reads them in the worker.
+        from spyre_inference.v1.attention.spyre_attn_bucketer import validate_kv_ladder_env
 
-            kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+        validate_kv_ladder_env()
 
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
@@ -813,6 +898,10 @@ class TorchSpyrePlatform(CpuPlatform):
             and vllm_config.speculative_config.use_dflash()
         ):
             raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
+        # Every process, ahead of the V1 validation that follows this hook in __post_init__.
+        from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
+
+        allow_xpress_on_v1()
         triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
@@ -843,6 +932,14 @@ class TorchSpyrePlatform(CpuPlatform):
                     "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
                     "runner."
                 )
+
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.rejection_sample_method == "fly":
+            # Upstream's CPU guard keys on the runner device, which is spyre here.
+            raise ValueError(
+                "Spyre does not support rejection_sample_method='fly': its acceptance "
+                "kernels are Triton-only and have no host implementation."
+            )
 
         # The pin holds only if the resolved property agrees; anything new that outranks
         # the env var must fail here rather than at the first runner-specific code path.
@@ -923,6 +1020,9 @@ class TorchSpyrePlatform(CpuPlatform):
                     max_num_seqs,
                     blocks_per_seq,
                 )
+
+        if vllm_config.model_config is not None:
+            cls._set_vision_token_limit(vllm_config)
 
     @staticmethod
     def _is_pooling_model(vllm_config: VllmConfig) -> bool:

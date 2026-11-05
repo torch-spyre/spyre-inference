@@ -80,32 +80,43 @@ def _conversation(*uris: str):
     ]
 
 
-def _generate(
-    conversations,
+def _llm(
     enforce_eager: bool,
+    max_num_seqs: int = 1,
     images_per_prompt: int = 1,
     model: str = MODEL,
     config_format: str = "mistral",
     dtype: str = "float16",
     revision: str | None = None,
+    max_model_len: int = MAX_MODEL_LEN,
+    encoder_budgets: tuple[int, ...] = (),
 ):
-    from vllm import LLM, SamplingParams
+    from vllm import LLM
 
-    llm = LLM(
+    return LLM(
         model=model,
         revision=revision,
         tokenizer_revision=revision,
         # Explicit, not `auto`: auto's mistral probe is a live Hub call, so the
         # offline CI runner silently loads the unpatched HF tower instead.
         config_format=config_format,
-        max_model_len=MAX_MODEL_LEN,
-        max_num_seqs=len(conversations),
-        # One decoding sequence, and a prefill of the whole prompt.
-        compilation_config={"compile_sizes": [1, MAX_MODEL_LEN]},
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        # One decoding sequence, and a prefill chunk of the whole prompt up to the platform's 512.
+        compilation_config={
+            "compile_sizes": [1, min(max_model_len, 512)],
+            "encoder_cudagraph_token_budgets": list(encoder_budgets),
+        },
         dtype=dtype,
         enforce_eager=enforce_eager,
         limit_mm_per_prompt={"image": images_per_prompt},
     )
+
+
+def _generate(conversations, enforce_eager: bool, **llm_kwargs):
+    from vllm import SamplingParams
+
+    llm = _llm(enforce_eager, max_num_seqs=len(conversations), **llm_kwargs)
     outputs = llm.chat(
         conversations,
         SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0),
@@ -114,17 +125,15 @@ def _generate(
 
 
 @pytest.mark.multimodal
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
-def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
 
-    Both modes: `CompileOutermost` samples the mode at construction, so under
-    `enforce_eager` the `maybe_compile` kernels fall through to eager — except the
-    norms, which pass `force=True` and compile in either mode — and the
-    compiled path — the repo default — goes uncovered.
+    The same engine first serves a text-only request under
+    ``SPYRE_COMPILE_GUARD=error``: it still reaches ``embed_input_ids``, so a late
+    embedding compile is fatal. Sharing the engine saves a second 14B build.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -133,35 +142,22 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
     # Building the graphs for a 14B two-tower model outruns the default timeout.
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-
-    uri = _synthetic_image_data_uri()
-    (text,) = _generate([_conversation(uri)], enforce_eager=enforce_eager)
-
-    assert text.strip(), "empty generation from the multimodal path"
-
-
-@pytest.mark.multimodal
-@pytest.mark.uses_subprocess
-@pytest.mark.timeout(3600)
-def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
-    """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
-
-    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
-    avoiding unrelated first-use compiles in the vision tower.
-    """
-    if spyre_device_count() == 0:
-        pytest.skip("Spyre device not available")
+    from vllm import SamplingParams
 
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    llm = _llm(enforce_eager=False)
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
 
-    (text,) = _generate([_conversation()], enforce_eager=False)
+    (output,) = llm.chat([_conversation()], params)
+    assert output.outputs[0].text.strip(), "empty text-only generation from the multimodal model"
 
-    assert text.strip(), "empty text-only generation from the multimodal model"
+    (output,) = llm.chat([_conversation(_synthetic_image_data_uri())], params)
+    assert output.outputs[0].text.strip(), "empty generation from the multimodal path"
 
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+@pytest.mark.e2e_smoke
 def test_two_image_prompt_produces_output():
     """Two images per prompt: the encoder runs once per image, and both images' tokens
     reach the decoder.
@@ -180,21 +176,110 @@ def test_two_image_prompt_produces_output():
 
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
-def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
     rewrite on CPU, this checks that what it rewrites to actually lowers.
 
-    Both modes, as for Pixtral above: compiled is the repo default, where the tower's
-    rewrites (gathered position embeddings and rope, permutation-matmul rope, the
-    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs,
-    not just run eagerly.
+    The tower's rewrites (gathered position embeddings and rope, permutation-matmul rope, the
+    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs. An
+    image above every budget is rejected up front.
     """
+    _skip_without_gemma4()
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    # A tower compile at request time is a missed warmup shape: fail, don't log.
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    from vllm import SamplingParams
+    from vllm.exceptions import VLLMValidationError
+
+    llm = _llm(False, model=GEMMA4_MODEL, config_format="hf", revision=GEMMA4_REVISION)
+    conversation = [_conversation(_synthetic_image_data_uri())]
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
+    (output,) = llm.chat(conversation, params)
+
+    assert output.outputs[0].text.strip(), "empty generation from the Gemma 4 vision path"
+    with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets"):
+        llm.chat(conversation, params, mm_processor_kwargs={"max_soft_tokens": 560})
+
+
+@pytest.mark.multimodal
+@pytest.mark.gemma4_vision
+@pytest.mark.uses_subprocess
+# Cold cache: ~30min of decoder warmup, then six vision budgets compile at ~5min each.
+@pytest.mark.timeout(7200)
+def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
+    """Every opted-in ``max_soft_tokens``, and a default and a 1120 image sharing one encoder
+    call, replay a budget compiled at warmup."""
+    _skip_without_gemma4()
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    # collective_rpc ships the probes below to the engine process with cloudpickle.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # An image is encoded with its request's prefill, and by default one request prefills
+    # at a time, so two requests' images only meet in one encoder call with a second slot.
+    monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "2")
+    from vllm import SamplingParams
+
+    def record_encoder_calls(worker):
+        manager = worker.model_runner.encoder_cudagraph_manager
+        manager.calls = []
+        execute = manager._execute_local
+
+        def recording(mm_kwargs):
+            manager.calls.append(manager._get_per_item_out_tokens(mm_kwargs))
+            return execute(mm_kwargs)
+
+        manager._execute_local = recording
+        return manager.graph_hits, manager.graph_misses
+
+    def encoder_calls(worker):
+        manager = worker.model_runner.encoder_cudagraph_manager
+        return manager.calls, manager._pack_tokens, manager.graph_hits, manager.graph_misses
+
+    llm = _llm(
+        enforce_eager=False,
+        max_num_seqs=2,
+        model=GEMMA4_MODEL,
+        config_format="hf",
+        revision=GEMMA4_REVISION,
+        max_model_len=2048,  # room for the 1120-token image
+        # Only what the asserts reach: 280 (the default and the pack size), 576 for 560
+        # and 1152 for 1120. Each budget is a full tower compile on a cold cache.
+        encoder_budgets=(280, 576, 1152),
+    )
+    ((hits, misses),) = llm.collective_rpc(record_encoder_calls)
+    larger = (560, 1120)
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
+    for seed, tokens in enumerate(larger):
+        (output,) = llm.chat(
+            [_conversation(_synthetic_image_data_uri(seed=seed))],
+            params,
+            mm_processor_kwargs={"max_soft_tokens": tokens},
+        )
+        assert output.outputs[0].text.strip(), f"empty generation at max_soft_tokens={tokens}"
+
+    # Paused, so both requests are queued before the step that encodes them is scheduled.
+    llm.sleep(level=0)
+    mixed = (None, {"max_soft_tokens": max(larger)})
+    for seed, kwargs in enumerate(mixed, start=len(larger)):
+        llm.enqueue_chat(
+            [_conversation(_synthetic_image_data_uri(seed=seed))],
+            params,
+            mm_processor_kwargs=kwargs,
+        )
+    llm.wake_up(tags=["scheduling"])
+    for output in llm.wait_for_completion():
+        assert output.outputs[0].text.strip(), "empty generation from the mixed batch"
+
+    ((calls, pack, *counts),) = llm.collective_rpc(encoder_calls)
+    assert any(len(c) == 2 and min(c) <= pack < max(c) for c in calls), calls
+    assert counts == [hits + len(larger) + 2, misses]
+
+
+def _skip_without_gemma4() -> None:
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")
-
     # The 26B weights are prefetched only by the perf job, which never runs on a PR, so
     # the shared cache can legitimately not have them yet.
     from huggingface_hub import snapshot_download
@@ -204,22 +289,6 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
         snapshot_download(GEMMA4_MODEL, revision=GEMMA4_REVISION, local_files_only=True)
     except LocalEntryNotFoundError:
         pytest.skip(f"{GEMMA4_MODEL}@{GEMMA4_REVISION[:7]} not in the local HF cache")
-
-    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-    # A tower compile at request time is a missed warmup shape: fail, don't log.
-    if not enforce_eager:
-        monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-
-    uri = _synthetic_image_data_uri()
-    (text,) = _generate(
-        [_conversation(uri)],
-        enforce_eager=enforce_eager,
-        model=GEMMA4_MODEL,
-        config_format="hf",
-        revision=GEMMA4_REVISION,
-    )
-
-    assert text.strip(), "empty generation from the Gemma 4 vision path"
 
 
 if __name__ == "__main__":

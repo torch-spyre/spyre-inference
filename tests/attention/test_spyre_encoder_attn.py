@@ -572,7 +572,6 @@ def test_spyre_encoder_attn(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
         sliding_window=None,
         kv_cache_dtype="auto",
         logits_soft_cap=None,
@@ -667,7 +666,6 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
         head_size=head_size,
         scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
         sliding_window=None,
         kv_cache_dtype="auto",
         logits_soft_cap=None,
@@ -689,6 +687,20 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
         query.contiguous(), key.contiguous(), value.contiguous(), [total_tokens], head_size**-0.5
     )
     torch.testing.assert_close(output.to("cpu"), ref, atol=0.2, rtol=0.2)
+
+
+def test_attention_sinks_are_rejected(default_vllm_config):
+    """openai_privacy_filter passes sinks to an encoder-only layer, and nothing upstream
+    screens it out on Spyre. These kernels never read sinks, so without the raise it would
+    silently run plain attention."""
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        SpyreEncoderAttentionImpl(
+            num_heads=8,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=8,
+            sinks=torch.zeros(8, dtype=torch.float16),
+        )
 
 
 @torch.inference_mode()
@@ -719,7 +731,6 @@ def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config) -
         head_size=head_size,
         scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
         sliding_window=None,
         kv_cache_dtype="auto",
         logits_soft_cap=None,
@@ -874,7 +885,6 @@ def test_grouped_attention_matches_the_per_sequence_reference(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
         sliding_window=None,
         kv_cache_dtype="auto",
         logits_soft_cap=None,
@@ -967,7 +977,6 @@ def test_fast_and_ragged_paths_agree(
             head_size=head_size,
             scale=scale,
             num_kv_heads=num_kv_heads,
-            alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="auto",
             logits_soft_cap=None,

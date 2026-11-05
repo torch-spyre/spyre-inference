@@ -38,8 +38,10 @@ def _inputs(b, bpc, c, kv):
     return k_pages, v_pages, page_ids, mask, j_total
 
 
-def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap):
-    """Independent per-sequence softmax; pages concatenated along the token axis."""
+def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap, sinks=None):
+    """Independent per-sequence softmax; pages concatenated along the token axis.
+
+    ``sinks`` ([kv, q, 1]) adds each head's logit to the denominator once."""
     out = torch.empty(b, kv, q, HEAD)
     for s in range(b):
         k = torch.cat([k_pages[int(page_ids[jj, s])] for jj in range(j_total)], dim=1)
@@ -50,26 +52,32 @@ def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap):
                 sc = (query[s, h, qq] @ k[h].transpose(0, 1)) * SCALE
                 if cap > 0.0:
                     sc = torch.tanh(sc / cap) * cap
-                out[s, h, qq] = torch.softmax(sc + m, dim=-1) @ v[h]
+                sc = sc + m
+                if sinks is None:
+                    out[s, h, qq] = torch.softmax(sc, dim=-1) @ v[h]
+                else:
+                    p = torch.softmax(torch.cat([sc, sinks[h, qq]]), dim=-1)[:-1]
+                    out[s, h, qq] = p @ v[h]
     return out.reshape(b, kv * q, HEAD)
 
 
-def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0):
+def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None):
     return bdhm.batched_decode_head_major_kernel(
-        query,
-        rep,
-        k_pages,
-        v_pages,
-        page_ids,
-        mask,
-        SCALE,
-        b,
-        bpc,
-        kv,
-        q,
-        BLOCK,
-        HEAD,
+        query=query,
+        rep_row_ids=rep,
+        k_pages=k_pages,
+        v_pages=v_pages,
+        chunk_page_ids=page_ids,
+        mask_by_chunk=mask,
+        scale=SCALE,
+        num_seqs=b,
+        blocks_per_chunk=bpc,
+        num_kv_heads=kv,
+        num_queries_per_kv=q,
+        block_size=BLOCK,
+        head_size=HEAD,
         logits_soft_cap=cap,
+        sinks=sinks,
     )
 
 
@@ -103,7 +111,7 @@ def test_one_chunk_keeps_chunk_reduction(monkeypatch):
     query, rep = _meta(b, bpc, kv, q)
     k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
 
-    def unexpected_merge(*args):
+    def unexpected_merge(**kwargs):
         pytest.fail("A single chunk must not build and merge per-slot state")
 
     monkeypatch.setattr(bdhm, "_merge_entry_local", unexpected_merge)
@@ -146,6 +154,30 @@ def test_multi_chunk_masked(c):
     )
 
 
+@pytest.mark.parametrize(("c", "bpc"), [(1, 2), (3, 1), (3, 2)])
+def test_sinks_count_once_per_sequence(c, bpc):
+    """A sink joins the denominator once per sequence: with several slots per chunk the
+    per-slot merge must not add it per slot. Some sinks dominate the scores, some vanish,
+    and one sequence has a fully masked slot in every chunk."""
+    b, kv, q = 2, 2, 4
+    query, rep = _meta(b, bpc, kv, q)
+    k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
+    if bpc > 1:
+        for jj in range(0, j_total, bpc):
+            mask[jj, 1, 0, 0, :] = float("-inf")
+    sinks = torch.randn(kv, q, 1) * 3
+    sinks[0, 0] = 20.0
+    sinks[-1, -1] = -20.0
+    got = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, sinks=sinks)
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(
+        got,
+        _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0, sinks),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
 def test_body_matches_reference_with_init_state():
     """Thread the real FET init ``(-inf, 0, 0)`` through every trip, with slot 0 of the
     first chunk fully masked."""
@@ -170,7 +202,16 @@ def test_body_matches_reference_with_init_state():
         scores = torch.matmul(q_flat, k_page.transpose(-2, -1)) * SCALE
         sc = scores.reshape(bpc, b, kv, q, BLOCK) + tile_mask
         carry = bdhm._entry_local_update(carry, sc, v_page, entries, bpc, b, kv, q, BLOCK, HEAD)
-    got = bdhm._merge_entry_local(*carry, b, kv, q, HEAD)
+    tile_max, tile_sum, tile_output = carry
+    got = bdhm._merge_entry_local(
+        tile_max=tile_max,
+        tile_sum=tile_sum,
+        tile_output=tile_output,
+        num_seqs=b,
+        num_kv_heads=kv,
+        num_queries_per_kv=q,
+        head_size=HEAD,
+    )
     torch.testing.assert_close(
         got,
         _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0),

@@ -302,16 +302,30 @@ def render(cfg, versions, sha1s=None):
         return "\n".join([header, *rows])
 
     arch_pins = overrides(cfg, versions)
+    # The digest clause only describes a lock that actually pins digests. A
+    # pre-digest lock (none resolved yet, pending a maintainer regeneration with
+    # Artifactory access) keeps the original wording so `--verify` round-trips it.
+    if sha1s:
+        x86_64_clause = (
+            "# x86_64 is pinned to the bundle's exact builds, each with its Artifactory\n"
+            "# actual_sha1 so scripts/install-pinned-rpms.sh can verify the download. Power\n"
+            "# (ppc64le) and Z (s390x) pin the same commits with the build number wildcarded:\n"
+            "# builds differ across platforms, so they carry no digest. A row marked `stale`\n"
+            "# is held at an older commit by [tool.spyre-rpms.stale.<arch>] until that arch\n"
+            "# builds the bundled one."
+        )
+    else:
+        x86_64_clause = (
+            "# x86_64 is pinned to the bundle's exact builds. Power (ppc64le) and Z (s390x)\n"
+            "# pin the same commits with the build number wildcarded: builds differ across\n"
+            "# platforms. A row marked `stale` is held at an older commit by\n"
+            "# [tool.spyre-rpms.stale.<arch>] until that arch builds the bundled one."
+        )
     return f"""\
 # Generated from the Spyre RPM bundle below by scripts/lock_spyre_rpms.py.
 # Change [tool.spyre-rpms] in pyproject.toml and re-run it instead of editing.
 #
-# x86_64 is pinned to the bundle's exact builds, each with its Artifactory
-# actual_sha1 so scripts/install-pinned-rpms.sh can verify the download. Power
-# (ppc64le) and Z (s390x) pin the same commits with the build number wildcarded:
-# builds differ across platforms, so they carry no digest. A row marked `stale`
-# is held at an older commit by [tool.spyre-rpms.stale.<arch>] until that arch
-# builds the bundled one.
+{x86_64_clause}
 
 version = 2
 

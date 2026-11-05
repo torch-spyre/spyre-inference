@@ -273,6 +273,24 @@ def test_verify_accepts_rendered_lock():
     lock.verify(CFG, _lock_text())
 
 
+def test_verify_accepts_pre_digest_lock():
+    # A lock generated before digests were pinned carries no `sha1`; the
+    # installer warns and proceeds rather than failing. `render()` must emit the
+    # pre-digest header for it so the committed lock round-trips through
+    # `--verify` until a maintainer regenerates it with Artifactory access.
+    versions, _ = run(FakeArtifactory())
+    text = lock.render(CFG, versions)
+    assert "each with its Artifactory" not in text
+    assert all("sha1" not in spec for spec in tomllib.loads(text)["packages"].values())
+    lock.verify(CFG, text)
+
+
+def test_render_header_describes_digests_only_when_pinned():
+    versions, sha1s = run(FakeArtifactory())
+    assert "each with its Artifactory" in lock.render(CFG, versions, sha1s)
+    assert "each with its Artifactory" not in lock.render(CFG, versions)
+
+
 @pytest.mark.parametrize(
     "cfg, edit, match",
     [

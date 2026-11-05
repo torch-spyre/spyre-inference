@@ -57,8 +57,8 @@ There is deliberately no CI guard: test timings swing widely with compile-cache 
 hard limit would either flake or need slack wide enough to be useless. Reviewers enforce the
 policy. The same policy covers `attention_smoke`.
 
-The gemma-4-26B-A4B compiled case is the named exception to the size limit. It is the only
-end-to-end MoE model in the suite.
+The compiled gemma-4 MoE case runs `joerunde/gemma-4-moe-nano`, the 26B-A4B layout at 6
+layers, so the suite's only end-to-end MoE model fits the size limit.
 
 These device paths ran in the integration tier before `e2e_smoke` and were left out on
 purpose when the set was first audited. The set was already at its budget, so a torch-spyre
@@ -68,7 +68,7 @@ regression on them is caught in `trunk`, not here:
   the granularity switch are covered on host by `tests/runtime/test_compile_granularity.py`
 - FP8 KV cache at TP1 (`test_fp8_kv_cache_tracks_the_fp16_cache`); the TP2 row is in
 - logprobs independent of KV-bucket padding (`test_logprobs_do_not_depend_on_the_padded_blocks`)
-- the compiled gemma-3-1b decoder (sliding-window attention); its slot went to gemma-4-26B-A4B
+- the compiled gemma-3-1b decoder (sliding-window attention); its slot went to the gemma-4 MoE case
 
 Admitting one of these follows the swap rule below.
 

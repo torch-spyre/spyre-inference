@@ -149,6 +149,13 @@ def validate_dflash_config(config) -> None:
         # SpeculativeConfig has already range-checked xpress_topc and written it here.
         if getattr(draft, "xpress_topc", None) is None:
             draft.xpress_topc = 128
+        draft.xpress_topc = min(draft.xpress_topc, draft.vocab_size)
+        if not 1 <= draft.xpress_topc <= 1024:
+            raise ValueError(
+                "Spyre XPress requires 1 to 1024 candidates: "
+                "min(xpress_topc, vocab_size) must be in this range; "
+                "full-vocabulary refinement (xpress_topc=0) is unsupported"
+            )
         passes = getattr(draft, "xpress_num_passes", None)
         if passes is None:
             draft.xpress_num_passes = 6

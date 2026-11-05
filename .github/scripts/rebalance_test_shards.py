@@ -54,6 +54,24 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 # upstream tests cloned (the others exclude upstream, so must not pull them in).
 SUITES = [
     {"key": "smoke", "makefile_name": "smoke", "var": "SMOKE_SHARDS", "collect_upstream": False},
+    {
+        "key": "smoke-unit",
+        "makefile_name": "smoke-unit",
+        "var": "SMOKE_UNIT_SHARDS",
+        "collect_upstream": False,
+    },
+    {
+        "key": "e2e-smoke",
+        "makefile_name": "e2e-smoke",
+        "var": "E2E_SMOKE_SHARDS",
+        "collect_upstream": False,
+    },
+    {
+        "key": "e2e-smoke-dist",
+        "makefile_name": "e2e-smoke-dist",
+        "var": "E2E_SMOKE_DIST_SHARDS",
+        "collect_upstream": False,
+    },
     {"key": "attn", "makefile_name": "attention", "var": "ATTN_SHARDS", "collect_upstream": False},
     {
         "key": "upstream",
@@ -93,7 +111,14 @@ def parse_makefile() -> dict[str, dict]:
         )
         if not count or not expr:
             raise SystemExit(f"Makefile: could not parse {suite['var']} / test-{name}-shard marker")
-        out[suite["key"]] = {"current": int(count.group(1)), "expr": expr.group(1)}
+        # The target's --ignore flags narrow its selection beyond the marker expression.
+        recipe = re.search(rf"^test-{name}-shard:.*?(?=^\S|\Z)", text, re.DOTALL | re.MULTILINE)
+        ignores = re.findall(r"--ignore=\S+", recipe.group(0)) if recipe else []
+        out[suite["key"]] = {
+            "current": int(count.group(1)),
+            "expr": expr.group(1),
+            "collect_args": [a.rstrip("'") for a in ignores],
+        }
     return out
 
 
@@ -130,10 +155,11 @@ def load_durations(args) -> dict[str, float]:
     return {str(k): float(v) for k, v in raw.items()}
 
 
-def collect_nodeids(expr: str, want_upstream: bool) -> set[str]:
+def collect_nodeids(expr: str, want_upstream: bool, extra_args: list[str]) -> set[str]:
     # --active --no-sync mirrors the Makefile's run-one: plain `uv run` re-syncs from
     # pyproject and clobbers a locally built torch-spyre (see CLAUDE.md).
     cmd = ["uv", "run", "--active", "--no-sync", "pytest", "--collect-only", "-q", "-m", expr]
+    cmd += extra_args
     if want_upstream:
         cmd.append("--upstream")
     result = subprocess.run(cmd, cwd=_REPO_ROOT, capture_output=True, text=True)
@@ -198,7 +224,7 @@ def main() -> None:
     for suite in SUITES:
         key = suite["key"]
         expr = makefile[key]["expr"]
-        nodeids = collect_nodeids(expr, suite["collect_upstream"])
+        nodeids = collect_nodeids(expr, suite["collect_upstream"], makefile[key]["collect_args"])
         weights = [durations[n] for n in nodeids if n in durations]
         unmeasured = len(nodeids) - len(weights)
         rec_n, busiest, over = recommend(weights, budget_s)
@@ -220,14 +246,14 @@ def main() -> None:
         return
 
     print(f"\nBudget: busiest shard <= {args.max_minutes:g} min of measured test time.\n")
-    hdr = f"{'suite':<10}{'cur':>4}{'total':>9}{'max1':>8}{'REC':>5}{'busiest':>9}{'new':>5}"
+    hdr = f"{'suite':<16}{'cur':>4}{'total':>9}{'max1':>8}{'REC':>5}{'busiest':>9}{'new':>5}"
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         flag = "  <- single test over budget" if r["over_budget"] else ""
         change = "" if r["recommended"] == r["current"] else f"  (was {r['current']})"
         print(
-            f"{r['suite']:<10}{r['current']:>4}{_fmt(r['measured_total_s']):>9}"
+            f"{r['suite']:<16}{r['current']:>4}{_fmt(r['measured_total_s']):>9}"
             f"{_fmt(r['max_single_s']):>8}{r['recommended']:>5}"
             f"{_fmt(r['busiest_at_recommended_s']):>9}{r['unmeasured']:>5}{change}{flag}"
         )

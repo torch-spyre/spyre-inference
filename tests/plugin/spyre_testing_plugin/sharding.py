@@ -14,12 +14,12 @@
 
 """Duration-weighted test sharding for CI fan-out.
 
-Each suite (attn/smoke/upstream/dist/probe/quality) is split across N parallel jobs; a job
-keeps only its shard's slice. Every shard job computes the same weighted greedy
-longest-processing-time partition, so no cross-job coordination is needed and
-the union of all shards is the full selection exactly once (guarded by
-tests/test_sharding.py). Shards are weighted by recorded per-test runtime when a
-durations file is pinned (see _load_durations), else by a static path heuristic.
+Each suite (attn/smoke/smoke-unit/e2e-smoke/e2e-smoke-dist/upstream/dist/probe/quality)
+is split across N parallel jobs; a job keeps only its shard's slice. Every shard job
+computes the same weighted greedy longest-processing-time partition, so no cross-job
+coordination is needed and the union of all shards is the full selection exactly once
+(guarded by tests/test_sharding.py). Shards are weighted by recorded per-test runtime
+when a durations file is pinned (see _load_durations), else by a static path heuristic.
 
 pytest_plugin.py registers this module as a plugin (in pytest_configure) and
 delegates `add_shard_options` and the per-test `record_duration` /
@@ -60,7 +60,17 @@ def _will_skip(item: pytest.Item) -> bool:
 def add_shard_options(parser) -> None:
     """Register one --<suite>-shards / --<suite>-shard-id pair per CI suite."""
     group = parser.getgroup("spyre-test-sharding")
-    for suite in ("attn", "smoke", "upstream", "dist", "probe", "quality"):
+    for suite in (
+        "attn",
+        "smoke",
+        "smoke-unit",
+        "e2e-smoke",
+        "e2e-smoke-dist",
+        "upstream",
+        "dist",
+        "probe",
+        "quality",
+    ):
         group.addoption(
             f"--{suite}-shards",
             type=int,
@@ -90,6 +100,8 @@ def apply_shards(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Run every suite applier. Each is a no-op unless its --<suite>-shards is set."""
     _apply_attention_shard(config, items)
     _apply_smoke_shard(config, items)
+    _apply_smoke_unit_shard(config, items)
+    _apply_e2e_smoke_shard(config, items)
     _apply_upstream_shard(config, items)
     _apply_distributed_shard(config, items)
     _apply_probe_shard(config, items)
@@ -290,6 +302,36 @@ def _apply_smoke_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
         label="smoke",
         durations=_load_durations(config),
     )
+
+
+def _apply_smoke_unit_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    _apply_shard(
+        config,
+        items,
+        num_shards=config.getoption("--smoke-unit-shards"),
+        shard_id=config.getoption("--smoke-unit-shard-id"),
+        select=lambda item: True,
+        weight=lambda item: 1,
+        label="smoke-unit",
+        durations=_load_durations(config),
+    )
+
+
+def _apply_e2e_smoke_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    for label, distributed in (("e2e-smoke", False), ("e2e-smoke-dist", True)):
+        _apply_shard(
+            config,
+            items,
+            num_shards=config.getoption(f"--{label}-shards"),
+            shard_id=config.getoption(f"--{label}-shard-id"),
+            select=lambda item, d=distributed: (
+                bool(item.get_closest_marker("e2e_smoke"))
+                and bool(item.get_closest_marker("distributed")) == d
+            ),
+            weight=lambda item: 8 if item.get_closest_marker("uses_subprocess") else 1,
+            label=label,
+            durations=_load_durations(config),
+        )
 
 
 def _apply_upstream_shard(config: pytest.Config, items: list[pytest.Item]) -> None:

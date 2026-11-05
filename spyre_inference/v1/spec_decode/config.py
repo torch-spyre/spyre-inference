@@ -12,32 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vLLM 0.32 predates XPress (vllm#54448); use upstream fields when its canary fails.
-# Retain Spyre validation when removing this bridge; cleanup: #1417.
+import functools
 
 import torch
+
+MAX_DFLASH_BATCH_SIZE = 4
+_XPRESS_ON_V1 = "xpress speculative decoding"
+
+
+def allow_xpress_on_v1() -> None:
+    """Drop upstream's V1 refusal of XPress: Spyre drives it from its own V1 proposer.
+
+    Upstream's XPress speculator is V2-only; remove this at the V2 runner flip (#906).
+    """
+    from vllm.config.vllm import VllmConfig
+
+    original = VllmConfig._get_v1_model_runner_unsupported_features
+    if getattr(original, "_spyre_patched", False):
+        return
+
+    @functools.wraps(original)
+    def without_xpress(self) -> list[str]:
+        return [f for f in original(self) if f != _XPRESS_ON_V1]
+
+    without_xpress._spyre_patched = True
+    VllmConfig._get_v1_model_runner_unsupported_features = without_xpress  # ty: ignore[invalid-assignment]
 
 
 def normalize_speculative_config(engine_args) -> None:
     spec = engine_args.speculative_config
-    if not isinstance(spec, dict) or spec.get("method") not in ("dflash", "xpress"):
+    if not isinstance(spec, dict):
         return
-    spec = dict(spec)
-    options = {}
-    for name, key in (("xpress_num_passes", "num_passes"), ("xpress_topc", "topc")):
-        value = spec.pop(name, None)
-        if value is not None:
-            if type(value) is not int or value < 0:
-                raise ValueError(f"{name} must be a nonnegative integer")
-            options[key] = value
-    # additional_config carries the XPress options that vLLM 0.32 does not recognize.
-    if spec["method"] == "xpress" or options:
-        extra = dict(engine_args.additional_config or {})
-        extra["spyre_xpress"] = dict(extra.get("spyre_xpress", {})) | options
-        engine_args.additional_config = extra
-    spec["method"] = "dflash"
-    spec["disable_padded_drafter_batch"] = True
-    engine_args.speculative_config = spec
+    method = spec.get("method")
+    if method is None:
+        model = str(spec.get("model", "")).lower()
+        # Match vLLM's name-based detection before it applies cache defaults.
+        if "dflash" in model and "eagle-" not in model and "eagle3" not in model:
+            method = "dflash"
+    if method != "dflash":
+        return
+    # Set before VllmConfig picks async scheduling, which this flag disables on V1.
+    engine_args.speculative_config = spec | {
+        "method": "dflash",
+        "disable_padded_drafter_batch": True,
+    }
     if engine_args.enable_prefix_caching is None:
         engine_args.enable_prefix_caching = False
 
@@ -47,6 +65,13 @@ def validate_dflash_config(config) -> None:
     if spec is None or not spec.use_dflash():
         return
     draft = spec.draft_model_config.hf_config
+    architecture = spec.draft_model_config.architecture
+    supported_drafts = {"DFlashDraftModel", "Qwen3XPressModel", "DFlashQwen3XPressModel"}
+    if architecture not in supported_drafts:
+        raise ValueError(
+            f"Unsupported Spyre DFlash/XPress draft architecture: {architecture}. "
+            f"Supported architectures: {', '.join(sorted(supported_drafts))}"
+        )
     target = config.model_config.hf_text_config
     parallel = config.parallel_config
     from spyre_inference import envs
@@ -67,9 +92,12 @@ def validate_dflash_config(config) -> None:
     if (
         parallel.tensor_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
-        or config.scheduler_config.max_num_seqs != 1
+        or not 1 <= config.scheduler_config.max_num_seqs <= MAX_DFLASH_BATCH_SIZE
     ):
-        raise ValueError("Spyre DFlash/XPress currently requires TP=1, PP=1 and max_num_seqs=1")
+        raise ValueError(
+            "Spyre DFlash/XPress currently requires TP=1, PP=1 and "
+            f"max_num_seqs<={MAX_DFLASH_BATCH_SIZE}"
+        )
     if config.cache_config.enable_prefix_caching:
         raise ValueError(
             "Disable prefix caching for Spyre DFlash/XPress: draft context needs every target state"
@@ -78,12 +106,13 @@ def validate_dflash_config(config) -> None:
         raise ValueError("Spyre DFlash/XPress currently supports the Qwen3 text target")
     if spec.draft_sample_method != "greedy":
         raise ValueError("Spyre DFlash/XPress currently uses greedy proposals")
+    max_batch = config.scheduler_config.max_num_seqs
     block = spec.num_speculative_tokens + 1
-    minimum_budget = block + spec.max_num_new_slots_for_drafting
+    minimum_budget = max_batch * (block + spec.max_num_new_slots_for_drafting)
     if config.scheduler_config.max_num_batched_tokens < minimum_budget:
         raise ValueError(
-            "max_num_batched_tokens must accommodate a complete draft block "
-            "and target verification with vLLM's drafting reservation "
+            "max_num_batched_tokens must cover target verification "
+            "and vLLM's per-request drafting reservation "
             f"(at least {minimum_budget} tokens)"
         )
     if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
@@ -114,29 +143,24 @@ def validate_dflash_config(config) -> None:
     block_size = getattr(draft, "xpress_block_size", getattr(draft, "block_size", None))
     if block_size != spec.num_speculative_tokens + 1:
         raise ValueError("num_speculative_tokens must equal the checkpoint block size minus one")
-    options = config.additional_config.get("spyre_xpress", {})
-    xpress = any(
-        arch in ("Qwen3XPressModel", "DFlashQwen3XPressModel") for arch in draft.architectures
-    )
-    if "spyre_xpress" in config.additional_config and not xpress:
-        raise ValueError(
-            "XPress options require an XPress checkpoint, including its refiner weights"
-        )
-    if xpress:
+    if architecture in ("Qwen3XPressModel", "DFlashQwen3XPressModel"):
         if not hasattr(draft, "xpress_rank"):
             raise ValueError("The XPress checkpoint is missing its refiner configuration")
-        for name, key, default in (
-            ("xpress_num_passes", "num_passes", 6),
-            ("xpress_topc", "topc", 128),
-        ):
-            value = options.get(key, getattr(draft, name, None))
-            if value is None:
-                value = default
-            if type(value) is not int or value < 0:
-                raise ValueError(f"{name} must be a nonnegative integer")
-            if name == "xpress_topc" and value > draft.vocab_size:
-                raise ValueError("xpress_topc must not exceed the draft vocabulary size")
-            setattr(draft, name, value)
+        # SpeculativeConfig has already range-checked xpress_topc and written it here.
+        if getattr(draft, "xpress_topc", None) is None:
+            draft.xpress_topc = 128
+        draft.xpress_topc = min(draft.xpress_topc, draft.vocab_size)
+        if not 1 <= draft.xpress_topc <= 1024:
+            raise ValueError(
+                "Spyre XPress requires 1 to 1024 candidates: "
+                "min(xpress_topc, vocab_size) must be in this range; "
+                "full-vocabulary refinement (xpress_topc=0) is unsupported"
+            )
+        passes = getattr(draft, "xpress_num_passes", None)
+        if passes is None:
+            draft.xpress_num_passes = 6
+        elif type(passes) is not int or passes < 0:
+            raise ValueError("xpress_num_passes must be a nonnegative integer")
     if getattr(draft, "sample_from_anchor", False) or draft.dflash_config.get(
         "sample_from_anchor", False
     ):

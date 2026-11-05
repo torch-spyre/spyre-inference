@@ -37,7 +37,20 @@ from vllm import LLM, SamplingParams
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
 
 
-@pytest.mark.parametrize("tuned", [False, True], ids=["defaults", "tuned"])
+@pytest.mark.parametrize(
+    "tuned",
+    [
+        pytest.param(
+            False,
+            id="defaults",
+            marks=pytest.mark.skipif(
+                os.environ.get("SPYRE_TEST_TIER") != "trunk",
+                reason="Default buckets run in trunk; tuned buckets cover PR regression",
+            ),
+        ),
+        pytest.param(True, id="tuned"),
+    ],
+)
 def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
@@ -71,7 +84,6 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
             model=DRAFT,
             revision=DRAFT_REVISION,
             num_speculative_tokens=15,
-            xpress_num_passes=6,
             xpress_topc=int(os.environ.get("SPYRE_XPRESS_TEST_TOPC", "128")),
         ),
     )
@@ -156,6 +168,7 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
             assert set(finished) == set(requested)
             state = llm.collective_rpc("validation_state")[0]
             state["request_ids"] = internal_ids
+            assert state["model"]["selection_calls"] == passes * state["model"]["host_argmax_calls"]
             metrics = _check_acceptance_metrics(
                 before, _acceptance_metrics(llm), state["verification_steps"]
             )
@@ -335,6 +348,13 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
                 )
             )
         ]
+        stochastic.append(
+            dict(
+                prompt_ids=repeated[:495],
+                max_tokens=17,
+                sampling=dict(temperature=0.9, top_k=20, top_p=0.8, seed=37),
+            )
+        )
         for label, mode, passes in (
             ("ordinary", "none", 6),
             ("dflash", "real", 0),
@@ -349,6 +369,16 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
             assert report[f"{label}_seeded"]["logprobs"] == report[f"{label}_replay"]["logprobs"]
             for first, second in zip(original, replay, strict=True):
                 assert first.outputs[0].token_ids == second.outputs[0].token_ids
+                request_id = original_state["request_ids"][first.request_id]
+                sampled = [
+                    token
+                    for step in original_state["verification_steps"]
+                    if step["request"] == request_id
+                    for token in step["sampled"]
+                ]
+                tokens = list(first.outputs[0].token_ids)
+                assert sampled[: len(tokens)] == tokens
+                assert len(tokens) <= len(sampled) < len(tokens) + 16
                 caches = [
                     torch.load(
                         state["snapshots"][state["request_ids"][output.request_id]]["path"],
@@ -359,6 +389,19 @@ def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
                 _compare_cache(*caches, exact=True)
             if mode == "real":
                 assert original_state["drafter"]["proposal_batch_sizes"][4] > 0
+                assert any(
+                    step["drafts"] and len(step["sampled"]) <= step["drafts"]
+                    for step in original_state["verification_steps"]
+                )
+                limit_id = original_state["request_ids"][original[-1].request_id]
+                limit_steps = [
+                    step for step in original_state["steps"] if step["request"] == limit_id
+                ]
+                assert any(step["native_proposals"] for step in limit_steps)
+                assert not limit_steps[-1]["native_proposals"]
+                assert any(
+                    step["committed_end"] > 496 and not step["proposals"] for step in limit_steps
+                )
         report["complete"] = True
         save()
         record_property("validation_report", str(report_path))

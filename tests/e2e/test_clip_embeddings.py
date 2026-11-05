@@ -143,6 +143,7 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+@pytest.mark.e2e_smoke
 def test_clip_image_embedding_matches_hf() -> None:
     _skip_without_spyre()
     image = _synthetic_image()

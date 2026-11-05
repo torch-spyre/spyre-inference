@@ -121,6 +121,11 @@ def _rerank_generator() -> ModuleType:
     return module
 
 
+def _with_e2e_smoke(models: list[str], smoke_model: str) -> list:
+    assert smoke_model in models, f"{smoke_model} is no longer a parametrize row"
+    return [pytest.param(m, marks=pytest.mark.e2e_smoke) if m == smoke_model else m for m in models]
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     return F.cosine_similarity(
         torch.tensor(a, dtype=torch.float32),
@@ -152,7 +157,9 @@ def _hf_last_token_embeddings(model: str, revision: str, prompts: list[str]) -> 
 
 
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("model", EMBEDDING_MODELS)
+@pytest.mark.parametrize(
+    "model", _with_e2e_smoke(EMBEDDING_MODELS, "ibm-granite/granite-embedding-30m-english")
+)
 def test_encoder_embed_models(model: str, record_property) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
     ref = _REFERENCES.get(model)
@@ -290,7 +297,7 @@ def test_encoder_embed_last_pooling() -> None:
 
 
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("model", RERANKER_MODELS)
+@pytest.mark.parametrize("model", _with_e2e_smoke(RERANKER_MODELS, "BAAI/bge-reranker-v2-m3"))
 def test_encoder_rerank_models(model: str, record_property) -> None:
     """Spyre reranker scores match the cached HF references within tolerance.
 
@@ -400,6 +407,7 @@ def _assert_scores_match(
 
 
 @pytest.mark.uses_subprocess
+@pytest.mark.e2e_smoke
 def test_encoder_token_classify() -> None:
     """Per-token scores match softmax(HF fp32 logits) and agree on every label."""
     from transformers import AutoModelForTokenClassification, AutoTokenizer

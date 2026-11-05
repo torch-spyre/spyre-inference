@@ -130,6 +130,10 @@ def _generate(conversations, enforce_eager: bool, **llm_kwargs):
 def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
+
+    The same engine first serves a text-only request under
+    ``SPYRE_COMPILE_GUARD=error``: it still reaches ``embed_input_ids``, so a late
+    embedding compile is fatal. Sharing the engine saves a second 14B build.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -138,35 +142,22 @@ def test_single_image_prompt_produces_output(monkeypatch):
 
     # Building the graphs for a 14B two-tower model outruns the default timeout.
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-
-    uri = _synthetic_image_data_uri()
-    (text,) = _generate([_conversation(uri)], enforce_eager=False)
-
-    assert text.strip(), "empty generation from the multimodal path"
-
-
-@pytest.mark.multimodal
-@pytest.mark.uses_subprocess
-@pytest.mark.timeout(3600)
-def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
-    """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
-
-    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
-    avoiding unrelated first-use compiles in the vision tower.
-    """
-    if spyre_device_count() == 0:
-        pytest.skip("Spyre device not available")
+    from vllm import SamplingParams
 
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    llm = _llm(enforce_eager=False)
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
 
-    (text,) = _generate([_conversation()], enforce_eager=False)
+    (output,) = llm.chat([_conversation()], params)
+    assert output.outputs[0].text.strip(), "empty text-only generation from the multimodal model"
 
-    assert text.strip(), "empty text-only generation from the multimodal model"
+    (output,) = llm.chat([_conversation(_synthetic_image_data_uri())], params)
+    assert output.outputs[0].text.strip(), "empty generation from the multimodal path"
 
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+@pytest.mark.e2e_smoke
 def test_two_image_prompt_produces_output():
     """Two images make the vision mask non-trivial: the `cu_seqlens`-derived
     block-diagonal mask must actually block cross-image attention, not collapse to a
@@ -216,7 +207,8 @@ def test_gemma4_single_image_prompt_produces_output(monkeypatch):
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
 @pytest.mark.uses_subprocess
-@pytest.mark.timeout(3600)
+# Cold cache: ~30min of decoder warmup, then six vision budgets compile at ~5min each.
+@pytest.mark.timeout(7200)
 def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     """Every opted-in ``max_soft_tokens``, and a default and a 1120 image sharing one encoder
     call, replay a budget compiled at warmup."""
@@ -253,8 +245,9 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
         config_format="hf",
         revision=GEMMA4_REVISION,
         max_model_len=2048,  # room for the 1120-token image
-        # 576 and 1152 hold 560 and 1120.
-        encoder_budgets=(64, 128, 256, 280, 576, 1152),
+        # Only what the asserts reach: 280 (the default and the pack size), 576 for 560
+        # and 1152 for 1120. Each budget is a full tower compile on a cold cache.
+        encoder_budgets=(280, 576, 1152),
     )
     ((hits, misses),) = llm.collective_rpc(record_encoder_calls)
     larger = (560, 1120)

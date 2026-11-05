@@ -15,15 +15,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU oracle for vLLM XPress at ce9467b757, independent of Spyre's split projections."""
+"""CPU oracle: upstream XPress's torch path, independent of Spyre's split projections."""
 
 import torch
-from torch.nn import functional as F
+from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead
 
 
 def merged_refine(head, base, hidden, anchors, passes):
-    summary = hidden.mean(dim=1, keepdim=True).expand_as(hidden)
-    cache = torch.cat((head.down_h(hidden), head.down_g(summary)), dim=-1)
+    cache = XPressRefinerHead.hidden_cache(head, hidden)
     draft = base[:, 1:].argmax(-1)
     candidates = None
     if head.topc:
@@ -31,10 +30,7 @@ def merged_refine(head, base, hidden, anchors, passes):
     for _ in range(passes):
         # XPressSpeculator uses the verified anchor as its own predecessor.
         previous = torch.cat((anchors[:, None], anchors[:, None], draft[:, :-1]), dim=1)
-        x = head.in_proj(torch.cat((cache, head.w1(previous)), dim=-1))
-        x = torch.bmm(head.mix_L.to(x.dtype), x.permute(2, 1, 0)).permute(2, 1, 0)
-        latent = x + head.mlp_down(F.silu(head.mlp_gate(x)) * head.mlp_up(x))
-        scores = base[:, 1:] + head.w2(latent)[:, 1:]
+        scores = base[:, 1:] + XPressRefinerHead.refine_bias(head, previous, cache)[:, 1:]
         if candidates is None:
             draft = scores.argmax(-1)
         else:

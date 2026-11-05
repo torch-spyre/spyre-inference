@@ -218,3 +218,9 @@ def _assert_compiled_output(
 
     assert prompt == output[0].prompt, "Model output contained wrong prompt!"
     assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"
+    # Sized from the card's free memory, which far exceeds what the batch needs.
+    cache_config = engine.llm_engine.vllm_config.cache_config
+    batch_blocks = kwargs["max_num_seqs"] * math.ceil(
+        kwargs["max_model_len"] / cache_config.block_size
+    )
+    assert cache_config.num_gpu_blocks > batch_blocks + 1

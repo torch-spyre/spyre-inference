@@ -371,9 +371,8 @@ dense V tensor per layer, pages selected by indirect indexing, so it
 costs only `num_layers × 2` mappings whatever the block count.
 
 **Fix:** keep the number of live Spyre allocations bounded. The platform
-already caps an unset `max_num_seqs` at 4 and sizes
-`num_gpu_blocks_override` to `max_num_seqs × ceil(max_model_len /
-block_size) + 1`; pass explicit, modest values when you override them.
+already caps an unset `max_num_seqs` at 4; pass an explicit, modest value
+when you override it.
 The "consider restarting Linux" text in the error message is
 misleading — pod restart does not help. This is a configuration issue,
 not an IOMMU-state issue.

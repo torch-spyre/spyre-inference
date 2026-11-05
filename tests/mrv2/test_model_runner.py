@@ -44,3 +44,16 @@ def test_a_step_without_block_copies_reaches_upstream(monkeypatch: pytest.Monkey
     runner.update_requests(output)
 
     assert upstream == [output]
+
+
+def test_profile_run_runs_no_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    """As TorchSpyreModelRunner's: on Spyre the first forward is the trace."""
+
+    def forward(*args, **kwargs):
+        raise AssertionError("profile_run ran a forward")
+
+    monkeypatch.setattr(GPUModelRunner, "profile_run", forward)
+    monkeypatch.setattr(GPUModelRunner, "_dummy_run", forward)
+    runner = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
+
+    runner.profile_run()

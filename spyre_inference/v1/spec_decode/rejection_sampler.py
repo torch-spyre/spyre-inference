@@ -15,10 +15,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM 0.32.0 dispatcher adapters for the vendored csrc/cpu/spec_decode_utils.cpp.
+"""vLLM 0.33.0 dispatcher adapters for the vendored csrc/cpu/spec_decode_utils.cpp.
 
-Adapted from vllm/utils/cpu_triton_utils.py at 5df63a7203. The native kernels
-accept the caller's dtypes directly and implement synthetic acceptance.
+Adapted from vllm/utils/cpu_triton_utils.py at 5df63a7203 (unchanged through v0.33.0).
+The native kernels accept the caller's dtypes directly and implement synthetic acceptance.
 """
 
 import torch

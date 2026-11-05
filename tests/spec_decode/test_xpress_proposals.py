@@ -16,33 +16,37 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from torch.nn import functional as F
 from xpress_reference import merged_refine
 
 from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
-from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead
+from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead, select_feedback
 
 
 @pytest.mark.parametrize(
-    "topc,vocab", [(0, 73), (1, 73), (7, 73), (73, 73), (128, 1031), (512, 1031)]
+    "topc,vocab,padded_vocab",
+    [(1, 73, 128), (7, 73, 128), (73, 73, 128), (128, 1031, 2048), (512, 1031, 2048)],
 )
 @pytest.mark.parametrize("passes", [0, 2, 6])
 @pytest.mark.parametrize("batch", [1, 2, 3, 4])
-def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_scores(
-    topc, vocab, passes, batch
+def test_serving_selection_ignores_padded_vocabulary_and_copies_only_initial_logits(
+    topc, vocab, padded_vocab, passes, batch
 ):
     torch.manual_seed(81)
     head = XPressRefinerHead(vocab, 128, 16, rank=64, mlp_hidden=128, topc=topc).eval()
     hidden, base = torch.randn(batch * 16, 128), torch.randn(batch * 16, vocab)
     anchor = torch.arange(batch) + 3
     model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=vocab),
         xpress_head=head,
         xpress_num_passes=passes,
         xpress_topc=topc,
-        compute_device_logits=lambda _: base,
+        compute_device_logits=lambda _: F.pad(base, (0, padded_vocab - vocab), value=100),
         _hidden_cache=head.project_hidden_cache,
-        _refine=head.refine_full,
-        _gather_readout=head.gather_readout,
-        _refine_candidates=head.refine_candidates,
+        _prepare_feedback=head.prepare_feedback,
+        _refine_feedback=head.refine_feedback,
+        _select_feedback=select_feedback,
+        _feedback_order=F.pad(torch.arange(topc).half(), (0, -topc % 64), value=-1),
     )
     transferred_bytes = []
 
@@ -66,4 +70,117 @@ def test_serving_selection_loop_matches_reference_and_transfers_only_candidate_s
         ]
         actual = SpyreDFlashQwen3ForCausalLM.propose_block(model, hidden, anchor)
     assert actual == expected
-    assert sum(transferred_bytes) == batch * (16 * vocab + passes * 15 * (topc or vocab)) * 4
+    assert transferred_bytes == [batch * 16 * padded_vocab * 4]
+
+
+@pytest.fixture
+def upstream_xpress_model(monkeypatch):
+    from vllm.model_executor.models import qwen3_xpress
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    from spyre_inference.models.qwen3_dflash import SpyreQwen3XPressForCausalLM
+
+    config = SimpleNamespace(
+        vocab_size=73,
+        hidden_size=128,
+        head_dim=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=256,
+        num_hidden_layers=0,
+        dflash_config={"target_layer_ids": [0, 2]},
+        xpress_block_size=16,
+        xpress_rank=64,
+        xpress_mlp_hidden=128,
+        xpress_topc=7,
+        xpress_num_passes=2,
+        draft_vocab_size=73,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=config)),
+        model_config=SimpleNamespace(get_num_layers=lambda _: 4, get_vocab_size=lambda: 73),
+        parallel_config=None,
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+
+    def backbone_init(self, *, vllm_config, start_layer_id=0, prefix=""):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.fc = torch.nn.Linear(256, 128, bias=False)
+        self.hidden_norm = torch.nn.RMSNorm(128)
+        self.norm = torch.nn.RMSNorm(128)
+        self.layers = torch.nn.ModuleList()
+
+    monkeypatch.setattr(DFlashQwen3Model, "__init__", backbone_init)
+    monkeypatch.setattr(qwen3_xpress, "ParallelLMHead", lambda *a, **k: torch.nn.Identity())
+    monkeypatch.setattr(qwen3_xpress, "LogitsProcessor", lambda *a, **k: torch.nn.Identity())
+    return SpyreQwen3XPressForCausalLM(vllm_config=vllm_config)
+
+
+def test_upstream_xpress_construction_builds_the_spyre_classes(upstream_xpress_model):
+    from vllm.model_executor.models import qwen3_xpress
+
+    from spyre_inference.models.qwen3_dflash import SpyreQwen3XPressModel
+
+    model = upstream_xpress_model
+
+    assert type(model.model) is SpyreQwen3XPressModel
+    head = model.xpress_head
+    assert head is model.model.xpress_head and type(head) is XPressRefinerHead
+    assert (head.rank, head.topc, model.xpress_num_passes) == (64, 7, 2)
+    assert "refine_bias" not in head.__dict__, "upstream's compiled refine_bias was left bound"
+    assert qwen3_xpress.XPressRefinerHead is not XPressRefinerHead, "class swap leaked"
+
+
+@pytest.fixture
+def upstream_xpress_weights(upstream_xpress_model):
+    model = upstream_xpress_model
+    weights = {
+        name: torch.full_like(value, 0.125)
+        for name, value in model.model.state_dict().items()
+        if not name.startswith("xpress_head.")
+    }
+    head = model.xpress_head
+    state = head.state_dict()
+    for index, (name, dest) in enumerate(head.HYBRID_KEY_MAP.items(), start=1):
+        reference = head.mix_L if name == "mix.L" else state[dest]
+        weights["xpress_head." + name] = torch.full_like(reference, index / 32)
+    return weights
+
+
+def test_upstream_xpress_checkpoint_roundtrip(upstream_xpress_model, upstream_xpress_weights):
+    model, weights = upstream_xpress_model, upstream_xpress_weights
+    model.load_weights(weights.items())
+    head = model.xpress_head
+    state = head.state_dict()
+    for name, dest in head.HYBRID_KEY_MAP.items():
+        expected = weights["xpress_head." + name]
+        if name == "mix.L":
+            expected = expected.tril() + torch.eye(head.block_size, dtype=expected.dtype)
+            dest = "mix_L"
+        torch.testing.assert_close(state[dest], expected, atol=0, rtol=0)
+    assert head._fused_buf is None
+    restored = XPressRefinerHead(73, 128, 16, rank=64, mlp_hidden=128, topc=7)
+    restored.load_state_dict(state)
+    torch.testing.assert_close(restored.state_dict(), state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("name", tuple(XPressRefinerHead.HYBRID_KEY_MAP))
+def test_missing_xpress_head_weight_fails(upstream_xpress_model, upstream_xpress_weights, name):
+    del upstream_xpress_weights["xpress_head." + name]
+    with pytest.raises(ValueError, match=name):
+        upstream_xpress_model.load_weights(upstream_xpress_weights.items())
+
+
+def test_raw_xpress_mixer_cannot_broadcast(upstream_xpress_model, upstream_xpress_weights):
+    upstream_xpress_weights["xpress_head.mix.L"] = upstream_xpress_weights["xpress_head.mix.L"][:1]
+    with pytest.raises(ValueError, match="mix.L shape"):
+        upstream_xpress_model.load_weights(upstream_xpress_weights.items())
+
+
+def test_folded_xpress_mixer_is_not_a_published_weight(
+    upstream_xpress_model, upstream_xpress_weights
+):
+    upstream_xpress_weights["xpress_head.mix_L"] = upstream_xpress_model.xpress_head.mix_L.clone()
+    with pytest.raises(ValueError, match="unexpected=.*mix_L"):
+        upstream_xpress_model.load_weights(upstream_xpress_weights.items())

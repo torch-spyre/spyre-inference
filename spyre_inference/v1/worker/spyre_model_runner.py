@@ -359,6 +359,16 @@ class _SpyreModelWrapper:
             self, "_keep_aux_hidden_states_on_device", keep_aux_hidden_states_on_device
         )
 
+    @contextmanager
+    def outputs_on_host(self):
+        """D2H the outputs for the duration, for upstream's host-side dummy-run gather."""
+        keep = self._keep_outputs_on_device
+        object.__setattr__(self, "_keep_outputs_on_device", False)
+        try:
+            yield keep
+        finally:
+            object.__setattr__(self, "_keep_outputs_on_device", keep)
+
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
@@ -1273,14 +1283,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if num_tokens is not None:
             attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
-        keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
-        if keep:
-            object.__setattr__(wrapper, "_keep_outputs_on_device", False)
-        try:
+        on_host = (
+            wrapper.outputs_on_host()
+            if isinstance(wrapper, _SpyreModelWrapper)
+            else nullcontext(False)
+        )
+        with on_host as keep:
             hidden_states, last_hidden_states = super()._dummy_run(*args, **kwargs)
-        finally:
-            if keep:
-                object.__setattr__(wrapper, "_keep_outputs_on_device", True)
 
         if (
             keep

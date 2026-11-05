@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.model_executor.models import idefics3
+from vllm.model_executor.models.idefics2_vision_model import Idefics2VisionAttention
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
@@ -73,6 +74,30 @@ def group_projection_weight(weight: torch.Tensor, groups: int) -> torch.Tensor:
     return weight.reshape(out_dim, groups, in_dim // groups).permute(1, 2, 0).contiguous()
 
 
+class SpyreIdefics2VisionAttention(Idefics2VisionAttention):
+    """Upstream's vision attention with the stick-aligned SDPA in place of ``MMEncoderAttention``.
+
+    Always takes the additive same-tile ``attention_mask``, which ``vision_embed`` builds once per
+    encoder call, so upstream's mask-free ``MMEncoderAttention`` branch is never used.
+    """
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch, patches, _ = hidden_states.shape
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = (
+            t.reshape(batch, patches, self.num_heads_per_partition, self.head_dim).transpose(1, 2)
+            for t in qkv.chunk(3, dim=-1)
+        )
+        out = padded_sdpa(q, k, v, attention_mask, scale=self.scale)
+        out = out.transpose(1, 2).reshape(batch, patches, -1)
+        out, _ = self.out_proj(out)
+        return out
+
+
 class SpyreIdefics3ForConditionalGeneration(
     SpyreVisionEncoderMixin, idefics3.Idefics3ForConditionalGeneration
 ):
@@ -97,6 +122,11 @@ class SpyreIdefics3ForConditionalGeneration(
             # Index into the learned position embedding.
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
+
+        # Switch each attention to the Spyre forward in place: the subclass adds no state, so the
+        # stock linears and their weight-loader names stay as built.
+        for layer in self.model.vision_model.encoder.layers:
+            layer.self_attn.__class__ = SpyreIdefics2VisionAttention
 
     def process_weights_after_loading(self) -> None:
         """Reshape the vision weights for the graphs, in place, as the Spyre linears do, so one

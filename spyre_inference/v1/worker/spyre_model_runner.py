@@ -955,22 +955,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self._warmup_vision_merge(model)
 
     def _multimodal_pruning_enabled(self, model: Any) -> bool:
-        """Upstream's check: the model implements pruning and the config turns it on.
-
-        A pruning rate on Pixtral or Gemma 4, which do not implement it, is ignored.
-        ``load_model`` is overridden here, so the flag upstream sets on the runner may
-        be absent; the config is only consulted for a model that supports pruning.
-        """
-        flag = bool(getattr(self, "is_multimodal_pruning_enabled", False))
-        if not flag:
-            mm_config = getattr(self.model_config, "multimodal_config", None)
-            enabled = getattr(mm_config, "is_multimodal_pruning_enabled", None)
-            flag = bool(enabled()) if callable(enabled) else bool(enabled)
-        if not flag:
-            return False
-        # Upstream ignores the rate on a model that does not implement pruning.
+        """The model implements pruning and the config turns it on."""
         from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 
+        mm_config = self.model_config.multimodal_config
+        if mm_config is None or not mm_config.is_multimodal_pruning_enabled():
+            return False
         return bool(supports_multimodal_pruning(model))
 
     def _install_encoder_output_table(self) -> None:
@@ -981,7 +971,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.models._vision_encoder import EncoderOutputCache, EncoderOutputTable
 
         model = self.model
-        if not isinstance(model, SpyreVisionEncoderMixin):
+        if not isinstance(model, SpyreVisionEncoderMixin) or not model.vision_output_table:
             return
         # The scheduler's EncoderCacheManager sizes from mm_budget.encoder_cache_size:
         # max(scheduler_config.encoder_cache_size, max_tokens_per_mm_item). The scheduler
@@ -1005,19 +995,32 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "The encoder-cache connector expects embeddings in the encoder cache. "
                 "Spyre stores row handles into an on-card table; run without an EC connector."
             )
+        mm_config = self.model_config.multimodal_config
+        if mm_config is not None and getattr(mm_config, "enable_mm_embeds", False):
+            raise NotImplementedError(
+                "enable_mm_embeds mixes float prompt embeddings with integer row handles. "
+                "The encoder output table stores handles; disable enable_mm_embeds, or set "
+                "vision_output_table = False."
+            )
         buckets = ()
         bucketer = getattr(self, "spyre_shape_bucketer", None)
         if bucketer is not None:
             buckets = tuple(bucketer.bucket_sizes)
-        # Spare rows between the cache and the trash row pad a short write up to a warmed
-        # length without taking cache slots. ``cache_size - 1`` of them cover a warmed
-        # write of ``cache_size`` from a single real token. One past that, or past any
-        # token bucket, so a gather is never the whole table (torch-spyre#4033).
-        spare = max(cache_size - 1, 0)
-        rows = max(cache_size + spare, max(buckets, default=0)) + 1
+        # Whole-budget writes pad onto spare rows. ``max(budgets) - 1`` covers keep=1 of
+        # the largest warmed write. Eager has no budgets, so spare is cache_size - 1.
+        # One past that, so a gather is never the whole table (torch-spyre#4033).
+        max_write = max(buckets, default=0) or cache_size
+        spare = max(max_write - 1, 0)
+        rows = cache_size + spare + 1
         dtype = self._model_dtype()
+        eager = self.compilation_config.mode is CompilationMode.NONE
         table = EncoderOutputTable(
-            cache_size, model.out_hidden_size, dtype, self._spyre_device, rows=rows
+            cache_size,
+            model.out_hidden_size,
+            dtype,
+            self._spyre_device,
+            rows=rows,
+            watch_writes=not eager,
         )
         model.output_table = table
         self.encoder_cache = EncoderOutputCache(table)
@@ -1028,7 +1031,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Eager has no buckets to warm, so the first prompt length traces this
             # after the guard is armed. Leave it unwatched there. A compiled tower
             # warms every bucket in _warmup_vision_merge, which does watch it.
-            eager = self.compilation_config.mode is CompilationMode.NONE
             model.compile_output_merge(watch=not eager)
         nbytes = table.table.numel() * table.table.element_size()
         logger.info(
@@ -1048,7 +1050,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if bucketer is None:
             return
         wrapper = cast(_SpyreModelWrapper, self.model)
-        table = getattr(model, "output_table", None)
+        table = model.output_table
         if table is None:
             image_rows = [torch.zeros(1, model.out_hidden_size, dtype=self._model_dtype())]
         else:

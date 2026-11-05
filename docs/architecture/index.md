@@ -357,9 +357,12 @@ Constraints the layout follows:
   `GatherTable` (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
   one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
   64-wide head's 32-wide halves cannot be sliced.
-- The encoder output comes back to the host in one copy and is sliced there: device views
-  at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
-  runs on the host anyway.
+- Mixin models keep encoder output on the card in an `EncoderOutputTable`; the cache holds
+  row handles and `embed_input_ids` gathers them. Compiled warmup records one table write
+  per token budget. `--enforce-eager` has no budget warmup, so each new image token count
+  compiles a write while serving (unwatched, like the gather). `SPYRE_COMPILE_GUARD=error`
+  is the compiled-path check. A model that still slices host rows sets
+  `vision_output_table = False` (Granite Vision, #1437).
 - Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
 
 ## Attention Backend

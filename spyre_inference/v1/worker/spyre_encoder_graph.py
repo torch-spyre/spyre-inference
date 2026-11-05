@@ -138,11 +138,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             output = self.model.encoder_cudagraph_forward(self._upload(values), path=path)
         table = getattr(self.model, "output_table", None)
         if table is not None:
-            # One compiled table write per budget that fits in the cache, beside the encoder
-            # graphs. A budget past the cache reuses that cache-sized write, so it adds no
-            # graph. The rows are dummy and go straight back to the free list. The log below
-            # includes this write. ``encoder_cache_rows`` is the projection serving stores
-            # (identity, except Gemma 4's host tail).
+            # One compiled table write per budget. Extra rows past the cache land on spare.
+            # Dummy rows go straight back to the free list. ``encoder_cache_rows`` is the
+            # projection serving stores (identity, except Gemma 4's host tail).
             table.warmup_write(self.model.encoder_cache_rows(output))
         logger.info("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
         self._staging.setdefault(path, {})[token_budget] = values

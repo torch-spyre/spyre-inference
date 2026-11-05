@@ -228,7 +228,7 @@ def test_warmup_stores_the_projected_rows_not_the_vision_width():
     assert rows.shape == (8, TEXT_HIDDEN)
     assert rows.dtype == torch.float16
 
-    table = EncoderOutputTable(8, TEXT_HIDDEN, torch.float16, torch.device("cpu"), rows=9)
+    table = EncoderOutputTable(8, TEXT_HIDDEN, torch.float16, torch.device("cpu"), rows=16)
     with pytest.raises(RuntimeError, match="table rows"):
         table.store(pooled)
     table.warmup_write(rows)

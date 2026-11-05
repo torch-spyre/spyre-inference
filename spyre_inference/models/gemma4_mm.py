@@ -511,13 +511,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
     def encoder_cache_rows(self, output: torch.Tensor) -> torch.Tensor:
         """The tail in fp32 on the host, as upstream: its scale can overflow fp16.
 
-        ``vision_project`` only pools, so its rows are the vision width. The table and the
-        prompt merge are the text width; this is the projection that gets them there.
-
-        Known gap for the on-card encoder table: the whole encoder output is downloaded,
-        the tail runs here, and ``store`` uploads the projected rows. A budget of 1120
-        tokens moves about four times the rows of a 280-token image, both ways. The tail
-        stays on the host until it can run on the card without that fp16 overflow.
+        ``vision_project`` pools to the vision width; the table is the text width.
         """
         tail = self._spyre_vision_tail
         x = convert(output, device="cpu").float() * tail.scale
@@ -540,18 +534,20 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """Slice the projected rows into ``dest``. With a table, store them and scatter handles.
+        """Download at offset 0, project the real prefix, pad to the budget, then store.
 
-        Download the whole encoder output (offset 0) and drop the budget's padding on the
-        host before the fp32 tail. Slicing on the card is a narrowed view, and running the
-        tail over that padding is a budget/actual multiple of host matmul.
+        Slicing on the card is a narrowed view (torch-spyre#3770). The fp32 tail stays
+        on the host until it can run on the card without overflowing fp16.
         """
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
         downloaded = convert(outputs["default"], device="cpu")
         tokens = self.encoder_cache_rows(downloaded[:num_tokens])
-        table = getattr(self, "output_table", None)
+        table = self.output_table
         if table is not None:
-            tokens = table.store(tokens)
+            pad = downloaded.shape[0] - tokens.shape[0]
+            if pad > 0 and tokens.shape[0] > 0:
+                tokens = torch.cat([tokens, tokens[-1:].repeat(pad, 1)], dim=0)
+            tokens = table.store(tokens, keep=num_tokens)
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:

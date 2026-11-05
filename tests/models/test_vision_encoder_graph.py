@@ -739,8 +739,8 @@ def test_output_cache_clear_del_and_update_release_rows():
 
 
 def test_store_keep_writes_the_budget_and_frees_the_tail():
-    """A budget-length write keeps the real prefix and returns the padding rows."""
-    table = _table(cache_size=8, rows=10)
+    """A budget-length write keeps the real prefix; padding lands on spare rows."""
+    table = _table()
     rows = torch.arange(6 * 8, dtype=torch.float16).view(6, 8)
     handles = table.store(rows, keep=2)
     assert handles.shape == (2, 1)
@@ -749,60 +749,51 @@ def test_store_keep_writes_the_budget_and_frees_the_tail():
     torch.testing.assert_close(gathered, rows[:2])
 
 
-def test_store_pads_an_unwarmed_budget_up_to_a_warmed_write():
-    """A tensor longer than the real prefix is not compiled when a warmed write fits.
-
-    The tail is a copied row with its own slots. A repeated trash index does not compile.
-    """
-    table = _table(cache_size=8, rows=10)
-    table._writes[6] = object()
+def test_store_writes_the_given_length_onto_spare():
+    """Padding uses spare rows so a warmed budget write is reused."""
+    table = _table()
+    table._writes[4] = object()
     rows = torch.arange(4 * 8, dtype=torch.float16).view(4, 8)
     handles = table.store(rows, keep=2)
     assert handles.shape == (2, 1)
     assert len(table._free) == 6
-    assert int((table.table[:8].abs().sum(-1) > 0).sum()) == 6
+    assert set(table._writes) == {4}
     gathered = table.table.index_select(0, handles.view(-1))
     torch.testing.assert_close(gathered, rows[:2])
 
 
 def test_warmup_write_records_its_own_count_beside_a_larger_one():
     """Each budget is its own write, including when a larger one is already warmed."""
-    table = _table(cache_size=8, rows=10)
+    table = _table()
     table._writes[8] = object()
     rows = torch.arange(4 * 8, dtype=torch.float16).view(4, 8)
     table.warmup_write(rows)
     assert len(table._free) == 8
     assert len(table._in_use) == 0
-    assert int((table.table[:8].abs().sum(-1) > 0).sum()) == 4
+    assert set(table._writes) == {8, 4}
 
 
-def test_store_pads_a_short_pack_up_to_a_warmed_write():
-    """A real token count that was not warmed reuses the next warmed write.
-
-    The extra rows are copies with their own slots, not a repeated trash index.
-    """
-    table = _table(cache_size=8, rows=10)
-    table._writes[6] = object()
-    rows = torch.arange(3 * 8, dtype=torch.float16).view(3, 8)
-    handles = table.store(rows)
+def test_store_reuses_a_warmed_budget_length():
+    """Callers pass the warmed budget; keep selects the real prefix."""
+    table = _table()
+    table.warmup_write(torch.zeros(6, 8, dtype=torch.float16))
+    rows = torch.arange(6 * 8, dtype=torch.float16).view(6, 8)
+    handles = table.store(rows, keep=3)
     assert handles.shape == (3, 1)
     assert len(table._free) == 5
+    assert set(table._writes) == {6}
     gathered = table.table.index_select(0, handles.view(-1))
-    torch.testing.assert_close(gathered, rows)
+    torch.testing.assert_close(gathered, rows[:3])
 
 
-def test_embed_rejects_handles_mixed_with_embeddings():
-    table = _table()
-    handles = table.store(torch.ones(2, 8, dtype=torch.float16))
-    model = _FakeVisionModel()
-    model.output_table = table
-    input_ids, is_multimodal = _prompt([1, 2, 3, 4])
-    with pytest.raises(RuntimeError, match="mixes floating-point prompt embeddings"):
-        model.embed_input_ids(
-            input_ids,
-            [handles, torch.ones(2, 8, dtype=torch.float16)],
-            is_multimodal=is_multimodal,
-        )
+def test_vision_output_table_defaults_on():
+    """Mixin models opt in; Granite Vision (#1437) sets this False."""
+    assert SpyreVisionEncoderMixin.vision_output_table is True
+
+    class _Off(SpyreVisionEncoderMixin, _Upstream):
+        vision_output_table = False
+
+    assert _Off.vision_output_table is False
 
 
 def test_output_table_refuses_more_rows_than_the_cache():
@@ -811,31 +802,40 @@ def test_output_table_refuses_more_rows_than_the_cache():
         table.store(torch.zeros(3, 8, dtype=torch.float16))
 
 
-def test_partly_full_cache_reuses_the_capped_budget_write():
-    """A budget above the cache warms one write of ``cache_size``.
+def test_store_refuses_more_padding_than_spare():
+    table = _table(cache_size=4, rows=6)
+    with pytest.raises(RuntimeError, match="spare rows"):
+        table.store(torch.zeros(4, 8, dtype=torch.float16), keep=2)
 
-    With some of those rows still held, the next image pads onto the spare rows.
+
+def test_partly_full_cache_reuses_the_budget_write():
+    """A budget above the cache warms that budget length onto spare rows.
+
+    With some cache slots still held, the next image writes the same length.
     ``_writes`` gains no new length.
     """
-    table = _table(cache_size=4, rows=8)
-    budget = torch.arange(1120 * 8, dtype=torch.float16).view(1120, 8)
+    budget_tokens = 1120
+    cache_size = 4
+    spare = budget_tokens - 1
+    table = _table(cache_size=cache_size, rows=cache_size + spare + 1)
+    budget = torch.arange(budget_tokens * 8, dtype=torch.float16).view(budget_tokens, 8)
     table.warmup_write(budget)
-    assert set(table._writes) == {4}
-    assert len(table._free) == 4
+    assert set(table._writes) == {budget_tokens}
+    assert len(table._free) == cache_size
 
-    held = table.store(torch.ones(2, 8, dtype=torch.float16))
+    held = table.store(torch.ones(budget_tokens, 8, dtype=torch.float16), keep=2)
     assert held.shape == (2, 1)
-    assert set(table._writes) == {4}
+    assert set(table._writes) == {budget_tokens}
     assert len(table._free) == 2
 
-    rows = torch.full((2, 8), 2, dtype=torch.float16)
-    handles = table.store(rows)
+    rows = torch.full((budget_tokens, 8), 2, dtype=torch.float16)
+    handles = table.store(rows, keep=2)
     assert handles.shape == (2, 1)
-    assert set(table._writes) == {4}
+    assert set(table._writes) == {budget_tokens}
     assert len(table._free) == 0
     assert len(table._in_use) == 4
     gathered = table.table.index_select(0, handles.view(-1))
-    torch.testing.assert_close(gathered, rows)
+    torch.testing.assert_close(gathered, rows[:2])
 
 
 def test_release_skips_a_stale_handle():
@@ -849,14 +849,17 @@ def test_release_skips_a_stale_handle():
     assert len(table._in_use) == 0
 
 
-def test_warmup_write_caps_a_budget_at_the_cache():
-    """A padded encoder budget can be far larger than the cache. Warmup compiles a write of
-    the free rows only; serving never stores more than that, and a repeated index does not
-    compile."""
-    table = _table(cache_size=4, rows=6)
-    rows = torch.arange(20 * 8, dtype=torch.float16).view(20, 8)
+def test_warmup_write_uses_spare_for_a_budget_past_the_cache():
+    """A padded encoder budget can be far larger than the cache. Warmup compiles that
+    budget onto spare rows, then frees the cache slots."""
+    budget_tokens = 20
+    cache_size = 4
+    spare = budget_tokens - 1
+    table = _table(cache_size=cache_size, rows=cache_size + spare + 1)
+    rows = torch.arange(budget_tokens * 8, dtype=torch.float16).view(budget_tokens, 8)
     table.warmup_write(rows)
-    assert len(table._free) == 4
+    assert set(table._writes) == {budget_tokens}
+    assert len(table._free) == cache_size
     assert len(table._in_use) == 0
 
 

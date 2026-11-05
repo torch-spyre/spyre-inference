@@ -15,24 +15,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM 0.32 lacks XPress (vllm#54448); test_xpress_vendored.py flags migration to its subclasses.
-# Retain Spyre context-KV, layout and refinement overrides when resolving #1417.
-
+from contextlib import contextmanager
 from typing import cast
 
 import torch
+from torch.nn import functional as F
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
+from vllm.model_executor.models.qwen3_xpress import Qwen3XPressForCausalLM, Qwen3XPressModel
 
 from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
 from spyre_inference.v1.spec_decode.checkpoint import validate_dflash_weights
-from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead
+from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead, select_feedback
+from spyre_inference.v1.worker import compile_guard
 
 
 def _project_context(attention, context, positions):
@@ -90,36 +91,40 @@ class SpyreDFlashQwen3Model(DFlashQwen3Model):
 class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = SpyreDFlashQwen3Model
     model: SpyreDFlashQwen3Model
+    xpress_num_passes = 0
 
-    def __init__(self, *, vllm_config, prefix=""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.xpress_head = None
-        self.xpress_num_passes = 0
-        self.xpress_topc = 0
-        if hasattr(self.config, "xpress_rank"):
-            self.xpress_topc = getattr(self.config, "xpress_topc", 128)
-            self.xpress_head = XPressRefinerHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                self.config.xpress_block_size,
-                self.config.xpress_rank,
-                self.config.xpress_mlp_hidden,
-                topc=self.xpress_topc,
-            )
-            self.xpress_num_passes = getattr(self.config, "xpress_num_passes", 6)
+    @property
+    def xpress_head(self) -> XPressRefinerHead | None:
+        return getattr(self.model, "xpress_head", None)
+
+    @property
+    def xpress_topc(self) -> int:
+        head = self.xpress_head
+        return 0 if head is None else head.topc
 
     def load_weights(self, weights):
         weights = dict(weights)
         validate_dflash_weights(self.config, weights)
-        if self.xpress_head is not None:
-            self.xpress_head.load_checkpoint_weights(weights)
-            weights = {
-                name: weight
-                for name, weight in weights.items()
-                if not name.startswith("xpress_head.")
-            }
-        elif any(name.startswith("xpress_head.") for name in weights):
-            raise ValueError("XPress weights require an XPress head in the checkpoint config")
+        head = self.xpress_head
+        names = {
+            name.removeprefix("xpress_head.") for name in weights if name.startswith("xpress_head.")
+        }
+        if head is None and names:
+            raise ValueError("XPress weights require an XPress checkpoint architecture")
+        if head is not None:
+            # Upstream loads partial heads and permits broadcasting the raw mixer.
+            expected = head.HYBRID_KEY_MAP.keys()
+            if names != expected:
+                raise ValueError(
+                    f"Invalid XPress head weights: missing={sorted(expected - names)}, "
+                    f"unexpected={sorted(names - expected)}"
+                )
+            raw = weights["xpress_head.mix.L"]
+            if raw.shape != head.mix_L.shape:
+                raise ValueError(
+                    f"Invalid xpress_head.mix.L shape: expected {tuple(head.mix_L.shape)}, "
+                    f"got {tuple(raw.shape)}"
+                )
         super().load_weights(weights.items())
 
     def prepare_for_spyre(self) -> None:
@@ -133,11 +138,20 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             self._hidden_cache = torch.compile(
                 head.project_hidden_cache, fullgraph=True, dynamic=False
             )
-            self._refine = torch.compile(head.refine_full, fullgraph=True, dynamic=False)
-            self._gather_readout = torch.compile(head.gather_readout, fullgraph=True, dynamic=False)
-            self._refine_candidates = torch.compile(
-                head.refine_candidates, fullgraph=True, dynamic=False
+            # DL16 represents shortlist positions and the sentinel exactly through 1024.
+            order = torch.arange(self.xpress_topc, dtype=torch.float16)
+            self._feedback_order = F.pad(order, (0, -self.xpress_topc % 64), value=-1).to(
+                head.w1.weight.device
             )
+            self._prepare_feedback = torch.compile(
+                head.prepare_feedback, fullgraph=True, dynamic=False
+            )
+            self._refine_feedback = torch.compile(
+                head.refine_feedback, fullgraph=True, dynamic=False
+            )
+            self._select_feedback = torch.compile(select_feedback, fullgraph=True, dynamic=False)
+            for function in (head.prepare_feedback, head.refine_feedback, select_feedback):
+                compile_guard.watch(function, f"XPress {function.__name__}")
 
     def combine_hidden_states(self, hidden_states):
         return self._combine(hidden_states)
@@ -151,40 +165,63 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         # Cast during D2H: device widening produces a nonstandard lane arrangement.
         return logits.to(device="cpu", dtype=torch.float32)
 
-    def _argmax_on_cpu(self, host_logits, candidates=None):
-        result = host_logits.argmax(-1)
-        if candidates is not None:
-            result = candidates.gather(-1, result.unsqueeze(-1)).squeeze(-1)
-        return result
+    def _argmax_on_cpu(self, host_logits):
+        return host_logits.argmax(-1)
 
     def propose_block(self, hidden_states, anchor_ids):
         batch = anchor_ids.numel()
         hidden_blocks = hidden_states.view(batch, -1, hidden_states.shape[-1])
         base = self.compute_device_logits(hidden_states).view(batch, hidden_blocks.shape[1], -1)
-        host_base = self._copy_logits_to_cpu(base)[:, 1:]
+        host_base = self._copy_logits_to_cpu(base)[:, 1:, : self.config.vocab_size]
         draft = self._argmax_on_cpu(host_base)
-        if self.xpress_head is not None and self.xpress_num_passes:
-            cache = self._hidden_cache(hidden_blocks)
-            candidates = readout = None
-            base = base[:, 1:]
-            if self.xpress_topc:
-                base_c, candidates = host_base.topk(
-                    min(self.xpress_topc, host_base.shape[-1]), dim=-1
-                )
-                # Flat indices avoid gather page splits across request axes.
-                candidate_ids = convert(candidates.flatten(), device=hidden_states.device)
-                base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
-                readout = self._gather_readout(candidate_ids)
-            for _ in range(self.xpress_num_passes):
-                # The verified anchor is also its own predecessor in merged XPress.
-                previous = torch.cat(
-                    (anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1
-                )
-                previous = convert(previous, device=hidden_states.device)
-                logits = (
-                    self._refine(base, previous, cache)
-                    if candidates is None
-                    else self._refine_candidates(base, previous, cache, readout)
-                )
-                draft = self._argmax_on_cpu(self._copy_logits_to_cpu(logits), candidates)
-        return draft.tolist()
+        if self.xpress_head is None or not self.xpress_num_passes:
+            return draft.tolist()
+        cache = self._hidden_cache(hidden_blocks)
+        base_c, candidates = host_base.topk(self.xpress_topc, dim=-1)
+        # BMM padding cannot split flattened candidate embedding rows.
+        padding = -self.xpress_topc % 64
+        candidate_ids = F.pad(candidates, (0, padding))
+        base_c = F.pad(base_c, (0, padding), value=-torch.inf)
+        # Flat indices avoid gather page splits across request axes.
+        candidate_ids = convert(candidate_ids.flatten(), device=hidden_states.device)
+        base = convert(base_c, device=hidden_states.device, dtype=hidden_states.dtype)
+        # The anchor is its own predecessor, as in upstream's XPressSpeculator.
+        previous = torch.cat((anchor_ids[:, None], anchor_ids[:, None], draft[:, :-1]), dim=1)
+        embeddings, feedback, readout = self._prepare_feedback(
+            candidate_ids, convert(previous, device=hidden_states.device)
+        )
+        for _ in range(self.xpress_num_passes):
+            logits = self._refine_feedback(base, feedback, cache, readout)
+            indices, feedback = self._select_feedback(
+                logits, embeddings, self._feedback_order, feedback
+            )
+        return candidates.gather(-1, indices.cpu().long().unsqueeze(-1)).squeeze(-1).tolist()
+
+
+class SpyreQwen3XPressModel(SpyreDFlashQwen3Model, Qwen3XPressModel):
+    pass
+
+
+class SpyreQwen3XPressForCausalLM(SpyreDFlashQwen3ForCausalLM, Qwen3XPressForCausalLM):
+    """Upstream's XPress model and loader, built with the Spyre head and context path."""
+
+    def __init__(self, *, vllm_config, prefix=""):
+        with _spyre_xpress_classes():
+            Qwen3XPressForCausalLM.__init__(self, vllm_config=vllm_config, prefix=prefix)
+        # Upstream wraps refine_bias in torch.compile; Spyre compiles its own helpers.
+        self.model.xpress_head.__dict__.pop("refine_bias", None)
+        self.xpress_num_passes = self.config.xpress_num_passes
+
+
+@contextmanager
+def _spyre_xpress_classes():
+    # Upstream constructs both by module-global name, with no class hook.
+    from vllm.model_executor.models import qwen3_xpress
+
+    saved = qwen3_xpress.Qwen3XPressModel, qwen3_xpress.XPressRefinerHead
+    qwen3_xpress.Qwen3XPressModel = SpyreQwen3XPressModel  # ty: ignore[invalid-assignment]
+    qwen3_xpress.XPressRefinerHead = XPressRefinerHead  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        qwen3_xpress.Qwen3XPressModel, qwen3_xpress.XPressRefinerHead = saved

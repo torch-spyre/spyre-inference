@@ -23,10 +23,14 @@ then upstream's runs: the mixin sits first in the MRO, so it must not define a m
 it does not implement.
 """
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
 class SpyreModelStateMixin:
@@ -42,3 +46,13 @@ class SpyreModelStateMixin:
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)  # ty: ignore[too-many-positional-arguments]
         self.spyre_device = spyre_device
+
+    def get_supported_generation_tasks(self) -> Any:
+        # Upstream's interface checks (is_text_generation_model, supports_transcription)
+        # fail on load.py's _SpyreModelWrapper, whose __init__ takes no vllm_config.
+        model = self.model
+        self.model = unwrap_model(model)
+        try:
+            return super().get_supported_generation_tasks()
+        finally:
+            self.model = model

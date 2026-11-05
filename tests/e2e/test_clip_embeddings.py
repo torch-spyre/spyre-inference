@@ -154,7 +154,15 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@_EAGER_AND_COMPILED
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        pytest.param(
+            False, id="compiled", marks=[pytest.mark.model_quality, pytest.mark.e2e_smoke]
+        ),
+    ],
+)
 def test_clip_image_embedding_matches_hf(enforce_eager: bool) -> None:
     _skip_without_spyre()
     image = _synthetic_image()

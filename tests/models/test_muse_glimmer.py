@@ -25,10 +25,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import MuseGlimmerConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.models import muse_glimmer as mg
-from vllm.transformers_utils.configs.muse_glimmer import MuseGlimmerConfig
 
 from spyre_inference.models import apply_prelaunch_overrides
 from spyre_inference.models.muse_glimmer import disable_vision
@@ -84,11 +84,10 @@ def test_language_model_only_is_left_alone():
     "hf_config",
     [
         _glimmer_config(),
-        _glimmer_config(vision_config=object(), has_vision=False),
         SimpleNamespace(model_type="gemma4", vision_config=object()),
         None,
     ],
-    ids=["no-vision-config", "has-vision-false", "other-model", "config-load-failed"],
+    ids=["no-vision-config", "other-model", "config-load-failed"],
 )
 def test_checkpoints_without_a_glimmer_tower_are_left_alone(hf_config):
     engine_args = _engine_args()

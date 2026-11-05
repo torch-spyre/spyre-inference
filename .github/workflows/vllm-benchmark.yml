@@ -18,11 +18,19 @@ on:
           vLLM commit SHA (optional, defaults to latest on the branch)
         required: false
         type: string
+      suite:
+        description: >
+          Suite to benchmark: the entries whose `labels` name it. Pull
+          requests labelled vllm-bench always run minimal.
+        required: false
+        type: choice
+        options: [minimal, base, reference, power-applications]
+        default: base
       models:
         description: >
-          Comma-separated list of models to benchmark (optional, default the
-          base suite). Each runs in the first of base, reference,
-          power-applications that has a config for it.
+          Comma-separated list of models to benchmark (optional, default every
+          model of the suite). Each runs in the first suite, from the chosen
+          one on, that has a config for it.
         required: false
         type: string
       skip_uv_for_benchmarking:
@@ -84,11 +92,13 @@ jobs:
         id: set-parameters
         env:
           MODELS: ${{ inputs.models || '' }}
+          SUITE: ${{ github.event_name == 'pull_request' && 'minimal' || inputs.suite || 'base' }}
         run: |
           set -eux
           pip install pyyaml
           python .github/scripts/generate_vllm_benchmark_matrix.py \
             --benchmark-configs-dir vllm-benchmarks/benchmarks \
+            --suite "${SUITE}" \
             --models "${MODELS}"
 
   # ─── Run vLLM benchmarks on Spyre hardware ───

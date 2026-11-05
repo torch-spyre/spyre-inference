@@ -39,6 +39,13 @@ repos:
   - id: actionlint
 - repo: local
   hooks:
+    - id: bench-config-tables
+      name: benchmark config tables
+      entry: python3 .github/scripts/generate_bench_config_tables.py
+      language: python
+      additional_dependencies: [pyyaml]
+      files: '^(vllm-benchmarks/|\.github/scripts/(generate_bench_config_tables|run_vllm_benchmarks)\.py$)'
+      pass_filenames: false
     - id: ty
       name: ty check
       entry: uvx ty@0.0.16 check spyre_inference

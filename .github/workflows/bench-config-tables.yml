@@ -1,0 +1,50 @@
+name: Benchmark config tables
+
+# Fails a change that edits a benchmark config without regenerating the README
+# tables, or that reuses a test_name.
+
+on:
+  pull_request:
+    paths:
+      - 'vllm-benchmarks/**'
+      - '.github/scripts/generate_bench_config_tables.py'
+      - '.github/scripts/run_vllm_benchmarks.py'
+      - '.github/workflows/bench-config-tables.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'vllm-benchmarks/**'
+      - '.github/scripts/generate_bench_config_tables.py'
+      - '.github/scripts/run_vllm_benchmarks.py'
+      - '.github/workflows/bench-config-tables.yml'
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check-tables:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+
+      # Exits 2 on a duplicate test_name, before writing anything.
+      - name: Regenerate the README tables
+        run: uv run --no-project --with pyyaml python .github/scripts/generate_bench_config_tables.py
+
+      - name: Check the README is up to date
+        run: |
+          if ! git diff --exit-code -- vllm-benchmarks/README.md; then
+            echo "::error file=vllm-benchmarks/README.md::The benchmark config tables are out of date. Run \`python3 .github/scripts/generate_bench_config_tables.py\` and commit the result (the diff is above)."
+            exit 1
+          fi

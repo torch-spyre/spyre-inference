@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run vLLM benchmarks from JSON config files.
+"""Run vLLM benchmarks from YAML config files.
 
-Reads benchmark configs from the specified directory, builds the appropriate
+Reads the benchmark configs of one suite, builds the appropriate
 `vllm bench latency` / `vllm bench throughput` / `vllm bench serve` commands,
 and executes them.
 """
@@ -57,13 +57,19 @@ def _dataset_path_defaults() -> dict[str, str]:
     return {var: str(cache / spec["path"]) for var, spec in fetch_bench_datasets.ARTIFACTS.items()}
 
 
+VALID_BENCH_TYPES = ("latency", "throughput", "serve")
+SUITES = ("minimal", "base", "reference", "power-applications")
+DEFAULT_SUITE = "base"
+
+
 def parse_args():
-    parser = ArgumentParser(description="Run vLLM benchmarks from JSON configs")
+    parser = ArgumentParser(description="Run vLLM benchmarks from YAML configs")
     parser.add_argument(
         "--configs-dir",
         type=str,
-        default="vllm-benchmarks/benchmarks/spyre",
-        help="directory containing benchmark JSON config files",
+        default="vllm-benchmarks/benchmarks",
+        help="directory searched for *-runs.yaml config files, or a single config "
+        "file, which runs unfiltered by suite",
     )
     parser.add_argument(
         "--results-dir",
@@ -109,10 +115,9 @@ def parse_args():
     parser.add_argument(
         "--suite",
         type=str,
-        default="",
-        help="config suite to run: empty for the CI configs (<type>-tests.yaml), "
-        "or e.g. 'dev' for <type>-tests-dev.yaml; a bench type with no file "
-        "for the suite is skipped, and a suite with no file at all is an error",
+        default=DEFAULT_SUITE,
+        help=f"suite to run: one of {', '.join(SUITES)} (default: {DEFAULT_SUITE}); "
+        "it runs the entries whose `labels` name it",
     )
     return parser.parse_args()
 
@@ -370,26 +375,14 @@ def run_benchmark(
     return True
 
 
-def run_benchmarks_from_file(
-    config_file: Path,
+def run_benchmarks(
+    configs: list,
     bench_type: str,
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
-    models: set[str],
-    tps: set[int],
 ) -> tuple[int, int]:
-    """Run all benchmarks from a config file. Returns (passed, failed) counts."""
-    if not config_file.exists():
-        log.info("No %s config found, skipping", config_file.name)
-        return 0, 0
-
-    configs = _load_configs(config_file)
-    if configs is None:
-        return 0, 1
-
-    configs = _select_configs(configs, models, tps)
-
+    """Run latency or throughput benchmarks. Returns (passed, failed) counts."""
     passed = 0
     failed = 0
     for config in configs:
@@ -554,25 +547,13 @@ def run_serve_benchmark(
     return True
 
 
-def run_serve_benchmarks_from_file(
-    config_file: Path,
+def run_serve_benchmarks(
+    configs: list,
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
-    models: set[str],
-    tps: set[int],
 ) -> tuple[int, int]:
-    """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
-    if not config_file.exists():
-        log.info("No %s config found, skipping", config_file.name)
-        return 0, 0
-
-    configs = _load_configs(config_file)
-    if configs is None:
-        return 0, 1
-
-    configs = _select_configs(configs, models, tps)
-
+    """Run serve benchmarks. Returns (passed, failed) counts."""
     passed = 0
     failed = 0
     for config in configs:
@@ -602,15 +583,79 @@ def run_serve_benchmarks_from_file(
     return passed, failed
 
 
-VALID_BENCH_TYPES = ("latency", "throughput", "serve")
+def _bench_type(config_file: Path) -> str | None:
+    """Bench type named by a config file's prefix, e.g. `serve-x-runs.yaml` -> serve."""
+    prefix = config_file.name.split("-", 1)[0]
+    return prefix if prefix in VALID_BENCH_TYPES else None
 
 
-def _suite_config_files(configs_dir: Path, suite: str, bench_types: set[str]) -> dict[str, Path]:
-    """Map each selected bench type to its `<type>-tests[-<suite>].yaml` config."""
-    suffix = f"-{suite}" if suite else ""
-    return {
-        b: configs_dir / f"{b}-tests{suffix}.yaml" for b in VALID_BENCH_TYPES if b in bench_types
-    }
+def config_files(configs_path: Path) -> list[Path]:
+    """Config files under `configs_path`, or `configs_path` itself if it is a file.
+
+    Exits when there is none, or when a file's prefix names no bench type.
+    """
+    files = [configs_path] if configs_path.is_file() else sorted(configs_path.rglob("*-runs.yaml"))
+    if not files:
+        log.error("No *-runs.yaml config file in %s", configs_path)
+        sys.exit(2)
+    for config_file in files:
+        if _bench_type(config_file) is None:
+            log.error("%s: name must start with one of %s", config_file, VALID_BENCH_TYPES)
+            sys.exit(2)
+    return files
+
+
+def test_name(config: dict, config_file: Path) -> str:
+    """The entry's test_name; exits when it is missing or not a string."""
+    name = config.get("test_name")
+    if not isinstance(name, str) or not name:
+        log.error("%s: an entry has no test_name", config_file)
+        sys.exit(2)
+    return name
+
+
+def _labels(config: dict, required: bool = True) -> list[str]:
+    """Suite labels of an entry; exits on unknown labels, or missing ones if `required`."""
+    labels = config.get("labels")
+    if labels is None and not required:
+        return []
+    if (
+        not isinstance(labels, list)
+        or not all(isinstance(label, str) and label in SUITES for label in labels)
+        or (required and not labels)
+    ):
+        log.error(
+            "%s has labels %r; it needs a non-empty list of %s",
+            config.get("test_name"),
+            labels,
+            SUITES,
+        )
+        sys.exit(2)
+    return labels
+
+
+def collect_configs(configs_path: Path, suite: str, bench_types: set[str]) -> dict[str, list]:
+    """Map each selected bench type to the configs of `suite`; a single file runs unfiltered."""
+    unfiltered = configs_path.is_file()
+    selected: dict[str, list] = {b: [] for b in VALID_BENCH_TYPES if b in bench_types}
+    seen: dict[str, Path] = {}
+    for config_file in config_files(configs_path):
+        bench_type = _bench_type(config_file)
+        configs = _load_configs(config_file)
+        if configs is None:
+            sys.exit(2)
+        for config in configs:
+            name = test_name(config, config_file)
+            if name in seen:
+                log.error("test_name %s is in both %s and %s", name, seen[name], config_file)
+                sys.exit(2)
+            seen[name] = config_file
+            labels = _labels(config, required=not unfiltered)
+            if bench_type not in selected:
+                continue
+            if unfiltered or suite in labels:
+                selected[bench_type].append(config)
+    return selected
 
 
 def main():
@@ -643,62 +688,41 @@ def main():
     if not bench_types:
         bench_types = set(VALID_BENCH_TYPES)
 
-    suite = args.suite.strip()
-    config_files = _suite_config_files(configs_dir, suite, bench_types)
-    # A mistyped suite would otherwise run nothing and still exit 0.
-    if suite and not any(f.exists() for f in config_files.values()):
-        log.error(
-            "Suite %r has no config in %s: expected one of %s",
-            suite,
-            configs_dir,
-            [f.name for f in config_files.values()],
-        )
+    suite = args.suite.strip() or DEFAULT_SUITE
+    if suite not in SUITES:
+        log.error("Unknown suite %r; valid: %s", suite, SUITES)
         sys.exit(2)
+    if not configs_dir.exists():
+        log.error("Config path %s does not exist", configs_dir)
+        sys.exit(2)
+    selected = collect_configs(configs_dir, suite, bench_types)
+    selected = {b: _select_configs(c, models, tps) for b, c in selected.items()}
 
     total_passed = 0
     total_failed = 0
 
-    # Run latency benchmarks
-    if "latency" in bench_types:
-        passed, failed = run_benchmarks_from_file(
-            config_file=config_files["latency"],
-            bench_type="latency",
-            results_dir=results_dir,
-            spyre_devices=args.spyre_devices,
-            aiu_world_size=args.aiu_world_size,
-            models=models,
-            tps=tps,
-        )
-        total_passed += passed
-        total_failed += failed
-
-    # Run throughput benchmarks
-    if "throughput" in bench_types:
-        passed, failed = run_benchmarks_from_file(
-            config_file=config_files["throughput"],
-            bench_type="throughput",
-            results_dir=results_dir,
-            spyre_devices=args.spyre_devices,
-            aiu_world_size=args.aiu_world_size,
-            models=models,
-            tps=tps,
-        )
-        total_passed += passed
-        total_failed += failed
-
-    # Run serve benchmarks (after latency/throughput to avoid port conflicts)
-    if "serve" in bench_types:
-        for serve_config in (config_files["serve"], configs_dir / "multimodal-serve-tests.yaml"):
-            passed, failed = run_serve_benchmarks_from_file(
-                config_file=serve_config,
+    for bench_type in ("latency", "throughput"):
+        if bench_type in selected:
+            passed, failed = run_benchmarks(
+                configs=selected[bench_type],
+                bench_type=bench_type,
                 results_dir=results_dir,
                 spyre_devices=args.spyre_devices,
                 aiu_world_size=args.aiu_world_size,
-                models=models,
-                tps=tps,
             )
             total_passed += passed
             total_failed += failed
+
+    # Run serve benchmarks (after latency/throughput to avoid port conflicts)
+    if "serve" in selected:
+        passed, failed = run_serve_benchmarks(
+            configs=selected["serve"],
+            results_dir=results_dir,
+            spyre_devices=args.spyre_devices,
+            aiu_world_size=args.aiu_world_size,
+        )
+        total_passed += passed
+        total_failed += failed
 
     # Summary
     log.info("=== Benchmark Summary ===")

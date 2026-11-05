@@ -1,0 +1,84 @@
+# Serve benchmarks for ibm-granite/granite-embedding-278m-multilingual (pooling).
+#
+# Each entry runs in the suites its `labels` name; an entry needs at least one.
+# See vllm-benchmarks/README.md.
+
+defaults:
+  server_health_timeout: 1800
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 4
+    model: ibm-granite/granite-embedding-278m-multilingual
+    tensor-parallel-size: 1
+    runner: pooling
+    max-model-len: 512
+  parameters:
+    dataset-name: random
+    endpoint: /v1/embeddings
+    metric-percentiles: 99,100
+    model: ibm-granite/granite-embedding-278m-multilingual
+    backend: openai-embeddings
+    random-input-len: 512
+    random-range-ratio: 0.5
+    request-rate: inf
+
+tests:
+  # _ci: 200 random prompts, conc 64.
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c64_ci
+    labels: [minimal]
+    environment_variables:
+      VLLM_CPU_KVCACHE_SPACE: 64
+      DTLOG_LEVEL: error
+    server_parameters:
+      max-num-batched-tokens: 512
+      enable-prefix-caching: true
+      dtype: float16
+    parameters:
+      num-prompts: 200
+      custom-output-len: -1
+      ignore-eos: true
+      disable-shuffle: true
+      percentile-metrics: ttft,tpot,itl,e2el
+      max-concurrency: 64
+      random-batch-size: 1
+      num-warmups: 8
+
+  # 10 000 random prompts and 100 warmups, at conc 16 / 32 / 64.
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c16
+    labels: [reference]
+    server_parameters:
+      enable-prefix-caching: false
+    parameters:
+      num-prompts: 10000
+      num-warmups: 100
+      percentile-metrics: e2el
+      max-concurrency: 16
+    container_parameters:
+      container_shm_size: 1G
+      container_memory: 16g
+
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c32
+    labels: [reference]
+    server_parameters:
+      enable-prefix-caching: false
+    parameters:
+      num-prompts: 10000
+      num-warmups: 100
+      percentile-metrics: e2el
+      max-concurrency: 32
+    container_parameters:
+      container_shm_size: 1G
+      container_memory: 16g
+
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_c64
+    labels: [base, reference]
+    server_parameters:
+      enable-prefix-caching: false
+    parameters:
+      num-prompts: 10000
+      num-warmups: 100
+      percentile-metrics: e2el
+      max-concurrency: 64
+    container_parameters:
+      container_shm_size: 1G
+      container_memory: 16g

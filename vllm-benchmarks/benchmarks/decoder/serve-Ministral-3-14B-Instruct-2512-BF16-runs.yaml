@@ -1,0 +1,48 @@
+# Serve benchmarks for mistralai/Ministral-3-14B-Instruct-2512-BF16.
+#
+# Each entry runs in the suites its `labels` name; an entry needs at least one.
+# See vllm-benchmarks/README.md.
+
+defaults:
+  server_health_timeout: 7200
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+    load-format: auto
+    tensor-parallel-size: 4
+    max-model-len: 32768
+    max-num-seqs: 32
+    enable-chunked-prefill: true
+    enable-prefix-caching: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 200
+    custom-output-len: -1
+    ignore-eos: true
+    disable-shuffle: true
+    temperature: 0.1
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+
+tests:
+  # TP4 · aiops
+  - test_name: serve_ministral3-14b_tp4_c5_aiops
+    labels: [reference]
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      max-concurrency: 5
+
+  # TP4 · vision
+  - test_name: serve_ministral3-14b_tp4_c4_vision
+    labels: [base, reference]
+    parameters:
+      dataset-name: custom_image
+      dataset-path: ${SPYRE_VISION_DATASET}
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4

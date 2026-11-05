@@ -80,8 +80,8 @@ public_models:
 # Each entry is verified against its sha256 after download and skipped when a
 # correct copy is already cached, so a re-dispatch is cheap and idempotent.
 #
-# The whole prefix is mirrored: 13 files, 474MB. Only 2 have a consumer in
-# benchmarks/spyre/serve-tests.yaml today, but a fork PR cannot fetch a missing
+# The whole prefix is mirrored: 13 files, 474MB. Only a few have a consumer in
+# benchmarks/ today, but a fork PR cannot fetch a missing
 # one for itself, so a partial mirror would make every new trace-replaying
 # config wait on a config change plus a dispatch. Caching all 13 up front costs
 # one transfer on a 770T shared volume and makes that wait go away.

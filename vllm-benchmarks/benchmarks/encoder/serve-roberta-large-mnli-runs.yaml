@@ -1,13 +1,20 @@
+# Serve benchmarks for FacebookAI/roberta-large-mnli (pooling).
+#
+# Each entry runs in the suites its `labels` name; an entry needs at least one.
+# See vllm-benchmarks/README.md.
+
 defaults:
   server_health_timeout: 1800
   environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
   server_parameters:
     load-format: auto
     max-num-seqs: 4
     enable-prefix-caching: false
     tensor-parallel-size: 1
     runner: pooling
-    model: ibm-granite/granite-embedding-278m-multilingual
+    model: FacebookAI/roberta-large-mnli
     max-model-len: 512
   parameters:
     dataset-name: random
@@ -18,22 +25,26 @@ defaults:
     request-rate: inf
     percentile-metrics: e2el
     metric-percentiles: 99,100
-    model: ibm-granite/granite-embedding-278m-multilingual
-    backend: openai-embeddings
-    endpoint: /v1/embeddings
+    model: FacebookAI/roberta-large-mnli
+    backend: vllm-pooling
+    endpoint: /pooling
   container_parameters:
     container_shm_size: 1G
     container_memory: 16g
 
 tests:
-  - test_name: serve_granite-embedding-278m-multilingual_mc16
+  # 10 000 random prompts and 100 warmups, at conc 16 / 32 / 64.
+  - test_name: serve_roberta-large-mnli_tp1_c16
+    labels: [reference]
     parameters:
       max-concurrency: 16
 
-  - test_name: serve_granite-embedding-278m-multilingual_mc32
+  - test_name: serve_roberta-large-mnli_tp1_c32
+    labels: [reference]
     parameters:
       max-concurrency: 32
 
-  - test_name: serve_granite-embedding-278m-multilingual_mc64
+  - test_name: serve_roberta-large-mnli_tp1_c64
+    labels: [base, reference]
     parameters:
       max-concurrency: 64

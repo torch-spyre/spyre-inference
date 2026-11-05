@@ -167,7 +167,7 @@ env | grep -E '^(SPYRE|VLLM|TORCH|TORCHINDUCTOR|AIU|FLEX|DT|COLL|SENTIENT|OMP)_'
 write_meta "${ENVS[@]}"
 
 echo "run_leg.sh: running $(grep -c 'test_name:' "$BENCH/serve-tests.yaml") configs, log in $OUT/run.log"
-setsid make perf-tests BENCH_TYPES=serve BENCH_CONFIGS_DIR="$BENCH" RESULTS_DIR="$OUT/results" \
+setsid make perf-tests BENCH_TYPES=serve BENCH_CONFIGS_DIR="$BENCH/serve-tests.yaml" RESULTS_DIR="$OUT/results" \
   >"$OUT/run.log" 2>&1 &
 MAKE_PID=$!
 wait "$MAKE_PID"

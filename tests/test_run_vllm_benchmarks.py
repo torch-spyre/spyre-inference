@@ -18,8 +18,8 @@ What the benchmarks depend on and a typo would silently break: tests merge over
 `defaults` per section rather than replacing it, TP drives
 SPYRE_DEVICES/AIU_WORLD_SIZE and server_health_timeout drives
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, the bench side inherits the server's model,
-`dataset-path` expands from the environment, and a selected test whose dataset is
-absent aborts the run instead of being skipped.
+`dataset-path` expands from the environment, a selected test whose dataset is
+absent aborts the run instead of being skipped, and `labels` pick the suite.
 
 All checked-in configs are loaded as-is at the end, so a config edit that
 breaks these invariants fails here.
@@ -44,13 +44,15 @@ _matrix_spec = importlib.util.spec_from_file_location(
 matrix = importlib.util.module_from_spec(_matrix_spec)
 _matrix_spec.loader.exec_module(matrix)
 
-_CONFIGS = _REPO / "vllm-benchmarks" / "benchmarks" / "spyre"
-SERVE_TESTS = _CONFIGS / "serve-tests.yaml"
-SERVE_DEV_TESTS = _CONFIGS / "serve-tests-dev.yaml"
-LATENCY_TESTS = _CONFIGS / "latency-tests.yaml"
-THROUGHPUT_TESTS = _CONFIGS / "throughput-tests.yaml"
-LATENCY_DEV_TESTS = _CONFIGS / "latency-tests-dev.yaml"
-THROUGHPUT_DEV_TESTS = _CONFIGS / "throughput-tests-dev.yaml"
+_TABLES_SCRIPT = _REPO / ".github" / "scripts" / "generate_bench_config_tables.py"
+_tables_spec = importlib.util.spec_from_file_location("bench_config_tables", _TABLES_SCRIPT)
+tables = importlib.util.module_from_spec(_tables_spec)
+_tables_spec.loader.exec_module(tables)
+
+_CONFIGS = _REPO / "vllm-benchmarks" / "benchmarks"
+CONFIG_FILES = runner.config_files(_CONFIGS)
+SERVE_FILES = [f for f in CONFIG_FILES if f.name.startswith("serve-")]
+OFFLINE_FILES = [f for f in CONFIG_FILES if not f.name.startswith("serve-")]
 
 
 def _write(tmp_path, raw) -> Path:
@@ -285,18 +287,109 @@ def test_model_filter_is_case_insensitive(tmp_path):
     assert len(runner._select_configs(configs, {"ibm-granite/x"}, set())) == 1
 
 
+# ── suites ──
+
+
+def _write_runs(directory: Path, name: str, labels_per_test: dict[str, list | None]) -> Path:
+    tests = []
+    for test_name, labels in labels_per_test.items():
+        config = {
+            "test_name": test_name,
+            "parameters": {"model": f"m-{test_name}", "tensor_parallel_size": 1},
+        }
+        if labels is not None:
+            config["labels"] = labels
+        tests.append(config)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(yaml.safe_dump({"tests": tests}))
+    return path
+
+
+def _names(selected: dict[str, list]) -> dict[str, list[str]]:
+    return {b: [c["test_name"] for c in configs] for b, configs in selected.items()}
+
+
 @pytest.mark.parametrize(
     ("suite", "expected"),
-    [("", "latency-tests.yaml"), ("dev", "latency-tests-dev.yaml")],
+    [
+        ("minimal", ["a"]),
+        ("base", ["a", "b"]),
+        ("reference", ["c"]),
+    ],
 )
-def test_suite_selects_config_file(tmp_path, suite, expected):
-    files = runner._suite_config_files(tmp_path, suite, {"latency"})
+def test_labels_select_the_suite(tmp_path, suite, expected):
+    """An entry runs in the suites it names."""
+    _write_runs(
+        tmp_path / "decoder",
+        "latency-x-runs.yaml",
+        {"a": ["minimal", "base"], "b": ["base"], "c": ["reference"]},
+    )
 
-    assert files == {"latency": tmp_path / expected}
+    selected = runner.collect_configs(tmp_path, suite, {"latency"})
+
+    assert _names(selected) == {"latency": expected}
+
+
+def test_bench_type_comes_from_the_file_prefix(tmp_path):
+    _write_runs(tmp_path / "a", "latency-x-runs.yaml", {"lat": ["base"]})
+    _write_runs(tmp_path / "b", "serve-x-runs.yaml", {"srv": ["base"]})
+    _write_runs(tmp_path, "notes.yaml", {"ignored": ["base"]})
+
+    selected = runner.collect_configs(tmp_path, "base", {"latency", "serve"})
+
+    assert _names(selected) == {"latency": ["lat"], "serve": ["srv"]}
+
+
+def test_single_config_file_runs_unfiltered(tmp_path):
+    path = _write_runs(tmp_path, "serve-x-runs.yaml", {"a": ["base"], "b": None})
+
+    selected = runner.collect_configs(path, "minimal", {"serve"})
+
+    assert _names(selected) == {"serve": ["a", "b"]}
+
+
+@pytest.mark.parametrize("labels", [None, [], ["smoke"], ["exhaustive"], "base", [["base"]]])
+def test_missing_or_unknown_label_aborts_the_run(tmp_path, labels):
+    """Such an entry would otherwise run in no suite without a word."""
+    _write_runs(tmp_path, "serve-x-runs.yaml", {"a": labels})
+
+    with pytest.raises(SystemExit) as exc:
+        runner.collect_configs(tmp_path, "base", {"serve"})
+    assert exc.value.code == 2
+
+
+def test_duplicate_test_name_aborts_the_run(tmp_path):
+    """A test_name names the result file, so a duplicate would overwrite it."""
+    _write_runs(tmp_path / "a", "serve-x-runs.yaml", {"t": ["base"]})
+    _write_runs(tmp_path / "b", "serve-y-runs.yaml", {"t": ["reference"]})
+
+    with pytest.raises(SystemExit) as exc:
+        runner.collect_configs(tmp_path, "base", {"serve"})
+    assert exc.value.code == 2
+
+
+def test_entry_without_test_name_aborts_the_run(tmp_path):
+    path = _write_runs(tmp_path, "serve-x-runs.yaml", {"a": ["base"]})
+    path.write_text(path.read_text().replace("test_name: a", "test_name: null"))
+
+    with pytest.raises(SystemExit) as exc:
+        runner.collect_configs(tmp_path, "base", {"serve"})
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("name", ["serve-tests.yaml", "servings-x-runs.yaml"])
+def test_no_or_misnamed_config_file_aborts_the_run(tmp_path, name):
+    """Such a directory would otherwise run nothing and still exit 0."""
+    _write_runs(tmp_path, name, {"a": ["base"]})
+
+    with pytest.raises(SystemExit) as exc:
+        runner.collect_configs(tmp_path, "base", {"serve"})
+    assert exc.value.code == 2
 
 
 def test_unknown_suite_aborts_the_run(monkeypatch, tmp_path):
-    (tmp_path / "latency-tests-dev.yaml").write_text("[]")
+    _write_runs(tmp_path, "latency-x-runs.yaml", {"a": ["base"]})
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -306,7 +399,7 @@ def test_unknown_suite_aborts_the_run(monkeypatch, tmp_path):
             "--results-dir",
             str(tmp_path / "results"),
             "--suite",
-            "devs",
+            "dev",
         ],
     )
 
@@ -315,36 +408,84 @@ def test_unknown_suite_aborts_the_run(monkeypatch, tmp_path):
     assert exc.value.code == 2
 
 
-def test_matrix_skips_dev_configs(tmp_path):
-    spyre = tmp_path / "spyre"
-    spyre.mkdir()
-    for name, model in [
-        ("latency-tests.yaml", "ci-model"),
-        ("latency-tests-dev.yaml", "dev-model"),
-    ]:
-        (spyre / name).write_text(
-            yaml.safe_dump([{"test_name": "t", "parameters": {"model": model}}])
-        )
+def test_matrix_follows_the_suite(tmp_path):
+    """The matrix holds exactly the models the run would bench for that suite."""
+    _write_runs(tmp_path, "latency-x-runs.yaml", {"small": ["minimal", "base"], "big": ["base"]})
 
-    result = matrix.generate_benchmark_matrix(str(tmp_path), [])
+    minimal = matrix.generate_benchmark_matrix(str(tmp_path), [], "minimal")
+    base = matrix.generate_benchmark_matrix(str(tmp_path), [], "base")
 
-    assert result["include"] == [{"models": "ci-model"}]
+    assert minimal["include"] == [{"models": "m-small", "suite": "minimal"}]
+    assert base["include"] == [
+        {"models": "m-small", "suite": "base"},
+        {"models": "m-big", "suite": "base"},
+    ]
+
+
+def test_matrix_model_falls_back_to_the_next_suite(tmp_path):
+    """A requested model runs in the first suite, from the default on, that has it."""
+    _write_runs(
+        tmp_path,
+        "latency-x-runs.yaml",
+        {"small": ["minimal", "base"], "big": ["base"], "huge": ["reference"]},
+    )
+
+    result = matrix.generate_benchmark_matrix(str(tmp_path), ["m-small", "m-big", "m-huge"])
+
+    assert result["include"] == [
+        {"models": "m-small", "suite": "base"},
+        {"models": "m-big", "suite": "base"},
+        {"models": "m-huge", "suite": "reference"},
+    ]
+    with pytest.raises(SystemExit):
+        matrix.generate_benchmark_matrix(str(tmp_path), ["m-unknown"])
 
 
 # ── the checked-in config ──
 
-# Each trace is replayed at the one max-model-len that fits its requests, and is
-# reached through its own env var.
-DATASET_CONTEXT_LEN = {"aiops": 4096, "cics": 8192, "all": 32768}
+# Each trace is reached through its own env var.
 DATASET_PATH_VARS = {
     "aiops": "${SPYRE_AIOPS_DATASET}",
     "cics": "${SPYRE_CICS_DATASET}",
     "all": "${SPYRE_ALL_SEQUENCES_DATASET}",
+    "vision": "${SPYRE_VISION_DATASET}",
+    "ee": "${SPYRE_EE_DATASET}",
+    "rag": "${SPYRE_RAG_DATASET}",
 }
+# One decoder setup per TP: (max-model-len, max-num-seqs). The power_use_case
+# files follow their own workloads' setups.
+DECODER_SETUP = {4: (32768, 32), 1: (8192, 8)}
 
 
-@pytest.mark.parametrize("config_file", [SERVE_TESTS, SERVE_DEV_TESTS])
-def test_serve_tests_yaml_derives_consistently(config_file):
+def test_checked_in_configs_are_found():
+    assert SERVE_FILES and OFFLINE_FILES
+
+
+def test_checked_in_test_names_and_labels_are_valid():
+    """collect_configs exits on a duplicate test_name or a missing or unknown label."""
+    for suite in runner.SUITES:
+        assert any(runner.collect_configs(_CONFIGS, suite, {"serve"}).values()), suite
+
+
+def test_readme_config_tables_are_up_to_date():
+    current = tables.README.read_text()
+
+    assert tables.updated_readme(current, tables.render(tables.load_entries())) == current
+
+
+def test_tables_reject_a_duplicate_test_name(monkeypatch, tmp_path):
+    _write_runs(tmp_path / "a", "serve-x-runs.yaml", {"t": ["base"]})
+    _write_runs(tmp_path / "b", "latency-y-runs.yaml", {"t": ["reference"]})
+    monkeypatch.setattr(tables, "CONFIGS_DIR", tmp_path)
+    monkeypatch.setattr(tables, "README", tmp_path / "README.md")
+
+    with pytest.raises(SystemExit) as exc:
+        tables.load_entries()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("config_file", SERVE_FILES, ids=lambda f: f.name)
+def test_serve_runs_yaml_derives_consistently(config_file):
     configs = runner._load_configs(config_file)
     assert configs
 
@@ -357,17 +498,26 @@ def test_serve_tests_yaml_derives_consistently(config_file):
         # The bench client must target the server's model, not a stale copy.
         assert config["parameters"]["model"] == config["server_parameters"]["model"]
 
+        name = config["test_name"]
+        server = config["server_parameters"]
         parameters = config["parameters"]
+        # A name maps to one config: it spells out the TP and, for decoders, the
+        # concurrency the entry runs at.
+        assert f"_tp{tp}_" in name, name
         if not parameters["dataset-name"].startswith("random"):
-            # The name's suffix has to say which trace the entry replays, and
-            # each trace needs a max-model-len that fits its requests: longer
-            # ones are rejected.
-            trace = config["test_name"].rsplit("_", 1)[1]
-            assert trace in DATASET_CONTEXT_LEN, config["test_name"]
+            assert f"_c{parameters['max-concurrency']}_" in name, name
+            # The name's suffix has to say which trace the entry replays.
+            trace = name.rsplit("_", 1)[1]
+            assert trace in DATASET_PATH_VARS, name
             # _select_configs expands the env var, so at load time it is still
             # the literal the entry names.
-            assert parameters["dataset-path"] == DATASET_PATH_VARS[trace]
-            assert config["server_parameters"]["max-model-len"] == DATASET_CONTEXT_LEN[trace]
+            assert parameters["dataset-path"] == DATASET_PATH_VARS[trace], name
+            if config_file.parent.name == "decoder":
+                setup = (server["max-model-len"], server["max-num-seqs"])
+                assert setup == DECODER_SETUP[tp], name
+        elif parameters["dataset-name"] == "random-mm":
+            assert "dataset-path" not in parameters, name
+            assert parameters["input-len"] <= server["max-model-len"], name
         else:
             # Generated prompts need no staged file, and a request over the
             # server's context is rejected.
@@ -377,31 +527,17 @@ def test_serve_tests_yaml_derives_consistently(config_file):
             )
 
 
-def test_serve_dev_tests_yaml_extends_serve_tests_yaml():
-    """The dev serve file holds every CI serve entry unchanged, plus only `_all` ones."""
-    ci = {c["test_name"]: c for c in runner._load_configs(SERVE_TESTS)}
-    dev = {c["test_name"]: c for c in runner._load_configs(SERVE_DEV_TESTS)}
-
-    for name, config in ci.items():
-        assert dev.get(name) == config, name
-    extra = dev.keys() - ci.keys()
-    assert extra
-    assert all(name.endswith("_all") for name in extra), sorted(extra)
-
-
 # The offline files spell input/output length under their own flag names.
 OFFLINE_LEN_KEYS = {
-    LATENCY_TESTS: ("input-len", "output-len"),
-    THROUGHPUT_TESTS: ("random-input-len", "random-output-len"),
-    LATENCY_DEV_TESTS: ("input-len", "output-len"),
-    THROUGHPUT_DEV_TESTS: ("random-input-len", "random-output-len"),
+    "latency": ("input-len", "output-len"),
+    "throughput": ("random-input-len", "random-output-len"),
 }
 
 
-@pytest.mark.parametrize("config_file", list(OFFLINE_LEN_KEYS))
+@pytest.mark.parametrize("config_file", OFFLINE_FILES, ids=lambda f: f.name)
 def test_offline_tests_yaml_derives_consistently(config_file):
     """Every offline entry derives its devices, and names the shape it runs."""
-    input_key, output_key = OFFLINE_LEN_KEYS[config_file]
+    input_key, output_key = OFFLINE_LEN_KEYS[config_file.name.split("-", 1)[0]]
     configs = runner._load_configs(config_file)
     assert configs
 
@@ -419,11 +555,11 @@ def test_offline_tests_yaml_derives_consistently(config_file):
         # disagrees with the flags silently mislabels a trend line.
         assert f"_tp{tp}_" in name, name
         shape = f"_in{parameters[input_key]}_out{parameters[output_key]}"
-        assert name.endswith((shape, f"{shape}_smoke")), name
+        assert name.endswith(shape), name
 
-        # A `_smoke` entry is its own short shape; every other splits
-        # max-model-len evenly between prompt and output.
-        if name.endswith("_smoke"):
+        # The in64_out64 entries are a short shape at max-model-len 128; every
+        # other splits max-model-len evenly between prompt and output.
+        if shape == "_in64_out64":
             continue
         half = parameters["max-model-len"] // 2
         assert parameters[input_key] == parameters[output_key] == half, name

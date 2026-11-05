@@ -14,26 +14,25 @@
 
 """Generate a simplified vLLM benchmark CI matrix for Spyre runners."""
 
-import glob
+import importlib.util
 import json
 import logging
 import os
+import sys
 from argparse import Action, ArgumentParser, Namespace
 from logging import warning
+from pathlib import Path
 from typing import Any
-
-import yaml
 
 logging.basicConfig(level=logging.INFO)
 
-# Tried in order; the first section that actually names a model wins. A serve
-# config has `server_parameters.model` and no `parameters.model`, so an
-# existing-but-modelless section must not stop the search.
-VLLM_BENCHMARK_CONFIGS_PARAMETER = (
-    "parameters",
-    "server_parameters",
-    "common_parameters",
-)
+# The scripts are not a package, so load the runner by path: the matrix uses
+# the same suite selection as the run.
+_RUNNER_SCRIPT = Path(__file__).resolve().parent / "run_vllm_benchmarks.py"
+_runner_spec = importlib.util.spec_from_file_location("run_vllm_benchmarks", _RUNNER_SCRIPT)
+assert _runner_spec and _runner_spec.loader
+runner = importlib.util.module_from_spec(_runner_spec)
+_runner_spec.loader.exec_module(runner)
 
 
 class ValidateDir(Action):
@@ -59,7 +58,14 @@ def parse_args() -> Any:
         type=str,
         default="vllm-benchmarks/benchmarks",
         action=ValidateDir,
-        help="the directory containing vLLM benchmark configs",
+        help="the directory searched for *-runs.yaml benchmark configs",
+    )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default=runner.DEFAULT_SUITE,
+        choices=runner.SUITES,
+        help=f"suite whose models make up the matrix (default: {runner.DEFAULT_SUITE})",
     )
     parser.add_argument(
         "--models",
@@ -82,56 +88,48 @@ def set_output(name: str, val: Any) -> None:
         env.write(f"{name}={val}\n")
 
 
-def generate_benchmark_matrix(benchmark_configs_dir: str, models: list[str]) -> dict[str, Any]:
-    """
-    Parse serving config JSON files in the spyre benchmark configs directory
-    to build a matrix of models to benchmark.
-    """
-    benchmark_matrix: dict[str, Any] = {
-        "include": [],
-    }
-
-    selected_models = []
-
-    # Only the CI configs: *-tests-<suite>.yaml files are for manual runs.
-    for file in glob.glob(f"{benchmark_configs_dir}/spyre/*-tests.yaml"):
-        with open(file) as f:
-            try:
-                configs = yaml.safe_load(f)
-            except yaml.YAMLError as e:
-                warning("Failed to load %s: %s", file, e)
-                continue
-
-        # Only the per-test `model` matters here, so `defaults` is not merged in.
-        if isinstance(configs, dict):
-            configs = configs.get("tests") or []
-
+def _suite_models(benchmark_configs_dir: str, suite: str) -> list[str]:
+    """Models with a config in `suite`, in file order."""
+    selected = runner.collect_configs(
+        Path(benchmark_configs_dir), suite, set(runner.VALID_BENCH_TYPES)
+    )
+    models: list[str] = []
+    for configs in selected.values():
         for config in configs:
-            model = None
-            for key in VLLM_BENCHMARK_CONFIGS_PARAMETER:
-                candidate = config.get(key, {}).get("model")
-                if candidate:
-                    model = candidate.lower()
-                    break
+            model = runner._config_model(config)
             if model is None:
-                warning("Model name not set in %s, skipping...", config)
+                warning("Model name not set in %s, skipping...", config.get("test_name"))
                 continue
+            if model.lower() not in models:
+                models.append(model.lower())
+    return models
 
-            # Dedup
-            if model in selected_models:
-                continue
-            # Filter to selected models if specified
-            if models and model not in models:
-                continue
-            selected_models.append(model)
 
-            benchmark_matrix["include"].append(
-                {
-                    "models": model,
-                }
-            )
+def generate_benchmark_matrix(
+    benchmark_configs_dir: str, models: list[str], suite: str = runner.DEFAULT_SUITE
+) -> dict[str, Any]:
+    """One matrix entry per model, with the suite it runs in.
 
-    return benchmark_matrix
+    With no `models`, every model of `suite`. Otherwise each model runs in the
+    first suite, from `suite` on in SUITES order, that has a config for it.
+    """
+    if not models:
+        return {
+            "include": [
+                {"models": m, "suite": suite} for m in _suite_models(benchmark_configs_dir, suite)
+            ]
+        }
+
+    candidates = runner.SUITES[runner.SUITES.index(suite) :]
+    suite_models = {s: _suite_models(benchmark_configs_dir, s) for s in candidates}
+    include = []
+    for model in dict.fromkeys(models):
+        model_suite = next((s for s in candidates if model in suite_models[s]), None)
+        if model_suite is None:
+            logging.error("%s has no config in suites %s", model, list(candidates))
+            sys.exit(2)
+        include.append({"models": model, "suite": model_suite})
+    return {"include": include}
 
 
 def main() -> None:
@@ -140,6 +138,7 @@ def main() -> None:
     benchmark_matrix = generate_benchmark_matrix(
         args.benchmark_configs_dir,
         models,
+        args.suite,
     )
     print(json.dumps(benchmark_matrix))
     set_output("benchmark_matrix", json.dumps(benchmark_matrix))

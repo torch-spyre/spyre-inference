@@ -273,11 +273,15 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
 @pytest.mark.uses_subprocess
-# Cold cache: ~30min of decoder warmup, then six vision budgets compile at ~5min each.
+# Cold cache: decoder warmup, then one tower compile per encoder budget.
 @pytest.mark.timeout(7200)
 def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
-    """Every opted-in ``max_soft_tokens``, and a default and a 1120 image sharing one encoder
-    call, replay a budget compiled at warmup."""
+    """Every opted-in ``max_soft_tokens`` replays a budget compiled at warmup.
+
+    A default image and an 1120-token image cannot share one encoder call: the
+    encoder cache and compute budget are one 1152-token item, and the two images
+    together exceed that.
+    """
     _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
@@ -339,8 +343,9 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     for output in llm.wait_for_completion():
         assert output.outputs[0].text.strip(), "empty generation from the mixed batch"
 
-    ((calls, pack, *counts),) = llm.collective_rpc(encoder_calls)
-    assert any(len(c) == 2 and min(c) <= pack < max(c) for c in calls), calls
+    ((calls, _, *counts),) = llm.collective_rpc(encoder_calls)
+    assert all(len(c) == 1 for c in calls), calls
+    assert len(calls) == len(larger) + 2
     assert counts == [hits + len(larger) + 2, misses]
 
 

@@ -1263,14 +1263,20 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return None if padded is None else BatchDescriptor(num_tokens=padded)
 
     def profile_run(self, randomize_inputs: bool = False) -> None:
-        """A no-op, so Worker.determine_available_memory measures what loading consumed.
+        """No forward: only the attention staging buffers, so the KV cache is sized
+        around them.
 
         Upstream's runs one forward at max_num_tokens before the KV cache exists, and on
         Spyre the first forward is the trace. Without pages the attention layers trace
         no KV write (attn_layer resolves its device from the KV cache), so warmup would
         retrace every block, and an eager model compiles its per-op kernels before
         warmup's compilation settings apply.
+
+        The staging buffers scale with max_num_batched_tokens (16384 by default for an
+        eager LLM), and warmup allocates them after the KV cache took the measured
+        memory; allocated here, Worker.determine_available_memory counts them instead.
         """
+        allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):

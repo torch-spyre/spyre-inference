@@ -18,11 +18,13 @@ import contextlib
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.nn as nn
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1GPUModelRunner
 
 from spyre_inference.v1.worker import model_load
+from spyre_inference.v1.worker.spyre import model_runner
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -53,17 +55,25 @@ def test_a_step_without_block_copies_reaches_upstream(monkeypatch: pytest.Monkey
     assert upstream == [output]
 
 
-def test_profile_run_runs_no_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_profile_run_allocates_the_staging_buffers_and_runs_no_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """As TorchSpyreModelRunner's: on Spyre the first forward is the trace."""
 
     def forward(*args, **kwargs):
         raise AssertionError("profile_run ran a forward")
 
+    staged = []
     monkeypatch.setattr(GPUModelRunner, "profile_run", forward)
     monkeypatch.setattr(GPUModelRunner, "_dummy_run", forward)
+    monkeypatch.setattr(model_runner, "allocate_staging_buffers", lambda *args: staged.append(args))
     runner = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.spyre_device = torch.device("cpu")
 
     runner.profile_run()
+
+    assert staged == [({}, torch.device("cpu"))]
 
 
 @pytest.mark.parametrize("scales_changed", [True, False])

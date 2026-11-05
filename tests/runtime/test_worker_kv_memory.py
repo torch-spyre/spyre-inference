@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWind
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import request_memory
 
+from spyre_inference.v1.worker import spyre_model_runner
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
@@ -242,19 +243,28 @@ def test_sizing_a_sliding_window_model_logs_no_vllm_warning(monkeypatch, caplog)
     assert not kv_logger.disabled
 
 
-def test_sizing_runs_no_forward(monkeypatch):
+def test_sizing_allocates_the_staging_buffers_and_runs_no_forward(monkeypatch):
     """On Spyre the first forward is the trace; run before the KV cache exists, it would
-    trace no KV write and warmup would retrace every block."""
+    trace no KV write and warmup would retrace every block. The staging buffers are
+    allocated inside the measurement instead: they scale with max_num_batched_tokens, and
+    allocated after the KV cache took the measured memory they would not fit."""
 
     def forward(*args, **kwargs):
         raise AssertionError("determine_available_memory ran a forward")
 
+    staged = []
     monkeypatch.setattr(GPUModelRunner, "profile_run", forward)
     monkeypatch.setattr(TorchSpyreModelRunner, "_dummy_run", forward)
+    monkeypatch.setattr(
+        spyre_model_runner, "allocate_staging_buffers", lambda *args: staged.append(args)
+    )
     worker = _worker(monkeypatch, free_after_load=60 * GiB)
     runner = object.__new__(TorchSpyreModelRunner)
     runner.model_memory_usage = 0
     runner.get_kv_cache_spec = worker.model_runner.get_kv_cache_spec
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner._spyre_device = torch.device("cpu")
     worker.model_runner = runner
 
     assert worker.determine_available_memory() > 0
+    assert staged == [({}, torch.device("cpu"))]

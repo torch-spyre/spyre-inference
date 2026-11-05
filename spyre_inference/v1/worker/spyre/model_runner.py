@@ -30,7 +30,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyrePagedKVCache,
+    allocate_staging_buffers,
+)
 from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
@@ -101,5 +104,5 @@ class SpyreModelRunnerV2(GPUModelRunner):
         warmup.run(self)
 
     def profile_run(self, randomize_inputs: bool = False) -> None:
-        # A no-op for the reasons TorchSpyreModelRunner.profile_run gives.
-        pass
+        # No forward, only the staging buffers, as TorchSpyreModelRunner.profile_run.
+        allocate_staging_buffers(self.compilation_config.static_forward_context, self.spyre_device)

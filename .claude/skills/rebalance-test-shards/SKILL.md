@@ -43,6 +43,9 @@ For every suite whose `REC` differs from its current count, set N = REC and edit
 | suite | Makefile var |
 |-------|--------------|
 | smoke | `SMOKE_SHARDS` |
+| smoke-unit | `SMOKE_UNIT_SHARDS` |
+| e2e-smoke | `E2E_SMOKE_SHARDS` |
+| e2e-smoke-dist | `E2E_SMOKE_DIST_SHARDS` |
 | attn | `ATTN_SHARDS` |
 | upstream | `UPSTREAM_SHARDS` |
 | dist | `DIST_SHARDS` |
@@ -50,15 +53,17 @@ For every suite whose `REC` differs from its current count, set N = REC and edit
 
 **`.github/workflows/_test_matrix.yaml`** — under the `test:` job's `matrix.include:`, each
 suite has N consecutive `- cfg:` blocks keyed by `test_target: test-<name>-shard-<i>`
-(`<name>` = smoke / attention / upstream / distributed / probes):
+(`<name>` = smoke / smoke-unit / e2e-smoke / e2e-smoke-dist / attention / upstream /
+distributed / probes / quality):
 
 - **Growing** (N larger): copy the block **directly above the insertion point** — already
   a block of this same suite — and change only two things in the copy: its `test_target`
   id (the next 0-based `...-shard-<i>`) and its `(shard k/N)` label. Do **not** hand-type
   the block or borrow one from a neighbouring suite. `test_types`, `runs_on`, and
   `image_label` differ between suites and must be identical within one; in particular
-  `test_types` decides which meta-suites a shard joins — attention, probes, and upstream
-  are deliberately **not** `integration`, while smoke and dist are — so a block cloned
+  `test_types` decides which meta-suites a shard joins — smoke-unit, e2e-smoke and
+  e2e-smoke-dist are `integration` **only**, while smoke, dist, attention, probes and
+  upstream are deliberately **not** `integration` — so a block cloned
   from the wrong suite silently files the new shard under the wrong coverage set (and the
   id cross-check in step 3 won't catch it; the uniformity guard will).
 - **Shrinking** (N smaller): delete the surplus highest-id blocks.
@@ -68,6 +73,10 @@ suite has N consecutive `- cfg:` blocks keyed by `test_target: test-<name>-shard
 
 Do **not** touch the `test_retry` job — its matrix is built dynamically from
 `collect_failed_suites`, so it inherits the new shards automatically.
+
+The e2e-smoke suites are sized by the `e2e_smoke` admission budget
+(`docs/contributing/integration-tier.md`), not just the per-shard ceiling: if their total
+has grown past ~90 min, flag it to the maintainer instead of only adding shards.
 
 ## 3. Verify the two files agree
 

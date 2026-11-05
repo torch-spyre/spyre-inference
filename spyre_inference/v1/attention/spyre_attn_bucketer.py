@@ -167,14 +167,32 @@ _KV_LADDERS: dict[str, Callable[[int, int], list[int]]] = {
 }
 
 
-def kv_ladder(name: str) -> Callable[[int, int], list[int]]:
+def kv_ladder(name: str, var: str = "SPYRE_ATTN_KV_LADDER") -> Callable[[int, int], list[int]]:
     try:
         return _KV_LADDERS[name]
     except KeyError:
         raise ValueError(
-            f"SPYRE_ATTN_KV_LADDER={name!r} is not one of {sorted(_KV_LADDERS)}. "
+            f"{var}={name!r} is not one of {sorted(_KV_LADDERS)}. "
             "SPYRE_ATTN_KV_BUCKETS overrides the ladder entirely if none of these fit."
         ) from None
+
+
+def validate_kv_ladder_env() -> None:
+    min_seqs = envs.SPYRE_ATTN_LARGE_BATCH_MIN_SEQS
+    if min_seqs < 1:
+        raise ValueError(f"SPYRE_ATTN_LARGE_BATCH_MIN_SEQS must be >= 1, got {min_seqs}")
+    large = envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH
+    if envs.SPYRE_ATTN_KV_BUCKETS:
+        # The explicit buckets replace the base ladder, so its name is not read.
+        if large:
+            raise ValueError(
+                f"SPYRE_ATTN_KV_LADDER_LARGE_BATCH={large!r} cannot be combined with "
+                "SPYRE_ATTN_KV_BUCKETS, which replaces the ladder it extends. Unset one of them."
+            )
+        return
+    kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+    if large:
+        kv_ladder(large, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH")
 
 
 def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
@@ -307,6 +325,40 @@ class SpyreAttnBucketer:
         if envs.SPYRE_ATTN_KV_LAYOUT == "head_major" and _min_num_kv_heads(vllm_config) == 1:
             self._num_blocks_buckets = sorted({max(2, n) for n in self._num_blocks_buckets})
 
+        validate_kv_ladder_env()
+
+        # Batched decode only: below the threshold the dense buckets cost warmup without a
+        # measured gain. Unioned, so none rounds up.
+        self._large_batch_min_seqs = envs.SPYRE_ATTN_LARGE_BATCH_MIN_SEQS
+        self._large_batch_blocks_buckets = self._num_blocks_buckets
+        large = envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH
+        if large and self._large_batch_min_seqs > self._num_seqs_buckets[-1]:
+            logger.warning(
+                "SPYRE_ATTN_KV_LADDER_LARGE_BATCH=%s never applies: "
+                "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS=%d is above the largest num_seqs bucket %d.",
+                large,
+                self._large_batch_min_seqs,
+                self._num_seqs_buckets[-1],
+            )
+        elif large:
+            dense = kv_ladder(large, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH")(max_model_len, block_size)
+            # Clamped to the base ladder's floor, which the single-KV-head rule may raise to 2.
+            self._large_batch_blocks_buckets = sorted(
+                set(self._num_blocks_buckets)
+                | {
+                    max(self._num_blocks_buckets[0], (kv + block_size - 1) // block_size)
+                    for kv in dense
+                }
+            )
+            logger.info(
+                "SpyreAttnBucketer: batched decode at >= %d seqs uses %d num_blocks buckets "
+                "(%s) instead of %d.",
+                self._large_batch_min_seqs,
+                len(self._large_batch_blocks_buckets),
+                large,
+                len(self._num_blocks_buckets),
+            )
+
         logger.info(
             "SpyreAttnBucketer: %d kv buckets [%d..%d], %d query buckets [%d..%d], "
             "max num_blocks=%d",
@@ -347,6 +399,19 @@ class SpyreAttnBucketer:
     def find_blocks_bucket(self, num_blocks: int) -> int | None:
         return self._round_up(num_blocks, self._num_blocks_buckets)
 
+    def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
+        """The num_blocks buckets batched decode records and dispatches onto at this batch size.
+
+        The default ``SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`` is tuned to ``batched_decode_chunking``;
+        revisit it if that chunking changes.
+        """
+        if num_seqs_bucket >= self._large_batch_min_seqs:
+            return self._large_batch_blocks_buckets
+        return self._num_blocks_buckets
+
+    def find_batched_blocks_bucket(self, num_blocks: int, num_seqs_bucket: int) -> int | None:
+        return self._round_up(num_blocks, self.batched_blocks_buckets(num_seqs_bucket))
+
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
         idx = bisect.bisect_left(self._query_buckets, padded_query_len)
@@ -384,23 +449,25 @@ class SpyreAttnBucketer:
     def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
-        The full ``num_seqs_buckets x num_blocks_buckets`` grid: unlike
+        Each num_seqs bucket against its own ``batched_blocks_buckets``: unlike
         ``variants()`` there is no inter-axis bound to exploit, since a decode
-        batch of any size can sit at any context length. Both axes are geometric,
-        so the grid stays small.
+        batch of any size can sit at any context length.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
         out: list[SpyreAttnBatchedDecodeBucket] = []
-        for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
-            for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
-                blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-                out.append(
-                    SpyreAttnBatchedDecodeBucket(
-                        num_seqs=num_seqs,
-                        num_blocks=num_blocks,
-                        blocks_per_chunk=blocks_per_chunk,
-                        num_chunks=num_chunks,
-                    )
+        pairs = sorted(
+            ((nb, ns) for ns in self._num_seqs_buckets for nb in self.batched_blocks_buckets(ns)),
+            reverse=True,
+        )
+        for num_blocks, num_seqs in pairs:
+            blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+            out.append(
+                SpyreAttnBatchedDecodeBucket(
+                    num_seqs=num_seqs,
+                    num_blocks=num_blocks,
+                    blocks_per_chunk=blocks_per_chunk,
+                    num_chunks=num_chunks,
                 )
+            )
         return out

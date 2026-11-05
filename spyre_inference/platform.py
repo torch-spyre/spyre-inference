@@ -877,11 +877,10 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
-        # Validate the ladder name now; the bucketer only reads it in the worker, after model load.
-        if not envs.SPYRE_ATTN_KV_BUCKETS:
-            from spyre_inference.v1.attention.spyre_attn_bucketer import kv_ladder
+        # Validate the ladder settings now; the bucketer only reads them in the worker.
+        from spyre_inference.v1.attention.spyre_attn_bucketer import validate_kv_ladder_env
 
-            kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+        validate_kv_ladder_env()
 
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
@@ -904,6 +903,10 @@ class TorchSpyrePlatform(CpuPlatform):
             and vllm_config.speculative_config.use_dflash()
         ):
             raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
+        # Every process, ahead of the V1 validation that follows this hook in __post_init__.
+        from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
+
+        allow_xpress_on_v1()
         triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
@@ -934,6 +937,14 @@ class TorchSpyrePlatform(CpuPlatform):
                     "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
                     "runner."
                 )
+
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.rejection_sample_method == "fly":
+            # Upstream's CPU guard keys on the runner device, which is spyre here.
+            raise ValueError(
+                "Spyre does not support rejection_sample_method='fly': its acceptance "
+                "kernels are Triton-only and have no host implementation."
+            )
 
         # The pin holds only if the resolved property agrees; anything new that outranks
         # the env var must fail here rather than at the first runner-specific code path.

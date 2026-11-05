@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4SelfDecoderLayers
+from vllm.model_executor.models.gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4Router,
+    Gemma4SelfDecoderLayers,
+)
 
 from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
 from spyre_inference.models._retype import retype
@@ -186,7 +190,8 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
                 activation="gelu_tanh",
                 routing="full_softmax",
                 prepare_down_weight=partial(
-                    _fold_gemma4_expert_scale, scale=decoder.router.per_expert_scale
+                    _fold_gemma4_expert_scale,
+                    scale=cast(Gemma4Router, decoder.router).per_expert_scale,
                 ),
             ),
         )

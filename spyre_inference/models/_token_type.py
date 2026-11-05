@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from spyre_inference.custom_ops.lazy_compile import CompileOutermost
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
 from spyre_inference.models._retype import retype
 
 if TYPE_CHECKING:
@@ -44,7 +44,11 @@ if TYPE_CHECKING:
 
 
 class SpyreTokenTypeEmbedding:
-    """Embedding mixin taking ``token_type_ids`` as a side input."""
+    """Embedding mixin taking ``token_type_ids`` as a side input.
+
+    One compiled forward: the word, segment, and position tables and the layer norm
+    inline into it. Combine with ``CompileOutermost``, which arms that compile.
+    """
 
     spyre_token_type_ids: torch.Tensor | None = None
 
@@ -95,6 +99,36 @@ class SpyreTokenTypeEmbedding:
             # all-zeros beats failing to lower the add.
             return torch.zeros_like(input_ids)
         return token_type_ids
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self._compiled_forward(
+            input_ids,
+            position_ids,
+            self.spyre_token_type_ids_for(input_ids),
+            inputs_embeds,
+        )
+
+    @maybe_compile
+    def _compiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        embeddings = (
+            inputs_embeds
+            + self.token_type_embeddings(token_type_ids)
+            + self.position_embeddings(position_ids)
+        )
+        return self.LayerNorm(embeddings)
 
 
 class SpyreTokenTypeModel:

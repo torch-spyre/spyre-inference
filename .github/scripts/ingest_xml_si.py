@@ -87,8 +87,23 @@ def classify_testcase(tc_el):
     return "passed", "", ""
 
 
+# JUnit XML here is an untrusted CI artifact and never declares a DTD.
+_SAFE_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    load_dtd=False,
+    dtd_validation=False,
+)
+
+
 def parse_test_xml(xml_path: Path):
-    tree = etree.parse(str(xml_path))
+    tree = etree.parse(str(xml_path), parser=_SAFE_XML_PARSER)
+    docinfo = tree.docinfo
+    if docinfo.internalDTD is not None or docinfo.externalDTD is not None:
+        raise ValueError(
+            f"Refusing {xml_path.name}: JUnit XML must not declare a DTD "
+            "(possible XML entity-expansion / XXE payload)."
+        )
     root = tree.getroot()
 
     suites = root.findall(".//testsuite")

@@ -210,7 +210,6 @@ _UPSTREAM_ATTRIBUTES = (
     "attn_groups",
     "kernel_block_sizes",
     "block_tables",
-    "pcp_manager",
     "ubatch_runner",
     "cudagraph_manager",
     "kv_caches",

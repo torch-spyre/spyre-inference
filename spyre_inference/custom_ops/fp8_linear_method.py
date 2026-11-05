@@ -13,7 +13,8 @@
 # limitations under the License.
 
 """Per-tensor FP8 loading without upstream's ``_C`` requant, which the ``+empty`` vLLM build
-lacks (#1458): shard scales go to the kernel as ``[1]`` or per-channel instead."""
+lacks (#1458): shard scales go to the kernel as ``[1]`` or per-channel instead. Covers
+``quant_method: fp8`` only; other per-tensor formats still reach the requant."""
 
 from __future__ import annotations
 
@@ -32,8 +33,6 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import convert_to_
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 
 logger = init_logger(__name__)
-
-_REGISTERED = False
 
 
 def shard_scales_to_kernel_scale(
@@ -96,9 +95,5 @@ class SpyreFp8Config(Fp8Config):
 
 
 def register_spyre_fp8_config() -> None:
-    global _REGISTERED
-    if _REGISTERED:
-        return
     register_quantization_config("fp8")(SpyreFp8Config)
-    _REGISTERED = True
     logger.info("Registered SpyreFp8Config for quantization='fp8' (no _C requant)")

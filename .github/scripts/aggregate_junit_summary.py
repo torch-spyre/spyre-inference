@@ -35,12 +35,8 @@ class DTDRefused(ValueError):
 
 class _NoDTD(ET.TreeBuilder):
     # Real JUnit XML has no DTD, and refusing one closes entity-expansion DoS.
-    # ElementTree calls doctype() on the target the moment it sees a <!DOCTYPE>,
-    # so raising here refuses the document before any entity is expanded.
     def doctype(self, name, pubid, system):
-        raise DTDRefused(
-            f"JUnit XML must not declare a DTD: {name} (entity-expansion DoS guard)"
-        )
+        raise DTDRefused(f"JUnit XML must not declare a DTD: {name} (entity-expansion DoS guard)")
 
 
 # emoji, word (word is plain text so a browser ctrl+f for "xpass" hits the row).

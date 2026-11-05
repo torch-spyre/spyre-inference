@@ -164,5 +164,7 @@ def test_packed_images_match_upstream_on_spyre(tp_group, compiled):
         start = 0
         for img in images:
             want = upstream(img[None])[0]
-            assert _cosine(out[start : start + img.shape[0]], want) > 0.995
+            # Tight: the residual alone keeps cosine above 0.995 with attention dropped or
+            # the mask zeroed.
+            assert _cosine(out[start : start + img.shape[0]], want) > 0.9999
             start += img.shape[0]

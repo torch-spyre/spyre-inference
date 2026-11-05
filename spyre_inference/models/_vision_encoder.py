@@ -109,7 +109,7 @@ def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
 
 
 # Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
-_MASK_MIN = torch.finfo(torch.float16).min / 2
+MASK_MIN = torch.finfo(torch.float16).min / 2
 # Most items per call with `segment_buffer`: the one-hot is a stick wide, its last column padding.
 SEGMENT_ITEMS = STICK - 1
 
@@ -127,7 +127,7 @@ def segment_mask(segments: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Additive `[1, 1, P, P]` mask keeping each patch to its own item."""
     # A matmul: Spyre cannot lay out a column-minus-row broadcast.
     segments = segments.to(dtype)
-    return ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
+    return ((1.0 - torch.matmul(segments, segments.t())) * MASK_MIN)[None, None]
 
 
 class SpyreVisionEncoderMixin:

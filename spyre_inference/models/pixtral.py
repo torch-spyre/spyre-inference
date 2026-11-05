@@ -41,7 +41,7 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
-    _MASK_MIN,
+    MASK_MIN,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
@@ -178,7 +178,7 @@ class SpyrePixtralForConditionalGeneration(
         self._patch_width = align_up(args.num_channels * args.patch_size**2)
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
-            "key_pad": VisionBuffer(None, pad=_MASK_MIN),
+            "key_pad": VisionBuffer(None, pad=MASK_MIN),
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
         # [cos | sin] per position, gathered on the card in vision_embed.
@@ -263,7 +263,7 @@ class SpyrePixtralForConditionalGeneration(
         # [patch width, D] since process_weights_after_loading.
         patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
-        mask = values["key_pad"][None, None, None, :]
+        mask = values["key_pad"].to(x.dtype)[None, None, None, :]
         rope = self.spyre_rope_table.gather(values["positions"])
         freqs_cis = (rope[:, : self._head_dim], rope[:, self._head_dim :])
         return x, {"mask": mask, "freqs_cis": freqs_cis}

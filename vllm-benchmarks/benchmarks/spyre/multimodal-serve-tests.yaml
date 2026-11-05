@@ -41,7 +41,7 @@ tests:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
       tensor-parallel-size: 2
       limit-mm-per-prompt: '{"image": 4}'
-      allowed-local-media-path: /models/wdu_dataset/june_16_2026/images/
+      allowed-local-media-path: ${SPYRE_VISION_IMAGES_DATASET}
     parameters:
       dataset-name: custom_image
       dataset-path: ${SPYRE_VISION_DATASET}

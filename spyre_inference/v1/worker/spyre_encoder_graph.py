@@ -101,9 +101,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 and comp_config.encoder_cudagraph_max_frames_per_batch is None
             ):
                 self.max_frames_per_batch = self.max_batch_size * self.config.max_frames_per_video
-        # Respect a layout limit on items per encoder call when packing. Upstream derived the
-        # frame limit from the wider item count, so it shrinks with it.
-        if cap is not None and cap < self.max_batch_size:
+        # Otherwise respect a layout limit on items per encoder call when packing. Upstream
+        # derived the frame limit from the wider item count, so it shrinks with it.
+        elif cap is not None and cap < self.max_batch_size:
             self.max_batch_size = cap
             self.max_frames_per_batch = min(
                 self.max_frames_per_batch, cap * self.config.max_frames_per_video

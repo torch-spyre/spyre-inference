@@ -38,7 +38,7 @@ This command will:
 1. Install all project dependencies
 2. Build vLLM from source with the empty backend (`VLLM_TARGET_DEVICE=empty`, no device-specific C kernels)
 3. Install or reuse the torch-spyre wheel for the pinned source revision (RPMs are provisioned separately)
-4. Install PyTorch 2.13.0 from the CPU-specific index
+4. Install PyTorch 2.15.0 from the CPU-specific index
 
 ## Verification
 

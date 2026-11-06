@@ -80,25 +80,7 @@ def test_batched_feedback_preserves_selection_and_request_anchors(block, topc):
                 assert torch.equal(feedback.cpu(), expected_feedback), (batch, kind)
 
 
-@pytest.mark.parametrize(
-    "batch,block,topc",
-    [
-        (4, 8, 1),
-        (4, 8, 65),
-        (4, 32, 256),
-        pytest.param(
-            1,
-            16,
-            512,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="deeptools sbf-ddc 'Incorrect chunk size' crash, likely the same "
-                "#4920 regression as deeptools#4965; remove on the next RPM bump once "
-                "the fix is in",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("batch,block,topc", [(4, 8, 1), (4, 8, 65), (4, 32, 256), (1, 16, 512)])
 def test_feedback_drives_refinement_without_per_pass_host_selection(batch, block, topc):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")

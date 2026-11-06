@@ -86,6 +86,7 @@ _COSINE_MIN = 0.99
                 pytest.mark.e2e_smoke,
                 pytest.mark.xfail(
                     strict=True,
+                    raises=AssertionError,
                     reason="main_snap_2026_11_06_06 RPMs (deeptools 1283a68) generate "
                     "' street and methodically knocking ...'; recheck the reference and "
                     "remove on the next RPM bump once deeptools#4965 is in",

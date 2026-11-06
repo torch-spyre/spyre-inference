@@ -17,10 +17,7 @@
 Every cached FP8 checkpoint lists ``lm_head`` in its ``ignore``, so this builds one that
 ships its head in FP8: the cached micro Granite FP8 checkpoint with its FP16 head
 quantized per vocab row and a config group targeting ``lm_head``, as llm-compressor
-writes it. The engine loads it through the real compressed-tensors path. Like
-``test_transformers_matches_native``, it is ordered with the ``uses_subprocess`` tests,
-ahead of the session ``tp_group`` that would already hold the TP group the engine
-initializes, and tears the engine's distributed state down after.
+writes it. The engine loads it through the real compressed-tensors path.
 """
 
 import json
@@ -68,44 +65,29 @@ def _fp8_head_checkpoint(dst: Path) -> Path:
 def test_fp8_lm_head_serves(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from vllm import LLM, SamplingParams
     from vllm.config import CompilationConfig
-    from vllm.distributed import cleanup_dist_env_and_memory
-
-    from spyre_inference.custom_ops import parallel_lm_head
 
     model = _fp8_head_checkpoint(tmp_path)
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-    loads = []
-    load = parallel_lm_head.SpyreFp8LMHeadMethod.process_weights_after_loading
+    # apply_model ships the probe below to the engine process with cloudpickle.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-    def counting_load(self, layer):
-        loads.append(layer)
-        load(self, layer)
-
-    monkeypatch.setattr(
-        parallel_lm_head.SpyreFp8LMHeadMethod, "process_weights_after_loading", counting_load
-    )
+    def head_method(model):
+        return type(model.lm_head.quant_method).__name__
 
     prompt = "What are IBMs main businesses?"
-    engine = None
-    try:
-        engine = LLM(
-            model=str(model),
-            enforce_eager=False,
-            max_model_len=128,
-            max_num_seqs=2,
-            max_num_batched_tokens=8,
-            compilation_config=CompilationConfig(compile_sizes=[1, 8]),
-        )
-        output = engine.generate(
-            prompt, SamplingParams(temperature=0.0, max_tokens=16), use_tqdm=False
-        )
-    finally:
-        # A half-built engine still holds the TP group the next test would initialize.
-        del engine
-        cleanup_dist_env_and_memory()
+    engine = LLM(
+        model=str(model),
+        enforce_eager=False,
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=8,
+        compilation_config=CompilationConfig(compile_sizes=[1, 8]),
+    )
+    output = engine.generate(prompt, SamplingParams(temperature=0.0, max_tokens=16), use_tqdm=False)
 
-    assert loads, "the checkpoint's FP8 head was not loaded as FP8"
+    assert engine.apply_model(head_method) == ["SpyreFp8LMHeadMethod"], (
+        "the checkpoint's FP8 head was not loaded as FP8"
+    )
     # The FP16-head reference: FP8 logits keep the same greedy tokens on this prompt.
     expected = "\n\nIBMs are a set of standards that are used to measure the performance"
     assert output[0].outputs[0].text == expected

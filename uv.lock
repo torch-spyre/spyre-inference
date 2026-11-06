@@ -422,6 +422,12 @@ wheels = [
 ]
 
 [[package]]
+name = "arctic-inference"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/63/c1/573fa2f00097cd9cc1167b31fd900b2482f58f3491867cebdd5516626533/arctic_inference-0.3.0.tar.gz", hash = "sha256:7f22e3e1b1071c6061c0d6951be17c0fb50b08d06d6e543144c8f52faba60a36", size = 226218, upload-time = "2026-08-28T20:40:44.755Z" }
+
+[[package]]
 name = "astor"
 version = "0.8.1"
 source = { registry = "https://pypi.org/simple" }
@@ -5982,6 +5988,7 @@ wheels = [
 name = "spyre-inference"
 source = { editable = "." }
 dependencies = [
+    { name = "arctic-inference" },
     { name = "torch", version = "2.13.0a0+gitcf30153", source = { git = "https://github.com/pytorch/pytorch?tag=v2.13.0#cf30153c4c131c8164ee7798e5022d810682e2cb" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
@@ -6002,6 +6009,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arctic-inference" },
     { name = "torch", marker = "platform_machine != 'ppc64le'", specifier = "==2.13.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
     { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=752115ab288506bc327aa0870bbdddb93f583cc2" },

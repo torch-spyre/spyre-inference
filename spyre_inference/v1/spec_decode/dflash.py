@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from copy import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -80,28 +79,27 @@ class SpyreDFlashProposer(DFlashProposer):
             groups, self.vllm_config.compilation_config.static_forward_context
         )
         self.draft_attn_groups = groups[self.kv_cache_gid]
-        self._draft_causal_by_layer = dict(
+        causal_by_layer = dict(
             zip(
                 self.model.get_draft_kv_cache_layer_names(),
                 self.model.get_draft_attn_causal(),
                 strict=True,
             )
         )
-        draft_config = copy(self.vllm_config)
-        draft_config.model_config = copy(self.draft_model_config)
-        draft_config.model_config.max_model_len = self.vllm_config.model_config.max_model_len
+        self._draft_group_causal = []
         # Upstream constructs each builder before appending the other layers.
         # Spyre binds KV write holders at construction, so bind the complete group.
         for group in self.draft_attn_groups:
+            causal = causal_by_layer[group.layer_names[0]]
+            assert all(causal_by_layer[name] == causal for name in group.layer_names)
+            self._draft_group_causal.append(causal)
             group.create_metadata_builders(
-                draft_config, self.device, kernel_block_size=self.block_size
+                self.vllm_config, self.device, kernel_block_size=self.block_size
             )
 
     def build_per_group_and_layer_attn_metadata(self, cad, draft_index=0):
         per_group, per_layer = [], {}
-        for group in self.draft_attn_groups:
-            causal = self._draft_causal_by_layer[group.layer_names[0]]
-            assert all(self._draft_causal_by_layer[name] == causal for name in group.layer_names)
+        for group, causal in zip(self.draft_attn_groups, self._draft_group_causal, strict=True):
             metadata = group.build_metadata_for_drafting(
                 common_attn_metadata=replace(cad, causal=causal), draft_index=draft_index
             )

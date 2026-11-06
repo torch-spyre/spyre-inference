@@ -33,13 +33,14 @@ DRAFT = "UIUC-SSAIL/gemma4-26b-a4b-XPress-b16"
 DRAFT_REVISION = "e69e3580df7a7cd76b77e82ef739803fd88ee445"
 
 
-# Cold target/draft compilation and attention warmup take about 28 minutes in CI.
+# Allow cold target/draft compilation and attention warmup in CI.
 @pytest.mark.timeout(3600)
 def test_gemma4_xpress_generation(monkeypatch, tmp_path, record_property):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
     monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64")
+    monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,256,2304")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30")
@@ -52,7 +53,7 @@ def test_gemma4_xpress_generation(monkeypatch, tmp_path, record_property):
         tokenizer_revision=TARGET_REVISION,
         hf_overrides=GEMMA4_TEXT_BACKBONE_OVERRIDE,
         dtype="float16",
-        max_model_len=256,
+        max_model_len=2304,
         max_num_seqs=1,
         max_num_batched_tokens=64,
         enable_prefix_caching=False,
@@ -71,11 +72,12 @@ def test_gemma4_xpress_generation(monkeypatch, tmp_path, record_property):
     report_path = tmp_path / "gemma4-xpress-validation.json"
     try:
         prompts = [
-            "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,",
-            ", ".join(str(i) for i in range(1, 37)) + ",",
+            ("short", "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,"),
+            ("chunked", ", ".join(str(i) for i in range(1, 37)) + ","),
+            ("past_draft_window", ", ".join(str(i) for i in range(1, 451)) + ","),
         ]
-        for prompt in prompts:
-            case = {"prompt": prompt}
+        for name, prompt in prompts:
+            case = {"name": name, "prompt": prompt}
             report["cases"].append(case)
             for mode in ("none", "real"):
                 engine.collective_rpc("configure_proposer", args=(mode,))
@@ -105,6 +107,8 @@ def test_gemma4_xpress_generation(monkeypatch, tmp_path, record_property):
                     state=state,
                 )
                 report_path.write_text(json.dumps(report, indent=2) + "\n")
+                if name == "past_draft_window":
+                    assert 2048 < len(result.prompt_token_ids) <= 2304 - 32
                 assert len(output.token_ids) == 32
                 assert all(
                     math.isfinite(value.logprob)
@@ -114,7 +118,8 @@ def test_gemma4_xpress_generation(monkeypatch, tmp_path, record_property):
                 if mode == "real":
                     assert case[mode]["token_ids"] == case["none"]["token_ids"], case
                     assert metrics["num_draft_tokens"] > 0
-                    assert metrics["num_accepted_tokens"] > 0
+                    # These pinned counting prompts accept over 80%; allow numerical headroom.
+                    assert metrics["num_accepted_tokens"] >= 0.5 * metrics["num_draft_tokens"], case
                     assert any(step["native_proposals"] for step in state["steps"])
         record_property("gemma4_xpress_validation", json.dumps(report))
     finally:

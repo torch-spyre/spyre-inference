@@ -2685,7 +2685,7 @@ sub-stick half) run directly in the compiled graph (see below).</p>
 <td>FP8 <code>ColumnParallelLinear</code> / fused QKV / <code>MergedColumnParallelLinear</code> / <code>RowParallelLinear</code></td>
 <td><code>SpyreFp8LinearKernel</code></td>
 <td>Spyre</td>
-<td>Checkpoint FP8 is DMA'd straight into <code>qfp8wt</code> at load (torch-spyre#4663), so <code>model.to("spyre")</code> skips it. <code>quantscalepertokenfp8</code> + <code>qfp8ch</code> + <code>spyre.scaled_mm</code> trace into the block graph, or compile as their own graph (<code>maybe_compile</code>) outside one. LM head stays FP16</td>
+<td>Checkpoint FP8 is DMA'd straight into <code>qfp8wt</code> at load (torch-spyre#4663), so <code>model.to("spyre")</code> skips it. <code>quantscalepertokenfp8</code> + <code>qfp8ch</code> + <code>spyre.scaled_mm</code> trace into the block graph, or compile as their own graph (<code>maybe_compile</code>) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which <code>SpyreFp8LMHeadMethod</code> DMAs into <code>qfp8wt</code> as is, compiled even under <code>enforce_eager</code></td>
 </tr>
 </tbody>
 </table>

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 
 import pytest
@@ -58,7 +59,7 @@ def _generate(
     try:
         outs = llm.generate(
             ["Hello, world!", "The capital of France is"],
-            SamplingParams(max_tokens=8, temperature=0.0, logprobs=NUM_LOGPROBS),
+            SamplingParams(max_tokens=8, temperature=0.0, logprobs=NUM_LOGPROBS, ignore_eos=True),
         )
         tokens = [list(o.outputs[0].token_ids) for o in outs]
         logprobs = [
@@ -89,6 +90,7 @@ def _assert_matches_tp1(
                 return i
         return min(len(a), len(b))
 
+    assert len(tp1) == len(tp2), f"prompt count: {names[0]} {len(tp1)} vs {names[1]} {len(tp2)}"
     for i, (a, b) in enumerate(zip(tp1, tp2)):
         n = prefix_len(a, b)
         assert n >= 2, (
@@ -97,23 +99,58 @@ def _assert_matches_tp1(
         )
 
 
+def _assert_top_logprobs_close(
+    where: str, ref: dict[int, float], lp: dict[int, float], tolerance: float
+) -> None:
+    """Every token in either top-k agrees within the tolerance.
+
+    A token outside one run's top-k sits at or below that run's k-th logprob, so it
+    fails only when its other logprob clears that bound by more than the tolerance.
+    """
+    for a, b, names in ((ref, lp, ("tp1", "tp2")), (lp, ref, ("tp2", "tp1"))):
+        floor = min(b.values())
+        for tid, value in a.items():
+            gap = abs(value - b[tid]) if tid in b else value - floor
+            assert gap <= tolerance, (
+                f"{where}: token {tid} logprob {names[0]} {value:.3f} vs {names[1]} "
+                f"{b.get(tid, f'<= {floor:.3f}')} (gap {gap:.3f} > {tolerance})"
+            )
+
+
 def _assert_logprobs_match_tp1(
     model: str,
     tp1: tuple[list[list[int]], list[list[dict[int, float]]]],
     tp2: tuple[list[list[int]], list[list[dict[int, float]]]],
 ) -> None:
-    """Up to the first divergence, TP=1's token is in TP=2's top tokens within the tolerance."""
+    """Up to the first divergence, both runs' top tokens agree within the tolerance.
+
+    A divergence must be a near tie: each run's winner is in the other's top tokens and
+    beats it by no more than the tolerance in both runs.
+    """
     tolerance = LOGPROB_TOLERANCE.get(model, DEFAULT_LOGPROB_TOLERANCE)
-    _assert_matches_tp1(tp1[0], tp2[0])
-    for i, (tokens, ref_steps, steps) in enumerate(zip(tp1[0], tp1[1], tp2[1])):
-        for step, (pick, ref_lp, lp) in enumerate(zip(tokens, ref_steps, steps)):
-            assert pick in lp, f"prompt {i} step {step}: tp1 token {pick} not in tp2 top {lp}"
-            gap = abs(ref_lp[pick] - lp[pick])
-            assert gap <= tolerance, (
-                f"prompt {i} step {step}: token {pick} logprob tp1 {ref_lp[pick]:.3f} "
-                f"vs tp2 {lp[pick]:.3f} (gap {gap:.3f} > {tolerance})"
+    assert len(tp1[0]) == len(tp2[0]), f"prompt count: tp1 {len(tp1[0])} vs tp2 {len(tp2[0])}"
+    for name, (tokens, logprobs) in (("tp1", tp1), ("tp2", tp2)):
+        for i, (seq, steps) in enumerate(zip(tokens, logprobs, strict=True)):
+            assert len(seq) == len(steps), (
+                f"prompt {i}: {name} has {len(seq)} tokens but {len(steps)} logprob rows"
             )
-            if max(lp, key=lp.get) != pick:
+    _assert_matches_tp1(tp1[0], tp2[0])
+    for i, (ref_tokens, tokens, ref_steps, steps) in enumerate(
+        zip(tp1[0], tp2[0], tp1[1], tp2[1], strict=True)
+    ):
+        for step, (ref_pick, pick, ref_lp, lp) in enumerate(
+            zip(ref_tokens, tokens, ref_steps, steps)
+        ):
+            where = f"prompt {i} step {step}"
+            assert ref_pick in lp, f"{where}: tp1 token {ref_pick} not in tp2 top {lp}"
+            assert pick in ref_lp, f"{where}: tp2 token {pick} not in tp1 top {ref_lp}"
+            _assert_top_logprobs_close(where, ref_lp, lp, tolerance)
+            if pick != ref_pick:
+                margins = (ref_lp[ref_pick] - ref_lp[pick], lp[pick] - lp[ref_pick])
+                assert max(margins) <= tolerance, (
+                    f"{where}: tp1 picked {ref_pick}, tp2 picked {pick}; not a near tie "
+                    f"(margins tp1 {margins[0]:.3f}, tp2 {margins[1]:.3f} > {tolerance})"
+                )
                 # Past a flip the two runs condition on different tokens.
                 break
 
@@ -195,6 +232,61 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
             model, tp=2, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
         ),
     )
+
+
+def _run(winners: list[int], steps: list[dict[int, float]]):
+    return [winners], [steps]
+
+
+def _steps(n: int = 4) -> list[dict[int, float]]:
+    return [{t: math.log(0.9), 99: math.log(0.05)} for t in range(n)]
+
+
+def test_logprob_comparator_accepts_close_runs() -> None:
+    tp2 = [{t: lp + 0.05 for t, lp in step.items()} for step in _steps()]
+    _assert_logprobs_match_tp1("m", _run([0, 1, 2, 3], _steps()), _run([0, 1, 2, 3], tp2))
+
+
+def test_logprob_comparator_accepts_near_tie_flip() -> None:
+    tp1, tp2 = _steps(), _steps()
+    tp1[2] = {2: math.log(0.40), 50: math.log(0.38)}
+    tp2[2] = {2: math.log(0.38), 50: math.log(0.40)}
+    _assert_logprobs_match_tp1("m", _run([0, 1, 2, 3], tp1), _run([0, 1, 50, 7], tp2))
+
+
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("winner_flip", "token 50 logprob"),
+        ("alternatives_replaced", "token 1000 logprob"),
+        ("selected_drop", "token 0 logprob"),
+        ("no_rows", "4 tokens but 0 logprob rows"),
+        ("short_rows", "4 tokens but 2 logprob rows"),
+        ("lost_prompt", "prompt count"),
+    ],
+)
+def test_logprob_comparator_rejects(case: str, match: str) -> None:
+    winners, tp1, tp2 = [0, 1, 2, 3], _steps(), _steps()
+    tp2_winners = list(winners)
+    if case == "winner_flip":
+        # The tp1 token keeps its logprob while a competitor overtakes it.
+        tp1[2] = {2: math.log(0.30), 50: math.log(0.01)}
+        tp2[2] = {2: math.log(0.30), 50: math.log(0.65)}
+        tp2_winners[2:] = [50, 7]
+    elif case == "alternatives_replaced":
+        # Above the other run's k-th logprob, so not a top-k boundary change.
+        tp2 = [{t: math.log(0.9), 1000 + t: math.log(0.08)} for t in winners]
+    elif case == "selected_drop":
+        tp2 = [{t: math.log(0.5), 99: math.log(0.05)} for t in winners]
+    elif case == "no_rows":
+        tp1 = tp2 = []
+    elif case == "short_rows":
+        tp1, tp2 = tp1[:2], tp2[:2]
+    tp1_run, tp2_run = _run(winners, tp1), _run(tp2_winners, tp2)
+    if case == "lost_prompt":
+        tp1_run = ([winners, winners], [tp1, tp1])
+    with pytest.raises(AssertionError, match=match):
+        _assert_logprobs_match_tp1("m", tp1_run, tp2_run)
 
 
 MULTIMODAL_MODEL = "mistralai/Ministral-3-14B-Instruct-2512-BF16"

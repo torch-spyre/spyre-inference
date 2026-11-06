@@ -96,7 +96,7 @@ USE_SPYRE_PROFILER=1 \
 
 Pin `<rev>` to whatever commit `[tool.uv.sources.torch-spyre]` in
 `pyproject.toml` resolves to. Do **not** pass `--no-build-isolation`:
-the build system's `torch~=2.13.0` requirement needs an isolated env,
+the build system's `torch~=2.14.0` requirement needs an isolated env,
 and the venv's torch is not trusted for build. Build isolation
 downloads ~1 GB of torch into `/tmp/pip-build-env-*/` and cleans up
 after; watch `/tmp` space on tight pods.
@@ -111,7 +111,7 @@ Stock torch is expected — the `+aiu.kineto` suffix is gone:
 
 ```bash
 python -c "import torch; print(torch.__version__)"
-# Expected: 2.13.0+cpu   (no +aiu.kineto suffix)
+# Expected: 2.14.1+cpu   (no +aiu.kineto suffix)
 ```
 
 The real signal is that the AIUPTI backend is linked into

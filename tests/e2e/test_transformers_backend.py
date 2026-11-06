@@ -64,7 +64,14 @@ def _generate_greedy(model: str, model_impl: str) -> list[list[int]]:
     [
         # head_dim=64 takes the padded branch. The unpadded one (micro-g3.3, 128) is
         # covered by upstream's test_backend.py::test_models in upstream_tests.yaml.
-        "meta-llama/Llama-3.2-1B-Instruct",
+        pytest.param(
+            "meta-llama/Llama-3.2-1B-Instruct",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="deeptools#4965 (dbo-opt uniformize_op crash); remove on the next "
+                "RPM bump once the fix is in",
+            ),
+        ),
     ],
 )
 def test_transformers_matches_native(model: str) -> None:

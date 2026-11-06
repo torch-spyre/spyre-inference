@@ -82,7 +82,15 @@ _COSINE_MIN = 0.99
                 " street and ball ball. people's hats off then I account it high time",
                 GEMMA4_TEXT_BACKBONE_OVERRIDE,
             ),
-            marks=pytest.mark.e2e_smoke,
+            marks=[
+                pytest.mark.e2e_smoke,
+                pytest.mark.xfail(
+                    strict=True,
+                    reason="main_snap_2026_11_06_06 RPMs (deeptools 1283a68) generate "
+                    "' street and methodically knocking ...'; recheck the reference and "
+                    "remove on the next RPM bump once deeptools#4965 is in",
+                ),
+            ],
         ),
     ],
     ids=[

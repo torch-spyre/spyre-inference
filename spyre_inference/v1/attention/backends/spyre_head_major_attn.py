@@ -27,6 +27,7 @@ it — advertised shape, allocation, kernels, index tables — are duplicated ra
 parameterised.
 """
 
+import math
 from collections.abc import Callable
 from contextvars import copy_context
 from typing import ClassVar, TypeVar
@@ -93,7 +94,17 @@ compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kern
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
+_PAGE_GROUP = 8
+_PAGE_GROUP_MAX_QUERY_WIDTH = 1024
 _T = TypeVar("_T")
+
+
+def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
+    # Measured: grouping helps every shape up to num_heads * head_size = 1024 and regresses some
+    # beyond it. A group over most of a short context is slower too.
+    if num_heads * head_size > _PAGE_GROUP_MAX_QUERY_WIDTH:
+        return 1
+    return math.gcd(_PAGE_GROUP, max(1, num_blocks // 4))
 
 
 def _lx_max_cores(output_units: int) -> int:
@@ -382,6 +393,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 out=out,
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
+                page_group=_prefill_page_group(num_blocks, self.num_heads, self.head_size),
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)

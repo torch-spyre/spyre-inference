@@ -64,6 +64,9 @@ jobs:
       - spyre_pf_x0
       - linux
       - image_torch_spyre
+    env:
+      # Read by spyre-rpm-install; keep the two paths in sync.
+      NFS_RPMS: /storage-1/spyre-inference/.cache/spyre-rpms/x86_64
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -89,11 +92,18 @@ jobs:
           key: spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}
           lookup-only: true
 
+      - name: Check RPMs on NFS
+        id: rpm-nfs
+        run: |
+          if [[ -d "${NFS_RPMS}/${{ hashFiles('spyre-rpms.lock') }}" ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # We only build/cache on x86_64, but validate resolves all arches so a lock
       # that pins a commit missing on ppc64le/s390x fails review, not a later
       # (untested) P/Z install.
       - name: Validate lock resolves on all arches
-        if: steps.rpm-cache.outputs.cache-hit != 'true'
+        if: steps.rpm-cache.outputs.cache-hit != 'true' || steps.rpm-nfs.outputs.hit != 'true'
         env:
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
@@ -101,7 +111,7 @@ jobs:
         run: python3 .github/scripts/resolve_rpms.py validate
 
       - name: Download RPMs
-        if: steps.rpm-cache.outputs.cache-hit != 'true'
+        if: steps.rpm-cache.outputs.cache-hit != 'true' || steps.rpm-nfs.outputs.hit != 'true'
         env:
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
@@ -127,3 +137,20 @@ jobs:
         with:
           path: /tmp/spyre-rpms
           key: spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}
+
+      # Readers treat the directory's existence as completeness, so it is staged
+      # alongside and renamed into place.
+      - name: Publish RPMs to NFS
+        if: steps.rpm-nfs.outputs.hit != 'true'
+        env:
+          KEY: ${{ hashFiles('spyre-rpms.lock') }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$NFS_RPMS"
+          tmp="$(mktemp -d "${NFS_RPMS}/.${KEY}.XXXXXX")"
+          trap 'rm -rf "$tmp"' EXIT
+          cp /tmp/spyre-rpms/*.rpm "$tmp/"
+          chmod 0755 "$tmp"
+          mv -T "$tmp" "${NFS_RPMS}/${KEY}" || echo "${KEY} was published concurrently; keeping that copy"
+          # Keep the newest locks; each is one bundle's RPMs.
+          ls -1dt "${NFS_RPMS}"/[0-9a-f]*/ | tail -n +21 | xargs -r rm -rf

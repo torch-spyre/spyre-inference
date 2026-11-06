@@ -39,8 +39,9 @@ import random
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Bump to invalidate every cached tar at once after a format change.
 KEY_SALT = "nfs-uv-cache-v1"
@@ -153,11 +154,61 @@ def _newest_tar(arch_dir):
     return max(tars, key=lambda p: p.stat().st_mtime)
 
 
+class UnsafeTarMember(Exception):
+    """A tar member would extract outside the destination directory."""
+
+
+def _assert_members_confined(tar_path, dest):
+    """Reject any member that would land outside ``dest``.
+
+    A cache tar is written by another CI job in a per-PR scope, so a poisoned
+    archive could carry an absolute path, a ``..`` component, or a symlink /
+    hardlink whose target escapes the tree, and plain ``tar -x`` would follow it
+    and overwrite a file the runner later trusts. Validate every member before
+    unpacking (the project already gates fetched artifacts on a digest; this is
+    the extraction-side counterpart). Mirrors tarfile's own data_filter rule:
+    resolve each name — and each link target — against ``dest`` and require the
+    result to stay within it.
+    """
+    dest = Path(dest).resolve()
+
+    def _confined(name):
+        if name is None:
+            return True
+        resolved = (dest / name).resolve()
+        return resolved == dest or dest in resolved.parents
+
+    try:
+        tar = tarfile.open(tar_path)
+    except (tarfile.TarError, OSError):
+        # Unreadable or corrupt archive: let the `tar` subprocess fail on it so
+        # the caller's existing "bad tar -> start cold" path handles it.
+        return
+    with tar:
+        try:
+            members = tar.getmembers()
+        except (tarfile.TarError, OSError):
+            return
+        for member in members:
+            if PurePosixPath(member.name).is_absolute() or not _confined(member.name):
+                raise UnsafeTarMember(f"{tar_path}: unsafe member path {member.name!r}")
+            # A link's target is resolved relative to the member's own directory.
+            if member.islnk() or member.issym():
+                base = PurePosixPath(member.name).parent
+                target = member.linkname
+                rel = target if PurePosixPath(target).is_absolute() else str(base / target)
+                if PurePosixPath(target).is_absolute() or not _confined(rel):
+                    raise UnsafeTarMember(
+                        f"{tar_path}: unsafe link {member.name!r} -> {target!r}"
+                    )
+
+
 def _extract(tar_path, dest):
     # tar preserves uv's internal hardlinks and avoids a per-file metadata storm
     # over NFS; GNU tar auto-detects compression on extract.
+    _assert_members_confined(tar_path, dest)
     subprocess.run(
-        ["tar", "-xf", str(tar_path), "-C", str(dest)],
+        ["tar", "--no-same-owner", "-xf", str(tar_path), "-C", str(dest)],
         check=True,
     )
 

@@ -1213,9 +1213,9 @@ def test_attention_sinks_are_held_kv_major(default_vllm_config):
 def test_attention_sinks_follow_the_parameter_moved_to_spyre(
     default_vllm_config, monkeypatch, configure_device
 ):
-    """gpt-oss and granite register the sinks on their own attention module, so
-    ``model.to("spyre")`` replaces that Parameter and a reload writes the replacement. A
-    host-only test cannot see this: on CPU the move keeps the original."""
+    """gpt-oss and granite register the sinks on their own attention module, so the impl
+    must see a reload's write to that Parameter after ``model.to("spyre")``. A host-only test
+    cannot see this: only the move to Spyre could swap the Parameter."""
     from vllm.model_executor.layers.attention.attention import Attention
 
     from spyre_inference.v1.worker.model_load import move_model_to_spyre

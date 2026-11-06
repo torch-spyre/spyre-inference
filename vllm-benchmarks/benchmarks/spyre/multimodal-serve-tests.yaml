@@ -1,5 +1,8 @@
 # Multimodal serve benchmarks for Spyre devices, using vLLM's random-mm dataset.
 # Same defaults/tests format as serve-tests.yaml.
+#
+# The *_mm_vision entry instead replays a custom image dataset (custom_image)
+# via SPYRE_VISION_DATASET, which has no default and must be set explicitly.
 
 defaults:
   server_health_timeout: 3600
@@ -32,3 +35,16 @@ tests:
   - test_name: serve_gemma4-26b-a4b-it_tp4_mm_random
     server_parameters:
       model: google/gemma-4-26B-A4B-it
+
+  - test_name: serve_ministral3-14b_tp2_mm_vision
+    server_parameters:
+      model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+      tensor-parallel-size: 2
+      limit-mm-per-prompt: '{"image": 4}'
+      allowed-local-media-path: ${SPYRE_VISION_IMAGES_DATASET}
+    parameters:
+      dataset-name: custom_image
+      dataset-path: ${SPYRE_VISION_DATASET}
+      tokenizer-mode: hf
+      num-prompts: -1
+      output-len: 256

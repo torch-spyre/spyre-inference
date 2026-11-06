@@ -68,10 +68,6 @@ _RUN_TIMEOUT_S = 600
 _CACHE_DISABLED_MSG = "Kernel cache disabled"
 
 
-class CacheGrewError(AssertionError):
-    """The populated-cache run added entries; the only failure the xfail accepts."""
-
-
 def _cache_entries(cache_root: Path) -> set[str]:
     if not cache_root.is_dir():
         return set()
@@ -89,12 +85,11 @@ def _run(
     tmp_path: Path,
     name: str,
     tp: int,
-    fresh_lowering: bool,
     kernel_cache: bool,
 ) -> tuple[dict, str]:
     """Run one generation in a fresh process; return its output and its log."""
     env = dict(os.environ)
-    # Inherited cache switches would change what "shared" and "fresh" mean.
+    # Inherited cache switches would stop the warm run reusing the cold run's graph.
     for var in (
         "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
         "TORCHINDUCTOR_FX_GRAPH_CACHE",
@@ -110,14 +105,6 @@ def _run(
         VLLM_CACHE_ROOT=str(tmp_path / "vllm"),
         VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="36000",
     )
-    if fresh_lowering:
-        # Leave the Spyre kernel cache as the only state shared between runs, so
-        # every run lowers the model again, as after a code change.
-        env.update(
-            TORCHINDUCTOR_FX_GRAPH_CACHE="0",
-            TORCHINDUCTOR_AUTOGRAD_CACHE="0",
-            VLLM_CACHE_ROOT=str(tmp_path / f"vllm-{name}"),
-        )
     out_path = tmp_path / f"{name}.json"
     log_path = tmp_path / f"{name}.log"
     timed_out = False
@@ -150,61 +137,40 @@ def _run(
     return json.loads(out_path.read_text()), log_text
 
 
-_XFAIL_FRESH_LOWERING = pytest.mark.xfail(
-    strict=True,
-    raises=CacheGrewError,
-    reason=(
-        "when vLLM and Inductor lower the model again, some cache keys (fused RMSNorm+mm, "
-        "attention) differ from the previous process, so those kernels compile again"
-    ),
-)
-
-
 _TP2 = [
     pytest.mark.distributed,
     pytest.mark.skipif(spyre_device_count() < 2, reason="needs >=2 Spyre cards for TP=2"),
 ]
 
 
-# The xfail case runs at TP=1 only: TP=2 would hit the same cache-key bug. It
-# skips the uncached run, already checked against the cold run by tp1-shared.
 @pytest.mark.timeout(3 * (_RUN_TIMEOUT_S + 60) + 120)
 @pytest.mark.parametrize(
-    ("tp", "fresh_lowering"),
+    "tp",
     [
-        pytest.param(1, False, id="tp1-shared", marks=pytest.mark.e2e_smoke),
-        pytest.param(2, False, id="tp2-shared", marks=[*_TP2, pytest.mark.e2e_smoke]),
-        pytest.param(1, True, id="tp1-fresh", marks=_XFAIL_FRESH_LOWERING),
+        pytest.param(1, id="tp1-shared", marks=pytest.mark.e2e_smoke),
+        pytest.param(2, id="tp2-shared", marks=[*_TP2, pytest.mark.e2e_smoke]),
     ],
 )
-def test_kernel_cache(tmp_path: Path, tp: int, fresh_lowering: bool) -> None:
-    """Cache off, cold cache, warm cache: same output, and the warm run adds no entries.
-
-    ``shared`` keeps the vLLM and Inductor graph caches across runs, so the warm run
-    reuses the cold run's lowered graph; ``fresh`` lowers the model again in every run.
-    """
+def test_kernel_cache(tmp_path: Path, tp: int) -> None:
+    """Cache off, cold cache, warm cache: same output, and the warm run adds no entries."""
     cache_root = tmp_path / "inductor" / "inductor-spyre-cache"
-    args = (tp, fresh_lowering)
 
-    if not fresh_lowering:
-        disabled, _ = _run(tmp_path, "disabled", *args, kernel_cache=False)
-        assert not _cache_entries(cache_root), "cache populated with SPYRE_KERNEL_CACHE=0"
+    disabled, _ = _run(tmp_path, "disabled", tp, kernel_cache=False)
+    assert not _cache_entries(cache_root), "cache populated with SPYRE_KERNEL_CACHE=0"
 
-    cold, _ = _run(tmp_path, "cold", *args, kernel_cache=True)
+    cold, _ = _run(tmp_path, "cold", tp, kernel_cache=True)
     cold_entries = _cache_entries(cache_root)
     assert cold_entries, "cold run did not populate the kernel cache"
     assert not (cache_root / "failed").exists(), "cold run left failed compiles"
-    if not fresh_lowering:
-        assert cold == disabled, "cold-cache output differs from the uncached output"
+    assert cold == disabled, "cold-cache output differs from the uncached output"
 
-    warm, warm_log = _run(tmp_path, "warm", *args, kernel_cache=True)
+    warm, warm_log = _run(tmp_path, "warm", tp, kernel_cache=True)
     # A run that bypasses the cache also adds no entries, so check it was consulted.
     assert _CACHE_DISABLED_MSG not in warm_log, "warm run did not use the kernel cache"
     assert warm == cold, "warm-cache output differs from the cold-cache output"
 
     new_entries = _cache_entries(cache_root) - cold_entries
-    if new_entries:
-        raise CacheGrewError(
-            f"warm run compiled {len(new_entries)} new kernels on top of the "
-            f"{len(cold_entries)} cached ones"
-        )
+    assert not new_entries, (
+        f"warm run compiled {len(new_entries)} new kernels on top of the "
+        f"{len(cold_entries)} cached ones"
+    )

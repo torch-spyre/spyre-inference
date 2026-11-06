@@ -101,7 +101,7 @@ _T = TypeVar("_T")
 
 def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
     # Measured: grouping helps every shape up to num_heads * head_size = 1024 and regresses some
-    # beyond it (torch-spyre#5139). A group over most of a short context is slower too.
+    # beyond it. A group over most of a short context is slower too.
     if num_heads * head_size > _PAGE_GROUP_MAX_QUERY_WIDTH:
         return 1
     return math.gcd(_PAGE_GROUP, max(1, num_blocks // 4))

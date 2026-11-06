@@ -95,14 +95,14 @@ compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kern
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
 _PAGE_GROUP = 8
-_PAGE_GROUP_MAX_HEAD_SIZE = 128
+_PAGE_GROUP_MAX_QUERY_WIDTH = 1024
 _T = TypeVar("_T")
 
 
-def _prefill_page_group(num_blocks: int, head_size: int) -> int:
-    # Grouping regresses at head size 512 (torch-spyre#5139). Capped to a quarter of the pages: a
-    # group spanning most of a short context measured slower than one page per update.
-    if head_size > _PAGE_GROUP_MAX_HEAD_SIZE:
+def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
+    # Measured: grouping helps every shape up to num_heads * head_size = 1024 and regresses some
+    # beyond it (torch-spyre#5139). A group over most of a short context is slower too.
+    if num_heads * head_size > _PAGE_GROUP_MAX_QUERY_WIDTH:
         return 1
     return math.gcd(_PAGE_GROUP, max(1, num_blocks // 4))
 
@@ -393,7 +393,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 out=out,
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
-                page_group=_prefill_page_group(num_blocks, self.head_size),
+                page_group=_prefill_page_group(num_blocks, self.num_heads, self.head_size),
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)

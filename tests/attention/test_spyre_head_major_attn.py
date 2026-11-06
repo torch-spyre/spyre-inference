@@ -1428,20 +1428,22 @@ def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group,
 
 
 @pytest.mark.parametrize(
-    "num_blocks,head_size,expected",
+    "num_blocks,num_heads,head_size,expected",
     [
-        (4, 128, 1),
-        (8, 128, 2),
-        (16, 128, 4),
-        (32, 128, 8),
-        (256, 128, 8),
-        (13, 128, 1),
-        (256, 256, 1),
-        (256, 512, 1),
+        (4, 8, 128, 1),
+        (8, 8, 128, 2),
+        (16, 8, 128, 4),
+        (32, 8, 128, 8),
+        (256, 8, 128, 8),
+        (13, 8, 128, 1),
+        (256, 4, 256, 8),
+        (256, 16, 128, 1),
+        (256, 32, 128, 1),
+        (256, 4, 512, 1),
     ],
 )
-def test_prefill_page_group_selection(num_blocks, head_size, expected):
-    assert _prefill_page_group(num_blocks, head_size) == expected
+def test_prefill_page_group_selection(num_blocks, num_heads, head_size, expected):
+    assert _prefill_page_group(num_blocks, num_heads, head_size) == expected
 
 
 def test_prefill_page_group_must_divide_num_blocks():

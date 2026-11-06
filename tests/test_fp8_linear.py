@@ -804,11 +804,13 @@ def test_shard_scales_to_kernel_scale(scales, expected_shape):
 
 def test_shard_scales_missing_scale_raises():
     """A shard the checkpoint gave no scale must not borrow another shard's."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import FP8_SCALE_SENTINEL
+
     from spyre_inference.custom_ops.fp8_linear_method import shard_scales_to_kernel_scale
 
-    unloaded = torch.finfo(torch.float32).min
+    sentinel = FP8_SCALE_SENTINEL
     with pytest.raises(ValueError, match=r"shard\(s\) \[1, 2\]"):
-        shard_scales_to_kernel_scale(torch.tensor([0.5, unloaded, unloaded]), [2, 2, 2])
+        shard_scales_to_kernel_scale(torch.tensor([0.5, sentinel, sentinel]), [2, 2, 2])
 
 
 def test_fp8_quantization_resolves_to_spyre_config():

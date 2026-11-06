@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from vllm.model_executor.layers.quantization.utils.fp8_utils import FP8_SCALE_SENTINEL
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import convert_to_channelwise
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
@@ -42,8 +43,8 @@ def shard_scales_to_kernel_scale(
     if weight_scale.ndim == 0:
         return weight_scale.reshape(1)
     # weight_loader_v2 fills every slot from a fused-on-disk scale, so a slot left at the
-    # float32-min sentinel means the checkpoint has no scale for that shard.
-    unloaded = weight_scale <= torch.finfo(torch.float32).min
+    # sentinel means the checkpoint has no scale for that shard.
+    unloaded = weight_scale <= FP8_SCALE_SENTINEL
     if bool(unloaded.any()):
         missing = unloaded.nonzero().flatten().tolist()
         raise ValueError(f"FP8 checkpoint has no weight scale for shard(s) {missing}")

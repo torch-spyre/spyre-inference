@@ -512,7 +512,9 @@ def _moe_persistent_in_graph(
             tile_size=1,
             init=init,
         )
-    return result.squeeze(0)
+    # Sum, not squeeze: an in-graph all_reduce of a view of a for_each_tile result returns each
+    # rank's own partial on the pinned torch-spyre (torch-spyre#5880, #6008).
+    return result.sum(dim=0)
 
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:

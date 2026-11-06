@@ -512,7 +512,11 @@ def _moe_persistent_in_graph(
             tile_size=1,
             init=init,
         )
-    return result.squeeze(0)
+    # A sum over the size-1 axis, not a squeeze: MoERunner all-reduces this result in the same
+    # graph, and on the pinned torch-spyre an all_reduce of a view of a for_each_tile result
+    # returns each rank's own partial (fixed by torch-spyre#5880, which the pin excludes for
+    # torch-spyre#6008). squeeze, clone and contiguous all stay views here; the sum is a new buffer.
+    return result.sum(dim=0)
 
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:

@@ -2088,7 +2088,8 @@ activate the pinned RPMs first (requires access to the configured RPM repository
 <p>The <code>--rebuild</code> option rebuilds torch-spyre against those libraries, clearing uv's
 revision-keyed wheel cache first. After an RPM-only update, <code>uv sync</code> by itself can
 reuse a wheel built against the old libraries. The installer leaves the system
-<code>/opt/ibm/spyre</code> tree unchanged; source its <code>env.sh</code> in each new shell.
+<code>/opt/ibm/spyre</code> tree unchanged and points the unpacked binaries' hardcoded paths at a
+<code>/tmp/&lt;tag&gt;/spyre</code> symlink to itself. Source its <code>env.sh</code> in each new shell.
 Unlike the Install command below, <code>--rebuild</code> runs
 <code>uv sync --group dev --reinstall-package torch-spyre</code> without <code>--frozen</code> and may update
 <code>uv.lock</code>.</p>

@@ -94,7 +94,17 @@ compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kern
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
+_PAGE_GROUP = 8
+_PAGE_GROUP_MAX_HEAD_SIZE = 128
 _T = TypeVar("_T")
+
+
+def _prefill_page_group(num_blocks: int, head_size: int) -> int:
+    # Grouping regresses at head size 512 (torch-spyre#5139). Capped to a quarter of the pages: a
+    # group spanning most of a short context measured slower than one page per update.
+    if head_size > _PAGE_GROUP_MAX_HEAD_SIZE:
+        return 1
+    return math.gcd(_PAGE_GROUP, max(1, num_blocks // 4))
 
 
 def _lx_max_cores(output_units: int) -> int:
@@ -176,11 +186,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             "Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache, "
             "LX-resident pages"
         )
-        if envs.SPYRE_ATTN_PAGE_GROUP > 1:
-            logger.info_once(
-                "Head-major prefill groups up to %d KV pages per online-softmax update",
-                envs.SPYRE_ATTN_PAGE_GROUP,
-            )
 
     @classmethod
     def allocate_pages(
@@ -388,9 +393,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 out=out,
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
-                # At most a quarter of the pages: a group spanning most of a short context
-                # measured slower than one page per update.
-                page_group=math.gcd(envs.SPYRE_ATTN_PAGE_GROUP, max(1, num_blocks // 4)),
+                page_group=_prefill_page_group(num_blocks, self.head_size),
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)

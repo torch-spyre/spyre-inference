@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
-    SPYRE_ATTN_PAGE_GROUP: int = 1
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
@@ -94,9 +93,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
-    # KV pages per online-softmax update in head-major prefill; capped per variant to a
-    # divisor of a quarter of its block count. Default 1 (no grouping).
-    "SPYRE_ATTN_PAGE_GROUP": lambda: max(1, int(os.getenv("SPYRE_ATTN_PAGE_GROUP", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.

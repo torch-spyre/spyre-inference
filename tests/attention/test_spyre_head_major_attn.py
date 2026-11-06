@@ -38,6 +38,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
     SpyreHeadMajorAttentionImpl,
+    _prefill_page_group,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
@@ -1424,6 +1425,23 @@ def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group,
         )
         assert actual.shape == expected.shape
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "num_blocks,head_size,expected",
+    [
+        (4, 128, 1),
+        (8, 128, 2),
+        (16, 128, 4),
+        (32, 128, 8),
+        (256, 128, 8),
+        (13, 128, 1),
+        (256, 256, 1),
+        (256, 512, 1),
+    ],
+)
+def test_prefill_page_group_selection(num_blocks, head_size, expected):
+    assert _prefill_page_group(num_blocks, head_size) == expected
 
 
 def test_prefill_page_group_must_divide_num_blocks():

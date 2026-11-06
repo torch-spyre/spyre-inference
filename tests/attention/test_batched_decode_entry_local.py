@@ -293,4 +293,4 @@ def test_temp_split_layout_fields():
 
     layout = temporary_chunk_major_page_index_layout(3, 8)
     assert list(layout.device_size) == [3, 1, 8, 32]
-    assert list(layout.stride_map) == [8, -1, 1, -1]
+    assert list(layout.stride_map) == [8, 0, 1, 0]

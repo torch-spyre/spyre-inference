@@ -1382,6 +1382,81 @@ def test_mixed_layout_layers_in_one_kv_cache_tensor_each_get_their_own_pages(mon
     assert caches["layers.1.self_attn"]._spyre_impl_cls is SpyreAttentionImpl
 
 
+def _prefill_case(num_blocks: int, page_group: int, soft_cap: float, sinks: bool = False):
+    kv, qpk, d, block, query_len = 2, 2, 16, 16, 7
+    set_random_seed(0)
+    # Non-contiguous page ids: a grouped gather must follow the table, not a range.
+    page_table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    page_table[:, 0] = (torch.arange(num_blocks) * 3 + 1) % (num_blocks + 2)
+    mask_stack = torch.zeros(num_blocks, query_len, block)
+    mask_stack[-1, :, block // 2 :] = torch.finfo(torch.float32).min
+    return dict(
+        query=torch.randn(query_len + 1, kv * qpk, d),
+        query_row_index=torch.arange(query_len, dtype=torch.int32),
+        k_pages=torch.randn(num_blocks + 2, kv, block, d),
+        v_pages=torch.randn(num_blocks + 2, kv, block, d),
+        page_index_table=page_table,
+        mask_stack=mask_stack,
+        scale=d**-0.5,
+        num_blocks=num_blocks,
+        padded_query_len=query_len,
+        num_heads=kv * qpk,
+        num_kv_heads=kv,
+        head_size=d,
+        logits_soft_cap=soft_cap,
+        sinks=torch.randn(kv, qpk, 1) if sinks else None,
+        page_group=page_group,
+    )
+
+
+@pytest.mark.parametrize("for_each_tile", [False, True], ids=["loop", "for_each_tile"])
+@pytest.mark.parametrize("page_group", [2, 4, 8])
+def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group, for_each_tile):
+    """Grouping reassociates the online softmax, so the result must not move."""
+    from spyre_inference.v1.attention.ops import tile_loop
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
+    torch.set_default_device("cpu")
+    for soft_cap, sinks in ((0.0, False), (30.0, False), (0.0, True)):
+        expected = page_attn_head_major_prefill_kernel(**_prefill_case(8, 1, soft_cap, sinks))
+        actual = page_attn_head_major_prefill_kernel(
+            **_prefill_case(8, page_group, soft_cap, sinks)
+        )
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_prefill_page_group_must_divide_num_blocks():
+    torch.set_default_device("cpu")
+    with pytest.raises(ValueError, match="positive divisor"):
+        page_attn_head_major_prefill_kernel(**_prefill_case(6, 4, 0.0))
+
+
+def test_prefill_page_group_keeps_the_group_as_a_batch_axis(monkeypatch):
+    """No traced tensor merges the group into the token axis; one K/V gather per group."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from spyre_inference.v1.attention.ops import tile_loop
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    torch.set_default_device("cpu")
+    page_group, num_blocks, block_size = 4, 8, 16
+    case = _prefill_case(num_blocks, page_group, 0.0)
+    names = [k for k, v in case.items() if isinstance(v, torch.Tensor)]
+    rest = {k: v for k, v in case.items() if k not in names}
+    traced = make_fx(lambda *a: page_attn_head_major_prefill_kernel(**dict(zip(names, a)), **rest))(
+        *(case[k] for k in names)
+    )
+
+    merged = page_group * block_size
+    for node in traced.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            assert merged not in tuple(value.shape), f"{node.format_node()} merged the group axis"
+    gathers = [n for n in traced.graph.nodes if "index_select" in str(n.target)]
+    assert len(gathers) == 2 * (num_blocks // page_group) + 1
+
+
 def test_page_attn_head_major_matches_fp32_reference():
     """The per-sequence decode kernel matches the suite's CPU reference."""
     from spyre_testing_plugin.attn_helpers import ref_attn

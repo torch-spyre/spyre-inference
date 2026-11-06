@@ -204,6 +204,9 @@ class SpyreVisionEncoderMixin:
     vision_taps: ClassVar[tuple[int, ...]] = ()
     # Most items one encoder call can carry, when the layout bounds it (e.g. a one-hot width).
     vision_max_items_per_call: ClassVar[int | None] = None
+    # Limit items per call by budget tokens and vision_max_items_per_call (then required)
+    # instead of upstream's smallest budget, e.g. for a tower with one token per image.
+    vision_items_limited_by_tokens: ClassVar[bool] = False
 
     @property
     def vision_pad_groups(self) -> int:

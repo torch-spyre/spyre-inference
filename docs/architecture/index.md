@@ -322,6 +322,7 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` |
 | `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 

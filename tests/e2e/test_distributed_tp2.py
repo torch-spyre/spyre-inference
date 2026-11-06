@@ -29,8 +29,7 @@ from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 MAX_MODEL_LEN = 128
 MAX_NUM_SEQS = 2
 NUM_LOGPROBS = 5
-# Largest gap, in nats, between TP=1's and TP=2's logprob of the same token at a step where
-# both runs condition on the same prefix. The 6-layer nano model's fp16 gaps run larger.
+# Max logprob gap (nats) per token while TP=1 and TP=2 share a prefix; the 6-layer nano runs wider.
 LOGPROB_TOLERANCE = {"joerunde/gemma-4-moe-nano": 1.0}
 DEFAULT_LOGPROB_TOLERANCE = 0.1
 
@@ -43,7 +42,6 @@ def _generate(
     hf_overrides=None,
     kv_cache_dtype: str = "auto",
 ) -> tuple[list[list[int]], list[list[dict[int, float]]]]:
-    """Per-prompt token ids, and per-step ``{token id: logprob}`` for the top tokens."""
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -104,8 +102,7 @@ def _assert_logprobs_match_tp1(
     tp1: tuple[list[list[int]], list[list[dict[int, float]]]],
     tp2: tuple[list[list[int]], list[list[dict[int, float]]]],
 ) -> None:
-    """The token prefix check, then at every step up to the first divergence TP=1's token is
-    among TP=2's top tokens with a logprob within the model's tolerance."""
+    """Up to the first divergence, TP=1's token is in TP=2's top tokens within the tolerance."""
     tolerance = LOGPROB_TOLERANCE.get(model, DEFAULT_LOGPROB_TOLERANCE)
     _assert_matches_tp1(tp1[0], tp2[0])
     for i, (tokens, ref_steps, steps) in enumerate(zip(tp1[0], tp1[1], tp2[1])):

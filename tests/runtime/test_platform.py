@@ -944,6 +944,20 @@ def test_compile_sizes_user_provided_wins_over_the_verification_ladder():
     assert vllm_config.compilation_config.compile_sizes == [8, 512]
 
 
+def test_engine_args_honors_a_user_max_model_len_above_the_derived_cap():
+    """``check_max_model_len`` caps only a derived length; a user's 128k passes through."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = EngineArgs(
+        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b", max_model_len=131072, max_num_seqs=8
+    ).create_engine_config()
+
+    assert vllm_config.model_config.max_model_len == 131072
+    assert TorchSpyrePlatform._DEFAULT_DERIVED_MAX_MODEL_LEN < 131072
+
+
 def test_compile_sizes_empty_list_opts_out():
     """An explicit empty list disables bucketing and leaves the scheduler alone."""
     from spyre_inference.platform import TorchSpyrePlatform

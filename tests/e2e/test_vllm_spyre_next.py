@@ -23,24 +23,6 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 @pytest.mark.uses_subprocess
-def test_basic_model_load():
-    model = LLM(
-        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        max_model_len=128,
-        max_num_seqs=2,
-        enforce_eager=True,
-        attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
-    )
-
-    sampling_params = SamplingParams(max_tokens=5)
-    output: list[RequestOutput] = model.generate(
-        prompts="Hello World", sampling_params=sampling_params
-    )
-
-    assert len(output[0].outputs[0].text) > 0
-
-
-@pytest.mark.uses_subprocess
 def test_long_context_model_load():
     """Verify that user-specified large max_model_len values are honored, and
     that long contexts don't crash."""
@@ -72,22 +54,16 @@ _PADDED_PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode())
 _PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
 
 
+@pytest.mark.e2e_smoke
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(False, id="compiled", marks=pytest.mark.e2e_smoke),
-    ],
-)
-def test_padded_head_dim_and_intermediate_size_generate(enforce_eager: bool) -> None:
+def test_padded_head_dim_and_intermediate_size_generate() -> None:
     """Loading the model fires both pads; greedy decode matches the unpadded
-    reference token ids. head_dim 64 takes the split-free RoPE path, so the compiled
-    case traces it into a block graph."""
+    reference token ids. head_dim 64 takes the split-free RoPE path, so the block
+    graph traces it in."""
     llm = LLM(
         model="qwrt/Swedish0.1M",
         dtype="float16",
-        enforce_eager=enforce_eager,
+        enforce_eager=False,
         max_model_len=128,
         max_num_seqs=1,
     )

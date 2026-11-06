@@ -78,6 +78,10 @@ pytest -m "attention and upstream"
 pytest --upstream -m "attention"
 ```
 
+`e2e_smoke` and `attention_smoke` are the opt-in subsets that carry e2e and attention
+coverage into the `integration` tier. Adding a test to either is an admission decision; see
+[The Integration Tier](integration-tier.md).
+
 #### Model Output Quality Gate
 
 The quality gate holds the product models to their output, and runs as one suite of two

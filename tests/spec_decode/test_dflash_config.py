@@ -54,11 +54,11 @@ def test_context_excludes_rejected_rows_and_uncomputed_correction(
 
 
 def test_dflash_bridge_disables_padding_and_only_the_default_prefix_cache():
-    original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=0)
+    original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128)
     args = NS(speculative_config=original, enable_prefix_caching=None)
     normalize_speculative_config(args)
     assert original == dict(
-        method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=0
+        method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128
     )
     assert args.speculative_config == original | {"disable_padded_drafter_batch": True}
     assert args.enable_prefix_caching is False
@@ -154,13 +154,29 @@ def test_published_contract_is_accepted(config, batch):
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
 
-@pytest.mark.parametrize("checkpoint,expected", [(None, 128), (512, 512), (0, 0)])
+@pytest.mark.parametrize("checkpoint,expected", [(None, 128), (1, 1), (512, 512), (1024, 1024)])
 def test_spyre_topc_default_applies_only_when_unset(config, checkpoint, expected):
     # Upstream writes --xpress-topc onto the draft config before this runs.
     draft = config.speculative_config.draft_model_config.hf_config
     draft.xpress_topc = checkpoint
     validate_dflash_config(config)
     assert draft.xpress_topc == expected
+
+
+@pytest.mark.parametrize("topc", [0, 1025, 2048])
+def test_unsupported_shortlists_fail_before_model_loading(config, topc):
+    config.speculative_config.draft_model_config.hf_config.xpress_topc = topc
+    with pytest.raises(ValueError, match="requires 1 to 1024 candidates"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("topc", [128, 1024, 2048])
+def test_shortlist_width_is_normalized_to_the_real_vocabulary(config, topc):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.xpress_topc = topc
+    draft.vocab_size = config.model_config.hf_text_config.vocab_size = 73
+    validate_dflash_config(config)
+    assert draft.xpress_topc == 73
 
 
 @pytest.mark.parametrize("value", [-1, True, 1.5])

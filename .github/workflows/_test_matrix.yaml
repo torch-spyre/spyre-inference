@@ -1327,7 +1327,6 @@ jobs:
     needs: resolve
     if: >-
       ${{ !cancelled()
-          && github.event_name != 'pull_request'
           && needs.resolve.outputs.resolved_test_type == 'perf' }}
     runs-on: ubuntu-latest
     outputs:
@@ -1346,7 +1345,9 @@ jobs:
         id: legs
         run: |
           pip install pyyaml
-          LEGS="$(make -s perf-legs)"
+          # TEMP (revert before merge): only the TP4 legs plus gemma TP1.
+          LEGS="$(python3 -c 'import json, sys; a, b = (json.loads(x) for x in sys.argv[1:]); print(json.dumps(a + b))' \
+            "$(make -s perf-legs TPS=4)" "$(make -s perf-legs MODELS=google/gemma-4-26B-A4B TPS=1)")"
           echo "${LEGS}"
           if [[ "${LEGS}" == "[]" ]]; then
             echo "::error::No benchmark config selected; perf would pass having run nothing."

@@ -468,6 +468,11 @@ BENCH_TYPES ?=
 # which runs every entry whatever BENCH_SUITE says.
 BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks
 BENCH_SUITE ?= base
+# Serve entries run in two phases: a startup record per server config (a cold and a
+# warm start on one private compile cache), then the serve benchmarks on that warm
+# cache. BENCH_SERVE_PHASES=startup or =serve runs one alone; =serve keeps the
+# caller's own cache settings.
+BENCH_SERVE_PHASES ?= all
 
 # The serve configs replay trace files that are not in the repo, so the fetch is
 # what makes a serve config runnable at all and is on by default. Set
@@ -488,7 +493,7 @@ else
 BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_SUITE=minimal|base|reference|power-applications to pick the suite (default base). Set BENCH_CONFIGS_DIR=<dir or file> to run custom config files; a single file runs unfiltered. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_SUITE=minimal|base|reference|power-applications to pick the suite (default base). Set BENCH_CONFIGS_DIR=<dir or file> to run custom config files; a single file runs unfiltered. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them. Set BENCH_SERVE_PHASES=startup|serve to run only the startup records or only the serve benchmarks (default both).
 	mkdir -p "$(RESULTS_DIR)"
 	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \
@@ -499,4 +504,6 @@ perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
 		--models "$(MODELS)" \
 		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)" \
-		--suite "$(BENCH_SUITE)"
+		--suite "$(BENCH_SUITE)" \
+		$(if $(filter startup,$(BENCH_SERVE_PHASES)),--startup-only) \
+		$(if $(filter serve,$(BENCH_SERVE_PHASES)),--serve-only)

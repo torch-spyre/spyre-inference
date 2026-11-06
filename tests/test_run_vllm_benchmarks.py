@@ -25,7 +25,9 @@ All checked-in configs are loaded as-is at the end, so a config edit that
 breaks these invariants fails here.
 """
 
+import contextlib
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -439,6 +441,206 @@ def test_matrix_model_falls_back_to_the_next_suite(tmp_path):
     ]
     with pytest.raises(SystemExit):
         matrix.generate_benchmark_matrix(str(tmp_path), ["m-unknown"])
+
+
+# ── startup records ──
+
+
+def _serve_entry(name: str, model: str = "org/m", **server) -> dict:
+    return {
+        "test_name": name,
+        "server_parameters": {
+            "model": model,
+            "tensor-parallel-size": 4,
+            "max-model-len": 32768,
+            "max-num-seqs": 32,
+            **server,
+        },
+        "parameters": {},
+        "environment_variables": {"SPYRE_DEVICES": "0,1,2,3", "AIU_WORLD_SIZE": "4"},
+    }
+
+
+def test_entries_that_share_a_server_config_share_a_startup_record():
+    """One record per server config, named by its shape and a hash of the config."""
+    aiops = _serve_entry("serve_m_tp4_c5_aiops")
+    cics = _serve_entry("serve_m_tp4_c5_cics")
+    other = _serve_entry("serve_m_tp4_c4_rag", **{"num-gpu-blocks-override": 2049})
+
+    groups = runner.server_groups([aiops, other, cics])
+
+    assert [[c["test_name"] for c in entries] for _, entries in groups] == [
+        ["serve_m_tp4_c5_aiops", "serve_m_tp4_c5_cics"],
+        ["serve_m_tp4_c4_rag"],
+    ]
+    first, second = (name for name, _ in groups)
+    assert first.startswith("startup_m_tp4_len32768_seqs32_h")
+    assert second.startswith("startup_m_tp4_len32768_seqs32_h")
+    assert first != second
+    # The hash token is not read as a shape: only tp, len and seqs are.
+    assert ingest_shapes(first) == {
+        "tensor_parallel": "4",
+        "max_model_len": "32768",
+        "max_num_seqs": "32",
+    }
+
+
+def ingest_shapes(name: str) -> dict[str, str]:
+    """The identity keys spyre_clickhouse_ingest.vllm.parse_input_shapes reads off a name."""
+    keys = {"tp": "tensor_parallel", "len": "max_model_len", "seqs": "max_num_seqs"}
+    keys |= {"in": "input_len", "out": "output_len", "c": "concurrency", "n": "num_prompts"}
+    out = {}
+    for token in name.split("_"):
+        for prefix, key in keys.items():
+            if token.startswith(prefix) and token[len(prefix) :].isdigit():
+                out[key] = token[len(prefix) :]
+    return out
+
+
+def test_checked_in_startup_record_names_are_unique():
+    """Each server config of the checked-in files gets its own record name."""
+    configs = [config for f in SERVE_FILES for config in runner._load_configs(f)]
+    names = [name for name, _ in runner.server_groups(configs)]
+    assert len(names) == len(set(names))
+
+
+class _FakeServer:
+    """Stands in for `running_server`: each start adds `files_per_start` files to the cache."""
+
+    def __init__(self, files_per_start: list[int], fail_on: int | None = None):
+        self.files_per_start = list(files_per_start)
+        self.fail_on = fail_on
+        self.starts: list[dict] = []
+
+    def __call__(self, server_parameters, env, config_env, results_dir, log_name, timeout):
+        index = len(self.starts)
+        self.starts.append({"log_name": log_name, "env": env})
+        cache = Path(env["TORCHINDUCTOR_CACHE_DIR"]) if "TORCHINDUCTOR_CACHE_DIR" in env else None
+        if cache is not None and index < len(self.files_per_start):
+            cache.mkdir(parents=True, exist_ok=True)
+            for i in range(self.files_per_start[index]):
+                (cache / f"start{index}_{i}").write_text("")
+
+        @contextlib.contextmanager
+        def ctx():
+            yield None if index == self.fail_on else 10.0 + index
+
+        return ctx()
+
+
+def _run_phases(monkeypatch, tmp_path, server, entries, phases):
+    served = []
+    monkeypatch.setattr(runner, "running_server", server)
+    monkeypatch.setattr(
+        runner,
+        "run_serve_benchmark",
+        lambda **kw: served.append((kw["test_name"], kw["env"])) or True,
+    )
+    result = runner.run_serve_benchmarks(entries, tmp_path, "0", "1", frozenset(phases))
+    return result, served
+
+
+def test_startup_record_counts_new_cache_files_per_start(monkeypatch, tmp_path):
+    """A cold start fills the cache; a warm start that adds files is recorded, not hidden."""
+    server = _FakeServer([3, 1])
+    entries = [_serve_entry("serve_m_tp4_c5_aiops")]
+
+    (passed, failed), _ = _run_phases(monkeypatch, tmp_path, server, entries, ["startup"])
+
+    assert (passed, failed) == (1, 0)
+    (record_file,) = tmp_path.glob("startup_*.json")
+    record = json.loads(record_file.read_text())
+    assert record["model"] == "org/m"
+    assert record["cold_startup_s"] == 10.0
+    assert record["warm_startup_s"] == 11.0
+    assert record["cold_new_cache_files"] == 3
+    assert record["warm_new_cache_files"] == 1
+    assert [s["log_name"] for s in server.starts] == [
+        f"{record_file.stem}_cold_server",
+        f"{record_file.stem}_warm_server",
+    ]
+
+
+def test_serve_entries_run_on_the_startup_cache(monkeypatch, tmp_path):
+    """Both starts and every serve entry of a server config share one cache, with every
+    cache layer on even when the caller turned them off."""
+    monkeypatch.setenv("TORCHINDUCTOR_FORCE_DISABLE_CACHES", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    server = _FakeServer([2, 0])
+    entries = [_serve_entry("serve_m_tp4_c5_aiops"), _serve_entry("serve_m_tp4_c5_cics")]
+
+    (passed, failed), served = _run_phases(monkeypatch, tmp_path, server, entries, runner.PHASES)
+
+    assert (passed, failed) == (3, 0)
+    assert [name for name, _ in served] == ["serve_m_tp4_c5_aiops", "serve_m_tp4_c5_cics"]
+    caches = {s["env"]["TORCHINDUCTOR_CACHE_DIR"] for s in server.starts}
+    caches |= {env["TORCHINDUCTOR_CACHE_DIR"] for _, env in served}
+    assert len(caches) == 1
+    for env in [s["env"] for s in server.starts] + [env for _, env in served]:
+        assert env["SPYRE_KERNEL_CACHE"] == "1"
+        assert "TORCHINDUCTOR_FORCE_DISABLE_CACHES" not in env
+        assert "VLLM_DISABLE_COMPILE_CACHE" not in env
+
+
+def test_failed_startup_fails_its_serve_entries(monkeypatch, tmp_path):
+    server = _FakeServer([1, 0], fail_on=0)
+    entries = [_serve_entry("serve_m_tp4_c5_aiops"), _serve_entry("serve_m_tp4_c5_cics")]
+
+    (passed, failed), served = _run_phases(monkeypatch, tmp_path, server, entries, runner.PHASES)
+
+    assert (passed, failed) == (0, 3)
+    assert served == []
+    assert not list(tmp_path.glob("startup_*.json"))
+
+
+def test_serve_only_keeps_the_callers_cache_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("TORCHINDUCTOR_FORCE_DISABLE_CACHES", "1")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "callers-cache"))
+    server = _FakeServer([])
+    entries = [_serve_entry("serve_m_tp4_c5_aiops")]
+
+    (passed, failed), served = _run_phases(monkeypatch, tmp_path, server, entries, ["serve"])
+
+    assert (passed, failed) == (1, 0)
+    assert server.starts == []
+    ((_, env),) = served
+    assert env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] == "1"
+    assert env["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "callers-cache")
+    assert not list(tmp_path.glob("startup_*.json"))
+
+
+@pytest.mark.parametrize(
+    ("flags", "phases"),
+    [([], {"startup", "serve"}), (["--startup-only"], {"startup"}), (["--serve-only"], {"serve"})],
+)
+def test_phase_flags(monkeypatch, tmp_path, flags, phases):
+    _write_runs(tmp_path, "serve-x-runs.yaml", {"a": ["base"]})
+    seen = []
+    monkeypatch.setattr(
+        runner, "run_serve_benchmarks", lambda **kw: seen.append(kw["phases"]) or (1, 0)
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_vllm_benchmarks.py",
+            "--configs-dir",
+            str(tmp_path),
+            "--results-dir",
+            str(tmp_path / "results"),
+            *flags,
+        ],
+    )
+
+    runner.main()
+
+    assert seen == [frozenset(phases)]
+
+
+def test_phase_flags_are_exclusive(monkeypatch, tmp_path):
+    monkeypatch.setattr("sys.argv", ["run_vllm_benchmarks.py", "--startup-only", "--serve-only"])
+    with pytest.raises(SystemExit) as exc:
+        runner.parse_args()
+    assert exc.value.code == 2
 
 
 # ── the checked-in config ──

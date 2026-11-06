@@ -167,7 +167,9 @@ env | grep -E '^(SPYRE|VLLM|TORCH|TORCHINDUCTOR|AIU|FLEX|DT|COLL|SENTIENT|OMP)_'
 write_meta "${ENVS[@]}"
 
 echo "run_leg.sh: running $(grep -c 'test_name:' "$BENCH/serve-tests.yaml") configs, log in $OUT/run.log"
-setsid make perf-tests BENCH_TYPES=serve BENCH_CONFIGS_DIR="$BENCH/serve-tests.yaml" RESULTS_DIR="$OUT/results" \
+# BENCH_SERVE_PHASES=serve: the leg's own cache settings must hold, and the startup
+# records would reset them to a fresh private cache with every layer on.
+setsid make perf-tests BENCH_TYPES=serve BENCH_SERVE_PHASES=serve BENCH_CONFIGS_DIR="$BENCH/serve-tests.yaml" RESULTS_DIR="$OUT/results" \
   >"$OUT/run.log" 2>&1 &
 MAKE_PID=$!
 wait "$MAKE_PID"

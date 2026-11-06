@@ -297,3 +297,34 @@ def test_identity_comes_from_the_shared_library_not_a_local_copy(mod):
 
     for name in ("run_id_of", "artifact_id_for", "base_artifact_id", "gha_artifact_id"):
         assert getattr(mod, name) is getattr(lib, name), name
+
+
+# ── TLS for the ClickHouse write credential ─────────────────────────────────────
+
+
+def test_tls_off_by_default_on_plain_http_port(mod):
+    # The credential and rows travel in the clear on 8123; default stays cleartext so a
+    # trusted-network deployment keeps working, but nothing silently upgrades it either.
+    assert mod._use_tls({}, 8123) is False
+
+
+@pytest.mark.parametrize("flag", ["1", "true", "TRUE", "yes", "on", "On"])
+def test_tls_enabled_when_secure_flag_truthy(mod, flag):
+    assert mod._use_tls({"CLICKHOUSE_SECURE": flag}, 8123) is True
+
+
+@pytest.mark.parametrize("flag", ["0", "false", "no", "off", ""])
+def test_tls_flag_falsey_leaves_it_to_the_port(mod, flag):
+    assert mod._use_tls({"CLICKHOUSE_SECURE": flag}, 8123) is False
+    assert mod._use_tls({"CLICKHOUSE_SECURE": flag}, 8443) is True
+
+
+def test_tls_implicit_on_https_port_without_a_flag(mod):
+    # An operator who already moved to the conventional HTTPS interface gets encryption
+    # without having to also set CLICKHOUSE_SECURE.
+    assert mod._use_tls({}, 8443) is True
+
+
+def test_tls_unrecognized_value_is_treated_as_on(mod):
+    # A typo in the knob must not silently fall back to cleartext for the password.
+    assert mod._use_tls({"CLICKHOUSE_SECURE": "ture"}, 8123) is True

@@ -24,16 +24,17 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4Router
 
+from spyre_inference.models._prelaunch import disable_modalities
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from torch import nn
+    from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
@@ -101,25 +102,7 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
-def _disable_unsupported_modalities(engine_args: EngineArgs, has_audio: bool) -> None:
-    # A limit of 0 makes the frontend refuse the input per request; past it, the worker
-    # raises mid-step and takes the engine down with every in-flight request.
-    limits = dict(engine_args.limit_mm_per_prompt or {})
-    for modality in ("video", "audio") if has_audio else ("video",):
-        value = limits.get(modality)
-        # A dict without "count" takes vLLM's default, which enables the modality.
-        if isinstance(value, dict):
-            value = value.get("count", BaseDummyOptions().count)
-        if value:
-            raise NotImplementedError(
-                f"gemma-4 {modality} input is not supported on Spyre; remove it from "
-                "limit_mm_per_prompt."
-            )
-        limits[modality] = 0
-    engine_args.limit_mm_per_prompt = limits
-
-
-def force_text_backbone(engine_args: EngineArgs) -> None:
+def force_text_backbone(engine_args: EngineArgs, hf_config: PretrainedConfig | None) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
     Only a default: it is the same ``hf_overrides`` value ``GEMMA4_TEXT_BACKBONE_OVERRIDE``
@@ -131,28 +114,14 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     """
     if engine_args.hf_overrides:
         return
-    from vllm.transformers_utils.config import get_config
-
     # Detect gemma-4 by config model_type, not the checkpoint name: derivatives such as
-    # medgemma / translategemma carry a gemma4 config under an unrelated name. On any load
-    # failure, defer to ModelConfig, which loads the same config and raises the real error.
-    try:
-        hf_config = get_config(
-            engine_args.hf_config_path or engine_args.model,
-            engine_args.trust_remote_code,
-            engine_args.revision,
-            engine_args.code_revision,
-            engine_args.config_format,
-            token=engine_args.hf_token,
-        )
-    except Exception:
-        return
+    # medgemma / translategemma carry a gemma4 config under an unrelated name.
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return
     has_audio = getattr(hf_config, "audio_config", None) is not None
     # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
     if is_multimodal_gemma4(hf_config):
-        _disable_unsupported_modalities(engine_args, has_audio)
+        disable_modalities(engine_args, ("video", "audio") if has_audio else ("video",), "gemma-4")
         return
     if has_audio:
         # Falling through would force the text-only backbone and silently drop the

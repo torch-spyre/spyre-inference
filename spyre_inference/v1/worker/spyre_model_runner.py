@@ -37,7 +37,7 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 
 import numpy as np
 import torch
@@ -87,6 +87,7 @@ from spyre_inference.v1.pool.encoder_grid import (
     unpad_encoder_grid,
 )
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
+from spyre_inference.v1.sample import device_greedy
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
@@ -346,6 +347,7 @@ class _SpyreModelWrapper:
         model_dtype: torch.dtype,
         inputs_embeds_buffer: torch.Tensor | None = None,
         keep_aux_hidden_states_on_device: bool = False,
+        device_greedy_fn: Callable[[], bool] | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -358,6 +360,7 @@ class _SpyreModelWrapper:
         object.__setattr__(
             self, "_keep_aux_hidden_states_on_device", keep_aux_hidden_states_on_device
         )
+        object.__setattr__(self, "_device_greedy_fn", device_greedy_fn)
 
     @contextmanager
     def outputs_on_host(self):
@@ -431,7 +434,10 @@ class _SpyreModelWrapper:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
         hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
-        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
+        greedy_fn = self._device_greedy_fn
+        use_device_greedy = greedy_fn() if greedy_fn is not None else False
+        with device_greedy.activated() if use_device_greedy else nullcontext():
+            logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
             logits = logits[:num_rows]
@@ -731,6 +737,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
             keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
+            device_greedy_fn=self._device_greedy_now,
         )
 
     def _input_fits_in_drafter(self, common_attn_metadata):
@@ -797,6 +804,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _sample(self, logits, spec_decode_metadata):
         states = [(gen, gen.get_state()) for gen in self._discarded_generators().values()]
         try:
+            if logits is not None and logits.ndim == 1 and spec_decode_metadata is None:
+                return device_greedy.sampler_output(logits)
             return super()._sample(logits, spec_decode_metadata)
         finally:
             for gen, state in states:
@@ -836,6 +845,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
         super().reload_weights(*args, **kwargs)
         rewarm_after_reload(self)
 
+    def _device_greedy_now(self) -> bool:
+        """Whether this step's sample can be an on-device argmax.
+
+        Stays off during warmup so the dummy sampler still receives ``[B, V]`` logits.
+        Prompt logprobs and speculative decoding read the full rows, so they stay
+        on the host path too.
+        """
+        if not getattr(self, "_device_greedy_ready", False) or not envs.SPYRE_DEVICE_GREEDY:
+            return False
+        parallel = self.vllm_config.parallel_config
+        if parallel.tensor_parallel_size > 1 or parallel.pipeline_parallel_size > 1:
+            return False
+        if self.num_prompt_logprobs or self.speculative_config is not None:
+            return False
+        meta = self.input_batch.sampling_metadata
+        if meta is None:
+            return False
+        has_structured_output = any(
+            (req := self.requests.get(req_id)) is not None
+            and req.sampling_params is not None
+            and req.sampling_params.structured_outputs is not None
+            for req_id in self.input_batch.req_ids
+        )
+        return device_greedy.batch_is_device_greedy(meta, has_structured_output)
+
+    def _warmup_device_greedy(self, hidden_states: torch.Tensor) -> None:
+        """Compile the argmax at this row width. The result is discarded."""
+        if not envs.SPYRE_DEVICE_GREEDY:
+            return
+        wrapper = cast(_SpyreModelWrapper, self.model)
+        with device_greedy.activated():
+            wrapper._model.compute_logits(
+                convert_tensor_tree(hidden_states, device=wrapper._spyre_device)
+            )
+
     def warming_up_model(self) -> None:
         """Warm kernels / compile.
 
@@ -859,6 +903,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
+        self._device_greedy_ready = False
         # Before the first trace: see allocate_staging_buffers.
         allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
 
@@ -890,6 +935,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     self._record_attention_graphs()
                 self._warmup_multimodal_encoder()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
+            self._arm_device_greedy()
             return
 
         if is_pooling or self.spyre_shape_bucketer is None:
@@ -909,6 +955,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
+            self._arm_device_greedy()
             return
 
         bucket_sizes = self.spyre_shape_bucketer.bucket_sizes
@@ -939,6 +986,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+                    self._warmup_device_greedy(widest_hidden_states[:rows])
             self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
@@ -948,6 +996,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs()
         self._record_vision_graphs()
+        self._arm_device_greedy()
+
+    def _arm_device_greedy(self) -> None:
+        self._device_greedy_ready = (
+            envs.SPYRE_DEVICE_GREEDY and self.model_config.runner_type != "pooling"
+        )
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:

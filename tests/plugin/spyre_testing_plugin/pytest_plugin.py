@@ -1273,7 +1273,10 @@ def pytest_runtest_teardown(item, nextitem):
     if not spyre_hardware_present():
         return
     if getattr(item, "_spyre_reap_card", False):
-        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
+        # An xfail engine crash leaves a holder to kill, and the card needs a moment
+        # after the kill before the next test can open it.
+        settle = 3.0 if item.get_closest_marker("xfail") else 0.0
+        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log, settle=settle)
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)

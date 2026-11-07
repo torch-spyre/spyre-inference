@@ -131,7 +131,15 @@ def test_tp2_llm_generate_matches_tp1(record_property) -> None:
         # pins the text-only backbone -- the decoder is what TP splits anyway, and the
         # tower's weights and warmup would be paid for nothing. The nano model keeps
         # the 26B-A4B layout (MoE, sliding + full attention) at 6 layers.
-        ("joerunde/gemma-4-moe-nano", GEMMA4_TEXT_BACKBONE_OVERRIDE),
+        pytest.param(
+            "joerunde/gemma-4-moe-nano",
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="deeptools#4965 (dbo-opt uniformize_op crash); remove on the next "
+                "RPM bump once the fix is in",
+            ),
+        ),
     ],
     ids=["micro-g3.3", "gemma-4-moe-nano-text"],
 )

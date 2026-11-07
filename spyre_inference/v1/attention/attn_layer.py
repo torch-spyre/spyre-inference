@@ -117,7 +117,13 @@ def _spyre_attention_forward(
 
     dep = None
     slots = cast(SlotMapping, self.spyre_slots).slots
-    if slots is not None and key is not None and value is not None:
+    # A KV-sharing layer reads its target's cache and must never write it.
+    if (
+        slots is not None
+        and key is not None
+        and value is not None
+        and self.kv_sharing_target_layer_name is None
+    ):
         # `dep` makes "scatter before read" a real data dependency, which is otherwise
         # invisible because the op reaches its cache through the forward context.
         dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
@@ -153,7 +159,6 @@ def _can_split(layer: Attention) -> bool:
         # otherwise scatter into an unbound cache.
         layer.attn_type == AttentionType.DECODER
         and hasattr(layer.impl, "do_kv_cache_update")
-        and layer.kv_sharing_target_layer_name is None
         and layer.query_quant is None
     )
 

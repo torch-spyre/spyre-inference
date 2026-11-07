@@ -34,6 +34,7 @@ def test_platform_rejects_v2_before_constructing_a_worker(monkeypatch):
         parallel_config=NS(
             data_parallel_size=1, pipeline_parallel_size=1, tensor_parallel_size=1, world_size=1
         ),
+        cache_config=NS(kv_sharing_fast_prefill=False),
         speculative_config=NS(use_dflash=lambda: True),
     )
     monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")

@@ -23,6 +23,8 @@ newest matching build via an Artifactory AQL query.
 
 Subcommands:
   resolve --arch ARCH   Print each resolved RPM's repo-relative path.
+                        With --with-digest, print `<path>\t<sha1>` (empty sha1
+                        when the lock entry pins no digest, e.g. override arches).
   validate              Assert every package resolves on ALL arches.
   names                 Print package names (no network).
 
@@ -48,6 +50,9 @@ DEFAULT_LOCK = "spyre-rpms.lock"
 _NAME_RE = re.compile(r"\A[A-Za-z0-9._+-]+\Z")
 _VERSION_RE = re.compile(r"\A[A-Za-z0-9._+*-]+\Z")
 _TREE_RE = re.compile(r"\A[A-Za-z0-9._/-]*\Z")
+# Artifactory actual_sha1 is a 40-hex-digit digest; reject anything else so a
+# tampered lock cannot smuggle a shell-special string into the installer.
+_SHA1_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 
 def _check_field(kind, value, pattern):
@@ -134,8 +139,20 @@ def resolve_arch(specs, base_url, repo, token, arch):
             missing.append(f"{name} @ {version} (tree={tree or 'prod'}, {arch})")
             continue
         relpath = f"{tree}/{arch}/{fn}" if tree else f"{arch}/{fn}"
-        out.append((relpath, fn))
+        out.append((name, relpath, fn))
     return out, missing
+
+
+def package_sha1(data, name):
+    """The `sha1` pinned for `name` in [packages], or None if it carries none.
+
+    Only the exact x86_64 builds in [packages] pin a digest; override arches
+    wildcard the build and have nothing to verify against.
+    """
+    sha1 = data.get("packages", {}).get(name, {}).get("sha1")
+    if sha1 is not None:
+        _check_field("sha1", sha1, _SHA1_RE)
+    return sha1
 
 
 def cmd_resolve(args):
@@ -149,8 +166,11 @@ def cmd_resolve(args):
         for m in missing:
             print(f"::error::could not resolve {m}", file=sys.stderr)
         sys.exit(1)
-    for relpath, _ in resolved:
-        print(relpath)
+    for name, relpath, _ in resolved:
+        if args.with_digest:
+            print(f"{relpath}\t{package_sha1(data, name) or ''}")
+        else:
+            print(relpath)
 
 
 def cmd_validate(args):
@@ -195,6 +215,11 @@ def main():
 
     r = sub.add_parser("resolve", help="print repo-relative RPM paths for one arch")
     r.add_argument("--arch", required=True, choices=ARCHES)
+    r.add_argument(
+        "--with-digest",
+        action="store_true",
+        help="print `<path>\\t<sha1>` so the installer can verify each download",
+    )
     r.set_defaults(func=cmd_resolve)
 
     v = sub.add_parser("validate", help="assert every package resolves on all arches")

@@ -138,7 +138,7 @@ def _bundled_version(name, bundled):
 
 
 def resolve(cfg, client, bundle_path, rpm_repo):
-    """{name: x86_64 version} for cfg's bundle."""
+    """({name: x86_64 version}, {name: x86_64 actual_sha1}) for cfg's bundle."""
     repo, _, subpath = bundle_path.strip("/").partition("/")
     folder = "/".join(p for p in (subpath, BUNDLE_ARCH, "prod", cfg["bundle"]) if p)
     bundled = client.listing(repo, folder)
@@ -149,6 +149,12 @@ def resolve(cfg, client, bundle_path, rpm_repo):
 
     errors = []
     versions = {}
+    # The x86_64 actual_sha1 of each pinned build, asserted equal between the
+    # bundle and the published RPM repo here and persisted into the lock so the
+    # developer installer (scripts/install-pinned-rpms.sh) can verify what it
+    # downloads. Only x86_64 carries an exact build (overrides wildcard it), so
+    # only x86_64 gets a digest.
+    sha1s = {}
     for name in cfg["packages"]:
         if name in devel:
             continue
@@ -162,14 +168,19 @@ def resolve(cfg, client, bundle_path, rpm_repo):
         if sha1 != bundled[filename]:
             what = "missing" if sha1 is None else f"sha1 {sha1}, bundle has {bundled[filename]}"
             errors.append(f"{name}: {rpm_repo}/{BUNDLE_ARCH}/{filename} {what}")
+        else:
+            sha1s[name] = sha1
     for name, base in devel.items():
         if base not in versions:
             errors.append(f"{name}: its base package {base} did not resolve")
             continue
         versions[name] = versions[base]
         filename = _match_pattern(name, versions[name], BUNDLE_ARCH)
-        if filename not in published[BUNDLE_ARCH]:
+        published_sha1 = published[BUNDLE_ARCH].get(filename)
+        if published_sha1 is None:
             errors.append(f"{name}: {rpm_repo}/{BUNDLE_ARCH}/{filename} missing")
+        else:
+            sha1s[name] = published_sha1
     if errors:
         raise LockError("\n".join(errors))
     for arch, pins in overrides(cfg, versions).items():
@@ -185,14 +196,17 @@ def resolve(cfg, client, bundle_path, rpm_repo):
                 )
     if errors:
         raise LockError("\n".join(errors))
-    return {name: versions[name] for name in cfg["packages"]}
+    versions = {name: versions[name] for name in cfg["packages"]}
+    return versions, {name: sha1s[name] for name in cfg["packages"]}
 
 
 def verify(cfg, lock_text):
     """Offline: the lock is exactly what this tool renders for `cfg`."""
     data = tomllib.loads(lock_text)
     bundle = data.get("bundle", {})
-    versions = {name: spec["version"] for name, spec in data.get("packages", {}).items()}
+    packages = data.get("packages", {})
+    versions = {name: spec["version"] for name, spec in packages.items()}
+    sha1s = {name: spec["sha1"] for name, spec in packages.items() if "sha1" in spec}
     errors = []
     if bundle.get("id") != cfg["bundle"]:
         errors.append(
@@ -212,7 +226,11 @@ def verify(cfg, lock_text):
         for name, base in cfg.get("devel", {}).items()
         if versions.get(name) != versions.get(base)
     ]
-    if not errors and lock_text != render(cfg, versions):
+    # A lock predating digests carries no `sha1`; the installer warns and
+    # proceeds for it, so verify must accept it too and only hold a lock that
+    # *does* pin digests to rendering them exactly. Once every entry has one,
+    # the round-trip below enforces that they stay correct.
+    if not errors and lock_text != render(cfg, versions, sha1s):
         errors.append("lock differs from what this tool renders for it (edited by hand?)")
     if errors:
         raise LockError("\n".join(errors))
@@ -265,27 +283,49 @@ def overrides(cfg, versions):
     return out
 
 
-def render(cfg, versions):
+def render(cfg, versions, sha1s=None):
+    sha1s = sha1s or {}
     width = max(map(len, versions))
 
-    def table(header, pins, marked=True):
+    def table(header, pins, marked=True, digests=None):
         rows = []
         for name, v in pins.items():
-            row = f"{name:<{width}} = {{ version = {json.dumps(v)} }}"
+            fields = f"version = {json.dumps(v)}"
+            # Only the exact x86_64 builds carry a digest; override arches
+            # wildcard the build, so there is no single sha1 to pin.
+            if digests and name in digests:
+                fields += f", sha1 = {json.dumps(digests[name])}"
+            row = f"{name:<{width}} = {{ {fields} }}"
             if marked and v != wildcard(versions[name]):
                 row += f"  # stale: bundle has {_commit(versions[name])}"
             rows.append(row)
         return "\n".join([header, *rows])
 
     arch_pins = overrides(cfg, versions)
+    # The digest clause only describes a lock that actually pins digests. A
+    # pre-digest lock (none resolved yet, pending a maintainer regeneration with
+    # Artifactory access) keeps the original wording so `--verify` round-trips it.
+    if sha1s:
+        x86_64_clause = (
+            "# x86_64 is pinned to the bundle's exact builds, each with its Artifactory\n"
+            "# actual_sha1 so scripts/install-pinned-rpms.sh can verify the download. Power\n"
+            "# (ppc64le) and Z (s390x) pin the same commits with the build number wildcarded:\n"
+            "# builds differ across platforms, so they carry no digest. A row marked `stale`\n"
+            "# is held at an older commit by [tool.spyre-rpms.stale.<arch>] until that arch\n"
+            "# builds the bundled one."
+        )
+    else:
+        x86_64_clause = (
+            "# x86_64 is pinned to the bundle's exact builds. Power (ppc64le) and Z (s390x)\n"
+            "# pin the same commits with the build number wildcarded: builds differ across\n"
+            "# platforms. A row marked `stale` is held at an older commit by\n"
+            "# [tool.spyre-rpms.stale.<arch>] until that arch builds the bundled one."
+        )
     return f"""\
 # Generated from the Spyre RPM bundle below by scripts/lock_spyre_rpms.py.
 # Change [tool.spyre-rpms] in pyproject.toml and re-run it instead of editing.
 #
-# x86_64 is pinned to the bundle's exact builds. Power (ppc64le) and Z (s390x)
-# pin the same commits with the build number wildcarded: builds differ across
-# platforms. A row marked `stale` is held at an older commit by
-# [tool.spyre-rpms.stale.<arch>] until that arch builds the bundled one.
+{x86_64_clause}
 
 version = 2
 
@@ -297,7 +337,7 @@ tree = ""
 id = {json.dumps(cfg["bundle"])}
 
 # x86_64
-{table("[packages]", versions, marked=False)}
+{table("[packages]", versions, marked=False, digests=sha1s)}
 
 # Power
 {table("[overrides.ppc64le]", arch_pins["ppc64le"])}
@@ -331,7 +371,7 @@ def main():
     client = Artifactory(_env("ARTIFACTORY_BASE_URL", "ARTIFACTORY_URL"), _env("ARTIFACTORY_TOKEN"))
     try:
         cfg = load_config(args.pyproject)
-        versions = resolve(
+        versions, sha1s = resolve(
             cfg,
             client,
             _env("ARTIFACTORY_BUNDLE_PATH"),
@@ -339,7 +379,7 @@ def main():
         )
     except LockError as e:
         sys.exit(f"{e}\n{args.lock} left unchanged")
-    Path(args.lock).write_text(render(cfg, versions))
+    Path(args.lock).write_text(render(cfg, versions, sha1s))
     for name, version in versions.items():
         print(f"{name:<{max(map(len, versions))}} {version}")
     print(f"wrote {args.lock} from bundle {cfg['bundle']}")

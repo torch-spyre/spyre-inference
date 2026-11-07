@@ -98,6 +98,7 @@ tests:
       num-prompts: 50
 
   - test_name: serve_gemma4-26b-a4b_tp1_cics
+    server_health_timeout: 3600
     server_parameters:
       model: google/gemma-4-26B-A4B
       tensor-parallel-size: 1

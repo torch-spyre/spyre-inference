@@ -65,11 +65,17 @@ tests:
         - test: "test_distributed"
           mode: mandatory_pass
           tags: [model, upstream, uses_subprocess, distributed]
+        - test: "test_pooling"
+          mode: mandatory_pass
+          tags: [transformers, upstream, uses_subprocess]
+          params:
+            override:
+              use_v2_model_runner:
+                - false
       block_list:
         - test: "test_quantization"
         - test: "test_embed_loading"
         - test: "test_hybrid_attention"
-        - test: "test_pooling"
         - test: "test_mla"
 
     - rel_path: tests/v1/attention/test_attention_backends.py

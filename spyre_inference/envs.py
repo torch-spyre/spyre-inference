@@ -56,6 +56,27 @@ if TYPE_CHECKING:
 _cache: dict[str, Any] = {}
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable consistently."""
+    raw = os.getenv(name)
+
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+
+    if value in {"true", "yes", "on"}:
+        return True
+
+    if value in {"false", "no", "off"}:
+        return False
+
+    try:
+        return bool(int(value))
+    except ValueError as exc:
+        raise ValueError(f"Invalid boolean value for {name}: {raw!r}") from exc
+
+
 # --8<-- [start:env-vars-definition]
 environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
@@ -84,15 +105,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
-    "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
+    "SPYRE_ATTN_PROFILING": lambda: _env_bool("SPYRE_ATTN_PROFILING", False),
     # When "1" (default), pre-compile every attention variant the run can need during
     # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
     # compiling each variant lazily on first use.
-    "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
+    "SPYRE_ATTN_RECORD": lambda: _env_bool("SPYRE_ATTN_RECORD", True),
     # When "1", paged attention walks KV pages and batched decode walks logical
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
-    "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
+    "SPYRE_ATTN_FOR_EACH_TILE": lambda: _env_bool("SPYRE_ATTN_FOR_EACH_TILE", True),
     # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.
@@ -127,24 +148,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Under the default tiled walk it applies only to the
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
-    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
+    "SPYRE_BATCHED_DECODE": lambda: _env_bool("SPYRE_BATCHED_DECODE", True),
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.
-    "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
+    "SPYRE_JAGGED_DECODE": lambda: _env_bool("SPYRE_JAGGED_DECODE", True),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
     # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.
     # Set to "0" when torch runs far more threads than the CPUs it gets (e.g. with
     # SPYRE_UPDATE_THREAD_CONFIG=0 in a CPU-limited pod): there it is slower.
-    "SPYRE_BLOCKED_TRANSPOSE": lambda: bool(int(os.getenv("SPYRE_BLOCKED_TRANSPOSE", "1"))),
+    "SPYRE_BLOCKED_TRANSPOSE": lambda: _env_bool("SPYRE_BLOCKED_TRANSPOSE", True),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
-    "SPYRE_KERNEL_CACHE": lambda: os.getenv("SPYRE_KERNEL_CACHE", "0") == "1",
+    "SPYRE_KERNEL_CACHE": lambda: _env_bool("SPYRE_KERNEL_CACHE", False),
     # When "1", each TP rank copies only its vocab shard of the logits to the host and the
     # shards are gathered on the CPU. Needs OMP_WAIT_POLICY=PASSIVE (spinning OpenMP
     # threads otherwise slow the next step).
-    "SPYRE_LOGITS_CPU_GATHER": lambda: os.getenv("SPYRE_LOGITS_CPU_GATHER", "0") == "1",
+    "SPYRE_LOGITS_CPU_GATHER": lambda: _env_bool("SPYRE_LOGITS_CPU_GATHER", False),
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
     # instead of topping itself up with a short chunk of the next. Any non-positive
@@ -165,7 +186,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When "1" (default), clamp the CPU threading env vars (OMP_NUM_THREADS and
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
-    "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    "SPYRE_UPDATE_THREAD_CONFIG": lambda: _env_bool("SPYRE_UPDATE_THREAD_CONFIG", True),
 }
 # --8<-- [end:env-vars-definition]
 

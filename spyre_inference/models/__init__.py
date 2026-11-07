@@ -40,6 +40,9 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
+    "TransformersEmbeddingModel": (
+        "spyre_inference.transformers_backend:SpyreTransformersEmbeddingModel"
+    ),
     "DFlashDraftModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
     "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
     "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
@@ -162,9 +165,18 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     plugin leaves that to the worker, too late for an in-process engine, which by then
     has cached the upstream class of a multimodal architecture such as CLIP.
     """
+    from spyre_inference.hf_adapters import uses_hf_adapters
     from spyre_inference.models import clip, gemma4, muse_glimmer
 
     register_models()
+    if uses_hf_adapters(engine_args):
+        if engine_args.runner == "pooling" or engine_args.convert == "embed":
+            if engine_args.enable_chunked_prefill is True:
+                raise ValueError(
+                    "HF-adapters embedding requires complete requests; disable chunked prefill"
+                )
+            engine_args.enable_chunked_prefill = False
+        return
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
     muse_glimmer.force_language_model_only(engine_args)

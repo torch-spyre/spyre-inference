@@ -228,12 +228,40 @@ class TorchSpyrePlatform(CpuPlatform):
 
         @functools.wraps(create_model_config)
         def _spyre_create_model_config(self):
+            from spyre_inference.hf_adapters import uses_hf_adapters
             from spyre_inference.models import apply_prelaunch_overrides
             from spyre_inference.v1.spec_decode.config import normalize_speculative_config
 
             apply_prelaunch_overrides(self)
             normalize_speculative_config(self)
-            return create_model_config(self)
+            if not uses_hf_adapters(self):
+                return create_model_config(self)
+
+            # Adapter execution supplies forward/attention independently of HF's
+            # backend hooks. Select the wrapper before vLLM checks those hooks.
+            original_overrides = self.hf_overrides
+            architecture = (
+                "TransformersEmbeddingModel"
+                if self.runner == "pooling" or self.convert == "embed"
+                else "TransformersForCausalLM"
+            )
+            if callable(original_overrides):
+
+                def adapter_overrides(config):
+                    config = original_overrides(config)
+                    config.architectures = [architecture]
+                    return config
+
+                self.hf_overrides = adapter_overrides
+            else:
+                self.hf_overrides = {
+                    **original_overrides,
+                    "architectures": [architecture],
+                }
+            try:
+                return create_model_config(self)
+            finally:
+                self.hf_overrides = original_overrides
 
         EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
 
@@ -327,6 +355,10 @@ class TorchSpyrePlatform(CpuPlatform):
         # is model-specific.
         if vllm_config.model_config is None:
             return
+
+        from spyre_inference.hf_adapters import validate_hf_adapters_config
+
+        validate_hf_adapters_config(vllm_config)
 
         # Eager pads to the declared length just like the compiled path, so the cap has
         # to land before the split below -- and before anything derives from
@@ -794,6 +826,11 @@ class TorchSpyrePlatform(CpuPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
+        from spyre_inference.hf_adapters import uses_hf_adapters, validate_hf_adapters_config
+
+        validate_hf_adapters_config(vllm_config)
+        use_hf_adapters = uses_hf_adapters(vllm_config)
+
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
@@ -804,7 +841,8 @@ class TorchSpyrePlatform(CpuPlatform):
             # multimodal model builds its decoder from.
             from spyre_inference.models.gemma4 import repair_head_dim_access
 
-            repair_head_dim_access(vllm_config.model_config.hf_config)
+            if not use_hf_adapters:
+                repair_head_dim_access(vllm_config.model_config.hf_config)
 
             if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
                 supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
@@ -831,10 +869,9 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
-            cls._maybe_pad_head_dim(vllm_config)
-
-            # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
-            cls._maybe_pad_intermediate_size(vllm_config)
+            if not use_hf_adapters:
+                cls._maybe_pad_head_dim(vllm_config)
+                cls._maybe_pad_intermediate_size(vllm_config)
 
         parallel_config = vllm_config.parallel_config
 

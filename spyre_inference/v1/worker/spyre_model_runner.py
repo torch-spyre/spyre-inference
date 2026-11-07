@@ -45,7 +45,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
+from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
@@ -65,6 +65,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
+from spyre_inference.hf_adapters import uses_hf_adapters, validate_hf_adapters_config
 from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
@@ -651,9 +652,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
+        validate_hf_adapters_config(self.vllm_config)
+        use_hf_adapters = uses_hf_adapters(self.vllm_config)
         model_loader = get_model_loader(self.load_config)
 
-        install_pad_loaders(model_loader, self.model_config)
+        if not use_hf_adapters:
+            install_pad_loaders(model_loader, self.model_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -677,7 +681,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.speculative_config and self.speculative_config.use_dflash():
             self.drafter.load_model(self.model)
 
-        fix_padded_model(self.model, self.model_config)
+        if use_hf_adapters:
+            from spyre_inference.transformers_backend import SpyreTransformersMixin
+
+            with set_current_vllm_config(self.vllm_config):
+                cast(SpyreTransformersMixin, self.model).prepare_hf_adapters()
+        else:
+            fix_padded_model(self.model, self.model_config)
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
@@ -704,7 +714,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Patches instances/classes, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.
-        apply_multimodal_patches(self.model, self._spyre_device)
+        if not use_hf_adapters:
+            apply_multimodal_patches(self.model, self._spyre_device)
 
         self._setup_eagle3_aux_hidden_state_outputs()
 
@@ -833,6 +844,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
     def reload_weights(self, *args, **kwargs) -> None:
+        if uses_hf_adapters(self.vllm_config):
+            raise NotImplementedError("Reloading a prepared HF-adapters body is not supported")
         super().reload_weights(*args, **kwargs)
         rewarm_after_reload(self)
 

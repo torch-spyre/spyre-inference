@@ -55,6 +55,14 @@ def test_leaves_a_fitting_max_model_len_alone():
     assert config.max_model_len == 512
 
 
+@pytest.mark.parametrize("family", ["roberta", "xlm-roberta", "mpnet"])
+def test_caps_generic_transformers_wrapper_by_backbone_type(family):
+    config = _model_config(architectures=("TransformersEmbeddingModel",))
+    config.hf_config.model_type = family
+    cap_max_model_len_for_position_offset(config)
+    assert config.max_model_len == 512
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

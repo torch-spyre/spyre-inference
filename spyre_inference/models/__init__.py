@@ -41,6 +41,8 @@ _ADAPTED_MODULES = ("bert", "roberta")
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
     "DFlashDraftModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
+    "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
+    "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
     # Vision tower only: upstream builds its language model through the registry, as
     # Gemma4ForCausalLM below.
@@ -48,6 +50,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
     ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "GptOssForCausalLM": "spyre_inference.models.gpt_oss:SpyreGptOssForCausalLM",
+    "Granite4VisionForConditionalGeneration": (
+        "spyre_inference.models.granite4_vision:SpyreGranite4VisionForConditionalGeneration"
+    ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
@@ -62,13 +68,6 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
     ),
-}
-
-# Temporary XPress registrations; test_xpress_vendored.py flags the upstream migration.
-# Cleanup: https://github.com/torch-spyre/spyre-inference/issues/1417
-_NEW_ARCHS = {
-    "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
-    "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
 }
 
 
@@ -120,7 +119,7 @@ def register_models() -> None:
             "model adaptations need updating for this vLLM version."
         )
 
-    for arch, model_cls in (models | _NEW_ARCHS).items():
+    for arch, model_cls in models.items():
         ModelRegistry.register_model(arch, model_cls)
 
 

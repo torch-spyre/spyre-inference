@@ -35,12 +35,32 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tomllib
 import urllib.request
 
 ARCHES = ("x86_64", "ppc64le", "s390x")
 DEFAULT_LOCK = "spyre-rpms.lock"
+
+# The lock can come from an untrusted fork PR and its fields are formatted into
+# a credentialed AQL query, so they must not be able to escape it.
+_NAME_RE = re.compile(r"\A[A-Za-z0-9._+-]+\Z")
+_VERSION_RE = re.compile(r"\A[A-Za-z0-9._+*-]+\Z")
+_TREE_RE = re.compile(r"\A[A-Za-z0-9._/-]*\Z")
+
+
+def _check_field(kind, value, pattern):
+    if not isinstance(value, str) or not pattern.match(value):
+        sys.exit(f"::error::illegal {kind} in spyre-rpms.lock: {value!r}")
+    return value
+
+
+def _check_tree(value):
+    _check_field("tree", value, _TREE_RE)
+    if ".." in value.split("/"):
+        sys.exit(f"::error::illegal tree in spyre-rpms.lock (path traversal): {value!r}")
+    return value
 
 
 def load_data(path):
@@ -65,6 +85,9 @@ def resolve_specs(data, arch):
         ov = overrides.get(name, {})
         version = ov.get("version", spec["version"])
         tree = ov.get("tree", spec.get("tree", default_tree))
+        _check_field("package name", name, _NAME_RE)
+        _check_field("version", version, _VERSION_RE)
+        _check_tree(tree)
         specs.append((name, version, tree))
     return specs
 

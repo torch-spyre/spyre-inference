@@ -19,7 +19,7 @@ dependencies = [
     # Only reaches wheel consumers: the `[tool.uv.sources]` pin below drops this
     # specifier from uv's own resolution. `>=0.5.0` would reject the 0.5.0rc1 release.
     "torch-spyre[cpsat]>=0.5.0rc1",
-    "vllm[grpc]>=0.32.0,<0.33",
+    "vllm[grpc]>=0.33.0,<0.34",
 
     # Direct dep so it's picked up from the pytorch-cpu index. Pinned to the
     # [build-system] torch: the csrc/ extension links libtorch, so wheel consumers
@@ -125,6 +125,13 @@ override-dependencies = [
     # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
     # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.
     "pyzmq>=27.2.0",
+
+    # orjson dropped its ppc64le/s390x wheels at 3.12.0 and its sdist wants rustc >=1.95
+    # against UBI10's 1.92. Capped unconditionally rather than per-arch: a marker-gated
+    # pair forks the resolution, so the lock carries two orjson versions and every
+    # downstream marker grows an arch term. One version everywhere keeps x86_64 resolving
+    # the same as the Power/Z builds.
+    "orjson>=3.11.6,<3.12",
 ]
 
 constraint-dependencies = [
@@ -159,9 +166,9 @@ SPYRE_RPM_BUNDLE = "main_snap_2026_11_02_06"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f8a09bb0e96870ab30fa69e209b8915ac88bd130" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "752115ab288506bc327aa0870bbdddb93f583cc2" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -358,11 +365,12 @@ markers = [
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
     "attention_smoke: small representative decoder-attention subset (also marked attention); its own 1-card job carries attention coverage into the integration tier, which the full attention suite is excluded from",
+    "e2e_smoke: small representative e2e subset (tests/e2e/); its own integration-only jobs carry e2e coverage into the integration tier, which the full e2e suite is excluded from; admission: see docs/contributing/integration-tier.md",
     "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
     "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
-    "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",
+    "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py, the long-context encoder rerank case, the batched CLIP cases and the speculative-decoding checks); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",
     "rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)",
-    "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
+    "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py, tests/custom_ops/test_parallel_lm_head.py)",
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
@@ -373,9 +381,9 @@ markers = [
     "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
     "gemma4_vision: Gemma-4 vision-tower tests (tests/models/test_gemma4_mm.py, plus the on-card row in tests/e2e/test_multimodal.py)",
-    "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
-    "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
-    "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
+    "granite4_vision: Granite Vision 4 encoder tests (tests/models/test_granite4_vision.py)",
+    "blip2: Spyre BLIP-2 Q-Former attention tests (tests/models/test_blip2.py)",
+    "siglip: SigLIP tower head-padding tests (tests/models/test_siglip.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
     "rmsnorm: RMSNorm and GemmaRMSNorm custom-op tests (tests/custom_ops/test_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",

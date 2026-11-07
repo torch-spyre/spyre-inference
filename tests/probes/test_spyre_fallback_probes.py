@@ -23,6 +23,8 @@ All device tests run against the real Spyre device when available; otherwise
 they skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -1035,17 +1037,21 @@ def test_spyre_slot_major_scatter_hits_exact_slots(spyre_device):
             "eager",
             marks=pytest.mark.xfail(
                 strict=True,
+                raises=RuntimeError,
                 reason=(
-                    "index_copy_ has no eager on-device path: an int32 index is "
-                    "rejected, an int64 one falls back to CPU. This is why "
-                    "SpyreAttentionImpl compiles the write kernel unconditionally."
+                    "Eager index_copy_ rejects an int32 index ('Expected a long tensor "
+                    "for index'), and the index uploaded to Spyre is int32. This is why "
+                    "SpyreAttentionImpl compiles the write kernel and the grouped decode "
+                    "store unconditionally."
                 ),
             ),
         ),
     ],
 )
 def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
-    """The write kernel must be compiled; eager either raises or leaves the device."""
+    """The write kernel must be compiled: eager rejects the int32 index Spyre carries."""
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
     num_slots, num_kv_heads, head_size = 512, 8, 128
     slots = torch.arange(64, 96, dtype=torch.int32)
     kv_cpu = torch.randn(slots.numel(), num_kv_heads, head_size, dtype=torch.float16)
@@ -1057,7 +1063,9 @@ def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
         scatter = torch.compile(scatter, dynamic=False)
 
     pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device)
-    scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
 
     assert pages.device.type == "spyre", "scatter left the device"
     expected = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
@@ -1289,3 +1297,31 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 14. Parameter identity across model.to("spyre")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#5976: model.to('spyre') installs a new Parameter for each moved one "
+        "instead of keeping the object, as nn.Module.to does. When this XPASS-es, drop "
+        "_sink_owners and the moe_quant_config rebuild from move_model_to_spyre."
+    ),
+)
+def test_spyre_module_to_keeps_parameter_objects(spyre_device):
+    """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
+    must see the device tensor after the move, and a reload's in-place write."""
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    held = model.sinks
+
+    model.to(spyre_device)
+
+    assert model.sinks is held
+    new = torch.full((8,), 3.0, dtype=torch.float16)
+    model.sinks.data.copy_(new.to(spyre_device))
+    torch.testing.assert_close(held.cpu(), new)

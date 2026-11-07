@@ -40,6 +40,14 @@ models:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
+        device_config:
+          # Extend model/TP entries here, not shape checks in generic kernels.
+          kernel_hints:
+            linear:
+              qkv_proj: {512: [4, 8]}
+              o_proj: {512: [4, 8]}
+              down_proj: {512: [4, 8]}
+            rope: {512: 32}
 
   ibm-granite/granite-4.1-8b:
     platforms: [x86_64]
@@ -47,6 +55,14 @@ models:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
+        device_config:
+          # Extend model/TP entries here, not shape checks in generic kernels.
+          kernel_hints:
+            linear:
+              qkv_proj: {512: [4, 8]}
+              o_proj: {512: [4, 8]}
+              down_proj: {512: [4, 8]}
+            rope: {512: 32}
 
   ibm-granite/granite-4.1-8b-fp8:
     platforms: [x86_64, ppc64le]

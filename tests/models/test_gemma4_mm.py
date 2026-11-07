@@ -196,10 +196,10 @@ def test_pipeline_matches_stock(standardize, num_images):
 
 
 def test_padding_does_not_leak_into_images():
-    """Padding slots have their own segment, and each offset group is padded separately."""
+    """Padding keys are masked, and each offset group is padded separately."""
     config = _tower_config(num_layers=1)
     model = _spyre_model(config)
-    mm_kwargs = _mm_kwargs(_images())
+    mm_kwargs = _mm_kwargs(_images()[:1])
     values = model.prepare_encoder_cudagraph_replay_buffers(mm_kwargs, 0, 0).values
     padding = model.get_encoder_cudagraph_config().padding_logics
 
@@ -215,6 +215,14 @@ def test_padding_does_not_leak_into_images():
     # The pooled sums reach ~16, where one fp16 ulp is 1/64 and a longer key axis reorders
     # the accumulation; a leak would move whole tokens, not single ulps.
     torch.testing.assert_close(tight[:n], loose[:n], atol=2e-2, rtol=1e-2)
+
+
+def test_encoder_call_carries_one_image():
+    """The key-pad mask has no same-image term, so a packed call must never reach it."""
+    model = _spyre_model(_tower_config(num_layers=1))
+    assert model.vision_max_items_per_call == 1
+    with pytest.raises(AssertionError, match="one image per encoder call"):
+        model.vision_inputs(_mm_kwargs(_images()))
 
 
 def test_offset_major_sum_matches_the_stock_pooler():
@@ -998,7 +1006,7 @@ def test_compiled_pipeline_matches_stock_on_spyre():
     from spyre_inference.custom_ops.utils import convert
 
     config = _tower_config()
-    images = _images()
+    images = _images()[:1]
     model = _spyre_model(config).to("spyre")
     mm_kwargs = _mm_kwargs(images)
     values = model.prepare_encoder_cudagraph_replay_buffers(mm_kwargs, 0, 0).values

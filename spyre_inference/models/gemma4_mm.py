@@ -33,14 +33,11 @@ from vllm.v1.worker.encoder_cudagraph_defs import ENCODER_CUDAGRAPH_AXIS_KEYS_KW
 from spyre_inference.custom_ops.head_pad import pad_input_end, pad_output_end
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
-    SEGMENT_ITEMS,
+    _MASK_MIN,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
     offset_major,
-    one_hot_segments,
-    segment_buffer,
-    segment_mask,
     unbind_items,
 )
 from spyre_inference.multimodal.utils import (
@@ -416,7 +413,8 @@ def _images(mm_kwargs: dict[str, Any]) -> list[tuple[torch.Tensor, torch.Tensor]
 
 
 class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForConditionalGeneration):
-    vision_max_items_per_call = SEGMENT_ITEMS
+    # One image per call, so attention needs a [P] key-pad row, not a dense [P, P] image mask.
+    vision_max_items_per_call = 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         # Transformers builds the tower at vision_config.dtype (bf16), and bf16 + fp16 in a graph
@@ -434,7 +432,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         self._patch_width = align_up(3 * vision_config.patch_size**2)
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
-            "segments": segment_buffer(),
+            "key_pad": VisionBuffer(None, pad=_MASK_MIN),
             "pos_x": VisionBuffer(None, pad=0, dtype=torch.int64),
             "pos_y": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
@@ -549,33 +547,33 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         ]
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Valid patches laid out offset-major, so the pool is a sum over offset groups."""
+        """One image's valid patches laid out offset-major, so the pool is a sum over offset
+        groups."""
+        images = _images(mm_kwargs)
+        assert len(images) == 1, f"one image per encoder call, got {len(images)}"
+        ((pixel_values, positions),) = images
         k = self._pool
-        patches, segments, xs, ys = [], [], [], []
-        for i, (pixel_values, positions) in enumerate(_images(mm_kwargs)):
-            pixel_values = convert(pixel_values, device="cpu")
-            positions = convert(positions, device="cpu")
-            valid = (positions != -1).any(dim=-1)
-            values, pos = pixel_values[valid], positions[valid]
-            wp, hp = (int(n) + 1 for n in pos.max(dim=0).values)
-            if hp * wp != pos.shape[0] or hp % k or wp % k:
-                raise ValueError(
-                    f"Gemma 4 image {i}: {pos.shape[0]} valid patches do not fill a "
-                    f"{hp}x{wp} grid divisible by the {k}x{k} pooling kernel"
-                )
-            grid = torch.empty(hp, wp, values.shape[-1], dtype=values.dtype)
-            grid[pos[:, 1], pos[:, 0]] = values
-            patches.append(offset_major(grid, k))
-            xs.append(offset_major(torch.arange(wp).expand(hp, wp), k))
-            ys.append(offset_major(torch.arange(hp)[:, None].expand(hp, wp), k))
-            segments.append(torch.full((k * k, hp * wp // (k * k)), i))
+        pixel_values = convert(pixel_values, device="cpu")
+        positions = convert(positions, device="cpu")
+        valid = (positions != -1).any(dim=-1)
+        values, pos = pixel_values[valid], positions[valid]
+        wp, hp = (int(n) + 1 for n in pos.max(dim=0).values)
+        if hp * wp != pos.shape[0] or hp % k or wp % k:
+            raise ValueError(
+                f"Gemma 4 image: {pos.shape[0]} valid patches do not fill a "
+                f"{hp}x{wp} grid divisible by the {k}x{k} pooling kernel"
+            )
+        grid = torch.empty(hp, wp, values.shape[-1], dtype=values.dtype)
+        grid[pos[:, 1], pos[:, 0]] = values
         # Stock's patch embedder starts with 2 * (x - 0.5).
-        flat = (torch.cat(patches, dim=1).flatten(0, 1).float() * 2 - 1).to(torch.float16)
+        flat = (offset_major(grid, k).flatten(0, 1).float() * 2 - 1).to(torch.float16)
         return {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
-            "segments": one_hot_segments(torch.cat(segments, dim=1).flatten()),
-            "pos_x": torch.cat(xs, dim=1).flatten().to(torch.int64),
-            "pos_y": torch.cat(ys, dim=1).flatten().to(torch.int64),
+            "key_pad": torch.zeros(flat.shape[0], dtype=torch.float16),
+            "pos_x": offset_major(torch.arange(wp).expand(hp, wp), k).flatten().to(torch.int64),
+            "pos_y": offset_major(torch.arange(hp)[:, None].expand(hp, wp), k)
+            .flatten()
+            .to(torch.int64),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -590,7 +588,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         x = (torch.matmul(values["patches"], patch_weight_t) + rows[:, :hidden]).unsqueeze(0)
         cos = rows[:, hidden : hidden + head_dim][None, :, None]
         sin = rows[:, hidden + head_dim :][None, :, None]
-        mask = segment_mask(values["segments"], x.dtype)
+        mask = values["key_pad"][None, None, None, :]
         return x, {"position_embeddings": (cos, sin), "attention_mask": mask}
 
     def vision_blocks(self) -> nn.ModuleList:

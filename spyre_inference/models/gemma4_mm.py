@@ -510,6 +510,19 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             )
         return super().embed_multimodal(**kwargs)
 
+    def encoder_cache_rows(self, output: torch.Tensor) -> torch.Tensor:
+        """The tail in fp32 on the host, as upstream: its scale can overflow fp16.
+
+        ``vision_project`` pools to the vision width; the table is the text width.
+        """
+        tail = self._spyre_vision_tail
+        x = convert(output, device="cpu").float() * tail.scale
+        if tail.std_bias is not None and tail.std_scale is not None:
+            x = (x - tail.std_bias) * tail.std_scale
+        # embed_vision: a weightless RMSNorm, then the projection.
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
+        return (x @ tail.weight.t()).to(tail.dtype)
+
     @property
     def vision_pack_tokens(self) -> int:
         return self.max_tokens_per_item
@@ -523,15 +536,20 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """The tail in fp32 on the host, as upstream: its scale can overflow fp16."""
+        """Download at offset 0, project the real prefix, pad to the budget, then store.
+
+        Slicing on the card is a narrowed view (torch-spyre#3770). The fp32 tail stays
+        on the host until it can run on the card without overflowing fp16.
+        """
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
-        tail = self._spyre_vision_tail
-        x = outputs["default"][:num_tokens].float() * tail.scale
-        if tail.std_bias is not None and tail.std_scale is not None:
-            x = (x - tail.std_bias) * tail.std_scale
-        # embed_vision: a weightless RMSNorm, then the projection.
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
-        tokens = (x @ tail.weight.t()).to(tail.dtype)
+        downloaded = convert(outputs["default"], device="cpu")
+        tokens = self.encoder_cache_rows(downloaded[:num_tokens])
+        table = self.output_table
+        if table is not None:
+            pad = downloaded.shape[0] - tokens.shape[0]
+            if pad > 0 and tokens.shape[0] > 0:
+                tokens = torch.cat([tokens, tokens[-1:].repeat(pad, 1)], dim=0)
+            tokens = table.store(tokens, keep=num_tokens)
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
 
     def select_encoder_cudagraph_items(

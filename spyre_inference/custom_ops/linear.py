@@ -40,10 +40,6 @@ from spyre_inference import envs
 
 logger = init_logger(__name__)
 
-# torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
-# full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
-_PAD_ROWS = 8
-_MAX_PAD_WEIGHT = 200_000_000
 _TRANSPOSE_BLOCK_ROWS = 128
 
 
@@ -68,24 +64,15 @@ def spyre_linear_t(
     x: torch.Tensor,
     weight_t: torch.Tensor,
     bias: torch.Tensor | None,
-    pad_rows: bool = False,
 ):
     """Linear forward with a pre-transposed weight: `x @ Wᵀ (+ bias)`.
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
-
-    ``pad_rows`` pads a short 2-D row block up to ``_PAD_ROWS`` and slices it
-    back (torch-spyre#4032). Callers that must not pad leave it off.
     """
-    rows = x.shape[0] if pad_rows and x.dim() == 2 else 0
-    if 0 < rows < _PAD_ROWS:
-        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
     out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
-    if 0 < rows < _PAD_ROWS:
-        out = out[:rows]
     return out
 
 
@@ -133,9 +120,6 @@ class SpyreTransposedWeightMethod:
         # so a distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
         setattr(layer, self.WEIGHT_T_ATTR, Parameter(_transpose_contiguous(w), requires_grad=False))
 
-    def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
-        return False
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -146,7 +130,6 @@ class SpyreTransposedWeightMethod:
             x,
             getattr(layer, self.WEIGHT_T_ATTR),
             bias,
-            pad_rows=self._pad_short_rows(layer),
         )
         padding = cast(int, layer.spyre_row_padding)
         if padding:
@@ -164,26 +147,6 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
     Uses the shared base defaults (`WEIGHT_T_ATTR="weight"`, no padding), so the
     forward GEMM is the Spyre-fast `x @ Wᵀ` instead of `F.linear`'s `x @ Aᵀ`.
     """
-
-
-class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
-    """Pads a partial row block to `_PAD_ROWS`; set on every merged-column layer."""
-
-    def _pads(self, layer: torch.nn.Module) -> bool:
-        return cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR)).numel() <= _MAX_PAD_WEIGHT
-
-    def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
-        return self._pads(layer)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        super().process_weights_after_loading(layer)
-        if self._pads(layer):
-            logger.warning_once(
-                "%s: short row blocks padded to %d rows (torch-spyre#4032) "
-                "expect numerical differences to upstream vLLM.",
-                layer.__class__.__name__,
-                _PAD_ROWS,
-            )
 
 
 class _SpyreTransposedLinearMixin:
@@ -212,8 +175,6 @@ class SpyreColumnParallelLinear(_SpyreTransposedLinearMixin, ColumnParallelLinea
 @MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
 class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnParallelLinear):
     """OOT MergedColumnParallelLinear (e.g. gate_up_proj) storing `Wᵀ`."""
-
-    LINEAR_METHOD = SpyrePaddedRowsLinearMethod
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")

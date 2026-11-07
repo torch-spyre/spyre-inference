@@ -161,8 +161,8 @@ def test_unquantized_layers_get_spyre_method(tp_group):
 def _rows_reaching_gemm(gate_up, x, monkeypatch):
     """Rows that reach ``torch.matmul``.
 
-    Short-row padding happens inside ``spyre_linear_t``, so ``apply`` still sees
-    the real token count. On CPU ``out[:m]`` matches whether or not the pad fired.
+    ``spyre_linear_t`` forwards the real token count, so this is the row count the
+    GEMM sees.
     """
     from spyre_inference.custom_ops import linear as linear_mod
 
@@ -180,24 +180,16 @@ def _rows_reaching_gemm(gate_up, x, monkeypatch):
 
 
 @pytest.mark.mlp
-@pytest.mark.parametrize(
-    ("num_tokens", "expected_rows"),
-    [(1, 8), (4, 8), (7, 8), (8, 8), (9, 9), (64, 64)],
-)
-def test_short_rows_padded_on_gate_up(tp_group, monkeypatch, num_tokens, expected_rows):
-    """A partial row block reaches the GEMM padded to `_PAD_ROWS`; a full one is untouched."""
-    from spyre_inference.custom_ops.linear import (
-        SpyrePaddedRowsLinearMethod,
-        SpyreUnquantizedLinearMethod,
-    )
+@pytest.mark.parametrize("num_tokens", [1, 4, 7, 8, 9, 64])
+def test_short_rows_are_not_padded_on_gate_up(tp_group, monkeypatch, num_tokens):
+    """Short row blocks reach the GEMM at their real height (padding was removed)."""
+    from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
 
     hidden, inter = 128, 256
     torch.manual_seed(0)
     mlp = _make_mlp_module(hidden, inter)
-    assert isinstance(mlp.gate_up_proj.quant_method, SpyrePaddedRowsLinearMethod)
-    assert not isinstance(mlp.down_proj.quant_method, SpyrePaddedRowsLinearMethod)
-
     gate_up = mlp.gate_up_proj
+    assert isinstance(gate_up.quant_method, SpyreUnquantizedLinearMethod)
     gate_up.weight.data.normal_(std=0.02)
     gate_up.quant_method.process_weights_after_loading(gate_up)
 
@@ -206,26 +198,9 @@ def test_short_rows_padded_on_gate_up(tp_group, monkeypatch, num_tokens, expecte
     reference = SpyreUnquantizedLinearMethod().apply(gate_up, x, None)
 
     rows, out = _rows_reaching_gemm(gate_up, x, monkeypatch)
-    assert rows == expected_rows
+    assert rows == num_tokens
     assert out.shape == (num_tokens, 2 * inter)
     torch.testing.assert_close(out.float(), reference.float(), atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.mlp
-def test_large_weights_not_padded(tp_group, monkeypatch):
-    """The weight bound disables padding, since past it the pad rows cost more."""
-    from spyre_inference.custom_ops import linear as linear_mod
-
-    hidden, inter = 128, 256
-    torch.manual_seed(0)
-    gate_up = _make_mlp_module(hidden, inter).gate_up_proj
-    gate_up.weight.data.normal_(std=0.02)
-    gate_up.quant_method.process_weights_after_loading(gate_up)
-
-    x = torch.randn(1, hidden, dtype=torch.float16)
-    monkeypatch.setattr(linear_mod, "_MAX_PAD_WEIGHT", gate_up.weight.numel() - 1)
-    rows, _ = _rows_reaching_gemm(gate_up, x, monkeypatch)
-    assert rows == 1
 
 
 # ---------------------------------------------------------------------------

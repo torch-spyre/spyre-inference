@@ -132,7 +132,7 @@ def _imports_model_runner(tree: ast.Module, containing_package: str) -> bool:
     # Not just cosmetic: the root tests/conftest.py skips any item whose id
     # contains "batched_decode" (unrelated to this package), which would
     # otherwise silently skip, rather than run, this check on
-    # batched_decode.py / batched_decode_head_major.py.
+    # batched_decode.py.
     ids=lambda p: str(p.relative_to(_REPO_ROOT)).replace("_", "-"),
 )
 def test_nothing_outside_the_package_imports_it(path: pathlib.Path) -> None:

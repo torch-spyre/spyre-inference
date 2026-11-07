@@ -326,7 +326,7 @@ def test_spyre_topk_scatter_dense_routing(spyre_device):
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
-    Mirrors the page gather in page_attn_kernel, but with a 0-dim
+    Mirrors the paged attention page gather, but with a 0-dim
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
@@ -431,10 +431,11 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     ],
 )
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
-    """`k_pages[idx]` for the page gather: works compiled, fails eager.
+    """`k_pages[idx]` for the page gather: works compiled, fails eager (torch-spyre#4334).
 
-    This asymmetry is why page_attn_kernel gathers with index_select,
-    which works in both modes.
+    The paged attention kernels gather pages this way, which is why SpyreAttentionImpl
+    compiles attention on Spyre even under --enforce-eager. When the eager case XPASSes,
+    `_page_attn_fns` and `_batched_decode_supported` can honor eager on Spyre too.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
     int32_elems_per_stick = 32
@@ -906,7 +907,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     An index that is a row of a 2-D table argument loses all but its first stick
     (test_spyre_scatter_index_row_of_2d_table); an in-graph slice of a
     stacked table is a different mechanism and holds at this shape, which is what
-    ``page_attn_head_major_prefill`` reads.
+    ``page_attn_prefill`` reads.
     """
     blocks, block_size, head_size = 4, 64, 64
     pages_cpu, pages = _stacked_index_pages(blocks, 1, block_size, head_size, spyre_device)
@@ -934,7 +935,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     ),
 )
 def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
-    """The same idea at the [KV, 1] entry shape ``page_attn_head_major`` gathers with.
+    """The same idea at the [KV, 1] entry shape ``page_attn_decode`` gathers with.
 
     A 2-D entry cannot go through index_select, hence the subscript.
     """
@@ -968,7 +969,7 @@ def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
 def test_spyre_scatter_index_row_of_2d_table(spyre_device):
     """index_copy_ with row 0 of a [2, 64] table, the form a [KV, T] head-major write index takes.
 
-    When this XPASS-es, SpyreHeadMajorAttentionImpl.kv_write_index can upload one [KV, T]
+    When this XPASS-es, SpyreAttentionImpl.kv_write_index can upload one [KV, T]
     tensor and hand the store its rows, instead of one allocation and H2D copy per KV head.
     """
     rows, entries, width = 128, 64, 128

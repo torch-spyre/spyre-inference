@@ -257,9 +257,8 @@ num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
 `SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
 less warmup.
 
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
-default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), warmup
+records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
@@ -272,8 +271,7 @@ each cached token takes:
 vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
-It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
 ...) are rejected at startup. It does not raise capacity: the platform pins the block count
 to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
 same number of tokens in half the device memory. Attention still computes in the model

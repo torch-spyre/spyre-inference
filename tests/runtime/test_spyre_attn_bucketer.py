@@ -625,13 +625,8 @@ class TestBatchedDecodeVariants:
 
 
 class TestSingleKvHeadBlockFloor:
-    """A lone KV head on a lone page will not compile under the head-major layout, so
-    the block ladder floors to two -- see the note at the floor."""
-
-    @pytest.fixture(autouse=True)
-    def _head_major(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
-        envs.clear_env_cache()
+    """A lone KV head on a lone page will not compile, so the block ladder floors to
+    two -- see the note at the floor."""
 
     def test_floors_the_ladder_at_one_kv_head(self):
         b = SpyreAttnBucketer(make_config(num_kv_heads=1))
@@ -661,15 +656,6 @@ class TestSingleKvHeadBlockFloor:
 
     def test_no_floor_above_one_kv_head(self):
         b = SpyreAttnBucketer(make_config(num_kv_heads=2))
-        assert min(b.num_blocks_buckets) == 1
-
-
-class TestSingleKvHeadBlockFloorTokenMajor:
-    def test_token_major_keeps_the_single_block_bucket(self, monkeypatch):
-        """Only the head-major decode kernel has the constraint."""
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
-        envs.clear_env_cache()
-        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
         assert min(b.num_blocks_buckets) == 1
 
 

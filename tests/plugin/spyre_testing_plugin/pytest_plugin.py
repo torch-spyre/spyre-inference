@@ -1156,11 +1156,8 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view; the physical layout underneath is token-major, which vLLM
-    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
-    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
-    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
-    # physical layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view, which is SpyreAttentionBackend's page shape with K and V
+    # concatenated on the last dim, so only the split and the device layout are ours.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -1181,24 +1178,25 @@ def patch_backend_list(request, monkeypatch):
         # defaulted parameters (use_cuda_graph in 0.30, layer_k/v_scale in 0.31).
         if backend == AttentionBackendEnum.CUSTOM:
 
-            def pin_slot_major(blocks):
-                # The KV write needs the slot-outermost layout, not the default.
+            def pin_head_major(blocks):
+                # The kernels gather a page along device dim 0, not the default layout's.
                 if blocks.device.type != "spyre":
                     return blocks
-                from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
+                from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
 
-                nb, bs, nkvh, hs = blocks.shape
+                nb, nkvh, bs, hs = blocks.shape
                 return blocks.cpu().to(
                     blocks.device,
-                    device_layout=slot_major_kv_layout(nb * bs, nkvh, hs, blocks.dtype),
+                    device_layout=head_major_kv_layout(nb * nkvh, bs, hs, blocks.dtype),
                 )
 
-            # K and V are concatenated on the last dim.
+            # Upstream hands an fp8 cache over as its uint8 bytes.
+            if kv_cache.dtype == torch.uint8:
+                kv_cache = kv_cache.view(torch.float8_e4m3fn)
             head_size = kv_cache.shape[-1] // 2
-            kv_cache = kv_cache.transpose(1, 2)
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (pin_slot_major(k_blocks), pin_slot_major(v_blocks))
+            kv_cache = (pin_head_major(k_blocks), pin_head_major(v_blocks))
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,
@@ -1215,6 +1213,36 @@ def patch_backend_list(request, monkeypatch):
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
+
+    # Upstream hands the store its raw slot mapping; attn_layer publishes the impl's own
+    # write index instead, one tensor per KV head. It also skips the load-time read of
+    # the layer's fp8 KV scales (resolve_kv_scales), which the store needs first.
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+
+    orig_update = SpyreAttentionImpl.do_kv_cache_update
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self.kv_cache_fp8 and self._kv_scales is None:
+            self.prepare_kv_scales(layer)
+        if isinstance(slot_mapping, torch.Tensor):
+            slot_mapping = self.kv_write_index(slot_mapping.cpu(), kv_cache[0].device)
+        return orig_update(self, layer, key, value, kv_cache, slot_mapping)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "do_kv_cache_update", do_kv_cache_update)
+
+    # The test runs on CPU, where a Spyre device layout (the batched decode index's stick
+    # layout) cannot be built; the plain transfer carries the same values.
+    orig_to = torch.Tensor.to
+
+    def to(tensor, *args, device_layout=None, **kwargs):
+        target = args[0] if args else kwargs.get("device")
+        if device_layout is not None and torch.device(target).type != "spyre":
+            device_layout = None
+        if device_layout is None:
+            return orig_to(tensor, *args, **kwargs)
+        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
 
     yield
 

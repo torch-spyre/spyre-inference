@@ -654,6 +654,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
 
         install_pad_loaders(model_loader, self.model_config)
+        # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
+        # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
+        # an nn.Module, but just the attention implementation.
+        Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
         # Load model on CPU
         self.model = model_loader.load_model(

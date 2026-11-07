@@ -139,6 +139,10 @@ class TorchSpyreWorker(Worker):
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
 
+        # Register `--load-format spyre`. Only the worker calls get_model_loader(), and
+        # this runs regardless of `VLLM_PLUGINS`, so it is the single registration point.
+        import spyre_inference.model_loader  # noqa: F401
+
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,

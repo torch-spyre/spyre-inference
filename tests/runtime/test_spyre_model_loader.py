@@ -1,0 +1,317 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for SpyreModelLoader and direct-to-device weight loading."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+from vllm.config import LoadConfig, ModelConfig, ParallelConfig, VllmConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader import get_model_loader
+
+from spyre_inference.model_loader import (
+    SpyreModelLoader,
+    _check_all_weights_loaded,
+    _get_host_loaded_param_names,
+)
+from spyre_inference.platform import (
+    TorchSpyrePlatform,
+    _is_multimodal_config,
+    _spyre_loader_supported,
+)
+
+
+def test_spyre_model_loader_registration():
+    """Verify that --load-format spyre returns SpyreModelLoader."""
+    load_config = LoadConfig(load_format="spyre")
+    loader = get_model_loader(load_config)
+    assert isinstance(loader, SpyreModelLoader)
+
+
+def _make_vllm_config(
+    tp_size=1,
+    quantization=None,
+    runner_type="generate",
+    load_format="auto",
+    transformers_backend=False,
+    moe=False,
+):
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+        quantization=quantization,
+    )
+    if runner_type != "generate":
+        model_config.runner_type = runner_type
+    if transformers_backend:
+        model_config.using_transformers_backend = lambda: True
+    if moe:
+        model_config.hf_text_config.num_experts = 8
+    return VllmConfig(
+        model_config=model_config,
+        load_config=LoadConfig(load_format=load_format),
+        parallel_config=ParallelConfig(tensor_parallel_size=tp_size),
+    )
+
+
+def test_platform_defaults_load_format_to_spyre():
+    """Positive control: a plain TP=1 text-generation config flips auto → spyre."""
+    vllm_config = _make_vllm_config()
+    assert vllm_config.load_config.load_format == "spyre"
+
+
+def test_platform_defaults_load_format_to_spyre_tp2():
+    """TP>1 is supported: auto resolves to spyre (linear weights shard on read)."""
+    vllm_config = _make_vllm_config(tp_size=2)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "spyre"
+
+
+def test_platform_defaults_load_format_to_spyre_multimodal():
+    """Multimodal models are supported: auto resolves to spyre."""
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.multimodal_config = object()
+    vllm_config.load_config.load_format = "auto"
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "spyre"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"quantization": "fp8"},  # quantized
+        {"runner_type": "pooling"},  # pooling
+    ],
+    ids=["quantized", "pooling"],
+)
+def test_platform_load_format_stays_auto(kwargs):
+    """load_format stays 'auto' for configs SpyreModelLoader doesn't support."""
+    vllm_config = _make_vllm_config(**kwargs)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "auto"
+
+
+# ---------------------------------------------------------------------------
+# _is_multimodal_config unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_multimodal_config_detects_multimodal():
+    """Both vLLM-native multimodal attributes are recognised."""
+    assert _is_multimodal_config(SimpleNamespace(multimodal_config=object()))
+    assert _is_multimodal_config(SimpleNamespace(is_multimodal_model=True))
+
+
+def test_is_multimodal_config_text_only():
+    """Text-only configs are not treated as multimodal."""
+    assert not _is_multimodal_config(SimpleNamespace())
+    assert not _is_multimodal_config(
+        SimpleNamespace(is_multimodal_model=False, multimodal_config=None)
+    )
+
+
+# ---------------------------------------------------------------------------
+# _spyre_loader_supported unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_ns(
+    tp_size=1,
+    runner_type="generate",
+    quantization=None,
+    transformers_backend=False,
+    moe=False,
+    multimodal=False,
+):
+    """Build a minimal SimpleNamespace config for _spyre_loader_supported tests."""
+    model_config = SimpleNamespace(
+        runner_type=runner_type,
+        quantization=quantization,
+        hf_text_config=SimpleNamespace(num_experts=8) if moe else SimpleNamespace(),
+        multimodal_config=object() if multimodal else None,
+        is_multimodal_model=False,
+    )
+    if transformers_backend:
+        model_config.using_transformers_backend = lambda: True
+    parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
+    return SimpleNamespace(model_config=model_config, parallel_config=parallel_config)
+
+
+def test_spyre_loader_supported_accepts_valid_config():
+    """Positive case: generate, unquantized, dense, non-transformers-backend is supported."""
+    assert _spyre_loader_supported(_make_ns())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"tp_size": 2}, {"tp_size": 4}, {"multimodal": True}, {"tp_size": 2, "multimodal": True}],
+    ids=["tp2", "tp4", "multimodal", "tp2-multimodal"],
+)
+def test_spyre_loader_supported_accepts_tp_and_multimodal(kwargs):
+    """TP > 1 and multimodal models are supported by the direct-to-device loader."""
+    assert _spyre_loader_supported(_make_ns(**kwargs))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "description"),
+    [
+        ({"runner_type": "pooling"}, "pooling runner"),
+        ({"runner_type": "unknown_future_runner"}, "unknown runner type"),
+        ({"quantization": "fp8"}, "quantized"),
+        ({"transformers_backend": True}, "transformers backend"),
+        ({"moe": True}, "MoE"),
+    ],
+)
+def test_spyre_loader_supported_rejects_unsupported(kwargs, description):
+    """_spyre_loader_supported returns False for each excluded config class."""
+    assert not _spyre_loader_supported(_make_ns(**kwargs)), description
+
+
+def test_platform_load_format_stays_auto_transformers_backend():
+    """load_format stays 'auto' for the transformers backend."""
+    assert _make_vllm_config(transformers_backend=True).load_config.load_format == "auto"
+
+
+def test_platform_load_format_stays_auto_moe():
+    """load_format stays 'auto' for MoE models."""
+    assert _make_vllm_config(moe=True).load_config.load_format == "auto"
+
+
+def test_explicit_spyre_load_format_rejected_for_unsupported_config():
+    """--load-format spyre passed explicitly raises for unsupported configs.
+
+    VllmConfig is built normally (load_format="auto"), then load_format is
+    patched to "spyre" directly on the load_config object to bypass pydantic
+    validation (which only accepts registered formats at construction time).
+    _spyre_loader_supported is mocked to False to simulate an unsupported config.
+    """
+    import unittest.mock as mock
+
+    import spyre_inference.platform as plat_mod
+
+    vllm_config = _make_vllm_config()
+    vllm_config.load_config.load_format = "spyre"
+    with (
+        mock.patch.object(plat_mod, "_spyre_loader_supported", return_value=False),
+        pytest.raises(ValueError, match="--load-format spyre is not supported"),
+    ):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_get_host_loaded_param_names(tp_group):
+    """Verify VocabParallelEmbedding parameters stay host-loaded."""
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = VocabParallelEmbedding(10, 10)
+            self.dense = nn.Linear(10, 10)
+
+    model = DummyModel()
+    host_names = _get_host_loaded_param_names(model)
+    assert "embed.weight" in host_names
+    assert "dense.weight" not in host_names
+
+
+def test_check_all_weights_loaded_passes_when_complete():
+    model = nn.Sequential(nn.Linear(2, 2))
+    _check_all_weights_loaded(model, {"0.weight", "0.bias"})
+
+
+def test_check_all_weights_loaded_raises_on_missing_param():
+    """A parameter with no checkpoint tensor would keep its uninitialized placeholder."""
+    model = nn.Sequential(nn.Linear(2, 2))
+    with pytest.raises(ValueError, match="not initialized from checkpoint.*0.bias"):
+        _check_all_weights_loaded(model, {"0.weight"})
+
+
+def test_check_all_weights_loaded_skips_untracked_models():
+    """A model whose load_weights returns None cannot be checked; it must not raise."""
+    model = nn.Sequential(nn.Linear(2, 2))
+    _check_all_weights_loaded(model, None)
+
+
+@pytest.mark.parametrize("attr", ["_spyre_orig_head_dim", "_spyre_orig_intermediate_size"])
+def test_spyre_loader_supported_rejects_padded(attr):
+    ns = _make_ns()
+    ns.model_config.hf_text_config = SimpleNamespace(**{attr: 16})
+    assert not _spyre_loader_supported(ns)
+
+
+def test_spyre_loader_supported_accepts_unpadded_text_config():
+    ns = _make_ns()
+    ns.model_config.hf_text_config = SimpleNamespace()
+    assert _spyre_loader_supported(ns)
+
+
+def test_gate_sees_padding_applied_by_the_hook(monkeypatch):
+    """The hook must pad before gating, since check_and_update_config runs later."""
+    vllm_config = _make_vllm_config()
+    vllm_config.load_config.load_format = "auto"
+
+    def fake_pad(cls, config):
+        config.model_config.hf_text_config._spyre_orig_head_dim = 16
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_maybe_pad_head_dim", classmethod(fake_pad))
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "auto"
+
+
+def test_explicit_spyre_load_format_rejected_for_padded_config():
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_text_config._spyre_orig_intermediate_size = 160
+    vllm_config.load_config.load_format = "spyre"
+    with pytest.raises(ValueError, match="--load-format spyre is not supported"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+class _FakeMultimodal(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Linear(2, 2)
+        self.vision_tower = nn.Linear(2, 2)
+        self.projector = nn.Linear(2, 2)
+
+
+_NON_TEXT = {"vision_tower.weight", "vision_tower.bias", "projector.weight", "projector.bias"}
+
+
+def test_host_loaded_names_include_vision_tower(monkeypatch):
+    from spyre_inference.custom_ops import text_backbone
+
+    model = _FakeMultimodal()
+    monkeypatch.setattr(
+        text_backbone, "_language_backbones", lambda m: [("language_model", m.language_model)]
+    )
+    assert _get_host_loaded_param_names(model) == _NON_TEXT
+
+
+def test_non_text_parameter_names_text_only_model(monkeypatch):
+    from spyre_inference.custom_ops import text_backbone
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    monkeypatch.setattr(text_backbone, "_language_backbones", lambda m: [("", m)])
+    assert text_backbone.non_text_parameter_names(model) == set()
+
+
+def test_non_text_parameter_names_unisolatable_backbone_is_conservative(monkeypatch):
+    from spyre_inference.custom_ops import text_backbone
+
+    model = _FakeMultimodal()
+    monkeypatch.setattr(text_backbone, "_language_backbones", lambda m: None)
+    assert text_backbone.non_text_parameter_names(model) == {n for n, _ in model.named_parameters()}

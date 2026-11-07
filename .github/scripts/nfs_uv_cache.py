@@ -82,7 +82,7 @@ def uv_version(uv):
     return parts[1] if len(parts) > 1 else out.strip()
 
 
-def compute_key(key_files, salt=KEY_SALT, uv_version=""):
+def compute_key(key_files, salt=KEY_SALT, uv_version="", key_salt=""):
     """Content-address the cache on the lockfiles' basenames and bytes.
 
     Only the basename, never the absolute path, feeds the digest -- runners with
@@ -93,6 +93,8 @@ def compute_key(key_files, salt=KEY_SALT, uv_version=""):
     digest = hashlib.sha256(salt.encode())
     if uv_version:
         digest.update(b"\0uv\0" + uv_version.encode())
+    if key_salt:
+        digest.update(b"\0salt\0" + key_salt.encode())
     for path in key_files:
         digest.update(b"\0")
         digest.update(os.fsencode(os.path.basename(path)))
@@ -162,10 +164,11 @@ def _extract(tar_path, dest):
     )
 
 
-def _create_tar(src, tar_path, compress_prog):
+def _create_tar(src, tar_path, compress_prog, exclude=()):
     cmd = ["tar"]
     if compress_prog:
         cmd += ["--use-compress-program", compress_prog]
+    cmd += [f"--exclude={pattern}" for pattern in exclude]
     cmd += ["-cf", str(tar_path), "-C", str(src), "."]
     subprocess.run(cmd, check=True)
 
@@ -178,6 +181,30 @@ def _write_kv(path, pairs):
             handle.write(f"{key}={value}\n")
 
 
+def _default_cache_dir(uv):
+    # The dir every later uv step in the job resolves, UV_CACHE_DIR included.
+    out = subprocess.run(
+        [uv, "cache", "dir"], capture_output=True, text=True, check=True, timeout=UV_TIMEOUT_S
+    )
+    return Path(out.stdout.strip())
+
+
+def _merge(src, dest):
+    # Hardlink without clobbering, so entries already in dest win. Archives go
+    # first: the bucket symlinks point into them.
+    dest.mkdir(parents=True, exist_ok=True)
+    # Not -a: preserving times or owners on dirs of dest that another uid owns (the
+    # image's cache under an OpenShift uid) fails.
+    cmd = ["cp", "-R", "-P", "-n"]
+    if os.stat(src).st_dev == os.stat(dest).st_dev:
+        cmd.append("-l")
+    for part in sorted(src.iterdir(), key=lambda p: not p.name.startswith("archive-v")):
+        # coreutils 9.2-9.4 exit 1 whenever -n skips a file, so judge by the result.
+        subprocess.run([*cmd, str(part), str(dest)])
+        if not (dest / part.name).exists():
+            raise OSError(f"could not merge {part.name} into {dest}")
+
+
 def cmd_restore(args):
     scopes = read_scopes(args.event_name, args.ref, args.pr_number)
     local = Path(args.local_dir)
@@ -186,7 +213,7 @@ def cmd_restore(args):
     hit = False
     restored_from = ""
     try:
-        key = compute_key(args.key_file, uv_version=args.uv_version)
+        key = compute_key(args.key_file, uv_version=args.uv_version, key_salt=args.key_salt)
         _reset_dir(local)
         # Prefer an exact-key tar in any readable scope (priority order); else
         # the newest tar there, so a lockfile change still starts warm.
@@ -216,13 +243,33 @@ def cmd_restore(args):
     except OSError as exc:
         _warn(f"uv cache restore errored ({type(exc).__name__}); starting cold")
 
-    # Always hand uv a usable local cache dir, hit or miss.
     local.mkdir(parents=True, exist_ok=True)
-    _write_kv(args.github_env, {"UV_CACHE_DIR": str(local)})
+    cache_dir = str(local)
+    if args.merge_into_default:
+        # Leave UV_CACHE_DIR alone so uv keeps the image's warm default cache;
+        # on any failure that cache is used as it was.
+        try:
+            default = _default_cache_dir(args.uv or "uv")
+            if restored_from:
+                _merge(local, default)
+            cache_dir = str(default)
+        except (subprocess.SubprocessError, OSError) as exc:
+            # An empty cache-dir makes save skip: what uv used is unknown, and shipping
+            # the scratch dir would publish a stale fallback under this exact key.
+            cache_dir = ""
+            _warn(f"uv cache merge into the default cache failed ({type(exc).__name__})")
+    else:
+        # Always hand uv a usable local cache dir, hit or miss.
+        _write_kv(args.github_env, {"UV_CACHE_DIR": str(local)})
     _write_kv(args.github_state, {"key": key})
     _write_kv(
         args.github_output,
-        {"cache-hit": "true" if hit else "false", "cache-key": key, "restored-from": restored_from},
+        {
+            "cache-hit": "true" if hit else "false",
+            "cache-key": key,
+            "cache-dir": cache_dir,
+            "restored-from": restored_from,
+        },
     )
 
     scope_list = "+".join(scopes)
@@ -294,7 +341,9 @@ def cmd_save(args):
     local = Path(args.local_dir)
 
     try:
-        key = args.key or compute_key(args.key_file, uv_version=args.uv_version)
+        key = args.key or compute_key(
+            args.key_file, uv_version=args.uv_version, key_salt=args.key_salt
+        )
         arch_dir = _scope_dir(args.nfs_root, scope, args.arch)
         target = arch_dir / f"{key}{ext}"
         # Skip if the key is already readable here, so an ordinary PR (key in
@@ -326,7 +375,7 @@ def cmd_save(args):
         # atomic rename(2) -- readers never see a half-written tar.
         tmp = arch_dir / f".{key}.{os.getpid()}.{random.randrange(1 << 30):x}.tmp"
         try:
-            _create_tar(local, tmp, prog)
+            _create_tar(local, tmp, prog, args.exclude)
             # Re-check under the gun: a concurrent writer may have won while we
             # tarred. Equal content, so skipping ours (not overwriting) is fine.
             if _find_exact(arch_dir, key) is not None:
@@ -356,7 +405,8 @@ def main(argv=None):
         p.add_argument("--local-dir", required=True, help="local UV_CACHE_DIR to populate/ship")
         # Matches `uname -m` (x86_64, ppc64le, s390x); wheels are arch-specific.
         p.add_argument("--arch", default=platform.machine())
-        p.add_argument("--key-file", action="append", required=True, dest="key_file")
+        p.add_argument("--key-file", action="append", default=[], dest="key_file")
+        p.add_argument("--key-salt", default="", help="extra string hashed into the key")
         p.add_argument("--event-name", default=os.getenv("GITHUB_EVENT_NAME", ""))
         p.add_argument("--ref", default=os.getenv("GITHUB_REF", ""))
         p.add_argument("--pr-number", default="")
@@ -367,6 +417,11 @@ def main(argv=None):
     r.add_argument("--github-env", default=os.getenv("GITHUB_ENV", ""))
     r.add_argument("--github-output", default=os.getenv("GITHUB_OUTPUT", ""))
     r.add_argument("--github-state", default=os.getenv("GITHUB_STATE", ""))
+    r.add_argument(
+        "--merge-into-default",
+        action="store_true",
+        help="merge into uv's default cache instead of exporting UV_CACHE_DIR",
+    )
     r.set_defaults(func=cmd_restore)
 
     s = sub.add_parser("save")
@@ -374,6 +429,9 @@ def main(argv=None):
     s.add_argument("--compress", choices=sorted(COMPRESS), default="none")
     # The job may rewrite its lockfile (e.g. `uv add`), so save under the restore-time key.
     s.add_argument("--key", default="", help="key computed at restore; recomputed if empty")
+    s.add_argument(
+        "--exclude", action="append", default=[], help="tar --exclude pattern, e.g. ./builds-v*"
+    )
     s.add_argument("--keep", type=int, default=5, help="tars to retain per scope/arch")
     s.add_argument(
         "--pr-ttl-days", type=int, default=14, help="evict PR-scope tars older than this"
@@ -381,6 +439,8 @@ def main(argv=None):
     s.set_defaults(func=cmd_save)
 
     args = parser.parse_args(argv)
+    if not (args.key_file or args.key_salt or getattr(args, "key", "")):
+        parser.error("one of --key-file, --key-salt (or --key on save) is required")
     args.uv_version = uv_version(args.uv)
     return args.func(args)
 

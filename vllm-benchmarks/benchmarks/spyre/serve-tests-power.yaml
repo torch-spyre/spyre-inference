@@ -1,0 +1,43 @@
+# Power-workload serve benchmarks (manual suite: BENCH_SUITE=power FETCH_BENCH_DATA=1).
+#
+# Replays the Power datasets fetched from Artifactory by fetch_bench_datasets.py:
+# RAG prompts and entity-extraction emails through a granite decoder; both jsonl
+# files carry a "prompt" key, so the plain `custom` dataset loader reads them.
+# The Oracle invoice dataset (needs its image tree mounted plus a custom_image
+# conversion) and questions_100K (embedding backend) have no entry yet.
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 32
+    enable-prefix-caching: true
+    enable-chunked-prefill: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 200
+    custom-output-len: -1
+    ignore-eos: true
+    temperature: 0.1
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    max-concurrency: 5
+
+tests:
+  - test_name: serve_granite41-8b_tp4_rag
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_RAG_DATASET}
+
+  - test_name: serve_granite41-8b_tp4_ee_emails
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_EE_EMAILS_DATASET}

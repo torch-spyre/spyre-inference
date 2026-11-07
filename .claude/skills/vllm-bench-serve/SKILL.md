@@ -36,6 +36,8 @@ This skill measures end-to-end serving under load. To isolate prefill time (TTFT
 
 `uv sync --frozen` installs torch-spyre into `.venv` from the git rev pinned in `pyproject.toml` (built once, then reused from uv's wheel cache keyed by that rev), so each leg's sync installs that leg's rev.
 
+Before the first leg, check the host. The image's `/opt/ibm/spyre` RPMs (`$LIB_VERSION_FILE`) often differ from `spyre-rpms.lock`, newer as often as older, and the pinned torch-spyre then fails to build. If they differ and `~/spyre-libs/env.sh` is missing, or `<spyre-inference>/.venv` is, ask the user, then run `bash scripts/install-pinned-rpms.sh --rebuild` and `source ~/spyre-libs/env.sh && uv sync --frozen`.
+
 ### 1. Resolve the legs
 
 1. Fetch by URL, since the checkout may have no `upstream` remote: `git fetch https://github.com/torch-spyre/spyre-inference main` and keep `FETCH_HEAD`'s sha as `<main>`. For each PR number: `git fetch https://github.com/torch-spyre/spyre-inference pull/<N>/head` and use `FETCH_HEAD`'s sha.

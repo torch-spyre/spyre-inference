@@ -25,14 +25,37 @@ import gc
 import itertools
 import json
 import os
+import subprocess
 import sys
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
 
-# _ATTN_PROFILING is read at import time in spyre_attn, so set it before import.
-os.environ["SPYRE_ATTN_PROFILING"] = "1"
+# _ATTN_PROFILING is read at import time in spyre_attn, so the timing mode has to be
+# resolved from argv before any spyre_inference import, not in main().
+TIMING = "profiler"
+for _i, _a in enumerate(sys.argv[1:]):
+    if _a == "--timing" and _i + 2 <= len(sys.argv) - 1:
+        TIMING = sys.argv[_i + 2]
+    elif _a.startswith("--timing="):
+        TIMING = _a.split("=", 1)[1]
+if TIMING not in ("wall", "profiler"):
+    raise SystemExit(f"--timing must be wall or profiler, got {TIMING!r}")
+
+_THREADS = "1" if TIMING == "profiler" else "8"
+for _i, _a in enumerate(sys.argv[1:]):
+    if _a == "--threads" and _i + 2 <= len(sys.argv) - 1:
+        _THREADS = sys.argv[_i + 2]
+    elif _a.startswith("--threads="):
+        _THREADS = _a.split("=", 1)[1]
+
+os.environ["SPYRE_ATTN_PROFILING"] = "1" if TIMING == "profiler" else "0"
 os.environ.setdefault("VLLM_PLUGINS", "spyre_inference")
+# Assigned, not setdefault: an inherited SPYRE_NUM_CPUS or OMP_NUM_THREADS from the shell
+# would otherwise decide the thread count and the report would record a value that did
+# not apply.
+os.environ["SPYRE_NUM_CPUS"] = _THREADS
 for _k, _v in (
     ("RANK", "0"),
     ("LOCAL_RANK", "0"),
@@ -40,11 +63,16 @@ for _k, _v in (
     ("LOCAL_WORLD_SIZE", "1"),
     ("MASTER_ADDR", "127.0.0.1"),
     ("MASTER_PORT", "29500"),
-    ("OMP_NUM_THREADS", "1"),
-    ("OPENBLAS_NUM_THREADS", "1"),
-    ("MKL_NUM_THREADS", "1"),
 ):
     os.environ.setdefault(_k, _v)
+for _k in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ[_k] = _THREADS
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -450,6 +478,28 @@ def grid_to_requests(
     return query_lens, seq_lens
 
 
+def assert_extension_matches_timing(timing):
+    """Each timing mode needs the opposite torch-spyre build; fail early, not at report time.
+
+    Profiler mode reads device time from AIUPTI spans, so the extension must carry it.
+    Wall mode times a synchronized interval that the same instrumentation would inflate.
+    """
+    import torch_spyre
+
+    linked = "libaiupti" in subprocess.check_output(["ldd", torch_spyre._C.__file__], text=True)
+    if timing == "wall" and linked:
+        raise SystemExit(
+            "--timing wall needs a torch-spyre built with USE_SPYRE_PROFILER=0: the "
+            "AIUPTI instrumentation lands inside the measured interval and inflates it."
+        )
+    if timing == "profiler" and not linked:
+        raise SystemExit(
+            "--timing profiler needs a torch-spyre built with USE_SPYRE_PROFILER=1 "
+            "(see docs/user_guide/kineto_profiling.md sec 1.3); without libaiupti there "
+            "are no device spans to attribute."
+        )
+
+
 def assert_device_profiler_active(prof):
     """Abort unless the probe profile carries real Spyre device events."""
     total = sum(getattr(e, "self_device_time_total", 0.0) or 0.0 for e in prof.events())
@@ -613,6 +663,29 @@ def make_forward(
     return run, output, impl
 
 
+def measure_wall(run, iterations):
+    """Synchronized wall latency per forward, in microseconds.
+
+    No profiler: the fences bound exactly one forward, so dispatch and host work are
+    inside the number. Instrumentation would land in the same interval, which is why
+    this mode refuses a libaiupti build.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        samples = []
+        for _ in range(iterations):
+            torch.spyre.synchronize()
+            before = time.perf_counter_ns()
+            run()
+            torch.spyre.synchronize()
+            samples.append((time.perf_counter_ns() - before) / 1e3)
+    finally:
+        gc.enable()
+    zeros = [0.0] * len(samples)
+    return samples, zeros, list(samples), zeros, {}
+
+
 def measure(run, iterations, span=SPANS["layer"]):
     """Profile each forward in its own short window.
 
@@ -772,7 +845,8 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "dtype": str(DTYPE),
         "implementation": meta["impl_label"],
         "variant": variant,
-        "benchmark_mode": "BenchmarkMode.SPYRE_PROFILER",
+        "benchmark_mode": TIMING,
+        "threads": _THREADS,
         "span": span,
         "model": cfg.get("model", ""),
         "ms": float("nan"),
@@ -906,13 +980,18 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         from torch._dynamo.utils import counters
 
         graphs_before = counters["stats"]["unique_graphs"]
-        dev_us, mem_us, cpu_us, n_kernels, by_op = measure(run, cfg.get("iterations", 10), span)
+        if TIMING == "wall":
+            dev_us, mem_us, cpu_us, n_kernels, by_op = measure_wall(run, cfg.get("iterations", 10))
+        else:
+            dev_us, mem_us, cpu_us, n_kernels, by_op = measure(run, cfg.get("iterations", 10), span)
         row["late_compile"] = counters["stats"]["unique_graphs"] != graphs_before
         if row["late_compile"]:
             print("    -> WARNING: a kernel compiled inside a measured window", flush=True)
         row["kernels_attributed"] = int(np.median(n_kernels))
         row["kernels_expected"] = expected_kernels(row, span)
-        if row["kernels_attributed"] != row["kernels_expected"]:
+        # Kernel attribution is a profiler-span property; wall mode has no spans, so the
+        # count is always 0 and comparing it would mark every row failed.
+        if TIMING == "profiler" and row["kernels_attributed"] != row["kernels_expected"]:
             row["error"] = (
                 f"attributed {row['kernels_attributed']} compute kernels, expected "
                 f"{row['kernels_expected']}; the span under-counts (use --span layer)"
@@ -1097,13 +1176,17 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
     )
     probe_run()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
-        probe_run()
-    assert_span_present(prof, span)
-    if not args.allow_empty_device_profile:
-        assert_device_profiler_active(prof)
-    total, _, _, _ = span_device_times(prof, span)
-    print(f"  [guard] profiler active; '{span}' device time = {total:.1f}us\n", flush=True)
+    if TIMING == "profiler":
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
+            probe_run()
+        assert_span_present(prof, span)
+        if not args.allow_empty_device_profile:
+            assert_device_profiler_active(prof)
+        total, _, _, _ = span_device_times(prof, span)
+        print(f"  [guard] profiler active; '{span}' device time = {total:.1f}us\n", flush=True)
+    else:
+        torch.spyre.synchronize()
+        print("  [guard] wall timing; profiler span checks skipped\n", flush=True)
     del probe_inputs, probe_run
     gc.collect()
 
@@ -1111,6 +1194,21 @@ def run_startup_guard(cfg, entries, block_size, span, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
+    ap.add_argument(
+        "--timing",
+        choices=["wall", "profiler"],
+        default="profiler",
+        help="wall: synchronized perf_counter around one forward, needs a profiler-free "
+        "torch-spyre. profiler: device time from a record_function span, needs "
+        "USE_SPYRE_PROFILER=1. Parsed before imports; see the module header.",
+    )
+    ap.add_argument(
+        "--threads",
+        default=None,
+        help="CPU thread count. Defaults to 1 under --timing profiler (device time is "
+        "thread-insensitive, so fewer threads means less host jitter) and 8 under wall, "
+        "where host work is inside the measured interval.",
+    )
     ap.add_argument("--output-dir", default="./microbench_results")
     ap.add_argument("--variants", nargs="+", default=None)
     ap.add_argument("--iterations", type=int, default=None)
@@ -1166,6 +1264,8 @@ def main():
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
     args = ap.parse_args()
+    # Mode already took effect at import (module header); this only verifies the wheel.
+    assert_extension_matches_timing(TIMING)
 
     with open(args.config) as f:
         cfg = json.load(f)
@@ -1288,7 +1388,7 @@ def main():
 
             from spyre_inference.v1.attention.backends import spyre_attn as sa
 
-            if not sa._ATTN_PROFILING:
+            if TIMING == "profiler" and not sa._ATTN_PROFILING:
                 raise SystemExit("SPYRE_ATTN_PROFILING was not honoured; span will be absent.")
             print(
                 f"  limits     : max_model_len={vllm_config.model_config.max_model_len} "

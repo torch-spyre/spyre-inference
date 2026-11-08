@@ -38,10 +38,52 @@ import os
 import re
 import sys
 import tomllib
+import urllib.error
+import urllib.parse
 import urllib.request
 
 ARCHES = ("x86_64", "ppc64le", "s390x")
 DEFAULT_LOCK = "spyre-rpms.lock"
+
+
+class _StripAuthOnCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Drop the Artifactory bearer token when a redirect leaves the origin host.
+
+    The stdlib default replays every request header, including Authorization,
+    onto the redirect target. A redirect to another host (a misconfigured
+    reverse proxy, or one injected by a network attacker) would then hand the
+    ARTIFACTORY_TOKEN to that host. requests strips credentials across hosts;
+    urllib does not, so we do it here.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _host(req.full_url) != _host(newurl):
+            new.remove_header("Authorization")
+        return new
+
+
+def _host(url):
+    return urllib.parse.urlsplit(url).netloc.lower()
+
+
+def artifactory_open(url, token, data=None, method=None):
+    """Open a credentialed Artifactory request over HTTPS only.
+
+    Rejects a non-https base URL so the bearer token is never sent in the
+    clear, and uses an opener that strips the token on a cross-host redirect.
+    """
+    if urllib.parse.urlsplit(url).scheme != "https":
+        sys.exit(f"::error::Artifactory URL must use https, refusing to send token to {url!r}")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "text/plain"},
+        method=method,
+    )
+    opener = urllib.request.build_opener(_StripAuthOnCrossHostRedirect)
+    return opener.open(req)
+
 
 # The lock can come from an untrusted fork PR and its fields are formatted into
 # a credentialed AQL query, so they must not be able to escape it.
@@ -113,13 +155,9 @@ def _aql_newest(base_url, repo, token, tree, arch, name_pattern):
         'items.find({"repo":"%s","path":"%s","name":{"$match":"%s"}})'
         '.sort({"$desc":["created"]}).limit(1)' % (repo, path, name_pattern)
     )
-    req = urllib.request.Request(
-        f"{base_url}/artifactory/api/search/aql",
-        data=query.encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "text/plain"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req) as resp:
+    with artifactory_open(
+        f"{base_url}/artifactory/api/search/aql", token, data=query.encode(), method="POST"
+    ) as resp:
         results = json.load(resp).get("results", [])
     return results[0]["name"] if results else None
 

@@ -327,4 +327,6 @@ def test_tls_implicit_on_https_port_without_a_flag(mod):
 
 def test_tls_unrecognized_value_is_treated_as_on(mod):
     # A typo in the knob must not silently fall back to cleartext for the password.
+    # "ture" is a deliberate misspelling of "true" standing in for an operator's typo;
+    # the typos hook ignores this exact literal via tool.typos.default.extend-ignore-re.
     assert mod._use_tls({"CLICKHOUSE_SECURE": "ture"}, 8123) is True

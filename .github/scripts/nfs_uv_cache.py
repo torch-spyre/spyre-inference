@@ -179,28 +179,22 @@ def _assert_members_confined(tar_path, dest):
         return resolved == dest or dest in resolved.parents
 
     try:
-        tar = tarfile.open(tar_path)
+        with tarfile.open(tar_path) as tar:
+            members = tar.getmembers()
     except (tarfile.TarError, OSError):
         # Unreadable or corrupt archive: let the `tar` subprocess fail on it so
         # the caller's existing "bad tar -> start cold" path handles it.
         return
-    with tar:
-        try:
-            members = tar.getmembers()
-        except (tarfile.TarError, OSError):
-            return
-        for member in members:
-            if PurePosixPath(member.name).is_absolute() or not _confined(member.name):
-                raise UnsafeTarMember(f"{tar_path}: unsafe member path {member.name!r}")
-            # A link's target is resolved relative to the member's own directory.
-            if member.islnk() or member.issym():
-                base = PurePosixPath(member.name).parent
-                target = member.linkname
-                rel = target if PurePosixPath(target).is_absolute() else str(base / target)
-                if PurePosixPath(target).is_absolute() or not _confined(rel):
-                    raise UnsafeTarMember(
-                        f"{tar_path}: unsafe link {member.name!r} -> {target!r}"
-                    )
+    for member in members:
+        if PurePosixPath(member.name).is_absolute() or not _confined(member.name):
+            raise UnsafeTarMember(f"{tar_path}: unsafe member path {member.name!r}")
+        # A link's target is resolved relative to the member's own directory.
+        if member.islnk() or member.issym():
+            base = PurePosixPath(member.name).parent
+            target = member.linkname
+            rel = target if PurePosixPath(target).is_absolute() else str(base / target)
+            if PurePosixPath(target).is_absolute() or not _confined(rel):
+                raise UnsafeTarMember(f"{tar_path}: unsafe link {member.name!r} -> {target!r}")
 
 
 def _extract(tar_path, dest):

@@ -1119,7 +1119,11 @@ def test_head_major_attn_sinks(
 
 @pytest.mark.parametrize(
     "num_query_heads,num_kv_heads",
-    [pytest.param(8, 8, id="mha"), pytest.param(8, 1, id="mqa")],
+    [
+        pytest.param(8, 8, id="mha"),
+        pytest.param(8, 2, id="gqa_kv2"),
+        pytest.param(8, 1, id="mqa"),
+    ],
 )
 @pytest.mark.parametrize(
     "configure_compilation",

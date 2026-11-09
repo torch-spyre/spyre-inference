@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -3079,9 +3079,8 @@ in a transfer consumes one entry. The KV cache is one dense K and one
 dense V tensor per layer, pages selected by indirect indexing, so it
 costs only <code>num_layers × 2</code> mappings whatever the block count.</p>
 <p><strong>Fix:</strong> keep the number of live Spyre allocations bounded. The platform
-already caps an unset <code>max_num_seqs</code> at 4 and sizes
-<code>num_gpu_blocks_override</code> to <code>max_num_seqs × ceil(max_model_len /
-block_size) + 1</code>; pass explicit, modest values when you override them.
+already caps an unset <code>max_num_seqs</code> at 4; pass an explicit, modest value
+when you override it.
 The "consider restarting Linux" text in the error message is
 misleading — pod restart does not help. This is a configuration issue,
 not an IOMMU-state issue.</p>
@@ -3265,7 +3264,7 @@ Perfetto trace window.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.tabs.link", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.top", "search.highlight", "search.share", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
     
   </body>

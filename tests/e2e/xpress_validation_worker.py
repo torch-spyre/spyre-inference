@@ -24,6 +24,11 @@ from spyre_inference.v1.spec_decode.dflash import accepted_context_length
 from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
 
+def read_blocks(pages, ids):
+    # Copying the whole tensor would scale with the KV cache, which fills the free card memory.
+    return torch.cat([pages[i : i + 1].to(device="cpu", dtype=torch.float32) for i in ids])
+
+
 class ValidationWorker(TorchSpyreWorker):
     def init_device(self):
         super().init_device()
@@ -55,9 +60,11 @@ class ValidationWorker(TorchSpyreWorker):
             ),
             "model": dict.fromkeys(
                 (
+                    "host_argmax_calls",
                     "selection_calls",
                     "device_to_host_seconds",
                     "host_argmax_seconds",
+                    "device_selection_seconds",
                     "candidate_gather_seconds",
                     "refiner_seconds",
                     "logits_seconds",
@@ -83,13 +90,15 @@ class ValidationWorker(TorchSpyreWorker):
             transferred="logits_transfer_bytes",
         )
         self._time_call(
-            model, "_argmax_on_cpu", "model", "host_argmax_seconds", count="selection_calls"
+            model, "_argmax_on_cpu", "model", "host_argmax_seconds", count="host_argmax_calls"
+        )
+        self._time_call(
+            model, "_select_feedback", "model", "device_selection_seconds", count="selection_calls"
         )
         for name, metric in (
             ("_hidden_cache", "refiner_seconds"),
-            ("_refine", "refiner_seconds"),
-            ("_refine_candidates", "refiner_seconds"),
-            ("_gather_readout", "candidate_gather_seconds"),
+            ("_refine_feedback", "refiner_seconds"),
+            ("_prepare_feedback", "candidate_gather_seconds"),
         ):
             if hasattr(model, name):
                 self._time_call(model, name, "model", metric)
@@ -114,6 +123,9 @@ class ValidationWorker(TorchSpyreWorker):
         setattr(owner, name, timed)
 
     def configure_proposer(self, mode, references=None, reject_at=-1, passes=None, tail_salt=0):
+        for counters in self._stats.values():
+            for name in counters:
+                counters[name] = 0
         self.mode = mode
         self.references = references or []
         self.reject_at = reject_at
@@ -231,12 +243,9 @@ class ValidationWorker(TorchSpyreWorker):
         for name, n in chosen:
             cache = caches[name]
             block_size = cache.k_pages.shape[2]
-            ids = self._last_blocks[: (n + block_size - 1) // block_size].long()
+            ids = self._last_blocks[: (n + block_size - 1) // block_size].tolist()
             result[name] = tuple(
-                pages.to(device="cpu", dtype=torch.float32)[ids]
-                .permute(0, 2, 1, 3)
-                .flatten(0, 1)[:n]
-                .contiguous()
+                read_blocks(pages, ids).permute(0, 2, 1, 3).flatten(0, 1)[:n].contiguous()
                 for pages in cache
             )
         torch.save(result, path)

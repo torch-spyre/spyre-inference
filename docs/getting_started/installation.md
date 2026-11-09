@@ -20,7 +20,8 @@ source ~/spyre-libs/env.sh
 The `--rebuild` option rebuilds torch-spyre against those libraries, clearing uv's
 revision-keyed wheel cache first. After an RPM-only update, `uv sync` by itself can
 reuse a wheel built against the old libraries. The installer leaves the system
-`/opt/ibm/spyre` tree unchanged; source its `env.sh` in each new shell.
+`/opt/ibm/spyre` tree unchanged and points the unpacked binaries' hardcoded paths at a
+`/tmp/<tag>/spyre` symlink to itself. Source its `env.sh` in each new shell.
 Unlike the Install command below, `--rebuild` runs
 `uv sync --group dev --reinstall-package torch-spyre` without `--frozen` and may update
 `uv.lock`.
@@ -38,7 +39,7 @@ This command will:
 1. Install all project dependencies
 2. Build vLLM from source with the empty backend (`VLLM_TARGET_DEVICE=empty`, no device-specific C kernels)
 3. Install or reuse the torch-spyre wheel for the pinned source revision (RPMs are provisioned separately)
-4. Install PyTorch 2.13.0 from the CPU-specific index
+4. Install PyTorch 2.14.1 from the CPU-specific index
 
 ## Verification
 

@@ -54,11 +54,11 @@ def test_context_excludes_rejected_rows_and_uncomputed_correction(
 
 
 def test_dflash_bridge_disables_padding_and_only_the_default_prefix_cache():
-    original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=0)
+    original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128)
     args = NS(speculative_config=original, enable_prefix_caching=None)
     normalize_speculative_config(args)
     assert original == dict(
-        method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=0
+        method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128
     )
     assert args.speculative_config == original | {"disable_padded_drafter_batch": True}
     assert args.enable_prefix_caching is False
@@ -113,6 +113,7 @@ def config():
         architectures=["DFlashQwen3XPressModel"],
         hidden_size=4096,
         vocab_size=151936,
+        num_hidden_layers=5,
         layer_types=["full_attention"] * 5,
         dflash_config={"target_layer_ids": [1, 9, 17, 25, 33]},
         xpress_block_size=16,
@@ -122,11 +123,14 @@ def config():
     return NS(
         speculative_config=NS(
             use_dflash=lambda: True,
+            draft_shares_target_positions=lambda: True,
+            max_model_len=None,
             draft_model_config=NS(
                 hf_config=draft,
                 architecture="DFlashQwen3XPressModel",
                 quantization=None,
                 dtype=torch.float16,
+                max_model_len=2048,
             ),
             num_speculative_tokens=15,
             max_num_new_slots_for_drafting=15,
@@ -134,6 +138,7 @@ def config():
         ),
         model_config=NS(
             hf_text_config=target,
+            max_model_len=2048,
             is_multimodal_model=False,
             dtype=torch.float16,
             enforce_eager=False,
@@ -154,13 +159,84 @@ def test_published_contract_is_accepted(config, batch):
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
 
-@pytest.mark.parametrize("checkpoint,expected", [(None, 128), (512, 512), (0, 0)])
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text"])
+def test_gemma4_xpress_contract_is_accepted(config, model_type):
+    target = config.model_config.hf_text_config
+    target.model_type = model_type
+    target.hidden_size, target.vocab_size, target.num_hidden_layers = 2816, 262144, 30
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.hidden_size, draft.vocab_size = target.hidden_size, target.vocab_size
+    draft.layer_types = ["sliding_attention"] * 4 + ["full_attention"]
+    draft.sliding_window = 2048
+    draft.dflash_config = {"target_layer_ids": [1, 6, 11, 17, 22, 27], "mask_token_id": 4}
+    validate_dflash_config(config)
+    assert draft.xpress_topc == 128
+    assert draft.layer_types == ["sliding_attention"] * 4 + ["full_attention"]
+
+
+@pytest.mark.parametrize(
+    "requested,shares_positions,expected",
+    [(None, True, 8192), (1024, True, 1024), (None, False, 2048)],
+)
+def test_draft_context_limit_respects_target_positions(
+    config, requested, shares_positions, expected
+):
+    config.model_config.max_model_len = 8192
+    spec = config.speculative_config
+    spec.max_model_len = requested
+    spec.draft_shares_target_positions = lambda: shares_positions
+    spec.draft_model_config.max_model_len = requested or 2048
+    validate_dflash_config(config)
+    assert spec.draft_model_config.max_model_len == expected
+
+
+@pytest.mark.parametrize("window", [None, 0, -1, True])
+def test_sliding_draft_requires_a_window(config, window):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.layer_types[0] = "sliding_attention"
+    draft.sliding_window = window
+    with pytest.raises(ValueError, match="positive window"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("layer_types", [["full_attention"], ["linear_attention"] * 5])
+def test_invalid_draft_attention_types_are_rejected(config, layer_types):
+    config.speculative_config.draft_model_config.hf_config.layer_types = layer_types
+    with pytest.raises(ValueError, match="per draft layer"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("model_type,multimodal", [("llama", False), ("gemma4_text", True)])
+def test_unsupported_targets_are_rejected(config, model_type, multimodal):
+    config.model_config.hf_text_config.model_type = model_type
+    config.model_config.is_multimodal_model = multimodal
+    with pytest.raises(ValueError, match="text targets"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("checkpoint,expected", [(None, 128), (1, 1), (512, 512), (1024, 1024)])
 def test_spyre_topc_default_applies_only_when_unset(config, checkpoint, expected):
     # Upstream writes --xpress-topc onto the draft config before this runs.
     draft = config.speculative_config.draft_model_config.hf_config
     draft.xpress_topc = checkpoint
     validate_dflash_config(config)
     assert draft.xpress_topc == expected
+
+
+@pytest.mark.parametrize("topc", [0, 1025, 2048])
+def test_unsupported_shortlists_fail_before_model_loading(config, topc):
+    config.speculative_config.draft_model_config.hf_config.xpress_topc = topc
+    with pytest.raises(ValueError, match="requires 1 to 1024 candidates"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("topc", [128, 1024, 2048])
+def test_shortlist_width_is_normalized_to_the_real_vocabulary(config, topc):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.xpress_topc = topc
+    draft.vocab_size = config.model_config.hf_text_config.vocab_size = 73
+    validate_dflash_config(config)
+    assert draft.xpress_topc == 73
 
 
 @pytest.mark.parametrize("value", [-1, True, 1.5])
@@ -278,7 +354,11 @@ def test_v1_keeps_upstreams_other_refusals_but_allows_xpress(monkeypatch):
     monkeypatch.setattr(
         VllmConfig,
         "_get_v1_model_runner_unsupported_features",
-        lambda self: ["prefill context parallel", "xpress speculative decoding"],
+        lambda self: [
+            "prefill context parallel",
+            "xpress speculative decoding",
+            "mixed sliding/full dflash drafts",
+        ],
     )
     allow_xpress_on_v1()
     allow_xpress_on_v1()

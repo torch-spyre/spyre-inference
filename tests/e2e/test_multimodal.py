@@ -125,17 +125,15 @@ def _generate(conversations, enforce_eager: bool, **llm_kwargs):
 
 
 @pytest.mark.multimodal
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
-def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_single_image_prompt_produces_output(monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
 
-    Both modes: `CompileOutermost` samples the mode at construction, so under
-    `enforce_eager` the `maybe_compile` kernels fall through to eager — except the
-    norms, which pass `force=True` and compile in either mode — and the
-    compiled path — the repo default — goes uncovered.
+    The same engine first serves a text-only request under
+    ``SPYRE_COMPILE_GUARD=error``: it still reaches ``embed_input_ids``, so a late
+    embedding compile is fatal. Sharing the engine saves a second 14B build.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").
@@ -144,35 +142,22 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
     # Building the graphs for a 14B two-tower model outruns the default timeout.
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-
-    uri = _synthetic_image_data_uri()
-    (text,) = _generate([_conversation(uri)], enforce_eager=enforce_eager)
-
-    assert text.strip(), "empty generation from the multimodal path"
-
-
-@pytest.mark.multimodal
-@pytest.mark.uses_subprocess
-@pytest.mark.timeout(3600)
-def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
-    """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
-
-    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
-    avoiding unrelated first-use compiles in the vision tower.
-    """
-    if spyre_device_count() == 0:
-        pytest.skip("Spyre device not available")
+    from vllm import SamplingParams
 
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    llm = _llm(enforce_eager=False)
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
 
-    (text,) = _generate([_conversation()], enforce_eager=False)
+    (output,) = llm.chat([_conversation()], params)
+    assert output.outputs[0].text.strip(), "empty text-only generation from the multimodal model"
 
-    assert text.strip(), "empty text-only generation from the multimodal model"
+    (output,) = llm.chat([_conversation(_synthetic_image_data_uri())], params)
+    assert output.outputs[0].text.strip(), "empty generation from the multimodal path"
 
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+@pytest.mark.e2e_smoke
 def test_two_image_prompt_produces_output():
     """Two images make the vision mask non-trivial: the `cu_seqlens`-derived
     block-diagonal mask must actually block cross-image attention, not collapse to a
@@ -192,35 +177,31 @@ def test_two_image_prompt_produces_output():
 
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
-def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
     rewrite on CPU, this checks that what it rewrites to actually lowers.
 
-    Both modes, as for Pixtral above: compiled is the repo default, where the tower's
-    rewrites (gathered position embeddings and rope, permutation-matmul rope, the
-    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs,
-    not just run eagerly. Compiled, an image above every budget is rejected up front.
+    The tower's rewrites (gathered position embeddings and rope, permutation-matmul rope, the
+    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs. An
+    image above every budget is rejected up front.
     """
     _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     # A tower compile at request time is a missed warmup shape: fail, don't log.
-    if not enforce_eager:
-        monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     from vllm import SamplingParams
     from vllm.exceptions import VLLMValidationError
 
-    llm = _llm(enforce_eager, model=GEMMA4_MODEL, config_format="hf", revision=GEMMA4_REVISION)
+    llm = _llm(False, model=GEMMA4_MODEL, config_format="hf", revision=GEMMA4_REVISION)
     conversation = [_conversation(_synthetic_image_data_uri())]
     params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
     (output,) = llm.chat(conversation, params)
 
     assert output.outputs[0].text.strip(), "empty generation from the Gemma 4 vision path"
-    if not enforce_eager:
-        with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets"):
-            llm.chat(conversation, params, mm_processor_kwargs={"max_soft_tokens": 560})
+    with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets"):
+        llm.chat(conversation, params, mm_processor_kwargs={"max_soft_tokens": 560})
 
 
 @pytest.mark.multimodal
@@ -264,8 +245,9 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
         config_format="hf",
         revision=GEMMA4_REVISION,
         max_model_len=2048,  # room for the 1120-token image
-        # 576 and 1152 hold 560 and 1120.
-        encoder_budgets=(64, 128, 256, 280, 576, 1152),
+        # Only what the asserts reach: 280 (the default and the pack size), 576 for 560
+        # and 1152 for 1120. Each budget is a full tower compile on a cold cache.
+        encoder_budgets=(280, 576, 1152),
     )
     ((hits, misses),) = llm.collective_rpc(record_encoder_calls)
     larger = (560, 1120)

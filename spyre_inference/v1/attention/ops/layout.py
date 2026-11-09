@@ -36,6 +36,7 @@ def temporary_chunk_major_page_index_layout(num_chunks: int, entries_per_chunk: 
         [num_chunks, 1, entries_per_chunk, INT32_ELEMS_PER_STICK],
         [entries_per_chunk, -1, 1, -1],
         get_device_dtype(torch.int32),
+        {(0,): num_chunks, (2,): entries_per_chunk, (1, 3): 1},
     )
 
 
@@ -62,6 +63,7 @@ def head_major_kv_layout(num_pages: int, block_size: int, head_size: int, dtype:
         device_size=[num_pages, block_size, sticks, eps],
         stride_map=[block_size * head_size, head_size, eps, 1],
         device_dtype=get_device_dtype(dtype),
+        valid_elements={(0,): num_pages, (1,): block_size, (2, 3): head_size},
         element_arrangement=(
             ElementArrangement.QFP8CH
             if dtype == torch.float8_e4m3fn

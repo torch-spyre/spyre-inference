@@ -1507,8 +1507,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
 
         Kv-major, matching the kernels' head order. Built on first use and dropped by
-        ``process_weights_after_loading``. ``move_model_to_spyre`` points the source at the
-        parameter the model holds on Spyre, which is the one a reload writes.
+        ``process_weights_after_loading``. ``model.to("spyre")`` keeps the parameter object,
+        so the source is the tensor a reload writes.
         """
         if self._sinks_source is None:
             return None
@@ -1946,11 +1946,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Pure cache geometry, so it is built once rather than per step, unlike the index
         tables -- which retires one H2D transfer per active block per sequence per step.
+
+        Uploaded page-outermost, as the gather needs it (torch-spyre#3705).
         """
         if self._kv_row_pool_device is None:
             rows = torch.arange(num_pages * self.num_kv_heads, dtype=torch.int32)
+            layout = (
+                temporary_chunk_major_page_index_layout(num_pages, self.num_kv_heads)
+                if device.type == "spyre"
+                else None
+            )
             self._kv_row_pool_device = convert(
-                rows.reshape(num_pages, self.num_kv_heads, 1), device=device
+                rows.reshape(num_pages, self.num_kv_heads, 1), device=device, device_layout=layout
             )
         return self._kv_row_pool_device
 

@@ -43,7 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
-from spyre_inference.v1.attention.ops import tile_loop
+from spyre_inference.v1.attention.ops import batched_decode, tile_loop
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
 )
@@ -71,7 +71,9 @@ def compiles() -> int:
 @pytest.fixture()
 def impl(default_vllm_config, monkeypatch):
     # CPU graph-reuse tests use the Python walk; Spyre e2e tests cover tiled lowering.
+    # The batched kernel reads its own copy of the flag.
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()

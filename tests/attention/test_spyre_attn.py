@@ -170,6 +170,7 @@ def _run_spyre_attn_test(
     kv_scales: tuple[float, float] = (1.0, 1.0),
     expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
+    num_blocks: int = 256,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation.
 
@@ -184,7 +185,6 @@ def _run_spyre_attn_test(
 
     from vllm.config import get_current_vllm_config
 
-    num_blocks = 256
     # SpyreAttentionImpl and the metadata builder both read the dtype off the VllmConfig.
     get_current_vllm_config().model_config.dtype = dtype
     torch.set_default_device("cpu")
@@ -799,9 +799,9 @@ def test_attention_sinks_are_held_kv_major(default_vllm_config):
 def test_attention_sinks_follow_the_parameter_moved_to_spyre(
     default_vllm_config, monkeypatch, configure_device
 ):
-    """gpt-oss and granite register the sinks on their own attention module, so
-    ``model.to("spyre")`` replaces that Parameter and a reload writes the replacement. A
-    host-only test cannot see this: on CPU the move keeps the original."""
+    """gpt-oss and granite register the sinks on their own attention module, so the impl
+    must see a reload's write to that Parameter after ``model.to("spyre")``. A host-only test
+    cannot see this: only the move to Spyre could swap the Parameter."""
     from vllm.model_executor.layers.attention.attention import Attention
 
     from spyre_inference.v1.worker.model_load import move_model_to_spyre
@@ -1091,7 +1091,6 @@ def test_page_index_tables_skipped_on_a_fully_batched_step(
 ):
     """A step the batched kernel fully serves uploads no per-sequence index table."""
     torch.set_default_device("cpu")
-    # Not the enable_batched_decode fixture: conftest skips its users, and no kernel runs here.
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     metadata = _padded_mask_metadata(seq_lens, block_size=64)
     assert metadata.padded_num_seqs is not None
@@ -1939,7 +1938,6 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
-# Named clear of the conftest batched-decode skip: this is the untiled walk on CPU.
 def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
     from spyre_inference.v1.attention.ops import batched_decode
 
@@ -2180,7 +2178,37 @@ def test_spyre_attn_dispatches_by_query_width(
     assert sorted(called) == ["decode", "prefill"], called
 
 
-# Not named "batched_decode": tests/conftest.py skips those under the tiled walk.
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_decode_compiles_at_a_prime_page_count(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """The decode kernel gathers page rows from a pool sized by the cache. In the default
+    layout torch-spyre relayouts that pool inside the page loop, and the copy fails to
+    compile at a prime page count above 65536 (114773: eager Qwen2.5-0.5B on a 96 GiB card).
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+
+    _run_spyre_attn_test(
+        seq_lens=[(1, 100)],
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=14,
+        num_kv_heads=2,
+        head_size=64,
+        num_blocks=114773,
+    )
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "use_sinks"),
     [
@@ -2310,7 +2338,7 @@ def test_spyre_attn_soft_cap(
         pytest.param([(1, 300), (64, 200)], 128, False, id="per_seq_sliding_window(128)"),
         # The multi-sequence decode kernel, which serves decode by default: kv 512 at block
         # 64 spans several chunks, so its per-slot merge runs and must count each sink
-        # once. Named apart from "batched_decode", which tests/conftest.py skips wholesale.
+        # once.
         pytest.param([(1, 512), (1, 300), (1, 64)], None, True, id="multi_seq_decode"),
     ],
 )

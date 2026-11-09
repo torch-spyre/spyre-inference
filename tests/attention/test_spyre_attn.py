@@ -2800,15 +2800,29 @@ def batched_decode_calls(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "seq_lens,soft_cap",
+    "seq_lens,soft_cap,sliding_window",
     [
-        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)] * 2, None, id="bucket_exact(N=8)"),
         pytest.param(
-            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)], None, id="bucket_pad(N=5_bucket=8)"
+            [(1, 256), (1, 512), (1, 128), (1, 384)] * 2, None, None, id="bucket_exact(N=8)"
+        ),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)],
+            None,
+            None,
+            id="bucket_pad(N=5_bucket=8)",
         ),
         # Leading decode prefix batched, trailing prefill through the per-seq loop.
-        pytest.param([(1, 256)] * 4 + [(64, 256)], None, id="mixed_decode_prefix(N=4+1)"),
-        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)], 50.0, id="soft_cap(N=4)"),
+        pytest.param([(1, 256)] * 4 + [(64, 256)], None, None, id="mixed_decode_prefix(N=4+1)"),
+        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)], 50.0, None, id="soft_cap(N=4)"),
+        # Windowed: the active blocks are a strict suffix of each sequence's blocks.
+        pytest.param(
+            [(1, 768), (1, 896), (1, 1024), (1, 1152), (1, 1280), (1, 768)],
+            None,
+            512,
+            id="window512_mixed_offsets(N=6)",
+        ),
+        pytest.param([(1, 512)] * 8, None, 128, id="window128_single_active(N=8)"),
+        pytest.param([(1, 768)] * 8, None, 500, id="window500_unaligned(N=8)"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2824,6 +2838,7 @@ def test_spyre_attn_batched_decode_correctness(
     batched_decode_calls,
     seq_lens,
     soft_cap,
+    sliding_window,
     configure_compilation,
     configure_device,
 ):
@@ -2835,10 +2850,13 @@ def test_spyre_attn_batched_decode_correctness(
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
-        sliding_window=None,
+        sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         soft_cap=soft_cap,
+        # Measured within 0.004 of the reference; dropping the window moves the output by
+        # up to 0.25, which the default 0.2 + 20% bound would absorb.
+        tolerance=(0.05, 0.05) if sliding_window is not None else None,
     )
     assert batched_decode_calls, "the batch fell back to the per-seq loop"
 

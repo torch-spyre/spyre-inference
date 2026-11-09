@@ -53,12 +53,14 @@ class DeviceConfig:
 
     env_vars: dict[str, Any] = field(default_factory=dict)
     num_gpu_blocks_override: int | None = None
+    kernel_hints: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DeviceConfig:
         return cls(
             env_vars=d.get("env_vars") or {},
             num_gpu_blocks_override=d.get("num_gpu_blocks_override"),
+            kernel_hints=d.get("kernel_hints") or {},
         )
 
 

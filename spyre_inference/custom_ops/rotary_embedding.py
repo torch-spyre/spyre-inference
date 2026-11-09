@@ -61,6 +61,7 @@ def _rotate_neox_2x2(
     x: torch.Tensor,
     rot: torch.Tensor,
     head_size: int,
+    work_div: dict[int, int] | None = None,
 ) -> torch.Tensor:
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
 
@@ -71,7 +72,22 @@ def _rotate_neox_2x2(
     """
     num_tokens = x.shape[0]
     inner = head_size // 2
-    x_pairs = x.view(num_tokens, -1, 2, inner)
+    row_owners = work_div.get(num_tokens) if work_div else None
+    if row_owners is not None:
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+
+        rows = f"_untracked_rope_rows_{num_tokens}"
+        heads = x.numel() // (num_tokens * head_size)
+        names = [
+            rows,
+            f"_untracked_rope_heads_{heads}",
+            "_untracked_2",
+            f"_untracked_rope_inner_{inner}",
+        ]
+        with spyre_hint(named_dims=names, work_div={rows: row_owners}):
+            x_pairs = x.view(num_tokens, -1, 2, inner)
+    else:
+        x_pairs = x.view(num_tokens, -1, 2, inner)
     out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)
     return out.flatten(-2).view(x.shape)
 
@@ -203,8 +219,9 @@ class _SpyreRotaryMixin:
             )
             return out_query, out_key
         rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
-        out_query = _rotate_neox_2x2(query, rot, self.head_size)
-        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
+        work_div = getattr(self, "spyre_work_div", None)
+        out_query = _rotate_neox_2x2(query, rot, self.head_size, work_div)
+        out_key = _rotate_neox_2x2(key, rot, self.head_size, work_div) if key is not None else None
         return out_query, out_key
 
 

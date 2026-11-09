@@ -293,7 +293,7 @@ def test_recorder_passes_explicit_causality_to_metadata(
     builder._attn_bucketer = make_bucketer()
     forward = MagicMock()
     monkeypatch.setattr(impl, "forward", forward)
-    monkeypatch.setattr(impl, "_batched_decode_supported", lambda: False)
+    monkeypatch.setattr(impl, "_batched_decode_supported", lambda device: False)
     impl.record_graphs(SimpleNamespace(), kv_cache, builder, causal=causal)
     assert forward.call_count > 0
     assert all(call.args[5].causal is causal for call in forward.call_args_list)

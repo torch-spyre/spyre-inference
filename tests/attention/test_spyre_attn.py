@@ -1380,6 +1380,32 @@ def test_bucketed_block_ids_match_scalar_fill(
             assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
 
 
+@pytest.mark.parametrize(
+    ("mode", "device", "compiled"),
+    [
+        ("STOCK_TORCH_COMPILE", "cpu", True),
+        ("NONE", "cpu", False),
+        # torch-spyre#4334: the eager page gather fails, so Spyre compiles regardless.
+        ("NONE", "spyre", True),
+    ],
+)
+def test_attn_compiled_gates_every_compiled_path(
+    default_vllm_config, monkeypatch, mode, device, compiled
+):
+    """Recording, batched decode and the fused store follow the kernels' compile choice."""
+    from vllm.config import CompilationMode, get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    get_current_vllm_config().compilation_config.mode = getattr(CompilationMode, mode)
+    impl = SpyreAttentionImpl(num_heads=8, head_size=64, scale=0.125, num_kv_heads=2)
+    dev = torch.device(device)
+
+    assert impl._attn_compiled(dev) is compiled
+    assert impl._batched_decode_supported(dev) is compiled
+    prefill_fn, _ = impl._page_attn_fns(dev)
+    assert (prefill_fn is spyre_attn._page_attn_prefill_compiled) is compiled
+
+
 @pytest.mark.parametrize("batched_decode", ["0", "1"])
 def test_batched_decode_metadata_follows_env(
     default_vllm_config, monkeypatch, batched_decode: str
@@ -2696,8 +2722,9 @@ def test_spyre_attn_batched_decode_uses_plain_page_ids(default_vllm_config, conf
         num_kv_heads=num_kv_heads,
     )
 
-    assert impl._batched_decode_supported()
-    assert impl._batched_decode_preconditions_met(attn_metadata, 1 + num_seqs * blocks_per_seq), (
+    pages = torch.empty(1 + num_seqs * blocks_per_seq)
+    assert impl._batched_decode_supported(pages.device)
+    assert impl._batched_decode_preconditions_met(attn_metadata, pages), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
     )
     assert attn_metadata.chunk_page_ids_cpu is not None
@@ -2748,9 +2775,9 @@ def test_dispatch_declines_a_gather_spanning_the_cache(default_vllm_config, conf
     assert attn_metadata.blocks_per_chunk is not None
     entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
 
-    assert impl._batched_decode_preconditions_met(attn_metadata, entries + 1)
-    assert not impl._batched_decode_preconditions_met(attn_metadata, entries)
-    assert not impl._batched_decode_preconditions_met(attn_metadata, entries - 1)
+    for num_pages, reachable in ((entries + 1, True), (entries, False), (entries - 1, False)):
+        pages = torch.empty(num_pages)
+        assert impl._batched_decode_preconditions_met(attn_metadata, pages) is reachable
 
 
 @pytest.fixture()
@@ -2868,9 +2895,9 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
         scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
     )
-    assert impl._batched_decode_supported()
-
     device = torch.device(configure_device)
+    assert impl._batched_decode_supported(device)
+
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
     blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
     bucket = SpyreAttnBatchedDecodeBucket(

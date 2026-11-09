@@ -1235,10 +1235,12 @@ def patch_backend_list(request, monkeypatch):
     orig_to = torch.Tensor.to
 
     def to(tensor, *args, device_layout=None, **kwargs):
-        target = args[0] if args else kwargs.get("device")
-        if device_layout is not None and torch.device(target).type != "spyre":
-            device_layout = None
         if device_layout is None:
+            return orig_to(tensor, *args, **kwargs)
+        target = kwargs.get("device", args[0] if args else None)
+        if not isinstance(target, (str, torch.device)):
+            target = tensor.device
+        if torch.device(target).type != "spyre":
             return orig_to(tensor, *args, **kwargs)
         return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
 

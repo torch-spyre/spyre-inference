@@ -1435,8 +1435,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(reshape_and_cache_kernel, dynamic=False)
-        # Only reached compiled: _batched_decode_preconditions_met declines the whole
-        # path when self._compile_attn is False.
+        # Only reached compiled: _batched_decode_supported declines it otherwise.
         self._decode_fn = _batched_decode_compiled
 
         self._kv_slots: SpyrePagedKVCache | None = None
@@ -1456,9 +1455,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "Using SpyreAttentionBackend with a head-major paged KV cache, LX-resident pages"
         )
 
+    def _attn_compiled(self, device: torch.device) -> bool:
+        """Whether attention runs compiled: always on Spyre, whose eager page gather fails
+        (torch-spyre#4334); elsewhere only under STOCK_TORCH_COMPILE."""
+        return self._compile_attn or device.type == "spyre"
+
     def _page_attn_fns(self, device: torch.device) -> tuple[Callable, Callable]:
-        """The per-sequence (prefill, decode) kernels: compiled unless eager off Spyre."""
-        if self._compile_attn or device.type == "spyre":
+        """The per-sequence (prefill, decode) kernels."""
+        if self._attn_compiled(device):
             return _page_attn_prefill_compiled, _page_attn_decode_compiled
         return page_attn_prefill_kernel, page_attn_decode_kernel
 
@@ -1529,19 +1533,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
-    def _batched_decode_supported(self) -> bool:
+    def _batched_decode_supported(self, device: torch.device) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
         # Set SPYRE_BATCHED_DECODE=0 to force the per-seq loop for all sizes.
         if not envs.SPYRE_BATCHED_DECODE:
             return False
         # The 2-D page index lowers to aten.index, which upcasts the int32 index
         # to int64 and fails eager; eager takes the per-seq loop instead.
-        return self._compile_attn
+        return self._attn_compiled(device)
 
     def _batched_decode_preconditions_met(
-        self, attn_metadata: "SpyreAttentionMetadata", num_pages: int
+        self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
     ) -> bool:
-        if not self._batched_decode_supported():
+        if not self._batched_decode_supported(kv_pages.device):
             return False
         # Layer 0's builder gates on the decode count and the bucket lattice.
         if attn_metadata.padded_num_seqs is None:
@@ -1549,7 +1553,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.blocks_per_chunk is not None
         # The recorder's bound: a gather of the whole cache faults the device
         # (torch-spyre#4033), so warmup skips these variants and the per-seq loop serves them.
-        return attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk < num_pages
+        return attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk < kv_pages.shape[0]
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -1585,8 +1589,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Mirror batched-decode precomputes to device once per step, only for
         # layers whose impl can actually use the batched kernel (skips eager attention).
         if (
-            not self._grouped_decode_preconditions_met(attn_metadata, k_pages.shape[0])
-            and self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
+            not self._grouped_decode_preconditions_met(attn_metadata, k_pages)
+            and self._batched_decode_preconditions_met(attn_metadata, k_pages)
             and attn_metadata.rep_row_ids_dev is None
         ):
             self._mirror_batched_decode_indices(attn_metadata, _target_device)
@@ -1627,14 +1631,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         raised, so it cannot take down engine startup; dispatch then compiles it on
         first use.
         """
-        if not self._compile_attn:
+        device = kv_cache[0].device
+        if not self._attn_compiled(device):
             return 0
 
         num_pages = kv_cache[0].shape[0]
         variants = builder.attn_bucketer.variants()
         decode_variants = (
             builder.attn_bucketer.batched_decode_variants()
-            if self._batched_decode_supported()
+            if self._batched_decode_supported(device)
             else []
         )
         t_start = time.time()
@@ -2058,13 +2063,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output[:num_decode_seqs].copy_(src_block)
 
     def _grouped_decode_preconditions_met(
-        self, attn_metadata: "SpyreAttentionMetadata", num_pages: int
+        self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
     ) -> bool:
         groups = attn_metadata.decode_groups
-        if groups is None or not self._batched_decode_supported():
+        if groups is None or not self._batched_decode_supported(kv_pages.device):
             return False
         # The recorder's bound, per group (torch-spyre#4033).
-        return all(g.padded_num_seqs * g.blocks_per_chunk < num_pages for g in groups)
+        return all(g.padded_num_seqs * g.blocks_per_chunk < kv_pages.shape[0] for g in groups)
 
     def _run_grouped_decode(
         self,
@@ -2314,18 +2319,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
         # Let the kernel write its output buffer directly, saving a copy per layer.
-        store_out = self._compile_attn
+        store_out = self._attn_compiled(_target_device)
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
-        if self._grouped_decode_preconditions_met(attn_metadata, k_pages.shape[0]):
+        if self._grouped_decode_preconditions_met(attn_metadata, k_pages):
             self._run_grouped_decode(
                 query_dev, k_pages, v_pages, attn_metadata, output, _target_device
             )
             if num_decode_seqs == num_seqs:
                 return output
             batched_done = True
-        elif self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0]):
+        elif self._batched_decode_preconditions_met(attn_metadata, k_pages):
             self._run_batched_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
             if num_decode_seqs == num_seqs:
                 return output

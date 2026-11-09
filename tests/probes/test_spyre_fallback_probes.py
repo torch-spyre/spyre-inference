@@ -435,7 +435,7 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
 
     The paged attention kernels gather pages this way, which is why SpyreAttentionImpl
     compiles attention on Spyre even under --enforce-eager. When the eager case XPASSes,
-    `_page_attn_fns` and `_batched_decode_supported` can honor eager on Spyre too.
+    `SpyreAttentionImpl._attn_compiled` can honor eager on Spyre too.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
     int32_elems_per_stick = 32

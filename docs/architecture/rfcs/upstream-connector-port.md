@@ -275,10 +275,8 @@ larger chunks or multiple groups is an explicit extension, not demonstrated beha
 
 | Cache layout and encoding | Current attention support | Offload requirement |
 |---|---|---|
-| Head-major, model dtype | Default; normally FP16 | Qualify dense page addressing, padding and raw round-trip. |
-| Token-major, model dtype | Explicit opt-in | Qualify its distinct page mapping; do not use head-major offsets. |
+| Head-major, model dtype | The only layout; normally FP16 | Qualify dense page addressing, padding and raw round-trip. |
 | Head-major, `fp8` / `fp8_e4m3` | Allocated as `torch.float8_e4m3fn`; requires `head_size % 128 == 0` | Separate raw-copy/slot-sizing and end-to-end acceptance gate. |
-| Token-major, FP8 | Rejected by current attention implementation | Reject during configuration; do not imply M1 enables it. |
 
 For FP8, the vLLM cache spec can report `uint8` while actual device pages hold E4M3 values. Store the
 existing encoded bytes, not an FP16 expansion or a new quantization. Physical padding/alignment
@@ -665,7 +663,7 @@ for restart/reuse tests. Concurrent device tests require separately assigned har
   adjacent-slot canaries, nonzero page offsets and representative head/block geometries.
 - [ ] FP8-aware offload tokens match an **FP8 no-offload baseline**, not an FP16 model baseline.
   Shared instances establish identical resolved K/V scales and encoding.
-- [ ] Token-major FP8 and any unqualified copy/backend combination are rejected explicitly.
+- [ ] Any unqualified copy/backend combination is rejected explicitly.
 
 ### Persistent lifecycle acceptance, for both shared memory kinds
 

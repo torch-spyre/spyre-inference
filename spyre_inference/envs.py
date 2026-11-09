@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
+    SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
+    SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
@@ -95,6 +97,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.
     "SPYRE_ATTN_KV_LADDER": lambda: os.getenv("SPYRE_ATTN_KV_LADDER") or "pow2",
+    # A denser preset for batched decode at SPYRE_ATTN_LARGE_BATCH_MIN_SEQS sequences or
+    # more, unioned with SPYRE_ATTN_KV_LADDER. Unset keeps one ladder for every batch size;
+    # rejected together with SPYRE_ATTN_KV_BUCKETS.
+    "SPYRE_ATTN_KV_LADDER_LARGE_BATCH": lambda: (
+        os.getenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH") or None
+    ),
+    "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS": lambda: int(
+        os.getenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS") or "16"
+    ),
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
@@ -105,9 +116,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which
     #    drops the per-page permute the kernels do before the matmuls and is the only
     #    layout with a batched decode kernel under the default tiled walk. It always
-    #    compiles attention, even under --enforce-eager, and carries no ALiBi.
+    #    compiles attention, even under --enforce-eager.
     #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size], the fallback
-    #    for an ALiBi model or a fully eager attention run.
+    #    for a fully eager attention run.
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "head_major",
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.

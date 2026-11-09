@@ -23,6 +23,8 @@ All device tests run against the real Spyre device when available; otherwise
 they skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -281,6 +283,39 @@ def test_spyre_bool_mask_index_put(spyre_device):
     expected = torch.zeros(num_tokens, hidden, dtype=torch.float16)
     expected[mask.cpu()] = values.cpu()
     torch.testing.assert_close(t.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A scatter along the last (stick) dim does not compile (torch-spyre#4404), and "
+        "torch-spyre#3878 keeps topk's indices in fp16, which scatter rejects. With "
+        "#4404's fix, a last-dim scatter still writes wrong values (torch-spyre#4403). "
+        "spyre_inference.moe._topk_probs masks the logits with keep_by_index instead. "
+        "When this probe passes, revisit that workaround."
+    ),
+)
+def test_spyre_topk_scatter_dense_routing(spyre_device):
+    """Dense top-k routing weights: topk, then scatter the softmaxed weights back.
+
+    The canonical form of vLLM's ``topk_softmax`` routing, as ``_topk_probs`` wrote it
+    before the keep_by_index workaround.
+    """
+    tokens, experts, top_k = 16, 64, 4
+    gen = torch.Generator().manual_seed(0)
+    # Distinct logits per row, so the selected set has no fp16 ties.
+    ranks = torch.stack([torch.randperm(experts, generator=gen) for _ in range(tokens)])
+    logits = (ranks.float() / experts * 4 - 2).to(torch.float16)
+
+    @torch.compile(dynamic=False)
+    def fn(logits):
+        weights, ids = torch.topk(logits, top_k, dim=-1)
+        return torch.zeros_like(logits).scatter(-1, ids, torch.softmax(weights, dim=-1))
+
+    weights, ids = torch.topk(logits.float(), top_k, dim=-1)
+    expected = torch.zeros(tokens, experts).scatter(-1, ids, torch.softmax(weights, dim=-1))
+    out = fn(logits.to(spyre_device))
+    torch.testing.assert_close(out.cpu().float(), expected, atol=2e-3, rtol=2e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -1002,17 +1037,21 @@ def test_spyre_slot_major_scatter_hits_exact_slots(spyre_device):
             "eager",
             marks=pytest.mark.xfail(
                 strict=True,
+                raises=RuntimeError,
                 reason=(
-                    "index_copy_ has no eager on-device path: an int32 index is "
-                    "rejected, an int64 one falls back to CPU. This is why "
-                    "SpyreAttentionImpl compiles the write kernel unconditionally."
+                    "Eager index_copy_ rejects an int32 index ('Expected a long tensor "
+                    "for index'), and the index uploaded to Spyre is int32. This is why "
+                    "SpyreAttentionImpl compiles the write kernel and the grouped decode "
+                    "store unconditionally."
                 ),
             ),
         ),
     ],
 )
 def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
-    """The write kernel must be compiled; eager either raises or leaves the device."""
+    """The write kernel must be compiled: eager rejects the int32 index Spyre carries."""
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
     num_slots, num_kv_heads, head_size = 512, 8, 128
     slots = torch.arange(64, 96, dtype=torch.int32)
     kv_cpu = torch.randn(slots.numel(), num_kv_heads, head_size, dtype=torch.float16)
@@ -1024,7 +1063,9 @@ def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
         scatter = torch.compile(scatter, dynamic=False)
 
     pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device)
-    scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
 
     assert pages.device.type == "spyre", "scatter left the device"
     expected = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
@@ -1256,3 +1297,23 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 14. Parameter identity across model.to("spyre")
+# ---------------------------------------------------------------------------
+
+
+def test_spyre_module_to_keeps_parameter_objects(spyre_device):
+    """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
+    must see the device tensor after the move, and a reload's in-place write."""
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    held = model.sinks
+
+    model.to(spyre_device)
+
+    assert model.sinks is held
+    new = torch.full((8,), 3.0, dtype=torch.float16)
+    model.sinks.data.copy_(new.to(spyre_device))
+    torch.testing.assert_close(held.cpu(), new)

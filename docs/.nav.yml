@@ -11,8 +11,10 @@ nav:
       - Configuration: user_guide/configuration.md
       - Environment Variables: user_guide/env_vars.md
       - Kineto Profiling: user_guide/kineto_profiling.md
+      - Speculative Decoding: user_guide/speculative_decoding.md
     - Developer Guide:
       - Contributing: contributing/README.md
+      - The Integration Tier: contributing/integration-tier.md
       - vLLM Upgrade Procedure: contributing/vllm-upgrade-procedure.md
 
   - Getting Started:
@@ -25,6 +27,8 @@ nav:
     - Configuration: user_guide/configuration.md
     - Environment Variables: user_guide/env_vars.md
     - Kineto Profiling: user_guide/kineto_profiling.md
+    - Speculative Decoding: user_guide/speculative_decoding.md
   - Developer Guide:
     - Contributing: contributing/README.md
+    - The Integration Tier: contributing/integration-tier.md
     - vLLM Upgrade Procedure: contributing/vllm-upgrade-procedure.md

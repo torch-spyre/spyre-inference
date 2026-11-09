@@ -1,0 +1,94 @@
+# Serve benchmarks for vision models on Spyre devices (power use case).
+#
+# Server settings follow run_vllm_serve_vis.sh and benchmark settings follow
+# vllm_bench_serve_Vis_newstack.sh (spyre-cicd-workloads/test_scripts).
+# Uses SPYRE_VISION_DATASET (custom_image, openai-chat backend).
+#
+# Per-TP server settings from run_vllm_serve_vis.sh:
+#   TP=1: max-model-len 8192,  max-num-seqs 16
+#   TP=2: max-model-len 16384, max-num-seqs 16
+#   TP=4: max-model-len 32768, max-num-seqs 32
+
+defaults:
+  server_health_timeout: 3600
+  server_parameters:
+    load-format: auto
+    compilation-config.mode: STOCK_TORCH_COMPILE
+    trust-remote-code: true
+    allowed-local-media-path: /home/senuser/
+  parameters:
+    dataset-name: custom_image
+    dataset-path: ${SPYRE_VISION_DATASET}
+    backend: openai-chat
+    endpoint: /v1/chat/completions
+    input-len: 8192
+    output-len: 2048
+    num-prompts: 10
+    max-concurrency: 1
+    temperature: 0
+    metric-percentiles: 99,100
+    percentile-metrics: ttft,tpot,itl,e2el
+    disable-shuffle: true
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Granite Vision 4.1 4B
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite-vision41-4b_tp1_vision
+    server_parameters:
+      model: ibm-granite/granite-vision-4.1-4b
+      tensor-parallel-size: 1
+      max-model-len: 8192
+      max-num-seqs: 16
+
+  - test_name: serve_granite-vision41-4b_tp2_vision
+    server_parameters:
+      model: ibm-granite/granite-vision-4.1-4b
+      tensor-parallel-size: 2
+      max-model-len: 16384
+      max-num-seqs: 16
+
+  # ---------------------------------------------------------------------------
+  # Ministral-3-14B-Instruct
+  # ---------------------------------------------------------------------------
+  - test_name: serve_ministral-3-14b_tp2_vision
+    server_parameters:
+      model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+      tensor-parallel-size: 2
+      max-model-len: 16384
+      max-num-seqs: 16
+
+  - test_name: serve_ministral-3-14b_tp4_vision
+    server_parameters:
+      model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+      tensor-parallel-size: 4
+      max-model-len: 32768
+      max-num-seqs: 32
+
+  # ---------------------------------------------------------------------------
+  # Mistral-Small-3.2-24B
+  # ---------------------------------------------------------------------------
+  - test_name: serve_mistral-3.2-24b_tp2_vision
+    server_parameters:
+      model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+      tensor-parallel-size: 2
+      max-model-len: 16384
+      max-num-seqs: 16
+
+  - test_name: serve_mistral-3.2-24b_tp4_vision
+    server_parameters:
+      model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+      tensor-parallel-size: 4
+      max-model-len: 32768
+      max-num-seqs: 32
+
+  # ---------------------------------------------------------------------------
+  # Gemma 4 26B A4B-it
+  # ---------------------------------------------------------------------------
+  - test_name: serve_gemma4-26b-a4b-it_tp4_vision
+    server_parameters:
+      model: google/gemma-4-26B-A4B-it
+      tensor-parallel-size: 4
+      max-model-len: 32768
+      max-num-seqs: 32

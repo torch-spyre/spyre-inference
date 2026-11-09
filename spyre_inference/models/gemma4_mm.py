@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from transformers.models.gemma4 import modeling_gemma4
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.model_executor.models.utils import scatter_output_slices
+from vllm.v1.worker.encoder_cudagraph_defs import ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG
 
 from spyre_inference.custom_ops.head_pad import pad_input_end, pad_output_end
 from spyre_inference.custom_ops.utils import convert
@@ -488,6 +489,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         del embedder.position_embedding_table
 
         standardize = getattr(config, "standardize", False)
+        assert self.embed_vision is not None, "a vision tower always has its embedder"
         projection = self.embed_vision.embedding_projection
         self._spyre_vision_tail = _VisionTail(
             # vision_project sums the k*k patches; the pooler averages and scales them.
@@ -508,6 +510,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             )
         return super().embed_multimodal(**kwargs)
 
+    @property
+    def vision_pack_tokens(self) -> int:
+        return self.max_tokens_per_item
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],
@@ -527,6 +533,14 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
         tokens = (x @ tail.weight.t()).to(tail.dtype)
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
+
+    def select_encoder_cudagraph_items(
+        self, mm_kwargs: dict[str, Any], indices: list[int]
+    ) -> dict[str, Any]:
+        # Upstream tags the selection with its row-width capture axis; Spyre declares none.
+        selected = super().select_encoder_cudagraph_items(mm_kwargs, indices)
+        selected.pop(ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG, None)
+        return selected
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
         return [

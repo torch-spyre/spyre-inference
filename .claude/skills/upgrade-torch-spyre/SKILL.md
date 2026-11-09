@@ -253,10 +253,10 @@ If you forget, the symptom is a `TypeError` referencing a kwarg or attribute tha
 The full test suite takes ~18 minutes and is better left to CI (which parallelizes across runners). Instead, run a single quick test to verify the build is functional:
 
 ```bash
-uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py::test_basic_model_load -m "not upstream" -x --timeout=120 -q 2>&1 | tail -20
+uv run --no-sync pytest 'tests/e2e/test_compile.py::test_basic_llm_inference[micro-g3.3]' -m "not upstream" -x --timeout=600 -q 2>&1 | tail -20
 ```
 
-This confirms torch-spyre loads and a model can be instantiated on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
+This confirms torch-spyre loads and a model compiles and decodes its reference output on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
 
 **A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§7). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[tool.spyre-rpms]` `packages` entry, then regenerate the lock.
 
@@ -274,7 +274,7 @@ If it fails, triage:
 
 ### 7. Update `spyre-rpms.lock`
 
-The torch-spyre bump typically coincides with newer `ibm-*` RPMs. Those are pinned by **bundle**: a published set of RPMs built against each other, at `<ARTIFACTORY_BUNDLE_PATH>/<arch>/prod/<bundle>/` next to a `build_hashes.json` naming each component's commit. `[tool.spyre-rpms]` in `pyproject.toml` names the bundle and the packages; `spyre-rpms.lock` is generated from it — never hand-edit the lock. CI still downloads from `ARTIFACTORY_RPM_PATH`'s prod tree (`<repo>/<arch>/`, `[defaults].tree = ""`), and `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
+The torch-spyre bump typically coincides with newer `ibm-*` RPMs. Those are pinned by **bundle**: a published set of RPMs built against each other, at `<ARTIFACTORY_BUNDLE_PATH>/<arch>/prod/<bundle>/`, one build of each package. `[tool.spyre-rpms]` in `pyproject.toml` names the bundle and the packages; `spyre-rpms.lock` is generated from it — never hand-edit the lock. CI still downloads from `ARTIFACTORY_RPM_PATH`'s prod tree (`<repo>/<arch>/`, `[defaults].tree = ""`), and `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
 
 The generated lock encodes two kinds of pin:
 
@@ -290,13 +290,13 @@ The generated lock encodes two kinds of pin:
 
 #### Step 1: Pick a bundle
 
-List the dated nightlies and take the newest that has a `build_hashes.json` (older ones don't, and the tool refuses them). `main` and `release-2.0` are re-published in place, so prefer a dated `main_nightly_YYYY_MM_DD`.
+List the dated snaps (`main_snap_YYYY_MM_DD_HH`; `main_nightly_*` before 2026-10-28) and take the newest. The tool needs exactly one build of each package in the folder, which only dated folders guarantee: `main`, `main_snap` and `release-2.0` are re-published in place and can keep stale builds (`main_snap` holds no RPMs at all).
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
 curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
   "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_BUNDLE_PATH/x86_64/prod" \
-  | jq -r '.children[].uri' | grep main_nightly_ | tail -5
+  | jq -r '.children[].uri' | grep -E 'main_snap_|main_nightly_' | sort | tail -5
 ```
 
 If torch-spyre fails to build against the newest bundle, bisect over bundles, not over individual packages.
@@ -310,7 +310,16 @@ ARTIFACTORY_BASE_URL="$ARTIFACTORY_URL" ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_R
   python3 scripts/lock_spyre_rpms.py
 ```
 
-It fails, leaving the lock untouched, unless every bundled RPM has a bit-exact (SHA-1) copy in the RPM repo, each `-devel`/`-headers` package in `[tool.spyre-rpms.devel]` exists at its base package's exact build (bundles don't ship them yet), and every commit has a build on ppc64le and s390x. A newly needed library is one more `packages` entry. CI's `Check spyre-rpms.lock` workflow runs `lock_spyre_rpms.py --verify`, which fails a PR whose lock doesn't match `[tool.spyre-rpms]` or was edited by hand.
+It fails, leaving the lock untouched, unless every bundled RPM has a bit-exact (SHA-1) copy in the RPM repo, each `-devel`/`-headers` package in `[tool.spyre-rpms.devel]` exists at its base package's exact build (bundles don't ship them yet), and every commit has a build on ppc64le and s390x. A newly needed library is one more `packages` entry.
+
+If Power or Z hasn't built one of the bundle's commits (`nothing matches …/s390x/…`), and the build team confirms that arch's newest build of it works with the rest of the bundle, hold it back explicitly rather than picking another bundle:
+
+```toml
+[tool.spyre-rpms.stale.s390x]
+ibm-senlib-core = "2.0.0-0.main.1+340.e2cc280"   # newest s390x commit: no build number
+```
+
+Every package at that package's bundled commit (here `-dd2` and `-headers` too) is held with it, and the lock marks those rows `# stale`. The tool fails once the arch publishes the bundled commit; drop the entry then. CI's `Check spyre-rpms.lock` workflow runs `lock_spyre_rpms.py --verify`, which fails a PR whose lock doesn't match `[tool.spyre-rpms]` or was edited by hand.
 
 #### Step 3: Validate the pin resolves on **all** arches — mandatory
 
@@ -428,7 +437,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits
 - [x] `uv lock` resolves cleanly to `<new-sha>`
 - [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
-- [x] Smoke test (`test_basic_model_load`) passes locally
+- [x] Smoke test (`test_compile[micro-g3.3]`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
 - [x] `spyre-rpms.lock` updated — no downgrades (commit-count check passed)
 
@@ -470,7 +479,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 - [x] `uv lock` resolves cleanly to `<new-sha>`
 - [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
-- [x] Smoke test (`test_basic_model_load`) passes locally
+- [x] Smoke test (`test_compile[micro-g3.3]`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
 - [x] `spyre-rpms.lock` updated — no downgrades (commit-count check passed)
 

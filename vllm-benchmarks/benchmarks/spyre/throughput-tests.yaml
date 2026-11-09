@@ -1,7 +1,6 @@
 # Throughput benchmarks for Spyre devices
 - test_name: throughput_granite8B_tp1_in64_out64
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
     SPYRE_DEVICES: '0'
   parameters:
@@ -15,7 +14,6 @@
     max-model-len: 128
 - test_name: throughput_granite33-8b_tp1_in64_out64
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
     SPYRE_DEVICES: '0'
     # Extra time to compile

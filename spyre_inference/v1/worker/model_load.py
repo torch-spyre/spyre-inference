@@ -24,7 +24,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
-from spyre_inference.custom_ops.conv import SpyreConv2d
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_qk_norm_eps,
@@ -39,6 +38,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
@@ -70,15 +70,12 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
 
 
 def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
-    """Move the layer weights to Spyre and place SpyreConv2d weights in their tiled layout."""
+    """Move the layer weights to Spyre."""
     # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
     # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
     # an nn.Module, but just the attention implementation.
     Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
     model.to(device=device)
-    for module in model.modules():
-        if isinstance(module, SpyreConv2d):
-            module.process_weights_after_loading()
 
 
 def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) -> bool:
@@ -132,3 +129,18 @@ def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) 
             len(pairs),
         )
     return changed
+
+
+def rewarm_after_reload(runner: Any) -> None:
+    """After upstream's reload_weights, shared by the V1 and V2 runners.
+
+    The reload reprocesses the weights, which rewrites the layers' KV scales. The
+    graphs that read them guard on their values, so only those retrace; warming here
+    does that before the next request, which an armed compile guard would fail.
+    """
+    if resolve_kv_scales(runner.get_model(), runner.compilation_config.static_forward_context):
+        logger.warning(
+            "KV cache scales changed on weight reload; re-warming the graphs that depend on them."
+        )
+        with compile_guard.allow_compile("KV cache scales changed on weight reload"):
+            runner.warming_up_model()

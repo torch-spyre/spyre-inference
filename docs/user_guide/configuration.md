@@ -49,6 +49,32 @@ That is also the configuration the tensor-parallel and compile e2e tests run the
 checkpoints under. A repository with no vision tower gets the override by default, so
 this is only needed for the multimodal ones.
 
+## Gemma-4: per-request image sizes
+
+The vision tower is compiled per token budget at warmup, for the image size the engine runs
+at: `max_soft_tokens` from `--mm-processor-kwargs`, default 280. A request can ask for a
+larger size (560 or 1120) in its own `mm_processor_kwargs`: offline through `LLM.chat` or
+`LLM.generate`, and online only when the server runs with `--trust-request-mm-kwargs`.
+
+Each larger size needs its own budget, compiled at warmup, so they are opt-in through
+`encoder_cudagraph_token_budgets`. To serve requests up to 1120:
+
+```bash
+vllm serve google/gemma-4-26B-A4B-it --tensor-parallel-size 4 \
+  --trust-request-mm-kwargs \
+  -cc '{"encoder_cudagraph_token_budgets": [64, 128, 256, 280, 576, 1152]}'
+```
+
+The list replaces the default budgets, so keep the small ones in it: 64 to 280 cover the
+engine's own 280, 576 covers 560 and 1152 covers 1120. Each budget is rounded up to a whole
+patch group. An image larger than the largest entry, as listed, is rejected with a 400
+(`VLLMValidationError` offline) rather than compiled mid-request, and the encoder cache is
+raised to hold one at that size. An entry above `max_num_batched_tokens` (512 unless
+`--max-num-batched-tokens` sets it) needs chunked MM input, so `--disable-chunked-mm-input`
+with it fails at startup.
+Raising the engine-wide `--mm-processor-kwargs '{"max_soft_tokens": 560}'` instead makes
+every image that size.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup
@@ -216,11 +242,50 @@ If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every p
 buckets where the lengths actually are. A workload that sits on one power of two gains nothing
 from any preset.
 
+#### A denser ladder for large batches only
+
+A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
+concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
+batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`
+(default 16, which with the default buckets means 9 or more sequences), while the per-sequence
+path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the dense buckets
+cost warmup without a measured gain. The second ladder is unioned with the first, so no length
+rounds up further.
+It is off by default, rejected at startup together with `SPYRE_ATTN_KV_BUCKETS`, which replaces
+the ladder it extends, and ignored with a warning when the threshold is above the largest
+num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
+`SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
+less warmup.
+
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
 the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
+
+## KV cache size
+
+The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
+card's free memory (`torch.accelerator.get_memory_info`) and gives the KV cache what is
+left of `--gpu-memory-utilization` (default 0.92) × total. The cache keeps every block
+that memory pays for, usually far more than `--max-num-seqs` requests at `--max-model-len`
+need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.
+
+Each Spyre layer allocates its own page per block, so the budget is converted into blocks
+at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
+groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
+one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
+regions, so a model with few layers gets fewer blocks than its budget: they must still pack
+into the regions. When memory runs out before a full batch fits, a warning names the knobs,
+and requests wait for pages instead of all running at full length.
+
+The profile run is skipped, as the first forward on Spyre would trace the model before
+the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`
+headroom. Lower it if a forward fails to allocate. `--kv-cache-memory-bytes` skips the
+measurement; `--num-gpu-blocks-override` replaces the block count it yields, so the
+warning above checks the override instead. `VLLM_CPU_KVCACHE_SPACE`, which sets the
+KV cache size on vLLM's CPU backend, is ignored, with a warning when it is set to a size;
+setting it to a size next to `--kv-cache-memory-bytes` is an error.
 
 ## FP8 KV cache
 
@@ -233,11 +298,10 @@ vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 
 It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
 that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
-...) are rejected at startup. It does not raise capacity: the platform pins the block count
-to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
-same number of tokens in half the device memory. Attention still computes in the model
-dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
-when it has none. The speedup grows with the number of cached tokens each decode step
+...) are rejected at startup. Since the KV cache is sized from free device memory (see
+[KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
+Attention still computes in the model dtype: pages are dequantized on read with the
+checkpoint's per-layer KV scales, or 1.0 when it has none. The speedup grows with the number of cached tokens each decode step
 reads, so it is small at short contexts; check accuracy against an fp16 cache before
 relying on it.
 
@@ -271,12 +335,12 @@ VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
 
 [tool.uv.extra-build-dependencies]
-torch-spyre = ["torch==2.13.0"]
+torch-spyre = ["torch==2.14.1"]
 ```
 
 These settings ensure:
 
-- torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+- torch-spyre is built against the same PyTorch version (2.14.1) the runtime pins, so its
   C++ extension cannot drift in ABI
 - vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`

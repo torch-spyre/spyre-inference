@@ -245,6 +245,81 @@ def test_item_tokens_count_valid_patches_only():
     assert model.vision_item_tokens(_mm_kwargs(_images())) == [6, 2]
 
 
+def _manager(model, budgets=()):
+    from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
+
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_max_vision_items_per_batch=0,
+            encoder_cudagraph_max_frames_per_batch=None,
+        ),
+        model_config=SimpleNamespace(
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda modality: 0 if modality == "video" else 2,
+                mm_encoder_tp_mode="weights",
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+    return SpyreEncoderGraphManager(vllm_config, torch.device("cpu"), torch.float16, model)
+
+
+@pytest.mark.parametrize(
+    ("budgets", "larger"),
+    [((), []), ((64, 128, 256, 280, 576), [576]), ((64, 128, 256, 280, 576, 1152), [576, 1152])],
+)
+def test_user_budgets_round_up_to_whole_patch_groups(budgets, larger):
+    model = _spyre_model(_tower_config(num_layers=1))
+    model.max_tokens_per_item = 280
+    assert _manager(model, budgets).token_budgets == [64, 128, 256, 320, *larger]
+
+
+def test_every_max_soft_tokens_has_a_budget_once_opted_in():
+    """A request's own ``max_soft_tokens`` lands on a compiled budget, not the eager path."""
+    model = _spyre_model(_tower_config(num_layers=1))
+    model.max_tokens_per_item = 280  # the engine's default; a request may ask for up to 1120
+    manager = _manager(model, (64, 128, 256, 280, 576, 1152))
+
+    for tokens in (70, 140, 280, 560, 1120):
+        assert manager._path_fitting_budget("default", tokens) is not None
+    # A square image at the default 280 comes out at 256 tokens and pads nothing.
+    assert manager._path_fitting_budget("default", 256) == 256
+    # Several images pack only up to the budget covering the engine's own largest item.
+    assert manager._pack_budgets == {"default": [64, 128, 256, 320]}
+
+
+def test_a_large_image_runs_alone_and_the_small_ones_pack():
+    """Gemma 4's own item selection splits a mixed batch, and every item replays a budget."""
+    config = _tower_config(num_layers=1)
+    config.position_embedding_size = 64  # room for the 42x42 grid
+    model = _spyre_model(config)
+    model.max_tokens_per_item = 192  # three items per call, packed up to 192 tokens
+    manager = _manager(model, (64, 128, 192, 280))
+    assert manager.token_budgets == [64, 128, 192, 320]
+    for budget in (64, 320):
+        manager._capture_budget_graph(budget)
+    ran = []
+    run = manager._run_budget_graph
+
+    def recording_run(mm_kwargs, budget, **kwargs):
+        ran.append(budget)
+        return run(mm_kwargs, budget, **kwargs)
+
+    manager._run_budget_graph = recording_run
+    mm_kwargs = _mm_kwargs([*_images(), _image(42, 42, pad=0, seed=3)])  # 6, 2 and 196 tokens
+
+    with torch.inference_mode():
+        outputs = manager.execute(mm_kwargs)
+        expected = model.embed_multimodal(**mm_kwargs)
+
+    # Unlimited, upstream packs all three into the 320 budget.
+    assert sorted(ran) == [64, 320]
+    assert (manager.graph_hits, manager.graph_misses) == (3, 0)
+    for got, want in zip(outputs, expected, strict=True):
+        assert _cosine(got, want) > 0.995
+
+
 def test_a_grid_the_kernel_does_not_divide_is_rejected():
     model = _spyre_model(_tower_config(num_layers=1))
     with pytest.raises(ValueError, match="pooling kernel"):

@@ -2769,11 +2769,11 @@ default the plugin sets only reaches spawned processes.</p>
 </span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="n">CMAKE_ARGS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"--fresh"</span>
 </span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>
 </span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="k">[tool.uv.extra-build-dependencies]</span>
-</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.13.0"</span><span class="p">]</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.14.1"</span><span class="p">]</span>
 </span></code></pre></div>
 <p>These settings ensure:</p>
 <ul>
-<li>torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+<li>torch-spyre is built against the same PyTorch version (2.14.1) the runtime pins, so its
   C++ extension cannot drift in ABI</li>
 <li>vLLM is built with the <strong>empty</strong> backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on <code>vllm._C</code>

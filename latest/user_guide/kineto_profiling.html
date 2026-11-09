@@ -2764,7 +2764,7 @@ torch-spyre with the flag set:</p>
 </span></code></pre></div>
 <p>Pin <code>&lt;rev&gt;</code> to whatever commit <code>[tool.uv.sources.torch-spyre]</code> in
 <code>pyproject.toml</code> resolves to. Do <strong>not</strong> pass <code>--no-build-isolation</code>:
-the build system's <code>torch~=2.13.0</code> requirement needs an isolated env,
+the build system's <code>torch~=2.14.0</code> requirement needs an isolated env,
 and the venv's torch is not trusted for build. Build isolation
 downloads ~1 GB of torch into <code>/tmp/pip-build-env-*/</code> and cleans up
 after; watch <code>/tmp</code> space on tight pods.</p>
@@ -2774,7 +2774,7 @@ wheel on top of this — invoke Python from the venv directly, or use
 <h3 id="14-verify-installation">1.4 Verify installation<a class="headerlink" href="#14-verify-installation" title="Permanent link">&para;</a></h3>
 <p>Stock torch is expected — the <code>+aiu.kineto</code> suffix is gone:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.__version__)"</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="c1"># Expected: 2.13.0+cpu   (no +aiu.kineto suffix)</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="c1"># Expected: 2.14.1+cpu   (no +aiu.kineto suffix)</span>
 </span></code></pre></div>
 <p>The real signal is that the AIUPTI backend is linked into
 <code>torch_spyre/_C.so</code>. Check the link, symbols, and a produced trace; wheel size

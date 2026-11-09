@@ -714,18 +714,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         }
 
         upstream_marker = pytest.mark.upstream
+        kept: list[pytest.Item] = []
         deselected: list[pytest.Item] = []
 
-        for item in items[:]:
+        for item in items:
             test_path = Path(item.fspath).resolve()
             if not test_path.is_relative_to(upstream_tests_base):
+                kept.append(item)
                 continue
 
             if _is_unsupported_on_current_platform(item):
-                items.remove(item)
                 deselected.append(item)
                 continue
 
+            kept.append(item)
             item.add_marker(upstream_marker)
 
             # Tag upstream items before the skip/xfail branches so tags land
@@ -774,6 +776,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
 
+        items[:] = kept
         if deselected:
             config.hook.pytest_deselected(items=deselected)
 

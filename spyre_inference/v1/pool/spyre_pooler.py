@@ -149,7 +149,7 @@ def pad_row_count_to_bucket(row_indices: torch.Tensor) -> tuple[torch.Tensor, in
 
 
 def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
-    """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
+    """Row gather via ``index_select``.
 
     ``row_indices`` may be 1-D (CLS/LAST, unpack) or ``[B, L]`` (pack), on CPU
     or already on ``hidden_states.device``. Spyre has no int64 index kernel.

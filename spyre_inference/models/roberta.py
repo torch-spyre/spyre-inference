@@ -58,7 +58,13 @@ def roberta_position_delta(hf_config: Any) -> int:
     if hf_config is None:
         return 0
     architectures = getattr(hf_config, "architectures", None) or []
-    if not any("Roberta" in arch for arch in architectures):
+    # The generic Transformers wrapper replaces architectures; model_type still
+    # identifies the backbone whose position table needs this offset.
+    if getattr(hf_config, "model_type", None) not in (
+        "roberta",
+        "xlm-roberta",
+        "mpnet",
+    ) and not any("Roberta" in arch or "MPNet" in arch for arch in architectures):
         return 0
     if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
         return 0

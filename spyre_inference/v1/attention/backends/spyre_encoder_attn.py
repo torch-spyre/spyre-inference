@@ -103,7 +103,9 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
     The clamp makes the scatter write one destination row repeatedly. That is benign
     -- every duplicate lane attends exactly the real keys, as the last real row does
     (a key-pad mask depends only on the KV column, and a causal row past the last real
-    one still sees all of them), so each carries the same value -- but ``index_copy_``
+    one still sees all of them), so each carries the same value. Query-dependent
+    position bias breaks that equivalence; the fused kernel clamps its output rows
+    before scatter in that case. ``index_copy_``
     with duplicate indices is formally undefined in
     PyTorch, so ``build_encoder_plan`` asserts the intent rather than leaving it
     implicit.
@@ -212,6 +214,7 @@ def _encoder_rect_kernel(
     num_heads,
     num_kv_heads,
     head_size,
+    position_bias=None,
 ):
     """Rectangular path: view ``[B*L, H, D]`` as the grid, attend, un-view. One graph.
 
@@ -226,6 +229,8 @@ def _encoder_rect_kernel(
     q = query.view(width, extent, num_heads, head_size).transpose(1, 2)
     k = key.view(width, extent, num_kv_heads, head_size).transpose(1, 2)
     v = value.view(width, extent, num_kv_heads, head_size).transpose(1, 2)
+    if position_bias is not None:
+        mask = mask + position_bias[:, :, :extent, :extent]
     attn = F.scaled_dot_product_attention(
         q,
         k,
@@ -250,11 +255,22 @@ def _encoder_rect_kernel_out(
     num_heads,
     num_kv_heads,
     head_size,
+    position_bias=None,
 ):
     """As above, writing the layer's output buffer inside the same graph."""
     out.copy_(
         _encoder_rect_kernel(
-            query, key, value, mask, scale, width, extent, num_heads, num_kv_heads, head_size
+            query,
+            key,
+            value,
+            mask,
+            scale,
+            width,
+            extent,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            position_bias,
         )
     )
     return out
@@ -283,6 +299,7 @@ def _encoder_sdpa_kernel(
     num_heads,
     num_kv_heads,
     head_size,
+    position_bias=None,
 ):
     """Masked bidirectional attention over ``group`` sequences of equal padded length.
 
@@ -292,6 +309,8 @@ def _encoder_sdpa_kernel(
     q = q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2)
     k = k_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
     v = v_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
+    if position_bias is not None:
+        mask = mask + position_bias[:, :, :extent, :extent]
     attn = F.scaled_dot_product_attention(
         q,
         k,
@@ -316,6 +335,8 @@ def _encoder_fused_kernel(
     num_heads,
     num_kv_heads,
     head_size,
+    position_bias=None,
+    output_row_index=None,
 ):
     """Ragged path: gather, attend and store one group of equal-extent requests.
 
@@ -332,8 +353,22 @@ def _encoder_fused_kernel(
     """
     q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
     attn = _encoder_sdpa_kernel(
-        q_rows, k_rows, v_rows, mask, scale, group, num_heads, num_kv_heads, head_size
+        q_rows,
+        k_rows,
+        v_rows,
+        mask,
+        scale,
+        group,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        position_bias,
     )
+    if position_bias is not None:
+        # Padded queries gather the last real token but have different bias rows.
+        # Scatter identical copies of the real query's output to that destination.
+        assert output_row_index is not None
+        attn = attn.index_select(0, output_row_index)
     out.index_copy_(0, row_index, attn)
     return out
 
@@ -381,6 +416,7 @@ class EncoderGroupPlan:
     extent: int
     row_table: torch.Tensor
     mask: torch.Tensor
+    output_row_table: torch.Tensor | None = None
 
     @property
     def group(self) -> int:
@@ -450,8 +486,8 @@ def build_encoder_plan(
 
     def plan(chunk: list[tuple[int, int, int]], extent: int) -> EncoderGroupPlan:
         # The row table's pad lanes repeat the last real row, so the scatter writes it
-        # several times. Sound either way: the non-causal mask ignores the query axis,
-        # and the causal one puts every pad position past the real keys.
+        # several times. output_row_table restores equal values for duplicate writes
+        # when position bias makes padded queries differ from the last real query.
         assert all(m[1] >= 1 for m in chunk), "a zero-length request has no row to clamp onto"
         return EncoderGroupPlan(
             starts=[m[0] for m in chunk],
@@ -465,6 +501,15 @@ def build_encoder_plan(
             # kernel's batch dim indexes.
             mask=convert(
                 encoder_key_pad_mask(extent, [m[2] for m in chunk], dtype, causal), device
+            ),
+            output_row_table=convert(
+                torch.cat(
+                    [
+                        encoder_row_table(i * extent, m[1], extent, index_dtype)
+                        for i, m in enumerate(chunk)
+                    ]
+                ),
+                device,
             ),
         )
 
@@ -565,6 +610,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.position_bias: torch.nn.Module | None = None
         # Upstream checks supports_sink() on CUDA/ROCm only, and these kernels never read
         # the sinks (openai_privacy_filter passes them), so this is the only guard.
         if self._sinks_source is not None:
@@ -598,6 +644,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         return 0
 
     def _run_rect(self, out, query, key, value, plan_mask, width, extent, heads, kv_heads, dim):
+        bias = self.position_bias() if self.position_bias is not None else None
         if out is None:
             return self._rect_fn(
                 query,
@@ -610,6 +657,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 heads,
                 kv_heads,
                 dim,
+                bias,
             )
         return self._rect_out_fn(
             out,
@@ -623,6 +671,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             heads,
             kv_heads,
             dim,
+            bias,
         )
 
     def _run_gather(self, query, key, value, row_index):
@@ -639,9 +688,23 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             heads,
             kv_heads,
             dim,
+            self.position_bias() if self.position_bias is not None else None,
         )
 
-    def _run_fused(self, out, row_index, query, key, value, mask, group, heads, kv_heads, dim):
+    def _run_fused(
+        self,
+        out,
+        row_index,
+        query,
+        key,
+        value,
+        mask,
+        group,
+        heads,
+        kv_heads,
+        dim,
+        output_row_index=None,
+    ):
         return self._fused_fn(
             out,
             row_index,
@@ -654,6 +717,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             heads,
             kv_heads,
             dim,
+            self.position_bias() if self.position_bias is not None else None,
+            output_row_index if self.position_bias is not None else None,
         )
 
     def warm_kernels(
@@ -720,6 +785,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 num_heads,
                 num_kv_heads,
                 head_size,
+                convert(torch.arange(width * extent, dtype=index_dtype), device)
+                if self.position_bias is not None
+                else None,
             )
             traced += 1
         return traced
@@ -858,6 +926,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     num_heads,
                     num_kv_heads,
                     head_size,
+                    plan.output_row_table,
                 )
                 continue
             q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
@@ -953,6 +1022,7 @@ def _spyre_encoder_attention_forward(
 
     num_heads, num_kv_heads = self.num_heads, self.num_kv_heads
     head_size = self.head_size
+    position_bias = getattr(self, "encoder_position_bias", None)
     attn = _encoder_rect_kernel(
         query.view(-1, num_heads, head_size),
         key.view(-1, num_kv_heads, head_size),
@@ -964,6 +1034,7 @@ def _spyre_encoder_attention_forward(
         num_heads,
         num_kv_heads,
         head_size,
+        position_bias() if position_bias is not None else None,
     )
     return attn.reshape(-1, num_heads * head_size)
 

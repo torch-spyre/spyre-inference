@@ -18,12 +18,13 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-from vllm.config import CompilationMode, VllmConfig
+from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from spyre_inference import envs
+from spyre_inference.hf_adapters import uses_hf_adapters
 from spyre_inference.multimodal.utils import blocks_marked_compilable
 from spyre_inference.v1.worker import compile_guard
 
@@ -169,6 +170,14 @@ def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Mod
 
     if vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
         logger.info("Compilation disabled (enforce_eager=True)")
+        return model, 0
+
+    if uses_hf_adapters(vllm_config):
+        from spyre_inference.transformers_backend import SpyreTransformersMixin
+
+        with set_current_vllm_config(vllm_config):
+            cast(SpyreTransformersMixin, model).compile_hf_adapters()
+        logger.info("HF-adapters installed model body compilation")
         return model, 0
 
     model_name = type(model).__name__

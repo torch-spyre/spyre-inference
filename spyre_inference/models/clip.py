@@ -20,22 +20,18 @@ The LayerNorm boundary-norm swap lives in ``multimodal/clip.py`` instead
 
 from __future__ import annotations
 
-from copy import copy
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
 import vllm.model_executor.models.clip as vllm_clip
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.clip import (
     CLIPEmbeddingModel,
     _get_vision_feature_select_strategy,
 )
-from vllm.v1.attention.backend import AttentionBackend, AttentionType, subclass_attention_backend
-from vllm.v1.attention.selector import get_attn_backend
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.encoder_attention import CausalEncoderOnlyAttention
 from spyre_inference.v1.pool.spyre_pooler import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
 
@@ -116,37 +112,6 @@ def select_class_rows(feats: torch.Tensor) -> torch.Tensor:
     b, s, h = feats.shape
     rows = torch.arange(b, dtype=torch.int64) * s
     return select_rows(feats.reshape(b * s, h), rows).reshape(b, 1, h)
-
-
-@lru_cache
-def _causal_encoder_backend(backend: type[AttentionBackend]) -> type[AttentionBackend]:
-    class CausalEncoderOnlyBuilder(backend.get_builder_cls()):
-        def build(self, common_prefix_len, common_attn_metadata, *args, **kwargs):
-            common_attn_metadata = copy(common_attn_metadata)
-            common_attn_metadata.causal = True
-            return super().build(common_prefix_len, common_attn_metadata, *args, **kwargs)
-
-    return subclass_attention_backend(
-        "CausalEncoderOnlyAttention_", backend, CausalEncoderOnlyBuilder
-    )
-
-
-class CausalEncoderOnlyAttention(Attention):
-    """``EncoderOnlyAttention`` with the opposite builder: no KV cache, and the metadata is
-    causal by this layer's say rather than by vLLM's ``causal=True`` default."""
-
-    def __init__(self, num_heads: int, head_size: int, scale: float, **kwargs) -> None:
-        backend = get_attn_backend(
-            head_size, torch.get_default_dtype(), "auto", attn_type=AttentionType.ENCODER_ONLY
-        )
-        super().__init__(
-            num_heads,
-            head_size,
-            scale,
-            attn_backend=_causal_encoder_backend(backend),
-            attn_type=AttentionType.ENCODER_ONLY,
-            **kwargs,
-        )
 
 
 class SpyreCLIPEmbeddingModel(CLIPEmbeddingModel):

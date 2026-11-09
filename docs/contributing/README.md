@@ -99,10 +99,10 @@ kinds of case:
 
 ```bash
 make test-quality              # the whole gate, one card
-make test-quality-shard-0      # one CI shard (QUALITY_SHARDS=8)
+make test-quality-shard-0      # one CI shard
 ```
 
-CI runs the gate as `QUALITY_SHARDS` parallel 1-card jobs, weighted by recorded runtime like
+CI runs the gate as parallel 1-card jobs (`shards:` in `.github/test-matrix.yaml`), weighted by recorded runtime like
 the smoke and attention suites. The slowest single case bounds the useful shard count, so
 resize with the `rebalance-test-shards` skill rather than by raising it on a hunch.
 

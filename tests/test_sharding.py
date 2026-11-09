@@ -561,99 +561,46 @@ def test_upstream_shard_excludes_gsm8k(tmp_path, monkeypatch):
     assert shards[0] | shards[1] == other_ids | {gsm8k.nodeid}
 
 
-def _makefile_shard_counts() -> dict[str, int]:
-    text = (_REPO_ROOT / "Makefile").read_text()
-    counts = {}
-    for suite, var in (
-        ("smoke", "SMOKE_SHARDS"),
-        ("smoke-unit", "SMOKE_UNIT_SHARDS"),
-        ("e2e-smoke", "E2E_SMOKE_SHARDS"),
-        ("e2e-smoke-dist", "E2E_SMOKE_DIST_SHARDS"),
-        ("attention", "ATTN_SHARDS"),
-        ("upstream", "UPSTREAM_SHARDS"),
-        ("distributed", "DIST_SHARDS"),
-        ("probes", "PROBE_SHARDS"),
-        ("quality", "QUALITY_SHARDS"),
-    ):
-        m = re.search(rf"^{var}\s*\?=\s*(\d+)", text, re.MULTILINE)
-        assert m, f"{var} not found in Makefile"
-        counts[suite] = int(m.group(1))
-    return counts
-
-
-def _matrix_shard_ids() -> dict[str, list[int]]:
-    text = (_REPO_ROOT / ".github/test-matrix.yaml").read_text()
-    return {
-        suite: sorted({int(n) for n in re.findall(rf"test-{suite}-shard-(\d+)\b", text)})
-        for suite in (
-            "smoke",
-            "smoke-unit",
-            "e2e-smoke",
-            "e2e-smoke-dist",
-            "attention",
-            "upstream",
-            "distributed",
-            "probes",
-            "quality",
-        )
-    }
-
-
-def test_matrix_shard_entries_match_makefile_counts():
-    """Every declared shard 0..N-1 has exactly one matrix job.
-
-    The Makefile ``*_SHARDS`` count and the matrix entries are two copies of the
-    same number; if they drift, tests assigned to a shard id no job runs vanish
-    from CI green, since _apply_shard checks each test landed in *a* valid shard,
-    not that every shard is executed.
-    """
-    counts = _makefile_shard_counts()
-    ids = _matrix_shard_ids()
-    for suite, n in counts.items():
-        assert ids[suite] == list(range(n)), (
-            f"{suite}: matrix declares shard ids {ids[suite]} but the Makefile declares "
-            f"{n} shards; every shard 0..{n - 1} needs exactly one matrix job or its "
-            "tests never run in CI."
-        )
-
-
-def _matrix_include() -> list[dict]:
+def _matrix_suites() -> list[dict]:
     import yaml
 
     return yaml.safe_load((_REPO_ROOT / ".github/test-matrix.yaml").read_text())
 
 
+def test_makefile_reads_every_shard_count_from_the_matrix():
+    """A local `make test-<suite>-shard` must split a suite the way CI does."""
+    sharded = {s["test_target"]: s["shards"] for s in _matrix_suites() if "shards" in s}
+    assert sharded
+    for target, n in sharded.items():
+        out = subprocess.run(
+            ["make", "-n", "-C", str(_REPO_ROOT), f"{target}-0"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        counts = set(re.findall(r"--[a-z0-9-]+-shards=(\S*)", out))
+        assert counts, f"{target}: no --*-shards flag in the recipe"
+        assert counts == {str(n)}, (
+            f"{target}: Makefile resolves {counts} shards, the matrix declares {n}"
+        )
+
+
+def test_every_matrix_target_is_a_makefile_target():
+    """A typo in test_target would schedule a leg that fails with 'No rule to make target'."""
+    for suite in _matrix_suites():
+        target = suite["test_target"] + ("-0" if "shards" in suite else "")
+        result = subprocess.run(
+            ["make", "-n", "-C", str(_REPO_ROOT), target], capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"{target}: {result.stderr.strip()}"
+
+
 def test_every_pytest_tier_plans_at_least_one_leg():
     """A tier that selects nothing would schedule no job and report green."""
-    entries = _matrix_include()
+    entries = _matrix_suites()
     makefile = (_REPO_ROOT / "Makefile").read_text()
     tiers = re.search(r"^VALID_TEST_TYPES := (.+)$", makefile, re.MULTILINE).group(1).split()
     for tier in set(tiers) - {"perf"}:
         assert any(tier in e["test_types"].split() for e in entries), tier
     declared = {t for e in entries for t in e["test_types"].split()}
     assert declared <= set(tiers), f"unknown tiers in test-matrix.yaml: {declared - set(tiers)}"
-
-
-def test_matrix_shard_blocks_within_a_suite_are_uniform():
-    """Every block of a suite must share test_types / runs_on / image_label.
-
-    Only the ``test_target`` id and the cosmetic ``(shard k/N)`` cfg label may
-    differ between a suite's shards. ``test_types`` decides which meta-suites a
-    job joins (``integration``/``unit``/...), so a block cloned from the wrong
-    suite silently files the shard under the wrong coverage set -- and the id
-    cross-check above still passes because the ids are contiguous. This is the
-    guard for that: a shard added by the rebalance skill must be a copy of its
-    own suite, not a neighbour.
-    """
-    groups: dict[str, list[dict]] = {}
-    for entry in _matrix_include():
-        suite = re.sub(r"-shard-\d+$", "", entry["test_target"])
-        groups.setdefault(suite, []).append(entry)
-
-    for suite, entries in groups.items():
-        for field in ("test_types", "runs_on", "image_label"):
-            values = {repr(e.get(field)) for e in entries}
-            assert len(values) == 1, (
-                f"{suite}: shards disagree on {field}: {sorted(values)}. Every block of a "
-                f"suite must be cloned from that same suite so {field} stays identical."
-            )

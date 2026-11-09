@@ -29,8 +29,34 @@ BENCH_CONFIGS = REPO / "vllm-benchmarks" / "benchmarks" / "spyre"
 CARD_POOLS = (1, 2, 4)
 
 
+def _runs_on(cards: int) -> list[str]:
+    return ["x86_64", f"spyre_pf_x{cards}", "linux"]
+
+
 def load_test_configs(path: Path = TEST_MATRIX) -> list[dict]:
-    return yaml.safe_load(path.read_text())
+    """The matrix as per-job legs: each `shards: N` suite becomes N legs."""
+    legs = []
+    for suite in yaml.safe_load(path.read_text()):
+        leg = {
+            "cfg": suite["cfg"],
+            "test_types": suite["test_types"],
+            "runs_on": _runs_on(suite["cards"]),
+            "image_label": "image_torch_spyre",
+            "test_target": suite["test_target"],
+        }
+        n = suite.get("shards")
+        if n is None:
+            legs.append(leg)
+            continue
+        legs.extend(
+            {
+                **leg,
+                "cfg": f"{leg['cfg']} (shard {i + 1}/{n})",
+                "test_target": f"{leg['test_target']}-{i}",
+            }
+            for i in range(n)
+        )
+    return legs
 
 
 def select_test_configs(configs: list[dict], test_type: str) -> list[dict]:
@@ -75,7 +101,7 @@ def plan_perf(configs_dir: Path = BENCH_CONFIGS, models: set[str] | None = None)
     legs = []
     for model, tp in tp_by_model.items():
         cards = next(n for n in CARD_POOLS if n >= tp)
-        legs.append({"model": model, "runs_on": ["x86_64", f"spyre_pf_x{cards}", "linux"]})
+        legs.append({"model": model, "runs_on": _runs_on(cards)})
     return legs
 
 

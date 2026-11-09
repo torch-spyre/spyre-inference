@@ -1436,6 +1436,9 @@ def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group,
         (32, 8, 128, 8),
         (256, 8, 128, 8),
         (13, 8, 128, 1),
+        # A sliding window's block count: gemma-4-26B at TP4, window 1024, 1024-row query.
+        (17, 4, 256, 1),
+        (18, 8, 128, 2),
         (256, 4, 256, 8),
         (256, 16, 128, 1),
         (256, 32, 128, 1),
@@ -1444,6 +1447,13 @@ def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group,
 )
 def test_prefill_page_group_selection(num_blocks, num_heads, head_size, expected):
     assert _prefill_page_group(num_blocks, num_heads, head_size) == expected
+
+
+def test_prefill_page_group_divides_every_block_count():
+    """The kernel rejects a group that does not divide num_blocks, and a sliding window's
+    block count is not a bucket, so every count must get a divisor."""
+    for num_blocks in range(1, 1025):
+        assert num_blocks % _prefill_page_group(num_blocks, 8, 128) == 0, num_blocks
 
 
 def test_prefill_page_group_must_divide_num_blocks():

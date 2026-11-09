@@ -2533,7 +2533,12 @@ are missing.</p>
 <tr>
 <td><code>allow_xpress_on_v1()</code> (<code>spyre_inference/v1/spec_decode/config.py</code>)</td>
 <td><code>VllmConfig._get_v1_model_runner_unsupported_features</code> (<code>vllm/config/vllm.py</code>)</td>
-<td>Drops only the "xpress speculative decoding" entry, since upstream's XPress speculator is V2-only and Spyre drives XPress from its V1 DFlash proposer. Delete at the V2 runner flip (#906).</td>
+<td>Drops "xpress speculative decoding" and "mixed sliding/full dflash drafts": Spyre drives both through its V1 DFlash proposer. This is the config-level half of the decoder-layer workaround below. Retain while V1 is supported; delete when speculative decoding moves to V2 (#1575) and V1 is removed (#1245, part of #906).</td>
+</tr>
+<tr>
+<td><code>SpyreDFlashQwen3DecoderLayer.__init__</code> (<code>spyre_inference/models/qwen3_dflash.py</code>)</td>
+<td><code>_resolve_layer_attention</code>'s V2 check (<code>vllm/model_executor/models/qwen3_dflash.py</code>)</td>
+<td>Stubs the module's <code>get_current_vllm_config</code> to report <code>use_v2_model_runner=True</code> during layer construction, allowing mixed sliding/full drafts on V1. Spyre gives these layers a shared full-allocation KV group (<code>SpyreGemma4ForCausalLM.get_kv_cache_groups</code>) and splits attention metadata by window. Other current-config reads in the layer's construction see the stub too (currently only <code>DFlashQwen3Attention</code>'s ROCm branch); audit them on each vLLM upgrade. Delete once these drafts use V2 (#1575) and V1 is removed (#1245, part of #906).</td>
 </tr>
 <tr>
 <td><code>use_spyre_dflash_proposer()</code> (<code>spyre_inference/v1/spec_decode/dflash.py</code>)</td>

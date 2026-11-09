@@ -92,6 +92,10 @@ class SpyreDFlashProposer(DFlashProposer):
         for group in self.draft_attn_groups:
             causal = causal_by_layer[group.layer_names[0]]
             assert all(causal_by_layer[name] == causal for name in group.layer_names)
+            if not causal and not group.backend.supports_non_causal():
+                raise ValueError(
+                    f"{group.backend.get_name()} does not support non-causal DFlash draft attention"
+                )
             self._draft_group_causal.append(causal)
             group.create_metadata_builders(
                 self.vllm_config, self.device, kernel_block_size=self.block_size
@@ -103,7 +107,6 @@ class SpyreDFlashProposer(DFlashProposer):
             metadata = group.build_metadata_for_drafting(
                 common_attn_metadata=replace(cad, causal=causal), draft_index=draft_index
             )
-            assert getattr(metadata, "causal", None) is causal
             per_group.append(metadata)
             for name in group.layer_names:
                 per_layer[name] = metadata

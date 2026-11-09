@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -168,6 +169,41 @@ def test_layer_attention_gate_is_restored_after_initialization_error(monkeypatch
         SpyreDFlashQwen3DecoderLayer(None)
     assert qwen3_dflash.get_current_vllm_config() is current
     assert current.use_v2_model_runner is False
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_draft_backend_causality_is_checked_at_initialization(monkeypatch, causal):
+    group = SimpleNamespace(
+        layer_names=["draft.attn"],
+        kv_cache_spec=None,
+        backend=SimpleNamespace(
+            supports_non_causal=lambda: False, get_name=lambda: "causal-only backend"
+        ),
+        create_metadata_builders=Mock(),
+    )
+
+    def initialize(self, kv_cache_config, kernel_block_sizes):
+        self.kv_cache_gid, self.block_size = 0, 64
+        self.draft_attn_groups = [group]
+
+    monkeypatch.setattr(DFlashProposer, "initialize_attn_backend", initialize)
+    drafter = object.__new__(SpyreDFlashProposer)
+    drafter.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={})
+    )
+    drafter.device = torch.device("cpu")
+    drafter.model = SimpleNamespace(
+        get_draft_kv_cache_layer_names=lambda: group.layer_names,
+        get_draft_attn_causal=lambda: [causal],
+    )
+    cache = SimpleNamespace(kv_cache_groups=[None])
+    if causal:
+        drafter.initialize_attn_backend(cache)
+        group.create_metadata_builders.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="causal-only backend.*non-causal DFlash"):
+            drafter.initialize_attn_backend(cache)
+        group.create_metadata_builders.assert_not_called()
 
 
 @pytest.mark.parametrize("causal_override", [None, False, True])

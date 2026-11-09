@@ -228,23 +228,12 @@ def test_spyre_index_add_for_mean_pooling(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Fancy indexing (aten::index.Tensor) is unreliable on Spyre for the "
-        "shapes pooling / logits selection need. Related gather bugs: "
-        "torch-spyre#3499 (L3_ADDEARIMM overflow), #3502 (fused two gathers, "
-        "different indices), #3503 (fused two gathers, shared index). "
-        "spyre-inference works around this with host-built indices + "
-        "index_select (CLS/LAST) and CPU D2H before hidden_states[logits_indices]. "
-        "When this probe passes, revisit those workarounds."
-    ),
-)
 def test_spyre_fancy_index_tensor(spyre_device):
     """Row gather via advanced indexing ``hs[idx]`` (aten::index.Tensor).
 
-    Upstream CLSPool / logits selection use this form; we use index_select
-    instead. Probe uses a flat [T, H] activation and 1-D int64 row indices.
+    Upstream CLSPool / logits selection use this form. torch-spyre#5978 runs it
+    eagerly for a single 1-D int32/int64 index on dim 0; other index forms still
+    raise. Probe uses a flat [T, H] activation and 1-D int64 row indices.
     """
     hidden_states = torch.randn(32, 128, dtype=torch.float16, device=spyre_device)
     # CLS-style first-token indices for a few sequences (not a simple arange).

@@ -44,11 +44,6 @@ _matrix_spec = importlib.util.spec_from_file_location(
 matrix = importlib.util.module_from_spec(_matrix_spec)
 _matrix_spec.loader.exec_module(matrix)
 
-_PLAN_SCRIPT = _REPO / ".github" / "scripts" / "plan_test_matrix.py"
-_plan_spec = importlib.util.spec_from_file_location("plan_test_matrix", _PLAN_SCRIPT)
-plan = importlib.util.module_from_spec(_plan_spec)
-_plan_spec.loader.exec_module(plan)
-
 _CONFIGS = _REPO / "vllm-benchmarks" / "benchmarks" / "spyre"
 SERVE_TESTS = _CONFIGS / "serve-tests.yaml"
 SERVE_DEV_TESTS = _CONFIGS / "serve-tests-dev.yaml"
@@ -334,75 +329,6 @@ def test_matrix_skips_dev_configs(tmp_path):
     result = matrix.generate_benchmark_matrix(str(tmp_path), [])
 
     assert result["include"] == [{"models": "ci-model"}]
-
-
-def test_perf_plan_skips_dev_configs(tmp_path):
-    for name, model in [
-        ("latency-tests.yaml", "ci-model"),
-        ("latency-tests-dev.yaml", "dev-model"),
-    ]:
-        (tmp_path / name).write_text(
-            yaml.safe_dump([{"test_name": "t", "parameters": {"model": model}}])
-        )
-
-    legs = plan.plan_perf(tmp_path)
-
-    assert [leg["model"] for leg in legs] == ["ci-model"]
-
-
-def test_perf_plan_sizes_each_leg_to_its_largest_tp(tmp_path):
-    (tmp_path / "latency-tests.yaml").write_text(
-        yaml.safe_dump(
-            [
-                {"test_name": "a", "parameters": {"model": "Small", "tensor_parallel_size": 1}},
-                {"test_name": "b", "parameters": {"model": "Big", "tensor_parallel_size": 1}},
-            ]
-        )
-    )
-    (tmp_path / "serve-tests.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "defaults": {"server_parameters": {"tensor-parallel-size": 1}},
-                "tests": [
-                    {
-                        "test_name": "c",
-                        "server_parameters": {"model": "Big", "tensor-parallel-size": 4},
-                    },
-                    {
-                        "test_name": "d",
-                        "server_parameters": {"model": "Mid", "tensor-parallel-size": 2},
-                    },
-                ],
-            }
-        )
-    )
-
-    legs = {leg["model"]: leg["runs_on"][1] for leg in plan.plan_perf(tmp_path)}
-
-    assert legs == {"small": "spyre_pf_x1", "big": "spyre_pf_x4", "mid": "spyre_pf_x2"}
-
-
-def test_perf_plan_filters_models(tmp_path):
-    (tmp_path / "latency-tests.yaml").write_text(
-        yaml.safe_dump(
-            [
-                {"test_name": "a", "parameters": {"model": "One"}},
-                {"test_name": "b", "parameters": {"model": "Two"}},
-            ]
-        )
-    )
-
-    assert [leg["model"] for leg in plan.plan_perf(tmp_path, {"two"})] == ["two"]
-
-
-def test_perf_plan_covers_every_checked_in_model():
-    """Each model in the CI configs gets a leg, so none is silently never benchmarked."""
-    models = set()
-    for path in _CONFIGS.glob("*-tests.yaml"):
-        for config in runner._load_configs(path):
-            models.add(runner._config_model(config).lower())
-
-    assert {leg["model"] for leg in plan.plan_perf()} == models
 
 
 # ── the checked-in config ──

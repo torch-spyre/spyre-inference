@@ -567,28 +567,37 @@ def _matrix_suites() -> list[dict]:
     return yaml.safe_load((_REPO_ROOT / ".github/test-matrix.yaml").read_text())
 
 
-def test_makefile_reads_every_shard_count_from_the_matrix():
-    """A local `make test-<suite>-shard` must split a suite the way CI does."""
-    sharded = {s["test_target"]: s["shards"] for s in _matrix_suites() if "shards" in s}
-    assert sharded
-    for target, n in sharded.items():
-        out = subprocess.run(
+def test_every_sharded_matrix_suite_has_a_makefile_count():
+    """CI takes shard counts from `make print-shards`; a suite missing there can't be planned."""
+    out = subprocess.run(
+        ["make", "-s", "-C", str(_REPO_ROOT), "print-shards"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    counts = dict(line.split() for line in out.splitlines())
+    sharded = {s["test_target"] for s in _matrix_suites() if s.get("sharded")}
+    assert sharded == set(counts), (
+        f"matrix-only: {sorted(sharded - set(counts))}, "
+        f"Makefile-only: {sorted(set(counts) - sharded)}"
+    )
+    for target, n in counts.items():
+        assert n.isdigit() and int(n) > 0, f"{target}: print-shards gave {n!r}"
+        recipe = subprocess.run(
             ["make", "-n", "-C", str(_REPO_ROOT), f"{target}-0"],
             capture_output=True,
             text=True,
             check=True,
         ).stdout
-        counts = set(re.findall(r"--[a-z0-9-]+-shards=(\S*)", out))
-        assert counts, f"{target}: no --*-shards flag in the recipe"
-        assert counts == {str(n)}, (
-            f"{target}: Makefile resolves {counts} shards, the matrix declares {n}"
+        assert set(re.findall(r"--[a-z0-9-]+-shards=(\S*)", recipe)) == {n}, (
+            f"{target}: its recipe does not shard by the count print-shards reports ({n})"
         )
 
 
 def test_every_matrix_target_is_a_makefile_target():
     """A typo in test_target would schedule a leg that fails with 'No rule to make target'."""
     for suite in _matrix_suites():
-        target = suite["test_target"] + ("-0" if "shards" in suite else "")
+        target = suite["test_target"] + ("-0" if suite.get("sharded") else "")
         result = subprocess.run(
             ["make", "-n", "-C", str(_REPO_ROOT), target], capture_output=True, text=True
         )

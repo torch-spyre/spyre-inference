@@ -120,7 +120,7 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
+.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type print-shards \
         test-smoke test-smoke-shard test-smoke-unit-shard test-quality test-quality-shard \
         test-e2e-smoke test-e2e-smoke-shard test-e2e-smoke-dist-shard tests-integration \
         test-probes test-probes-shard \
@@ -142,6 +142,19 @@ help: ## Show this help message
 print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_test_matrix.yaml) resolve TEST_TYPE via `make -s print-test-type TEST_TYPE=...` without duplicating this Makefile's validation logic.
 	@echo "$(TEST_TYPE)"
 
+# CI's planner (.github/scripts/plan_test_matrix.py) reads shard counts from here rather
+# than keeping its own copy.
+print-shards: ## Internal: print `<shard target> <count>` for every sharded suite.
+	@echo "test-smoke-shard $(SMOKE_SHARDS)"
+	@echo "test-smoke-unit-shard $(SMOKE_UNIT_SHARDS)"
+	@echo "test-e2e-smoke-shard $(E2E_SMOKE_SHARDS)"
+	@echo "test-e2e-smoke-dist-shard $(E2E_SMOKE_DIST_SHARDS)"
+	@echo "test-quality-shard $(QUALITY_SHARDS)"
+	@echo "test-attention-shard $(ATTN_SHARDS)"
+	@echo "test-distributed-shard $(DIST_SHARDS)"
+	@echo "test-probes-shard $(PROBE_SHARDS)"
+	@echo "test-upstream-shard $(UPSTREAM_SHARDS)"
+
 # Marker set for the CI matrix (.github/test-matrix.yaml) is intentionally NOT duplicated in
 # YAML: each matrix.cfg's "Run tests" step calls one of the test-<name>
 # targets below by name (test_target), so this Makefile is the sole owner of the marker
@@ -157,11 +170,6 @@ print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_
 # A from-source build leaves a project .venv; prefer it so `uv run --active` targets
 # it, not the image's baked venv that ibm-aiu-setup.sh re-activates in-shell. Prebaked
 # images have no project .venv and fall through to $VIRTUAL_ENV.
-# Shard counts live in .github/test-matrix.yaml (`shards:` on each sharded suite), so CI and
-# local runs split a suite the same way. awk, not yaml: the Makefile can't assume pyyaml.
-MATRIX_FILE := $(dir $(lastword $(MAKEFILE_LIST))).github/test-matrix.yaml
-matrix_shards = $(shell awk '/^- cfg:/{t=""} /^  test_target: /{t=$$2} /^  shards: /&&t=="$(1)"{print $$2; exit}' $(MATRIX_FILE))
-
 AIU_SETUP_STAMP := /tmp/.spyre-inference-aiu-setup-done
 define AIU_SETUP_CMD
 if [ ! -f "$(AIU_SETUP_STAMP)" ]; then rm -f /tmp/etc/ibm/spyre/topo.json; touch "$(AIU_SETUP_STAMP)"; fi; \
@@ -196,7 +204,8 @@ test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-at
 # out across parallel shard jobs the same way as attention. The plugin owns the
 # weighted partition (--smoke-shards); it balances by recorded per-test runtime
 # when a durations file is present (SPYRE_TEST_DURATIONS), else by e2e-path weight.
-SMOKE_SHARDS := $(or $(SMOKE_SHARDS),$(call matrix_shards,test-smoke-shard))
+# SMOKE_SHARDS is the single source of truth for the count.
+SMOKE_SHARDS ?= 11
 SMOKE_SHARD_ID ?= 0
 test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' \
@@ -209,7 +218,7 @@ test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # The integration tier's unit-level jobs: the smoke expression without tests/e2e.
-SMOKE_UNIT_SHARDS := $(or $(SMOKE_UNIT_SHARDS),$(call matrix_shards,test-smoke-unit-shard))
+SMOKE_UNIT_SHARDS ?= 3
 SMOKE_UNIT_SHARD_ID ?= 0
 test-smoke-unit-shard: ## Run one unit-level smoke shard, tests/e2e excluded (SMOKE_UNIT_SHARDS=N SMOKE_UNIT_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' \
@@ -224,7 +233,7 @@ test-smoke-unit-shard-%:
 test-e2e-smoke: ## Run the whole e2e_smoke subset in one process (TP=2 cases skip on a 1-card host).
 	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and not distributed_tp4' JUNIT_XML=$(JUNIT_XML)
 
-E2E_SMOKE_SHARDS := $(or $(E2E_SMOKE_SHARDS),$(call matrix_shards,test-e2e-smoke-shard))
+E2E_SMOKE_SHARDS ?= 3
 E2E_SMOKE_SHARD_ID ?= 0
 test-e2e-smoke-shard: ## Run one 1-card e2e_smoke shard (E2E_SMOKE_SHARDS=N E2E_SMOKE_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and not (distributed or distributed_tp4)' \
@@ -234,7 +243,7 @@ test-e2e-smoke-shard: ## Run one 1-card e2e_smoke shard (E2E_SMOKE_SHARDS=N E2E_
 test-e2e-smoke-shard-%:
 	$(MAKE) test-e2e-smoke-shard E2E_SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
-E2E_SMOKE_DIST_SHARDS := $(or $(E2E_SMOKE_DIST_SHARDS),$(call matrix_shards,test-e2e-smoke-dist-shard))
+E2E_SMOKE_DIST_SHARDS ?= 2
 E2E_SMOKE_DIST_SHARD_ID ?= 0
 test-e2e-smoke-dist-shard: ## Run one 2-card e2e_smoke shard (E2E_SMOKE_DIST_SHARDS=N E2E_SMOKE_DIST_SHARD_ID=i). Needs 2 cards.
 	$(MAKE) run-one MARK_OVERRIDE='e2e_smoke and distributed and not distributed_tp4' \
@@ -257,8 +266,8 @@ test-quality: ## Run the model-output quality gate (product-model output checks 
 # CI fans the gate out across parallel 1-card shard jobs like smoke/attention; the plugin's
 # weighted partition (--quality-shards) balances by recorded runtime when a durations file
 # is present, else by the decoder/eval-vs-encoder path weight. No partition beats the slowest
-# single case, so that bounds the useful count.
-QUALITY_SHARDS := $(or $(QUALITY_SHARDS),$(call matrix_shards,test-quality-shard))
+# single case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
+QUALITY_SHARDS ?= 8
 QUALITY_SHARD_ID ?= 0
 test-quality-shard: ## Run one quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i). Needs 1 card.
 	$(MAKE) run-one MARK_OVERRIDE='(model_quality and not (distributed or upstream)) or (gsm8k and upstream)' \
@@ -275,8 +284,8 @@ test-probes: ## Run the torch-spyre backend probes (excluded from integration), 
 
 # The 2-card probe suite is sharded across parallel 2-card CI jobs, like the
 # distributed suite; the weighted partition (--probe-shards) balances by recorded
-# runtime when a durations file is present, else evenly.
-PROBE_SHARDS := $(or $(PROBE_SHARDS),$(call matrix_shards,test-probes-shard))
+# runtime when a durations file is present, else evenly. PROBE_SHARDS is the count.
+PROBE_SHARDS ?= 2
 PROBE_SHARD_ID ?= 0
 test-probes-shard: ## Run one probe shard (PROBE_SHARDS=N PROBE_SHARD_ID=i). Needs 2 cards.
 	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' \
@@ -297,8 +306,8 @@ test-attention: ## Run the decoder-attention marker combo (attention minus the e
 # bound per-process growth and cut wall-clock to the slowest shard. The plugin
 # owns the partition (--attn-shards), balancing by recorded per-test runtime when
 # a durations file is present else by compiled-case weight; this only threads the
-# knobs through.
-ATTN_SHARDS := $(or $(ATTN_SHARDS),$(call matrix_shards,test-attention-shard))
+# knobs through. ATTN_SHARDS is the single source of truth for the count.
+ATTN_SHARDS ?= 8
 ATTN_SHARD_ID ?= 0
 test-attention-shard: ## Run one decoder-attention shard (ATTN_SHARDS=N ATTN_SHARD_ID=i).
 	$(MAKE) run-one \
@@ -308,7 +317,7 @@ test-attention-shard: ## Run one decoder-attention shard (ATTN_SHARDS=N ATTN_SHA
 
 # CI runs one matrix job per shard as `test-attention-shard-<i>`, so each job's
 # JUnit artifact name (junit-<target>.xml) is unique; the pattern maps <i> to
-# ATTN_SHARD_ID.
+# ATTN_SHARD_ID. ATTN_SHARDS (the total) comes from its default above.
 test-attention-shard-%:
 	$(MAKE) test-attention-shard ATTN_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
@@ -327,8 +336,8 @@ test-distributed: ## Run the distributed marker combo (excludes probes; they run
 # The distributed (TP=2) suite is sharded across parallel 2-card CI jobs. Each
 # case spawns a TP=2 subprocess pair, so the model-run cases dominate; the
 # weighted partition (--dist-shards) balances by recorded runtime when a
-# durations file is present, else evenly.
-DIST_SHARDS := $(or $(DIST_SHARDS),$(call matrix_shards,test-distributed-shard))
+# durations file is present, else evenly. DIST_SHARDS is the source of the count.
+DIST_SHARDS ?= 3
 DIST_SHARD_ID ?= 0
 test-distributed-shard: ## Run one distributed shard (DIST_SHARDS=N DIST_SHARD_ID=i). Needs 2 cards.
 	$(MAKE) run-one MARK_OVERRIDE='distributed and not (upstream or probe)' \
@@ -352,8 +361,8 @@ test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (lo
 # model tests (under a models/ path) used to be a separate test-upstream-model
 # job; the weighted partition (--upstream-shards) balances them automatically,
 # by recorded per-test runtime when a durations file is present else by models/
-# path weight.
-UPSTREAM_SHARDS := $(or $(UPSTREAM_SHARDS),$(call matrix_shards,test-upstream-shard))
+# path weight. UPSTREAM_SHARDS is the single source of the count.
+UPSTREAM_SHARDS ?= 7
 UPSTREAM_SHARD_ID ?= 0
 test-upstream-shard: ## Run one non-distributed upstream shard (UPSTREAM_SHARDS=N UPSTREAM_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not gsm8k' \

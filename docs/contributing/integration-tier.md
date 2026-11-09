@@ -94,6 +94,6 @@ not removed for that alone; it is still the cheap guard on its path.
 
 ## Shard counts
 
-The `shards:` values on the smoke-unit, e2e-smoke and e2e-smoke-dist entries in
-`.github/test-matrix.yaml` set the counts for both CI and the Makefile. Resize them with
-the `rebalance-test-shards` skill.
+`SMOKE_UNIT_SHARDS`, `E2E_SMOKE_SHARDS` and `E2E_SMOKE_DIST_SHARDS` in the `Makefile` set
+the counts, and CI schedules one job per shard from them. Resize them with the
+`rebalance-test-shards` skill.

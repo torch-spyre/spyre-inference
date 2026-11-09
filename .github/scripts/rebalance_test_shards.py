@@ -18,8 +18,8 @@ Recommend a shard count per sharded suite from recorded per-test durations.
 For each suite the plugin balances shards by measured runtime (see
 tests/plugin/spyre_testing_plugin/sharding.py); this picks the *number* of shards
 so the busiest shard's measured test time stays under a wall-clock budget. It only
-reports -- the `rebalance-test-shards` skill applies the numbers to the `shards:`
-values in .github/test-matrix.yaml, which both CI and the Makefile read.
+reports -- the `rebalance-test-shards` skill applies the numbers to the Makefile
+(`*_SHARDS`), which CI reads through `make print-shards`.
 
 Durations come from the newest *passing* run on the main branch (same resolver the
 CI pin uses), or a local file via --durations. Suite membership is resolved by real
@@ -48,42 +48,48 @@ import resolve_durations_run
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # The sharded suites. `makefile_name` names both the Makefile shard target
-# (test-<name>-shard, source of the marker expression) and its matrix entry; the
+# (test-<name>-shard, source of the marker expression) and the *_SHARDS var; the
 # marker expression itself is parsed from that target so the Makefile stays the one
 # source of truth. `collect_upstream` marks the suite whose collection needs the
 # upstream tests cloned (the others exclude upstream, so must not pull them in).
 SUITES = [
-    {"key": "smoke", "makefile_name": "smoke", "collect_upstream": False},
+    {"key": "smoke", "makefile_name": "smoke", "var": "SMOKE_SHARDS", "collect_upstream": False},
     {
         "key": "smoke-unit",
         "makefile_name": "smoke-unit",
+        "var": "SMOKE_UNIT_SHARDS",
         "collect_upstream": False,
     },
     {
         "key": "e2e-smoke",
         "makefile_name": "e2e-smoke",
+        "var": "E2E_SMOKE_SHARDS",
         "collect_upstream": False,
     },
     {
         "key": "e2e-smoke-dist",
         "makefile_name": "e2e-smoke-dist",
+        "var": "E2E_SMOKE_DIST_SHARDS",
         "collect_upstream": False,
     },
-    {"key": "attn", "makefile_name": "attention", "collect_upstream": False},
+    {"key": "attn", "makefile_name": "attention", "var": "ATTN_SHARDS", "collect_upstream": False},
     {
         "key": "upstream",
         "makefile_name": "upstream",
+        "var": "UPSTREAM_SHARDS",
         "collect_upstream": True,
     },
     {
         "key": "dist",
         "makefile_name": "distributed",
+        "var": "DIST_SHARDS",
         "collect_upstream": False,
     },
-    {"key": "probe", "makefile_name": "probes", "collect_upstream": False},
+    {"key": "probe", "makefile_name": "probes", "var": "PROBE_SHARDS", "collect_upstream": False},
     {
         "key": "quality",
         "makefile_name": "quality",
+        "var": "QUALITY_SHARDS",
         # Folds in the GSM8K accuracy evals (gsm8k marker), which live in the upstream
         # vLLM tree, so collecting this suite needs the upstream checkout cloned.
         "collect_upstream": True,
@@ -94,27 +100,22 @@ SUITES = [
 def parse_makefile() -> dict[str, dict]:
     with open(os.path.join(_REPO_ROOT, "Makefile")) as f:
         text = f.read()
-    with open(os.path.join(_REPO_ROOT, ".github", "test-matrix.yaml")) as f:
-        matrix_counts = {
-            m.group(1): int(m.group(2))
-            for m in re.finditer(r"test_target: (\S+)\n  shards: (\d+)", f.read())
-        }
     out = {}
     for suite in SUITES:
         name = suite["makefile_name"]
-        count = matrix_counts.get(f"test-{name}-shard")
+        count = re.search(rf"^{suite['var']}\s*\?=\s*(\d+)", text, re.MULTILINE)
         # First MARK_OVERRIDE after the `test-<name>-shard:` target header is that
         # target's; non-greedy stops before the next target's recipe.
         expr = re.search(
             rf"^test-{name}-shard:.*?MARK_OVERRIDE='([^']*)'", text, re.DOTALL | re.MULTILINE
         )
         if not count or not expr:
-            raise SystemExit(f"could not find test-{name}-shard's shards / marker expression")
+            raise SystemExit(f"Makefile: could not parse {suite['var']} / test-{name}-shard marker")
         # The target's --ignore flags narrow its selection beyond the marker expression.
         recipe = re.search(rf"^test-{name}-shard:.*?(?=^\S|\Z)", text, re.DOTALL | re.MULTILINE)
         ignores = re.findall(r"--ignore=\S+", recipe.group(0)) if recipe else []
         out[suite["key"]] = {
-            "current": count,
+            "current": int(count.group(1)),
             "expr": expr.group(1),
             "collect_args": [a.rstrip("'") for a in ignores],
         }
@@ -262,7 +263,7 @@ def main() -> None:
         "tests with no recorded duration (excluded from the estimate)."
     )
     if any(r["recommended"] != r["current"] for r in rows):
-        print("\nApply the REC column to the shards: values in .github/test-matrix.yaml.")
+        print("\nApply the REC column to the Makefile *_SHARDS defaults (see the skill).")
 
 
 if __name__ == "__main__":

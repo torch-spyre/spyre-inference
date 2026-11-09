@@ -1,6 +1,6 @@
 # Spyre vLLM benchmarks
 
-Benchmark configs for the CI perf run (`integration-tests.yaml` with `test_type=perf`) and for local runs on
+Benchmark configs for the `vLLM Benchmark` CI workflow and for local runs on
 Spyre hardware. Each config file under `benchmarks/spyre/` is either a YAML list
 of test entries or a `defaults` mapping plus a `tests` list, where each test
 entry is merged over `defaults` so it only spells out what differs; one entry

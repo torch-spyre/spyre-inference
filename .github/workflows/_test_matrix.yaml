@@ -2,8 +2,9 @@ name: Test matrix (reusable)
 
 # ---------------------------------------------------------------------------
 # Reusable workflow, called by test_each_commit.yaml (push/PR/merge_group) and
-# integration-tests.yaml (dispatch, the only perf entrypoint). The plan job schedules
-# only the legs the tier selects; every leg gets its stack from setup-test-env.
+# integration-tests.yaml (dispatch, including perf). The plan job schedules only the
+# legs the tier selects: pytest legs from .github/test-matrix.yaml, or one benchmark
+# leg per model for perf.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -29,7 +30,9 @@ on:
         type: string
         default: ''
       use_prebaked_image:
-        description: When true, use the runner image's RPMs and venv as they are (see setup-test-env).
+        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
+        # action). It does not change the override step or any other step.
+        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
         required: false
         type: boolean
         default: false
@@ -185,7 +188,6 @@ jobs:
             .github/test-matrix.yaml
             .github/actions/override-spyre-rpms/action.yml
             .github/actions/run-matrix-config/action.yml
-            .github/actions/setup-test-env/action.yml
             .github/actions/spyre-rpm-install/action.yml
             .github/scripts/plan_test_matrix.py
             pyproject.toml
@@ -332,7 +334,7 @@ jobs:
   build_kernels:
     name: Build csrc/ sampling kernels
     needs: plan
-    if: ${{ !inputs.use_prebaked_image && (needs.plan.outputs.has_tests == 'true' || needs.plan.outputs.has_perf == 'true') }}
+    if: ${{ !inputs.use_prebaked_image && needs.plan.outputs.has_tests == 'true' }}
     # Same image as the x86_64 test configs, so compiler, glibc and Python match. A compile needs
     # no card, so it takes the card-less pool, which only carries the standing image label.
     runs-on: ${{ fromJSON(format('["x86_64","{0}","linux","{1}"]', (inputs.runner_label || github.event_name == 'merge_group') && 'spyre_pf_x1' || 'spyre_pf_x0', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
@@ -798,8 +800,8 @@ jobs:
 
   perf:
     name: Perf benchmarks (${{ matrix.model }})
-    needs: [plan, build_kernels]
-    if: ${{ !cancelled() && needs.plan.outputs.has_perf == 'true' && (needs.build_kernels.result == 'success' || needs.build_kernels.result == 'skipped') }}
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.outputs.has_perf == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.perf_matrix) }}
@@ -811,6 +813,8 @@ jobs:
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
       RESULTS_DIR: benchmark-results
+      # The dev image's editable spyre-inference tree (keeps .git), installed into its $VIRTUAL_ENV.
+      PREBAKED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
       # The serve configs replay trace files that are not in the repo. Cache
       # them on the same RWX volume as the HuggingFace cache above: it outlives
       # the pod, so the first job to need a trace fetches it and every later job
@@ -826,22 +830,74 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Set up the test environment
-        id: env
-        uses: ./.github/actions/setup-test-env
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
+      - name: Install Spyre RPMs
+        if: ${{ !inputs.use_prebaked_image }}
+        uses: ./.github/actions/spyre-rpm-install
+
+      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
+      # steps. See .github/scripts/nfs_uv_cache.py.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          uv_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
-          # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
-          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || 'image_torch_spyre') }}
-          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          enable-cache: false
+
+      # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
+      - name: uv cache (NFS)
+        if: ${{ !inputs.use_prebaked_image }}
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+
+      - name: Install override Spyre RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        uses: ./.github/actions/override-spyre-rpms
+        with:
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
           artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
           artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-          hf_token: ${{ secrets.HF_TOKEN }}
+
+      - name: Gather runner info
+        uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || 'image_torch_spyre') }}
+
+      # Prebaked runs use the image's venv: a cached torch-spyre wheel may be built against other RPMs.
+      - name: Build spyre-inference
+        if: ${{ !inputs.use_prebaked_image }}
+        env:
+          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          if [[ -n "$TORCH_SPYRE_REF" ]]; then
+            # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
+            # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
+            # `uv run` reuses the shared venv instead of re-resolving), but uv rejects
+            # UV_NO_SYNC together with `--frozen` on `uv add` ("cannot be used with
+            # --frozen"). Shadow it to a false value for this one call so the add
+            # succeeds; the surrounding UV_NO_SYNC=1 is unchanged for every other uv run.
+            UV_NO_SYNC=0 uv add --frozen \
+              "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
+            uv sync --verbose --group dev
+          else
+            uv sync --frozen --verbose --group dev
+          fi
+          uv pip show torch
+          uv pip freeze
+
+      - name: Ensure public HF models cached
+        env:
+          HF_HUB_OFFLINE: '0'
+          # Authenticated cache-miss downloads; anonymous Hub requests get rate-limited.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: uv run .github/cache_config/manage_cache.py --public
 
       - name: Run vLLM benchmarks
         id: bench
@@ -852,7 +908,8 @@ jobs:
           # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
           SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
           MODEL: ${{ matrix.model }}
-          SRC_DIR: ${{ steps.env.outputs.src_dir }}
+          # Prebaked runs use the image's tree: an unbuilt checkout would shadow its spyre_inference._C kernels.
+          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
         run: |
           make -C "${SRC_DIR}" perf-tests RESULTS_DIR="${GITHUB_WORKSPACE}/${RESULTS_DIR}" MODELS="${MODEL}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
@@ -868,7 +925,7 @@ jobs:
           REF_IN: ${{ inputs.ref }}
           REF_NAME: ${{ github.ref_name }}
           REPO: ${{ inputs.repository || github.repository }}
-          SRC_DIR: ${{ steps.env.outputs.src_dir }}
+          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
         run: |
           SHA="$(git -C "${SRC_DIR}" rev-parse HEAD)" || { echo "::warning::could not read the commit of ${SRC_DIR}; recording the checkout's"; SHA="$(git rev-parse HEAD)"; }
           BRANCH="${REF_IN:-${REF_NAME}}"

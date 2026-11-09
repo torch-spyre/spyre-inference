@@ -16,6 +16,7 @@
 
 import json
 import os
+import subprocess
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -33,8 +34,16 @@ def _runs_on(cards: int) -> list[str]:
     return ["x86_64", f"spyre_pf_x{cards}", "linux"]
 
 
+def makefile_shard_counts() -> dict[str, int]:
+    out = subprocess.run(
+        ["make", "-s", "-C", str(REPO), "print-shards"], capture_output=True, text=True, check=True
+    ).stdout
+    return {target: int(n) for target, n in (line.split() for line in out.splitlines())}
+
+
 def load_test_configs(path: Path = TEST_MATRIX) -> list[dict]:
-    """The matrix as per-job legs: each `shards: N` suite becomes N legs."""
+    """The matrix as per-job legs: each sharded suite becomes one leg per Makefile shard."""
+    counts = makefile_shard_counts()
     legs = []
     for suite in yaml.safe_load(path.read_text()):
         leg = {
@@ -44,10 +53,12 @@ def load_test_configs(path: Path = TEST_MATRIX) -> list[dict]:
             "image_label": "image_torch_spyre",
             "test_target": suite["test_target"],
         }
-        n = suite.get("shards")
-        if n is None:
+        if not suite.get("sharded"):
             legs.append(leg)
             continue
+        n = counts.get(leg["test_target"])
+        if not n:
+            raise SystemExit(f"::error::`make print-shards` has no count for {leg['test_target']}")
         legs.extend(
             {
                 **leg,

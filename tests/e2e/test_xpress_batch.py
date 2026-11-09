@@ -48,15 +48,7 @@ pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
                 reason="Default buckets run in trunk; tuned buckets cover PR regression",
             ),
         ),
-        pytest.param(
-            True,
-            id="tuned",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="deeptools#4965 (dbo-opt uniformize_op crash); remove on the next "
-                "RPM bump once the fix is in",
-            ),
-        ),
+        pytest.param(True, id="tuned"),
     ],
 )
 def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):

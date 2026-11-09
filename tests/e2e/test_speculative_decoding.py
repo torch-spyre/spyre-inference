@@ -126,11 +126,6 @@ def xpress_engine(monkeypatch):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="deeptools#4965 (dbo-opt uniformize_op crash); remove on the next RPM bump "
-    "once the fix is in",
-)
 def test_qwen3_xpress_verification_and_generation(xpress_engine, tmp_path, record_property):
     engine = xpress_engine
     tokenizer = engine.get_tokenizer()

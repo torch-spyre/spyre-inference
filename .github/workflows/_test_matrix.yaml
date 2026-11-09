@@ -297,9 +297,9 @@ jobs:
           installed: ${{ steps.delta.outputs.installed }}
           library-dir: ${{ github.workspace }}/.torch-spyre-identity
 
-  # Builds the csrc/ sampling kernels once, before any test or perf job: a broken build fails CI
-  # here instead of every job silently falling back to PyTorch sampling, and the jobs (and the
-  # pod-level retries) download this build instead of compiling their own copy.
+  # Builds the csrc/ sampling kernels once, before any test job: a broken build fails CI here
+  # instead of every test job silently falling back to PyTorch sampling, and the test jobs
+  # (and their pod-level retries) download this build instead of compiling their own copy.
   # It also owns the changed-files detection the test jobs gate on.
   build_kernels:
     name: Build csrc/ sampling kernels

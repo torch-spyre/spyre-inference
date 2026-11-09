@@ -1304,14 +1304,6 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#5976: model.to('spyre') installs a new Parameter for each moved one "
-        "instead of keeping the object, as nn.Module.to does. When this XPASS-es, drop "
-        "_sink_owners and the moe_quant_config rebuild from move_model_to_spyre."
-    ),
-)
 def test_spyre_module_to_keeps_parameter_objects(spyre_device):
     """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
     must see the device tensor after the move, and a reload's in-place write."""

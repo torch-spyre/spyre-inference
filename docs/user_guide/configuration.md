@@ -335,12 +335,12 @@ VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
 
 [tool.uv.extra-build-dependencies]
-torch-spyre = ["torch==2.13.0"]
+torch-spyre = ["torch==2.14.1"]
 ```
 
 These settings ensure:
 
-- torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+- torch-spyre is built against the same PyTorch version (2.14.1) the runtime pins, so its
   C++ extension cannot drift in ABI
 - vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`

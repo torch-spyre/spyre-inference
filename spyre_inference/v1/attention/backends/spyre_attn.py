@@ -202,7 +202,7 @@ _batched_decode_compiled = torch.compile(
 )
 
 
-# Compiled: eager index_copy_ falls back to CPU and segfaults on vLLM output buffers.
+# Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
 def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     dst.index_copy_(0, rows, src[: rows.shape[0]])
     return dst
@@ -929,7 +929,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
+            b_blocks = (
+                self._attn_bucketer.find_batched_blocks_bucket(max(decode_blocks), b_seqs)
+                if b_seqs is not None
+                else None
+            )
 
             if b_seqs is not None and b_blocks is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
@@ -1174,7 +1178,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """Metadata for the all-decode batch that dispatches to ``bucket``.
 
         ``num_seqs`` sequences of one query token each, all at the same length, so
-        ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
+        ``find_sequence_bucket`` and ``find_batched_blocks_bucket`` return the bucket's own
         values and ``decode_uniformity`` is 1.
         """
         num_seqs = bucket.num_seqs
@@ -1191,7 +1195,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 max_query_len=1,
                 max_seq_len=kv_len,
                 # Every block points at page 0, vLLM's null block: nothing real is read.
-                block_table_tensor=torch.zeros(num_seqs, bucket.num_blocks, dtype=torch.int32),
+                # As wide as build()'s per-seq padding, which a large-batch bucket can sit below.
+                block_table_tensor=torch.zeros(
+                    num_seqs, self._pad_num_blocks(bucket.num_blocks), dtype=torch.int32
+                ),
                 slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
@@ -1444,8 +1451,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
 
         Kv-major, matching the kernels' head order. Built on first use and dropped by
-        ``process_weights_after_loading``. ``move_model_to_spyre`` points the source at the
-        parameter the model holds on Spyre, which is the one a reload writes.
+        ``process_weights_after_loading``. ``model.to("spyre")`` keeps the parameter object,
+        so the source is the tensor a reload writes.
         """
         if self._sinks_source is None:
             return None
@@ -1933,8 +1940,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The decode prefix's query rows are range(num_decode_seqs), so the scatter
         # is a contiguous prefix write at (0, 0). Neither per-row
         # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
-        # via @compile_once and can return a stale binary) nor index_copy_
-        # (CPU-fallback segfaults on vLLM output buffers) is safe here.
+        # via @compile_once and can return a stale binary) nor eager index_copy_
+        # (rejects the int32 row index) is safe here.
         result_flat = result.reshape(b_seqs, num_heads, head_size)
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)

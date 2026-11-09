@@ -89,7 +89,6 @@ from spyre_inference.v1.pool.encoder_grid import (
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
-from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
@@ -105,6 +104,7 @@ from spyre_inference.v1.worker.model_load import (
     install_pad_loaders,
     move_model_to_spyre,
     resolve_kv_scales,
+    rewarm_after_reload,
 )
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -301,6 +301,20 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
         raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
 
 
+def model_dtype(model_config) -> torch.dtype:
+    """The activation dtype the platform settled on (float16 for every engine run;
+    see ``TorchSpyrePlatform.apply_config_platform_defaults``)."""
+    dtype = model_config.dtype
+    return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
+
+def unwrap_model(model: Any) -> nn.Module:
+    """The bare model under the wrapper and any whole-model OptimizedModule."""
+    if isinstance(model, _SpyreModelWrapper):
+        model = model._model
+    return getattr(model, "_orig_mod", model)
+
+
 class _SpyreModelWrapper:
     """Transparent wrapper that converts model inputs/outputs at the boundary.
 
@@ -344,6 +358,16 @@ class _SpyreModelWrapper:
         object.__setattr__(
             self, "_keep_aux_hidden_states_on_device", keep_aux_hidden_states_on_device
         )
+
+    @contextmanager
+    def outputs_on_host(self):
+        """D2H the outputs for the duration, for upstream's host-side dummy-run gather."""
+        keep = self._keep_outputs_on_device
+        object.__setattr__(self, "_keep_outputs_on_device", False)
+        try:
+            yield keep
+        finally:
+            object.__setattr__(self, "_keep_outputs_on_device", keep)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -810,16 +834,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
-        # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
-        # The graphs that read them guard on their values, so only those retrace; warming
-        # here does that before the next request, which an armed compile guard would fail.
-        if resolve_kv_scales(self.get_model(), self.compilation_config.static_forward_context):
-            logger.warning(
-                "KV cache scales changed on weight reload; re-warming the graphs that "
-                "depend on them."
-            )
-            with compile_guard.allow_compile("KV cache scales changed on weight reload"):
-                self.warming_up_model()
+        rewarm_after_reload(self)
 
     def warming_up_model(self) -> None:
         """Warm kernels / compile.
@@ -1014,8 +1029,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Nothing else traces the tower before the compile guard arms: the dummy runs
         reach the text body only, and upstream's ``profile_run`` (one pass at
-        ``mm_max_items_per_batch``) never runs, as ``TorchSpyreWorker`` overrides
-        ``determine_available_memory``. Under ``dynamic=False`` every width is its own
+        ``mm_max_items_per_batch``) is a no-op here. Under ``dynamic=False`` every width is its own
         graph, for marked encoder blocks and ``SpyreConv2d`` alike, so each runs here
         (spyre-inference#1182).
 
@@ -1248,6 +1262,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         padded = bucketer.warmed_bucket(num_tokens) if bucketer is not None else None
         return None if padded is None else BatchDescriptor(num_tokens=padded)
 
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        """No forward: only the attention staging buffers, so the KV cache is sized
+        around them.
+
+        Upstream's runs one forward at max_num_tokens before the KV cache exists, and on
+        Spyre the first forward is the trace. Without pages the attention layers trace
+        no KV write (attn_layer resolves its device from the KV cache), so warmup would
+        retrace every block, and an eager model compiles its per-op kernels before
+        warmup's compilation settings apply.
+
+        The staging buffers scale with max_num_batched_tokens (16384 by default for an
+        eager LLM), and warmup allocates them after the KV cache took the measured
+        memory; allocated here, Worker.determine_available_memory counts them instead.
+        """
+        allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
+
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
         """Force D2H during dummy forward (upstream logits index is CPU).
@@ -1268,14 +1298,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if num_tokens is not None:
             attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
-        keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
-        if keep:
-            object.__setattr__(wrapper, "_keep_outputs_on_device", False)
-        try:
+        on_host = (
+            wrapper.outputs_on_host()
+            if isinstance(wrapper, _SpyreModelWrapper)
+            else nullcontext(False)
+        )
+        with on_host as keep:
             hidden_states, last_hidden_states = super()._dummy_run(*args, **kwargs)
-        finally:
-            if keep:
-                object.__setattr__(wrapper, "_keep_outputs_on_device", True)
 
         if (
             keep
@@ -1575,10 +1604,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def _model_dtype(self) -> torch.dtype:
-        """The activation dtype the platform settled on (float16 for every engine run;
-        see ``TorchSpyrePlatform.apply_config_platform_defaults``)."""
-        dtype = self.model_config.dtype
-        return dtype if isinstance(dtype, torch.dtype) else torch.float16
+        return model_dtype(self.model_config)
 
     def initialize_kv_cache_tensors(
         self,
@@ -1627,12 +1653,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def get_model(self) -> nn.Module:
         # Return the unwrapped model for isinstance checks
         # (e.g. is_text_generation_model in get_supported_tasks).
-        model = self.model
-        if isinstance(model, _SpyreModelWrapper):
-            model = model._model
-        # Unwrap torch.compile's OptimizedModule (has _orig_mod attribute)
-        if hasattr(model, "_orig_mod"):
-            model = model._orig_mod
+        model = unwrap_model(self.model)
         assert isinstance(model, nn.Module)
         return model
 

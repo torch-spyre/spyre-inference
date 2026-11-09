@@ -92,7 +92,7 @@ on:
         type: string
         default: ''
       use_prebaked_image:
-        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        description: When true, use the runner image's RPMs and venv as they are instead of installing spyre-rpms.lock and syncing a venv.
         required: false
         type: boolean
         default: false

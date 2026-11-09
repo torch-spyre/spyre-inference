@@ -16,11 +16,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import cast
 
 import torch
 from torch.nn import functional as F
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.models import qwen3_dflash
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
@@ -46,7 +48,19 @@ def _project_context(attention, context, positions):
     )
 
 
+class SpyreDFlashQwen3DecoderLayer(DFlashQwen3DecoderLayer):
+    def __init__(self, *args, **kwargs):
+        # Bypass only the upstream resolver's V2 gate; Spyre groups mixed drafts on V1.
+        original = qwen3_dflash.get_current_vllm_config
+        qwen3_dflash.get_current_vllm_config = lambda: SimpleNamespace(use_v2_model_runner=True)  # ty: ignore[invalid-assignment]
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            qwen3_dflash.get_current_vllm_config = original
+
+
 class SpyreDFlashQwen3Model(DFlashQwen3Model):
+    decoder_layer_cls = SpyreDFlashQwen3DecoderLayer
     fc: ReplicatedLinear
 
     def _build_fused_kv_buffers(self) -> None:

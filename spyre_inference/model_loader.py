@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -25,6 +26,7 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -84,10 +86,12 @@ class SpyreModelLoader(BaseModelLoader):
                 shard_path,
                 framework="pt",
                 device="spyre",
-                target_dtype=target_dtype,
+                target_dtype=target_dtype,  # ty: ignore[unknown-argument]
             ) as f_spyre:
                 ordered_keys = f_spyre.offset_keys()
-                cpu_keys = {k for k in ordered_keys if k in cpu_fallback_names}
+                cpu_keys = {
+                    k for k in ordered_keys if _param_name_for(model, k) in cpu_fallback_names
+                }
                 f_cpu = None
                 if cpu_keys or tp_size > 1:
                     f_cpu = safe_open(shard_path, framework="pt", device="cpu")
@@ -118,7 +122,9 @@ class SpyreModelLoader(BaseModelLoader):
 
         # Delegate to model.load_weights() so fused parameters are scattered
         # by each layer's weight_loader.
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        loaded_weights = model.load_weights(  # ty: ignore[call-non-callable,union-attr]
+            self.get_all_weights(model_config, model)
+        )
         logger.info("SpyreModelLoader: delegated weight loading to model.load_weights()")
         _check_all_weights_loaded(model, loaded_weights)
 
@@ -128,7 +134,23 @@ class SpyreModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
     ) -> nn.Module:
-        with set_default_torch_dtype(model_config.dtype):
+        # `auto` reads *.bin when a repo has no safetensors; this loader streams
+        # safetensors only, so such repos load exactly as they do on the stock path.
+        if not _has_safetensors_checkpoint(model_config, self.load_config):
+            logger.info(
+                "SpyreModelLoader: %s has no safetensors checkpoint; using DefaultModelLoader.",
+                model_config.model,
+            )
+            stock_config = copy.copy(self.load_config)
+            stock_config.load_format = "auto"
+            return DefaultModelLoader(stock_config).load_model(vllm_config, model_config, prefix)
+
+        # Before any module is built or moved; see keep_attention_buffers_on_host.
+        from spyre_inference.v1.worker.model_load import keep_attention_buffers_on_host
+
+        keep_attention_buffers_on_host()
+
+        with set_default_torch_dtype(model_config.dtype):  # ty: ignore[invalid-argument-type]
             model = initialize_model(
                 vllm_config=vllm_config,
                 model_config=model_config,
@@ -173,13 +195,40 @@ def _get_host_loaded_param_names(model: nn.Module) -> set[str]:
     (torch-spyre#2971).
     """
     from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
     from spyre_inference.custom_ops.text_backbone import non_text_parameter_names
+
     names = non_text_parameter_names(model)
     for module_name, module in model.named_modules():
         if isinstance(module, VocabParallelEmbedding):
             for param_name in module._parameters:
                 names.add(f"{module_name}.{param_name}" if module_name else param_name)
     return names
+
+
+def _hf_to_vllm_name(model: nn.Module, key: str) -> str:
+    """A checkpoint key after the model's ``hf_to_vllm_mapper`` (a no-op without one).
+
+    ``get_all_weights`` sees raw checkpoint keys, but the mapper runs inside
+    ``model.load_weights``, after the loader has already chosen host or device per key.
+    A key the mapper drops is returned unchanged.
+    """
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is None:
+        return key
+    mapped = mapper.apply_list([key])
+    return mapped[0] if mapped else key
+
+
+def _param_name_for(model: nn.Module, key: str) -> str:
+    """The vLLM parameter name a checkpoint key loads into: mapper first, then the
+    fused-layer name (``q_proj`` -> ``qkv_proj``) from ``packed_modules_mapping``."""
+    name = _hf_to_vllm_name(model, key)
+    for packed, shards in getattr(model, "packed_modules_mapping", {}).items():
+        for shard in shards:
+            if f".{shard}." in name:
+                return name.replace(f".{shard}.", f".{packed}.", 1)
+    return name
 
 
 def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None) -> None:
@@ -193,8 +242,10 @@ def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None)
     """
     if loaded_weights is None:
         logger.warning(
-            "SpyreModelLoader: model.load_weights() did not report which weights it "
-            "loaded; skipping the uninitialized-parameter check."
+            "SpyreModelLoader: %s.load_weights() did not report which weights it loaded; "
+            "skipping the uninitialized-parameter check (as the stock loader does). A "
+            "parameter missing from the checkpoint would keep its uninitialized placeholder.",
+            type(model).__name__,
         )
         return
     weights_not_loaded = {name for name, _ in model.named_parameters()} - loaded_weights
@@ -223,7 +274,9 @@ def _resolve_module(model: nn.Module, ckpt_name: str) -> tuple[nn.Module | None,
 
     Fused layers (q/k/v -> qkv_proj, gate/up -> gate_up_proj) are resolved through
     the model's ``packed_modules_mapping``. The second element is the original
-    shard name (e.g. ``"q_proj"``) when the key belongs to a fused layer.
+    shard name (e.g. ``"q_proj"``) when the key belongs to a fused layer, and None when
+    the key already names the layer itself, i.e. the checkpoint stores the fused tensor
+    (Phi-3 maps ``qkv_proj`` to ``["qkv_proj"]``).
     """
     if not ckpt_name.endswith(".weight"):
         return None, None
@@ -231,7 +284,9 @@ def _resolve_module(model: nn.Module, ckpt_name: str) -> tuple[nn.Module | None,
     for packed, shards in getattr(model, "packed_modules_mapping", {}).items():
         for shard in shards:
             if path.endswith(f".{shard}"):
-                return _get_submodule(model, path[: -len(shard)] + packed), shard
+                return _get_submodule(model, path[: -len(shard)] + packed), (
+                    None if shard == packed else shard
+                )
     return _get_submodule(model, path), None
 
 
@@ -264,6 +319,10 @@ def _shard_plan(model: nn.Module, ckpt_name: str, shape, tp_size: int, tp_rank: 
             size = module.num_kv_heads * head_size
             index = tp_rank // module.num_kv_head_replicas
         return param, 0, index * size, size
+    if isinstance(module, MergedColumnParallelLinear) and shard is None:
+        # A fused [gate; up] checkpoint tensor: one contiguous shape[0] // tp_size block
+        # is not this rank's share of each half. Take the host path.
+        return None
     if isinstance(module, (MergedColumnParallelLinear, ColumnParallelLinear)):
         size = shape[0] // tp_size
         return param, 0, tp_rank * size, size
@@ -303,7 +362,7 @@ def _iter_tp_sharded_weights(
             continue
 
         shape = f_cpu.get_slice(name).get_shape()
-        plan = _shard_plan(model, name, shape, tp_size, tp_rank)
+        plan = _shard_plan(model, _hf_to_vllm_name(model, name), shape, tp_size, tp_rank)
 
         if plan is _REPLICATED:
             yield name, f_spyre.get_tensor(name)
@@ -324,6 +383,15 @@ def _iter_tp_sharded_weights(
             yield name, tensor
         finally:
             param.tp_rank = saved_rank
+
+
+def _has_safetensors_checkpoint(model_config: ModelConfig, load_config) -> bool:
+    """Whether the checkpoint has safetensors shards (fetched first when remote)."""
+    try:
+        _resolve_checkpoint_files(model_config, load_config)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _resolve_checkpoint_files(

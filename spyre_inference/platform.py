@@ -164,19 +164,6 @@ def _hf_config_has_moe(text_config) -> bool:
     return False
 
 
-def _is_multimodal_config(model_config) -> bool:
-    """Return True when model_config describes a multimodal model.
-
-    Checks the two vLLM-native attributes that are authoritatively set for
-    multimodal models; hf_config vision/audio stubs are intentionally ignored
-    as some text-only models carry them.
-    """
-    return bool(
-        getattr(model_config, "is_multimodal_model", False)
-        or getattr(model_config, "multimodal_config", None) is not None
-    )
-
-
 def _padding_active(vllm_config) -> bool:
     """True when head_dim / intermediate_size padding was applied to the text config.
 
@@ -212,6 +199,9 @@ def _spyre_loader_supported(vllm_config) -> bool:
         full tensor on the host, but the direct path yields Spyre-resident (TP1)
         or pre-sharded (TP>1) tensors. Those configs stay on the stock loader.
       - MoE: dma_moe_expert_weight_to_spyre requires a CPU source tensor.
+      - speculative decoding: the draft model is loaded with the target's load_config,
+        and drafters such as XPress run host-side ops in load_weights that expect
+        host tensors.
 
     Supported, and worth knowing about when touching the loader:
       - TP > 1: linear weights are sharded on read (see
@@ -225,6 +215,8 @@ def _spyre_loader_supported(vllm_config) -> bool:
     if getattr(model_config, "quantization", None) is not None:
         return False
     if getattr(model_config, "runner_type", None) != "generate":
+        return False
+    if getattr(vllm_config, "speculative_config", None) is not None:
         return False
     if (
         hasattr(model_config, "using_transformers_backend")
@@ -980,7 +972,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # Spyre backend does not provide.
         if vllm_config.cache_config.kv_sharing_fast_prefill:
             raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
-        
+
         # Reject an explicitly-requested --load-format spyre for configs the loader
         # doesn't support. apply_config_platform_defaults only runs for load_format="auto";
         # a user who passes --load-format spyre directly bypasses that gate.
@@ -994,7 +986,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 "--load-format spyre is not supported for this configuration. "
                 "Supported: unquantized, dense, non-MoE, generate-only, "
                 "non-transformers-backend models without head_dim / "
-                "intermediate_size padding. "
+                "intermediate_size padding or speculative decoding. "
                 "Use --load-format auto or --load-format safetensors instead."
             )
 

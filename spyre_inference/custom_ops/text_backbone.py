@@ -66,6 +66,7 @@ def _language_backbones(model: torch.nn.Module) -> NamedModules | None:
             return [(name, module)]
     return None
 
+
 def non_text_parameter_names(model: torch.nn.Module) -> set[str]:
     """Names of the parameters outside a multimodal model's language backbone.
 

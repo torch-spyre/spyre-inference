@@ -650,6 +650,8 @@ def test_fly_rejection_sampling_is_rejected(monkeypatch):
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    # Reset load_format to "auto" because speculative decoding configs stay on the stock loader
+    vllm_config.load_config.load_format = "auto"
     monkeypatch.setattr(
         vllm_config, "speculative_config", SimpleNamespace(rejection_sample_method="fly")
     )

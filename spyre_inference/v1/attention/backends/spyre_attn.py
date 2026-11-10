@@ -25,6 +25,7 @@ none of the per-sequence kernel's ``(page, kv_head)`` fold.
 
 import contextlib
 import functools
+import math
 import time
 from collections.abc import Callable
 from contextvars import copy_context
@@ -244,7 +245,18 @@ FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
+_PAGE_GROUP = 8
+_PAGE_GROUP_MAX_QUERY_WIDTH = 1024
 _T = TypeVar("_T")
+
+
+def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
+    # Measured: grouping helps every shape up to num_heads * head_size = 1024 and regresses some
+    # beyond it. A group over most of a short context is slower too.
+    if num_heads * head_size > _PAGE_GROUP_MAX_QUERY_WIDTH:
+        return 1
+    # A divisor of num_blocks itself: a sliding window's block count is not a bucket.
+    return math.gcd(_PAGE_GROUP, num_blocks, max(1, num_blocks // 4))
 
 
 def _lx_max_cores(output_units: int) -> int:
@@ -2260,6 +2272,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 out=out,
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
+                page_group=_prefill_page_group(num_blocks, self.num_heads, self.head_size),
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)

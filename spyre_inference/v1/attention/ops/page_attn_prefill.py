@@ -44,6 +44,7 @@ def page_attn_prefill_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    page_group=1,
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
@@ -56,7 +57,13 @@ def page_attn_prefill_kernel(
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
+        page_group: pages per online-softmax update; must divide num_blocks.
     """
+    if page_group < 1 or num_blocks % page_group:
+        raise ValueError(
+            f"page_group={page_group} must be a positive divisor of num_blocks={num_blocks}"
+        )
+    grouped = page_group > 1
     num_queries_per_kv = num_heads // num_kv_heads
 
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
@@ -69,11 +76,16 @@ def page_attn_prefill_kernel(
         .transpose(1, 2)
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
+    if grouped:
+        q = q.unsqueeze(0)
 
     # Both walks tile tensor axes, so what an unrolled walk read per block arrives
     # stacked on dim 0.
     operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q)
     dims: tuple[int | None, ...] = (0, None, None, 0, None)
+
+    def fold_group(tile, reduce):
+        return reduce(tile, dim=0, keepdim=True) if grouped else tile
 
     def block_body(carry, tiles):
         page_index, k_pages, v_pages, mask_tile, q = tiles
@@ -81,9 +93,18 @@ def page_attn_prefill_kernel(
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which round-trips the index through the host
         # in eager.
-        page_idx = page_index[0, 0:1]
-        k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        if grouped:
+            page_idx = page_index[:, 0]
+            # The group stays a batch axis: merging it into the token axis crosses the kv axis,
+            # which is not viewable and lowers to a strided copy the backend rejects.
+            k_page = k_pages.index_select(0, page_idx).unsqueeze(2)
+            v_page = v_pages.index_select(0, page_idx).unsqueeze(2)
+            mask = mask_tile.unsqueeze(1).unsqueeze(1)
+        else:
+            page_idx = page_index[0, 0:1]
+            k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            mask = mask_tile[0]
         if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
@@ -93,16 +114,16 @@ def page_attn_prefill_kernel(
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        scores = scores + mask_tile[0]
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
+        scores = scores + mask
+        scores_max = fold_group(torch.amax(scores, dim=-1, keepdim=True), torch.amax)
 
         # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
         if carry is None:
             tile_probs = torch.exp(scores - scores_max)
             return (
                 scores_max,
-                tile_probs.sum(dim=-1, keepdim=True),
-                torch.matmul(tile_probs, v_page),
+                fold_group(tile_probs.sum(dim=-1, keepdim=True), torch.sum),
+                fold_group(torch.matmul(tile_probs, v_page), torch.sum),
             ), None
 
         tile_max, tile_sum, tile_output = carry
@@ -111,26 +132,29 @@ def page_attn_prefill_kernel(
         rescale = torch.exp(-torch.relu(scores_max - tile_max))
         new_max = torch.maximum(tile_max, scores_max)
         tile_probs = torch.exp(scores - new_max)
-        new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
-        new_output = tile_output * rescale + torch.matmul(tile_probs, v_page)
+        new_sum = tile_sum * rescale + fold_group(tile_probs.sum(dim=-1, keepdim=True), torch.sum)
+        new_output = tile_output * rescale + fold_group(torch.matmul(tile_probs, v_page), torch.sum)
         return (new_max, new_sum, new_output), None
 
-    state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
+    group_axis = (1,) if grouped else ()
+    state_shape = (*group_axis, num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
     (tile_max, tile_sum, tile_output), _ = walk_tiles(
         block_body,
         operands,
         dims=dims,
-        tile_size=1,
+        tile_size=page_group,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),
             torch.zeros(
-                (num_kv_heads, num_queries_per_kv, padded_query_len, head_size),
+                (*group_axis, num_kv_heads, num_queries_per_kv, padded_query_len, head_size),
                 **state_kwargs,
             ),
         ),
     )
+    if grouped:
+        tile_max, tile_sum, tile_output = (t.squeeze(0) for t in (tile_max, tile_sum, tile_output))
     # The state has a query-row axis the sinks broadcast over.
     attn = normalize(
         tile_max, tile_sum, tile_output, None if sinks is None else sinks.unsqueeze(-1)

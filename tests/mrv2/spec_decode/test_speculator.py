@@ -96,11 +96,26 @@ def speculator(monkeypatch):
     return s
 
 
-@pytest.mark.parametrize("num_reqs,padded", [(1, 1), (2, 2), (3, 4), (4, 4)])
-def test_the_draft_step_pads_to_a_power_of_two_request_count(num_reqs, padded):
-    desc = _DraftBatchPadding(BLOCK).dispatch(num_reqs, num_reqs * BLOCK, BLOCK, 0)
+@pytest.mark.parametrize(
+    "max_reqs,num_reqs,padded",
+    [(4, 1, 1), (4, 2, 2), (4, 3, 4), (4, 4, 4), (3, 3, 3), (3, 2, 2), (1, 1, 1)],
+)
+def test_the_draft_step_pads_to_a_power_of_two_within_max_num_seqs(max_reqs, num_reqs, padded):
+    """The token buffers need only cover max_num_seqs blocks, so padding stops there."""
+    desc = _DraftBatchPadding(BLOCK, max_reqs).dispatch(num_reqs, num_reqs * BLOCK, BLOCK, 0)
     assert desc.cg_mode is CUDAGraphMode.NONE
     assert (desc.num_reqs, desc.num_tokens) == (num_reqs, padded * BLOCK)
+
+
+@pytest.mark.parametrize("max_reqs,warmed", [(4, [4, 2, 1]), (3, [3, 2, 1]), (2, [2, 1]), (1, [1])])
+def test_warmup_covers_exactly_the_widths_the_draft_step_dispatches(speculator, max_reqs, warmed):
+    speculator.max_num_reqs = max_reqs
+    padding = _DraftBatchPadding(BLOCK, max_reqs)
+    dispatched = {padding.dispatch(n, n * BLOCK).num_tokens for n in range(1, max_reqs + 1)}
+    speculator.warm_draft_batches()
+    widths = [len(ids) for ids, _ in speculator.model.forwards]
+    assert widths == [r * BLOCK for r in warmed] and set(widths) == dispatched
+    assert max(widths) <= max_reqs * BLOCK
 
 
 def test_context_stays_at_the_targets_padded_width_and_padding_writes_the_null_page(speculator):

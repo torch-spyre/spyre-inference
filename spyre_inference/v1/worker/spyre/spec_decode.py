@@ -38,14 +38,20 @@ if TYPE_CHECKING:
     from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
 
 
+def padded_draft_reqs(num_reqs: int, max_num_reqs: int) -> int:
+    # Capped: max_num_batched_tokens need only cover max_num_reqs blocks.
+    return min(1 << (num_reqs - 1).bit_length(), max_num_reqs)
+
+
 class _DraftBatchPadding:
     """Pads the draft step to a power-of-two request count, the batches warmup compiles."""
 
-    def __init__(self, block: int) -> None:
+    def __init__(self, block: int, max_num_reqs: int) -> None:
         self.block = block
+        self.max_num_reqs = max_num_reqs
 
     def dispatch(self, num_reqs, num_tokens, *args, **kwargs) -> BatchExecutionDescriptor:
-        padded_reqs = 1 << (num_reqs - 1).bit_length()
+        padded_reqs = padded_draft_reqs(num_reqs, self.max_num_reqs)
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=padded_reqs * self.block, num_reqs=num_reqs
         )
@@ -78,7 +84,9 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        self.query_cudagraph_manager = _DraftBatchPadding(self.num_query_per_req)  # ty: ignore[invalid-assignment]
+        self.query_cudagraph_manager = _DraftBatchPadding(  # ty: ignore[invalid-assignment]
+            self.num_query_per_req, self.max_num_reqs
+        )
 
     def capture(self) -> None:
         pass
@@ -169,11 +177,12 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         Upstream's warmup dummies only reach the draft at their own request counts.
         """
         block = self.num_query_per_req
-        for power in range((self.max_num_reqs - 1).bit_length(), -1, -1):
-            num_tokens = (1 << power) * block
+        widths = {padded_draft_reqs(n, self.max_num_reqs) for n in range(1, self.max_num_reqs + 1)}
+        for reqs in sorted(widths, reverse=True):
+            num_tokens = reqs * block
             attn_layer.publish_null_slots(num_tokens)
             self.input_buffers.input_ids[:num_tokens] = self.parallel_drafting_token_id
             self.input_buffers.input_ids[:num_tokens:block] = 0
-            self.input_buffers.positions[:num_tokens] = torch.arange(block).repeat(1 << power)
-            self._generate_draft(1 << power, num_tokens, None, {}, None)
+            self.input_buffers.positions[:num_tokens] = torch.arange(block).repeat(reqs)
+            self._generate_draft(reqs, num_tokens, None, {}, None)
         self.draft_tokens.zero_()

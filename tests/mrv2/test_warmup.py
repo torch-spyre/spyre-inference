@@ -42,6 +42,7 @@ def _runner(*, pooling=False, eager=False, buckets=(1, 2, 4, 64, 512), max_reqs=
         is_pooling_model=pooling,
         max_num_reqs=max_reqs,
         max_num_tokens=max_tokens,
+        speculator=None,
     )
 
 

@@ -86,8 +86,8 @@ def page_attn_kernel(
     def block_body(carry, tiles):
         page_index, k_pages, v_pages, mask_tile, q = tiles
         page_idx = page_index[0, 0:1]
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
-        # aten.index, which upcasts the int32 index to int64 and fails eager.
+        # index_select rather than `k_pages[page_idx]`: same gather, without the
+        # host round trip of the index that eager aten.index makes.
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
         # Token-major page to head-major for the matmuls; permutes on device.

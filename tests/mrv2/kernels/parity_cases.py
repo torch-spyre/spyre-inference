@@ -922,8 +922,8 @@ def run_case(name: str, seed: int) -> list[str]:
 
 if __name__ == "__main__":
     # Run as a script this module is __main__; take the importable copy's cases too.
-    from tests.mrv2.kernels import parity_cases as _importable
-    from tests.mrv2.kernels import spec_decode_cases  # noqa: F401
+    from . import parity_cases as _importable
+    from . import spec_decode_cases  # noqa: F401
 
     CASES.update(_importable.CASES)
     failures = 0

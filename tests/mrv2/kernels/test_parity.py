@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.mrv2.kernels import parity_cases, spec_decode_cases  # noqa: F401  (registers cases)
+from . import parity_cases, spec_decode_cases  # noqa: F401  (registers cases)
 
 pytestmark = pytest.mark.skipif(
     platform.machine() != "x86_64" or importlib.util.find_spec("triton") is None,
@@ -36,16 +36,16 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def parity_report() -> dict[str, list[str]]:
     result = subprocess.run(
-        [sys.executable, str(Path(parity_cases.__file__))],
+        [sys.executable, "-m", "mrv2.kernels.parity_cases"],
         capture_output=True,
         text=True,
         env={
             **os.environ,
             "SPYRE_MODEL_RUNNER": "v2",
             "SPYRE_MRV2_KERNELS": "triton",
-            # The script imports its sibling case modules as tests.mrv2.kernels.*.
+            # Not via `tests`: a PEP 420 namespace that upstream vLLM's tests package shadows.
             "PYTHONPATH": os.pathsep.join(
-                [str(Path(__file__).parents[3]), os.environ.get("PYTHONPATH", "")]
+                [str(Path(__file__).parents[2]), os.environ.get("PYTHONPATH", "")]
             ),
         },
         timeout=1800,

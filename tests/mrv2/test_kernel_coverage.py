@@ -23,7 +23,8 @@ from pathlib import Path
 import pytest
 
 from spyre_inference.v1.worker.spyre import kernels
-from tests.mrv2.kernels import parity_cases, spec_decode_cases  # noqa: F401  (registers cases)
+
+from .kernels import parity_cases, spec_decode_cases  # noqa: F401  (registers cases)
 
 # Modules MRV2's runner reaches outside vllm/v1/worker/gpu.
 _OUTSIDE_GPU = ("utils", "mamba_utils")

@@ -20,7 +20,7 @@ import types
 import numpy as np
 import torch
 
-from tests.mrv2.kernels.parity_cases import _logits, _m, case
+from .parity_cases import _logits, _m, case
 
 _RS = "gpu.spec_decode.rejection_sampler_utils"
 

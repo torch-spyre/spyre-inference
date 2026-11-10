@@ -599,6 +599,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         abs_q_pos = context_len + q_pos  # [aligned_query_len]
         window_start = (abs_q_pos - self.sliding_window + 1).clamp(min=0)
         attend = attend & (kv_pos.unsqueeze(0) >= window_start.unsqueeze(1))
+        if not apply_causal_mask:
+            attend = attend & (kv_pos.unsqueeze(0) < (abs_q_pos + self.sliding_window).unsqueeze(1))
 
         mask_bool = ~attend
         return torch.where(
@@ -667,11 +669,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         last_lower_boundary = latest_window_start // block_size
         # A block is fully below the earliest query's causal limit
         # (abs_pos = context_len) iff (b + 1) * block_size - 1 <= context_len.
-        # For decode (no causal mask) all blocks satisfy this trivially.
+        # Non-causal sliding attention has a symmetric right boundary.
         if apply_causal_mask:
             last_causal_interior = (context_len + 1) // block_size - 1
         else:
-            last_causal_interior = num_blocks - 1
+            last_causal_interior = (context_len + self.sliding_window) // block_size - 1
         last_block = num_blocks - 1
 
         active_bs = list(range(first_active, num_blocks))
@@ -684,7 +686,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         for b in active_bs:
             is_lower_boundary = b <= last_lower_boundary
             is_upper_boundary = (b == last_block) and not is_lower_boundary
-            is_causal_boundary = apply_causal_mask and b > last_causal_interior and b != last_block
+            is_causal_boundary = b > last_causal_interior and b != last_block
             if is_lower_boundary or is_upper_boundary or is_causal_boundary:
                 tiles.append(
                     self._build_single_tile(
@@ -927,7 +929,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
+            b_blocks = (
+                self._attn_bucketer.find_batched_blocks_bucket(max(decode_blocks), b_seqs)
+                if b_seqs is not None
+                else None
+            )
 
             if b_seqs is not None and b_blocks is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
@@ -1172,7 +1178,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """Metadata for the all-decode batch that dispatches to ``bucket``.
 
         ``num_seqs`` sequences of one query token each, all at the same length, so
-        ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
+        ``find_sequence_bucket`` and ``find_batched_blocks_bucket`` return the bucket's own
         values and ``decode_uniformity`` is 1.
         """
         num_seqs = bucket.num_seqs
@@ -1189,7 +1195,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 max_query_len=1,
                 max_seq_len=kv_len,
                 # Every block points at page 0, vLLM's null block: nothing real is read.
-                block_table_tensor=torch.zeros(num_seqs, bucket.num_blocks, dtype=torch.int32),
+                # As wide as build()'s per-seq padding, which a large-batch bucket can sit below.
+                block_table_tensor=torch.zeros(
+                    num_seqs, self._pad_num_blocks(bucket.num_blocks), dtype=torch.int32
+                ),
                 slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
@@ -1442,8 +1451,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
 
         Kv-major, matching the kernels' head order. Built on first use and dropped by
-        ``process_weights_after_loading``. ``move_model_to_spyre`` points the source at the
-        parameter the model holds on Spyre, which is the one a reload writes.
+        ``process_weights_after_loading``. ``model.to("spyre")`` keeps the parameter object,
+        so the source is the tensor a reload writes.
         """
         if self._sinks_source is None:
             return None

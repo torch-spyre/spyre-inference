@@ -17,14 +17,11 @@ import functools
 import torch
 
 MAX_DFLASH_BATCH_SIZE = 4
-_XPRESS_ON_V1 = "xpress speculative decoding"
+_SPYRE_V1_FEATURES = {"xpress speculative decoding", "mixed sliding/full dflash drafts"}
 
 
 def allow_xpress_on_v1() -> None:
-    """Drop upstream's V1 refusal of XPress: Spyre drives it from its own V1 proposer.
-
-    Upstream's XPress speculator is V2-only; remove this at the V2 runner flip (#906).
-    """
+    """Allow XPress and mixed draft attention through Spyre's V1 proposer."""
     from vllm.config.vllm import VllmConfig
 
     original = VllmConfig._get_v1_model_runner_unsupported_features
@@ -32,11 +29,11 @@ def allow_xpress_on_v1() -> None:
         return
 
     @functools.wraps(original)
-    def without_xpress(self) -> list[str]:
-        return [f for f in original(self) if f != _XPRESS_ON_V1]
+    def without_spyre_features(self) -> list[str]:
+        return [f for f in original(self) if f not in _SPYRE_V1_FEATURES]
 
-    without_xpress._spyre_patched = True
-    VllmConfig._get_v1_model_runner_unsupported_features = without_xpress  # ty: ignore[invalid-assignment]
+    without_spyre_features._spyre_patched = True
+    VllmConfig._get_v1_model_runner_unsupported_features = without_spyre_features  # ty: ignore[invalid-assignment]
 
 
 def normalize_speculative_config(engine_args) -> None:
@@ -73,6 +70,9 @@ def validate_dflash_config(config) -> None:
             f"Supported architectures: {', '.join(sorted(supported_drafts))}"
         )
     target = config.model_config.hf_text_config
+    if spec.max_model_len is None and spec.draft_shares_target_positions():
+        # The platform's default length cap must not stop drafts inside the target context.
+        spec.draft_model_config.max_model_len = config.model_config.max_model_len
     parallel = config.parallel_config
     from spyre_inference import envs
 
@@ -102,8 +102,10 @@ def validate_dflash_config(config) -> None:
         raise ValueError(
             "Disable prefix caching for Spyre DFlash/XPress: draft context needs every target state"
         )
-    if target.model_type != "qwen3" or config.model_config.is_multimodal_model:
-        raise ValueError("Spyre DFlash/XPress currently supports the Qwen3 text target")
+    if target.model_type not in {"qwen3", "gemma4", "gemma4_text"} or (
+        config.model_config.is_multimodal_model
+    ):
+        raise ValueError("Spyre DFlash/XPress supports Qwen3 and Gemma 4 text targets")
     if spec.draft_sample_method != "greedy":
         raise ValueError("Spyre DFlash/XPress currently uses greedy proposals")
     max_batch = config.scheduler_config.max_num_seqs
@@ -121,18 +123,18 @@ def validate_dflash_config(config) -> None:
         raise ValueError("Spyre DFlash/XPress requires the full target vocabulary")
     if getattr(draft, "logit_scale", 1.0) != 1.0 or getattr(draft, "attention_bias", False):
         raise ValueError("Spyre DFlash/XPress requires unscaled logits and no attention bias")
-    if getattr(draft, "is_causal", False) or draft.dflash_config.get("causal", False):
-        raise ValueError("Spyre DFlash/XPress requires non-causal draft attention")
-    if draft.dflash_config.get("use_swa", False) or draft.dflash_config.get(
-        "attention_sink_bias", False
+    if draft.dflash_config.get("attention_sink_bias", False):
+        raise ValueError("Spyre DFlash/XPress does not support attention sinks")
+    layer_types = getattr(draft, "layer_types", None)
+    if layer_types is not None and (
+        len(layer_types) != draft.num_hidden_layers
+        or any(t not in {"full_attention", "sliding_attention"} for t in layer_types)
     ):
-        raise ValueError(
-            "Spyre DFlash/XPress does not support sliding attention or attention sinks"
-        )
-    if any(t != "full_attention" for t in getattr(draft, "layer_types", [])):
-        raise ValueError(
-            "Spyre DFlash currently supports full non-causal attention in every draft layer"
-        )
+        raise ValueError("DFlash requires one full or sliding attention type per draft layer")
+    if draft.dflash_config.get("use_swa", False) or "sliding_attention" in (layer_types or []):
+        window = draft.dflash_config.get("swa_window_size", getattr(draft, "sliding_window", None))
+        if type(window) is not int or window <= 0:
+            raise ValueError("DFlash sliding attention requires a positive window size")
     layers = draft.dflash_config.get("target_layer_ids", [])
     if (
         not layers

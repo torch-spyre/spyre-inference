@@ -44,6 +44,8 @@ runs:
             rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
           done
         done < <(python3 .github/scripts/resolve_rpms.py names)
+        # Otherwise senlib reads its boot sequence and configs from the image's /opt/ibm/spyre.
+        python3 -I .github/scripts/relocate_spyre_libs.py "$SPYRE_LIBS"
         NEW_PATHS=$(find "$SPYRE_LIBS/opt/ibm/spyre" -maxdepth 2 -type d -name "lib" | sort | tr '\n' ':' | sed 's/:$//')
         echo "LD_LIBRARY_PATH=${NEW_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
         # Point SENTIENT_BASE_INSTALL_DIR at our extracted RPMs and clear the

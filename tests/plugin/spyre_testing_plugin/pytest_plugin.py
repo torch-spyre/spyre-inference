@@ -64,6 +64,7 @@ import atexit
 import fnmatch
 import math
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -650,6 +651,29 @@ def _find_allow_entry(test_name: str, allow_list: tuple[AllowEntry, ...]) -> All
     return None
 
 
+# Architecture-specific model family exclusions for upstream tests
+_UNSUPPORTED_ARCH_MODELS: dict[str, tuple[str, ...]] = {
+    "ppc64le": ("qwen",),
+}
+
+
+def _is_unsupported_on_current_platform(item: pytest.Item) -> bool:
+    """Return True if the test item matches unsupported model families for the host architecture."""
+    arch = platform.machine()
+    patterns = _UNSUPPORTED_ARCH_MODELS.get(arch)
+    if not patterns:
+        return False
+    path_str = str(item.fspath).lower()
+    if any(pat in path_str for pat in patterns):
+        return True
+    params = getattr(getattr(item, "callspec", None), "params", {})
+    # Deliberately sweep all param values, not just a "model" key. The GSM8K gate
+    # (test_gsm8k_correctness.py) has no "qwen" in its file path; the match comes
+    # from its config_filename param ("qwen2.5-0.5b-instruct.yaml"). Narrowing this
+    # to params["model"] would silently re-enable that gate on ppc64le.
+    return any(any(pat in str(v).lower() for pat in patterns) for v in params.values())
+
+
 def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
     """Check if test should be skipped based on param_skips or param_allows.
 
@@ -690,12 +714,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         }
 
         upstream_marker = pytest.mark.upstream
+        kept: list[pytest.Item] = []
+        deselected: list[pytest.Item] = []
 
         for item in items:
             test_path = Path(item.fspath).resolve()
             if not test_path.is_relative_to(upstream_tests_base):
+                kept.append(item)
                 continue
 
+            if _is_unsupported_on_current_platform(item):
+                deselected.append(item)
+                continue
+
+            kept.append(item)
             item.add_marker(upstream_marker)
 
             # Tag upstream items before the skip/xfail branches so tags land
@@ -743,6 +775,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             # Inject fixtures for tests that have fixture_names defined
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
+
+        items[:] = kept
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
 
     _signal_timeout_for_subprocess_tests(items)
     _reorder_tests_by_name(items)
@@ -1273,7 +1309,10 @@ def pytest_runtest_teardown(item, nextitem):
     if not spyre_hardware_present():
         return
     if getattr(item, "_spyre_reap_card", False):
-        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
+        # An xfail engine crash leaves a holder to kill, and the card needs a moment
+        # after the kill before the next test can open it.
+        settle = 3.0 if item.get_closest_marker("xfail") else 0.0
+        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log, settle=settle)
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)

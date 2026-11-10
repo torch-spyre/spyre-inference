@@ -21,14 +21,12 @@ import contextlib
 import importlib.util
 import platform
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import vllm.platforms
 
 _IMPORTING = "vllm.triton_utils.importing"
-# Triton-free; V2 runs there on the replacement kernels kernels.py binds (#1238).
-_NO_TRITON_MACHINES = ("ppc64le", "s390x")
 _MARK = "_spyre_triton_gate"
 
 
@@ -98,48 +96,45 @@ def has_triton_cpu() -> bool:
         return False
 
 
-def check(runner: str) -> None:
-    """Raise unless HAS_TRITON matches runner. On Power and Z, V2 gets past vLLM's
-    "requires Triton" check in Worker.__init__; x86 V2 without triton-cpu fails here."""
+def wants_triton(runner: str, mrv2_kernels: str) -> bool:
+    """Only V2 on SPYRE_MRV2_KERNELS=triton runs Triton, and only on triton-cpu."""
+    return runner == "v2" and mrv2_kernels == "triton"
+
+
+def check(runner: str, mrv2_kernels: str) -> None:
+    """Raise unless HAS_TRITON matches the runner and kernel source. V2 on the host
+    kernels gets past vLLM's "requires Triton" check in Worker.__init__ on every
+    machine; V2 on SPYRE_MRV2_KERNELS=triton without triton-cpu fails here."""
     from vllm.triton_utils import HAS_TRITON
 
     # importing.py has bound HAS_TRITON, so the patches have done their job.
     _unpatch(importlib.util, "find_spec")
     _unpatch(vllm.platforms, "vllm_version_matches_substr")
-    want = runner == "v2" and has_triton_cpu()
-    if want != HAS_TRITON:
+    triton = wants_triton(runner, mrv2_kernels)
+    if triton and not has_triton_cpu():
         raise ValueError(
-            f"SPYRE_MODEL_RUNNER={runner} needs HAS_TRITON={want}, but vLLM resolved "
-            f"{HAS_TRITON}: set SPYRE_MODEL_RUNNER before vLLM is imported, and the same "
-            "in every process."
+            "SPYRE_MRV2_KERNELS=triton needs triton-cpu, which is x86-only; "
+            "unset it to run MRV2 on the host kernels."
         )
-    if runner == "v2" and not HAS_TRITON:
-        if platform.machine() not in _NO_TRITON_MACHINES:
-            raise ValueError("Model Runner V2 requires Triton.")
-        _allow_v2_without_triton()
-
-
-def _allow_v2_without_triton() -> None:
-    import vllm.v1.worker.gpu_worker as worker_module
-
-    init = worker_module.Worker.__init__
-    if hasattr(init, _MARK):
-        return
-
-    def without_triton(self: Any, *args: Any, **kwargs: Any) -> None:
-        # Upstream's own __init__, with its HAS_TRITON read made true.
-        with _has_triton(worker_module):
-            init(self, *args, **kwargs)
-
-    setattr(without_triton, _MARK, init)
-    worker_module.Worker.__init__ = without_triton  # ty: ignore[invalid-assignment]
+    if triton != HAS_TRITON:
+        raise ValueError(
+            f"SPYRE_MODEL_RUNNER={runner} SPYRE_MRV2_KERNELS={mrv2_kernels} needs "
+            f"HAS_TRITON={triton}, but vLLM resolved {HAS_TRITON}: set both before vLLM "
+            "is imported, and the same in every process."
+        )
 
 
 @contextlib.contextmanager
-def _has_triton(module: Any) -> Any:
-    saved = module.HAS_TRITON
-    module.HAS_TRITON = True
+def v2_worker_init() -> Iterator[None]:
+    """Around upstream's Worker.__init__ for V2: its "Model Runner V2 requires Triton"
+    check sees HAS_TRITON=True, since kernels.bind() replaces every kernel MRV2 launches.
+    Entered by the worker itself, in whichever process builds it (the engine core does
+    not rerun check_and_update_config)."""
+    import vllm.v1.worker.gpu_worker as worker_module
+
+    saved = worker_module.HAS_TRITON
+    worker_module.HAS_TRITON = True
     try:
         yield
     finally:
-        module.HAS_TRITON = saved
+        worker_module.HAS_TRITON = saved

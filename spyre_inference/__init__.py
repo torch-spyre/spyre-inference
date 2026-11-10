@@ -34,7 +34,7 @@ def register():
     # vLLM's plugin probe swallows exceptions here and falls back to another platform,
     # so errors are only logged; check_and_update_config rejects the resulting state.
     try:
-        if envs.SPYRE_MODEL_RUNNER == "v2":
+        if triton_gate.wants_triton(envs.SPYRE_MODEL_RUNNER, envs.SPYRE_MRV2_KERNELS):
             triton_gate.open()
         else:
             triton_gate.close()

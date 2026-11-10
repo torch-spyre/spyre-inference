@@ -54,7 +54,6 @@ pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
 def test_qwen3_xpress_batch_four(monkeypatch, tmp_path, record_property, tuned):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
     if tuned:
         monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
         monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "4")

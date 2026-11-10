@@ -1,18 +1,18 @@
 ---
 name: rebalance-test-shards
-description: Recompute the CI shard count per test suite from recorded durations and apply it to the Makefile and the CI matrix. Use when a test suite has grown or shrunk and a shard job now runs too long (or wastefully short), when someone asks to rebalance/resize the test shards, or after a large batch of tests is added or removed. Keeps the Makefile *_SHARDS counts and the _test_matrix.yaml job entries in lockstep (guarded by tests/test_sharding.py).
+description: Recompute the CI shard count per test suite from recorded durations and apply it to the Makefile *_SHARDS defaults. Use when a test suite has grown or shrunk and a shard job now runs too long (or wastefully short), when someone asks to rebalance/resize the test shards, or after a large batch of tests is added or removed. The Makefile is the only copy of each count; GHA's planner and the non-GHA CI both read it (guarded by tests/test_sharding.py).
 ---
 
 # Rebalance test shards
 
-CI fans each suite out across `*_SHARDS` parallel jobs and balances them by measured
+CI fans each sharded suite out across parallel jobs and balances them by measured
 runtime; this skill resizes the shard **count** so the busiest shard's test time stays
 under the wall-clock budget (default 10 min) without over-sharding. It touches CI config
 only — no production code.
 
-The count lives in **two** places that a cross-check test forces to agree: the Makefile
-`*_SHARDS` default and the per-shard job blocks in `.github/workflows/_test_matrix.yaml`.
-Change both together or the suite silently loses (or duplicates) shards.
+The count lives in one place: the suite's `*_SHARDS` default in the Makefile. GHA's plan
+job reads it through `make print-shards` and schedules that many jobs; the P and Z CI,
+which runs the Makefile directly, reads the same default.
 
 ## 1. Get the recommendation
 
@@ -34,11 +34,9 @@ The `new` column is collected tests with no recorded duration yet (excluded from
 estimate); a large `new` count means the recommendation is provisional until they run
 once.
 
-## 2. Apply each changed suite to BOTH files
+## 2. Apply each changed suite
 
-For every suite whose `REC` differs from its current count, set N = REC and edit both:
-
-**Makefile** — bump the one default:
+For every suite whose `REC` differs from its current count, set its Makefile default:
 
 | suite | Makefile var |
 |-------|--------------|
@@ -50,47 +48,23 @@ For every suite whose `REC` differs from its current count, set N = REC and edit
 | upstream | `UPSTREAM_SHARDS` |
 | dist | `DIST_SHARDS` |
 | probe | `PROBE_SHARDS` |
+| quality | `QUALITY_SHARDS` |
 
-**`.github/workflows/_test_matrix.yaml`** — under the `test:` job's `matrix.include:`, each
-suite has N consecutive `- cfg:` blocks keyed by `test_target: test-<name>-shard-<i>`
-(`<name>` = smoke / smoke-unit / e2e-smoke / e2e-smoke-dist / attention / upstream /
-distributed / probes / quality):
-
-- **Growing** (N larger): copy the block **directly above the insertion point** — already
-  a block of this same suite — and change only two things in the copy: its `test_target`
-  id (the next 0-based `...-shard-<i>`) and its `(shard k/N)` label. Do **not** hand-type
-  the block or borrow one from a neighbouring suite. `test_types`, `runs_on`, and
-  `image_label` differ between suites and must be identical within one; in particular
-  `test_types` decides which meta-suites a shard joins — smoke-unit, e2e-smoke and
-  e2e-smoke-dist are `integration` **only**, while smoke, dist, attention, probes and
-  upstream are deliberately **not** `integration` — so a block cloned
-  from the wrong suite silently files the new shard under the wrong coverage set (and the
-  id cross-check in step 3 won't catch it; the uniformity guard will).
-- **Shrinking** (N smaller): delete the surplus highest-id blocks.
-- **Always** renumber the `(shard k/N)` text in every block of that suite to the new N
-  (e.g. `Spyre attention tests (shard 3/9)`). The label is cosmetic; the `test_target` id
-  is what runs.
-
-Do **not** touch the `test_retry` job — its matrix is built dynamically from
-`collect_failed_suites`, so it inherits the new shards automatically.
+Nothing else changes: `.github/test-matrix.yaml` only marks a suite `sharded: true`, and
+the CI job names, `(shard k/N)` labels and per-shard targets are generated from the count.
 
 The e2e-smoke suites are sized by the `e2e_smoke` admission budget
 (`docs/contributing/integration-tier.md`), not just the per-shard ceiling: if their total
 has grown past ~90 min, flag it to the maintainer instead of only adding shards.
 
-## 3. Verify the two files agree
+## 3. Verify
 
 ```bash
 uv run pytest tests/test_sharding.py -m "not upstream" -q
 ```
 
-Two guards in that file must pass before you open the PR:
-
-- `test_matrix_shard_entries_match_makefile_counts` — the matrix shard ids are exactly
-  `0..N-1` for the Makefile's N. A mismatch means a shard's tests never run in CI.
-- `test_matrix_shard_blocks_within_a_suite_are_uniform` — every block of a suite shares
-  the same `test_types`, `runs_on`, and `image_label`. This catches a shard cloned from
-  the wrong suite (e.g. an attention shard that accidentally carries `integration`).
+`test_every_sharded_matrix_suite_has_a_makefile_count` checks that every suite the matrix
+marks as sharded has a count in `make print-shards`, and that its recipe shards by it.
 
 ## 4. Open the PR
 

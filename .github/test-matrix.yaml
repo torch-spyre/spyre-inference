@@ -1,0 +1,107 @@
+# The pytest suites of the CI test matrix (_test_matrix.yaml).
+#
+# The plan job (.github/scripts/plan_test_matrix.py) schedules only the suites whose
+# `test_types` contain the requested tier, so an unselected suite costs nothing.
+#
+#   cfg          job display name
+#   test_types   tiers the suite belongs to (unit | integration | regression | trunk)
+#   cards        Spyre cards per job (the spyre_pf_x<N> runner pool)
+#   test_target  Makefile target the job runs; the Makefile owns the marker expression
+#   sharded      split across parallel jobs, each running <test_target>-<i>. The count is
+#                the Makefile's (`make print-shards`), which non-GHA CI runs use too.
+
+# Smoke set. Carries the compiled (enforce_eager=False) tests/e2e/test_compile.py
+# cases, which the plugin's weighted partition (e2e paths weighted heavy) spreads
+# across the shards. Not `integration`: that tier runs the smoke-unit and e2e_smoke
+# shards below.
+- cfg: Non-distributed spyre tests
+  test_types: unit regression trunk
+  cards: 1
+  test_target: test-smoke-shard
+  sharded: true
+
+# Integration tier: tests/e2e enters only via the opt-in e2e_smoke marker
+# (docs/contributing/integration-tier.md); other tiers run the full shards.
+- cfg: Unit-level spyre tests
+  test_types: integration
+  cards: 1
+  test_target: test-smoke-unit-shard
+  sharded: true
+
+- cfg: Spyre e2e smoke
+  test_types: integration
+  cards: 1
+  test_target: test-e2e-smoke-shard
+  sharded: true
+
+- cfg: Spyre e2e smoke TP=2
+  test_types: integration
+  cards: 2
+  test_target: test-e2e-smoke-dist-shard
+  sharded: true
+
+# Model-output quality gate: the product-model output checks (model_quality) plus
+# the GSM8K accuracy evals (gsm8k), which need the upstream vLLM checkout; the
+# marker expression pulls it in. Not `integration`: every case compiles a product
+# model or starts a vLLM server.
+- cfg: Spyre quality gate
+  test_types: regression trunk
+  cards: 1
+  test_target: test-quality-shard
+  sharded: true
+
+# Decoder attention. The compiled cases grow HBM within a process, so each shard
+# gets its own card and holds only ~1/N of them.
+- cfg: Spyre attention tests
+  test_types: unit regression trunk
+  cards: 1
+  test_target: test-attention-shard
+  sharded: true
+
+- cfg: Encoder attention tests
+  test_types: unit regression trunk
+  cards: 1
+  test_target: test-encoder-attention
+
+# Carries attention coverage into the integration tier, which the full attention
+# shards are excluded from.
+- cfg: Spyre attention smoke
+  test_types: integration
+  cards: 1
+  test_target: test-attention-smoke
+
+# TP=2 suite; each case spawns a TP=2 subprocess pair. Not `integration` (it uses
+# the e2e_smoke TP=2 shards); probes run in their own job below.
+- cfg: Distributed spyre tests
+  test_types: unit regression trunk
+  cards: 2
+  test_target: test-distributed-shard
+  sharded: true
+
+# A distinct marker (distributed_tp4) keeps these out of the 2-card distributed
+# job, which would silently skip them.
+- cfg: Distributed TP4 spyre tests
+  test_types: unit regression trunk
+  cards: 4
+  test_target: test-distributed-tp4
+
+# torch-spyre backend probes (strict-xfail signals for backend readiness). Not
+# `integration`: an xfail flipping to xpass means the backend shipped support and
+# must not block integration runs. Some are TP=2 native-collective probes.
+- cfg: Spyre probe tests
+  test_types: unit regression trunk
+  cards: 2
+  test_target: test-probes-shard
+  sharded: true
+
+# Non-distributed upstream-vLLM suites; the plugin weights models/ paths heavy.
+- cfg: Upstream vLLM tests
+  test_types: regression trunk
+  cards: 1
+  test_target: test-upstream-shard
+  sharded: true
+
+- cfg: Upstream distributed vLLM tests
+  test_types: regression trunk
+  cards: 2
+  test_target: test-upstream-distributed

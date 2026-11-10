@@ -19,7 +19,7 @@ For each suite the plugin balances shards by measured runtime (see
 tests/plugin/spyre_testing_plugin/sharding.py); this picks the *number* of shards
 so the busiest shard's measured test time stays under a wall-clock budget. It only
 reports -- the `rebalance-test-shards` skill applies the numbers to the Makefile
-(`*_SHARDS`) and the CI matrix, which the count cross-check test keeps in lockstep.
+(`*_SHARDS`), which CI reads through `make print-shards`.
 
 Durations come from the newest *passing* run on the main branch (same resolver the
 CI pin uses), or a local file via --durations. Suite membership is resolved by real
@@ -263,7 +263,7 @@ def main() -> None:
         "tests with no recorded duration (excluded from the estimate)."
     )
     if any(r["recommended"] != r["current"] for r in rows):
-        print("\nApply the REC column to the Makefile *_SHARDS and the CI matrix (see the skill).")
+        print("\nApply the REC column to the Makefile *_SHARDS defaults (see the skill).")
 
 
 if __name__ == "__main__":

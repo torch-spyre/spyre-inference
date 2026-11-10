@@ -106,7 +106,7 @@ else ifeq ($(TEST_TYPE),integration)
 MARK_EXPR := -m "not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)"
 E2E_IGNORE_ARG := --ignore=tests/e2e
 else ifeq ($(TEST_TYPE),unit)
-# model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
+# model_quality is scheduled regression/trunk only (.github/test-matrix.yaml), so it stays
 # out of the unit tier as well. distributed_tp4 has its own 4-card job.
 MARK_EXPR := -m "not (upstream or model_quality or distributed_tp4)"
 else
@@ -120,7 +120,7 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
+.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type print-shards \
         test-smoke test-smoke-shard test-smoke-unit-shard test-quality test-quality-shard \
         test-e2e-smoke test-e2e-smoke-shard test-e2e-smoke-dist-shard tests-integration \
         test-probes test-probes-shard \
@@ -142,9 +142,22 @@ help: ## Show this help message
 print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_test_matrix.yaml) resolve TEST_TYPE via `make -s print-test-type TEST_TYPE=...` without duplicating this Makefile's validation logic.
 	@echo "$(TEST_TYPE)"
 
-# Marker set for GHA's _test_matrix.yaml is intentionally NOT duplicated in
+# CI's planner (.github/scripts/plan_test_matrix.py) reads shard counts from here rather
+# than keeping its own copy.
+print-shards: ## Internal: print `<shard target> <count>` for every sharded suite.
+	@echo "test-smoke-shard $(SMOKE_SHARDS)"
+	@echo "test-smoke-unit-shard $(SMOKE_UNIT_SHARDS)"
+	@echo "test-e2e-smoke-shard $(E2E_SMOKE_SHARDS)"
+	@echo "test-e2e-smoke-dist-shard $(E2E_SMOKE_DIST_SHARDS)"
+	@echo "test-quality-shard $(QUALITY_SHARDS)"
+	@echo "test-attention-shard $(ATTN_SHARDS)"
+	@echo "test-distributed-shard $(DIST_SHARDS)"
+	@echo "test-probes-shard $(PROBE_SHARDS)"
+	@echo "test-upstream-shard $(UPSTREAM_SHARDS)"
+
+# Marker set for the CI matrix (.github/test-matrix.yaml) is intentionally NOT duplicated in
 # YAML: each matrix.cfg's "Run tests" step calls one of the test-<name>
-# targets below by name, so this Makefile is the sole owner of the marker
+# targets below by name (test_target), so this Makefile is the sole owner of the marker
 # strings. Add/change a combo here only.
 
 # The env sourcing itself must happen in every recipe shell (env vars can't

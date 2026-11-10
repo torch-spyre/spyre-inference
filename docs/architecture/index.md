@@ -503,7 +503,7 @@ Key constraints:
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
   to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
   selects a denser preset
-- **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
+- **Query length bucketing**: `[1]`, powers of two from 64 below `min(512, max_num_batched_tokens)`, then multiples of it (pooling skips the powers of two)
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default; under the default tiled walk, the head-major layout only):

@@ -19,7 +19,7 @@ In addition to the generic table in `SKILL.md`:
 | Limitation | Workaround |
 |---|---|
 | KV alignment to bucketed length | `SpyreAttnBucketer` kv buckets: powers of two from `block_size` to `max_model_len`, consumed as a padded block count, so the same compiled kernel is reused as KV grows |
-| Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1] + multiples of min(512, max_num_batched_tokens)`; each sequence's query is padded up to its own bucket |
+| Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1]`, powers of two from 64 below `min(512, max_num_batched_tokens)`, then multiples of it (pooling skips the powers of two); each sequence's query is padded up to its own bucket |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
 | Head-major page gather is a 2-D subscript (`aten.index`), which fails eager | Head-major always compiles attention, even under `--enforce-eager`; batched decode still requires `STOCK_TORCH_COMPILE` mode on either layout |
 

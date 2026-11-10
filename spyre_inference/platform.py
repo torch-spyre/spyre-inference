@@ -377,10 +377,12 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
-                # Decode packs one token per running sequence; prefill lands on
-                # the largest bucket. Denser sizes only cost warmup time. The budget
-                # is the user's only if it still equals what they passed: a config
-                # built without EngineArgs carries vLLM's own default.
+                # Decode packs one token per running sequence. A step that carries
+                # a prefill pads to the next power of two up to the default prefill
+                # bucket, so a short prompt doesn't pay for (and, at TP>1, all-reduce)
+                # a full chunk. The budget is the user's only if it still equals what
+                # they passed: a config built without EngineArgs carries vLLM's own
+                # default.
                 budget = vllm_config.scheduler_config.max_num_batched_tokens
                 prefill = cls._DEFAULT_PREFILL_BUCKET
                 user_budget = cls._user_max_num_batched_tokens
@@ -402,7 +404,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 if max_capture_size > prefill:
                     sizes.add(prefill)
                 size = 1
-                while size < num_seqs:
+                while size < max(num_seqs, min(max_capture_size, prefill)):
                     sizes.add(size)
                     size *= 2
                 compile_sizes = sorted(sizes)

@@ -47,9 +47,10 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
 logger = init_logger(__name__)
 
 # Spacing of the default query buckets above the decode bucket, capped against
-# max_num_batched_tokens. Every non-decode batch pads its query length up to a
-# multiple of this.
+# max_num_batched_tokens. A decoder's prefill query below the step pads to a power
+# of two from one stick (_MIN_PREFILL_QUERY_BUCKET), one above it to a multiple of it.
 _DEFAULT_QUERY_BUCKET_STEP = 512
+_MIN_PREFILL_QUERY_BUCKET = 64
 
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
@@ -294,13 +295,20 @@ class SpyreAttnBucketer:
 
         # Default: [1] (the decode-only batch, exempt from query padding by
         # build()) then multiples of a step up to max_num_batched_tokens, the
-        # query lengths a prefill pads up to.
+        # query lengths a prefill pads up to. A decoder also gets powers of two
+        # below the step, so a short prompt doesn't pad to a whole chunk; pooling
+        # already pads its queries onto the encoder length ladder.
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
+        short = (
+            ()
+            if vllm_config.model_config.runner_type == "pooling"
+            else _powers_of_two_up_to(step, start=_MIN_PREFILL_QUERY_BUCKET)
+        )
         self._query_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_QUERY_BUCKETS,
             max_batched,
             "SPYRE_ATTN_QUERY_BUCKETS",
-            lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
+            lambda: sorted({1, *short, *range(step, max_batched + 1, step), max_batched}),
         )
 
         # Default: the SPYRE_ATTN_KV_LADDER preset. Sparse because the recorded set is a

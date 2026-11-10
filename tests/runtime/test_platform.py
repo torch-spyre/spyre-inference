@@ -756,8 +756,11 @@ def test_worker_reasserts_recompile_limits_after_autoload():
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
 
 
+_POW2_TO_512 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+
 def test_compile_sizes_default_generated():
-    """Defaults are powers of two up to max_num_seqs, plus one prefill bucket."""
+    """Defaults are powers of two up to the prefill bucket, plus max_num_seqs."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
@@ -765,7 +768,7 @@ def test_compile_sizes_default_generated():
     vllm_config.scheduler_config.max_num_seqs = 4
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512]
+    assert vllm_config.compilation_config.compile_sizes == _POW2_TO_512
 
 
 def test_compile_sizes_default_includes_non_power_of_two_max_num_seqs():
@@ -777,7 +780,19 @@ def test_compile_sizes_default_includes_non_power_of_two_max_num_seqs():
     vllm_config.scheduler_config.max_num_seqs = 6
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 6, 512]
+    assert vllm_config.compilation_config.compile_sizes == [
+        1,
+        2,
+        4,
+        6,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+    ]
 
 
 def test_compile_sizes_user_provided_respected():
@@ -817,17 +832,17 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
 
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 8, 16, 32]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 32
 
 
 @pytest.mark.parametrize(
     ("budget", "user_budget", "sizes"),
     [
-        pytest.param(2048, None, [1, 2, 4, 512], id="unset_default_is_capped"),
-        pytest.param(1024, 1024, [1, 2, 4, 512, 1024], id="user_budget_keeps_512"),
-        pytest.param(2048, 1024, [1, 2, 4, 512], id="budget_not_from_user_is_capped"),
-        pytest.param(256, 256, [1, 2, 4, 256], id="user_budget_below_default"),
+        pytest.param(2048, None, _POW2_TO_512, id="unset_default_is_capped"),
+        pytest.param(1024, 1024, [*_POW2_TO_512, 1024], id="user_budget_keeps_512"),
+        pytest.param(2048, 1024, _POW2_TO_512, id="budget_not_from_user_is_capped"),
+        pytest.param(256, 256, [1, 2, 4, 8, 16, 32, 64, 128, 256], id="user_budget_below_default"),
     ],
 )
 def test_compile_sizes_default_honors_a_user_budget(monkeypatch, budget, user_budget, sizes):
@@ -861,7 +876,7 @@ def test_compile_sizes_warns_above_twice_the_default(monkeypatch, caplog, budget
         caplog.clear()
         TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512, budget]
+    assert vllm_config.compilation_config.compile_sizes == [*_POW2_TO_512, budget]
     warned = any("torch-spyre#5250" in r.message for r in caplog.records)
     assert warned == expect_warn
 

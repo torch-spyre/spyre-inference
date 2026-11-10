@@ -106,8 +106,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS": lambda: int(
         os.getenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS") or "16"
     ),
-    # Comma-separated query_len buckets to record, unset uses the default buckets
-    # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
+    # Comma-separated query_len buckets to record, unset uses the default buckets:
+    # [1], powers of two from 64 below step = min(512, max_num_batched_tokens) (decoders
+    # only), then multiples of step up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 1 up to max_num_seqs.

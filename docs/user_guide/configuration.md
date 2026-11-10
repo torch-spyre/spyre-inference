@@ -169,7 +169,11 @@ llm = LLM(
 ```
 
 `1` and `8` cover decode steps (one token per running sequence, up to 8); `512` is the
-prefill bucket.
+prefill bucket. The default ladder is denser: powers of two from 1 up to 512, plus
+`--max-num-seqs` itself (`[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]` at `--max-num-seqs 8`),
+so a step carrying a short prompt pads to the next power of two rather than to 512. That
+saves compute and, at TP>1, shrinks every all-reduce in the step. A list like the one above
+trades that for a shorter warmup, which suits a workload whose prompts are mostly long.
 
 The default prefill bucket is 512 tokens, but larger ones compile. For prompts of many
 thousands of tokens, a 1024-token prefill chunk shortens time to first token, on dense

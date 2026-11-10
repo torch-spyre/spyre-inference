@@ -115,6 +115,13 @@ on:
           - perf
           - trunk
         default: integration
+      skip_uv_for_benchmarking:
+        description: >-
+          test_type=perf only. Bypass `uv run` and use the active venv's python3 directly.
+          Needed on s390x, where uv cannot resolve a torch/vllm wheel.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # PR-context runs (native pull_request, or workflow_dispatch carrying a
@@ -202,6 +209,7 @@ jobs:
       rpm_names: ${{ inputs.rpm_names || '' }}
       runner_label: ${{ inputs.runner_label || '' }}
       test_type: ${{ inputs.test_type || 'integration' }}
+      skip_uv_for_benchmarking: ${{ inputs.skip_uv_for_benchmarking || false }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job so callers can poll a single stable job name for pass/fail.

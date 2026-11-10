@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: DFlash/XPress speculator (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py),
-with host bookkeeping and no Triton."""
+"""MRV2: DFlash/XPress speculator (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py).
+
+Upstream's propose() and its input-prep kernel run as-is; the overrides keep the draft
+on Spyre and on shapes warmup compiled.
+"""
 
 from typing import TYPE_CHECKING, Any, cast
 
@@ -23,8 +26,7 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 from spyre_inference.custom_ops.utils import convert
@@ -36,26 +38,17 @@ if TYPE_CHECKING:
     from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
 
 
-def plan_drafts(
-    query_start_loc: list[int],
-    num_sampled: list[int],
-    num_rejected: list[int],
-    positions: torch.Tensor,
-    block: int,
-    max_model_len: int,
-) -> tuple[list[range], list[int | None]]:
-    """Each request's committed rows, and its draft block's first position or None."""
-    committed: list[range] = []
-    draft_starts: list[int | None] = []
-    for i, (start, end) in enumerate(zip(query_start_loc, query_start_loc[1:])):
-        valid = end - start - num_rejected[i]
-        if not 0 < valid <= end - start:
-            raise ValueError(f"Request {i}: {num_rejected[i]} rejected of {end - start} rows")
-        committed.append(range(start, start + valid))
-        context_end = int(positions[start + valid - 1]) + 1
-        drafts = num_sampled[i] > 0 and context_end + block <= max_model_len
-        draft_starts.append(context_end if drafts else None)
-    return committed, draft_starts
+class _DraftBatchPadding:
+    """Pads the draft step to a power-of-two request count, the batches warmup compiles."""
+
+    def __init__(self, block: int) -> None:
+        self.block = block
+
+    def dispatch(self, num_reqs, num_tokens, *args, **kwargs) -> BatchExecutionDescriptor:
+        padded_reqs = 1 << (num_reqs - 1).bit_length()
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE, num_tokens=padded_reqs * self.block, num_reqs=num_reqs
+        )
 
 
 class SpyreDFlashSpeculator(DFlashSpeculator):
@@ -66,8 +59,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
     ) -> None:
         super().__init__(vllm_config, device)
         self.spyre_device = spyre_device
-        self._warmed_context_rows: set[int] = set()
-        self._draft_warmed = False
+        self._context: torch.Tensor | None = None
 
     def load_draft_model(self, target_model: nn.Module, target_attn_layer_names: set[str]):
         model = cast(
@@ -86,145 +78,102 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        pass
+        self.query_cudagraph_manager = _DraftBatchPadding(self.num_query_per_req)  # ty: ignore[invalid-assignment]
 
     def capture(self) -> None:
         pass
 
-    @torch.inference_mode()
     def propose(
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        last_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        temperature: torch.Tensor,
-        seeds: torch.Tensor,
-        dp_sync_state: Any = None,
+        input_batch,
+        attn_metadata,
+        slot_mappings,
+        last_hidden_states,
+        aux_hidden_states,
+        *args,
         dummy_run: bool = False,
-        skip_attn_for_dummy_run: bool = False,
-        mm_inputs: Any = None,
-        is_profile: bool = False,
-        num_speculative_tokens: int | None = None,
+        **kwargs,
     ) -> torch.Tensor:
-        assert aux_hidden_states, "Spyre DFlash requires the target's auxiliary hidden states"
-        num_reqs = input_batch.num_reqs
-        features = torch.cat(aux_hidden_states, dim=-1)
-        if dummy_run:
-            self._warm(features)
-            return self.draft_tokens[:num_reqs]
-
-        num_tokens = input_batch.num_tokens
-        positions = input_batch.positions[:num_tokens]
-        committed, draft_starts = plan_drafts(
-            input_batch.query_start_loc_np[: num_reqs + 1].tolist(),
-            num_sampled[:num_reqs].tolist(),
-            num_rejected[:num_reqs].tolist(),
-            positions,
-            self.num_query_per_req,
-            self.max_model_len,
-        )
-        # Rejected and padded rows write the null page.
-        target_slots = slot_mappings[next(iter(self.draft_attn_layer_names))]
-        slots = torch.zeros(features.shape[0], dtype=torch.int64)
-        for rows in committed:
-            slots[rows.start : rows.stop] = target_slots[rows.start : rows.stop]
-        self._store_context(features, F.pad(positions, (0, features.shape[0] - num_tokens)), slots)
-
-        # Rows that draft nothing still verify whatever the scheduler places there.
-        self.draft_tokens[:num_reqs] = 0
-        active = [i for i, start in enumerate(draft_starts) if start is not None]
-        if active and num_speculative_tokens != 0:
-            anchors = last_sampled[input_batch.idx_mapping[active].long(), 0]
-            starts = [start for start in draft_starts if start is not None]
-            self.draft_tokens[active] = torch.tensor(self._draft(active, starts, anchors))
-        return self.draft_tokens[:num_reqs]
-
-    def _store_context(
-        self, features: torch.Tensor, positions: torch.Tensor, slots: torch.Tensor
-    ) -> None:
-        context = self.model.combine_hidden_states(features)
-        self.model.precompute_and_store_context_kv(
-            context, convert(positions, self.spyre_device), slots
-        )
-
-    def _draft(
-        self, active: list[int], starts: list[int], anchors: torch.Tensor
-    ) -> list[list[int]]:
-        block = self.num_query_per_req
-        batch = 1 << (len(active) - 1).bit_length()
-        num_tokens = batch * block
-        actual_tokens = len(active) * block
-        block_tables = [table[active] for table in self.block_tables.input_block_tables]
-
-        positions = torch.zeros(num_tokens, dtype=torch.int64)
-        slots = torch.zeros(len(block_tables), num_tokens, dtype=torch.int64)
-        ids = torch.full((num_tokens,), self.parallel_drafting_token_id, dtype=torch.int64)
-        ids[::block] = 0
-        for index, (start, anchor) in enumerate(zip(starts, anchors.tolist(), strict=True)):
-            rows = slice(index * block, (index + 1) * block)
-            pos = torch.arange(start, start + block, dtype=torch.int64)
-            positions[rows] = pos
-            ids[index * block] = anchor
-            for gid in self.draft_kv_cache_group_ids:
-                size = self.block_tables.block_sizes[gid]
-                pages = block_tables[gid][index, pos // size].long()
-                slots[gid, rows] = pages * size + pos % size
-
-        query_start_loc = torch.arange(0, actual_tokens + 1, block, dtype=torch.int32)
-        seq_lens = torch.tensor(starts, dtype=torch.int32) + block
-        per_layer = build_attn_metadata(
-            attn_groups=self.attn_groups,
-            num_reqs=len(active),
-            num_tokens=actual_tokens,
-            query_start_loc_gpu=query_start_loc,
-            query_start_loc_cpu=query_start_loc,
-            max_query_len=block,
-            seq_lens=seq_lens,
-            max_seq_len=int(seq_lens.max()),
-            block_tables=block_tables,
-            slot_mappings=slots,
-            kv_cache_config=self.kv_cache_config,
-            seq_lens_cpu_upper_bound=seq_lens,
-            causal=False,
-        )
-        with set_forward_context(
-            per_layer,
-            self.vllm_config,
-            num_tokens=num_tokens,
-            slot_mapping=build_slot_mappings_by_layer(slots, self.kv_cache_config),
-        ):
-            hidden = self.model(
-                input_ids=convert(ids, self.spyre_device),
-                positions=convert(positions, self.spyre_device),
+        if not dummy_run:
+            return super().propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                aux_hidden_states,
+                *args,
+                **kwargs,
             )
-        return self.model.propose_block(hidden, ids[::block])[: len(active)]
+        # Warmup's decoder dummies skip attention, and upstream's skip_attn branch (GPU
+        # memory profiling) reads host buffers with no hook; warm the context store at
+        # this row count against the null page, and the draft batches in warm_draft_batches.
+        self._store_hidden_states(0, last_hidden_states, aux_hidden_states)
+        self._precompute_context_kv(0, 0, dummy_run=True)
+        return self.draft_tokens[: input_batch.num_reqs]
 
-    def _warm(self, features: torch.Tensor) -> None:
-        rows = features.shape[0]
-        if rows not in self._warmed_context_rows:
-            positions = torch.zeros(rows, dtype=torch.int64)
-            self._store_context(features, positions, torch.zeros(rows, dtype=torch.int64))
-            self._warmed_context_rows.add(rows)
-        if self._draft_warmed:
-            return
+    def _store_hidden_states(self, num_tokens, last_hidden_states, aux_hidden_states, *args):
+        # Stays on Spyre at the target's padded width; upstream copies into a host buffer.
+        assert aux_hidden_states, "Spyre DFlash requires the target's auxiliary hidden states"
+        self._context = self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
+
+    def _precompute_context_kv(self, start: int, end: int, dummy_run: bool = False) -> None:
+        assert start == 0 and self._context is not None
+        rows = self._context.shape[0]
+        # Rows past the batch write the null page (upstream's PAD_SLOT_ID, clamped).
+        slots = F.pad(self._context_slot_mappings[0][:end], (0, rows - end), value=-1)
+        if dummy_run:
+            slots.fill_(-1)
+        self.model.precompute_and_store_context_kv(
+            self._context,
+            convert(F.pad(self.context_positions[:end], (0, rows - end)), self.spyre_device),
+            slots.clamp(min=0),
+        )
+
+    def _run_model(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> torch.Tensor:
+        with set_forward_context(
+            attn_metadata, self.vllm_config, num_tokens=num_tokens, slot_mapping=slot_mappings
+        ):
+            return self.model(
+                input_ids=convert(
+                    self.input_buffers.input_ids[:num_tokens], self.spyre_device, torch.int64
+                ),
+                positions=convert(self.input_buffers.positions[:num_tokens], self.spyre_device),
+            )
+
+    def _generate_draft(self, num_reqs: int, num_tokens_padded: int, *args, **kwargs) -> None:
+        # Upstream's eager metadata publishes slots for the real rows only; the padded
+        # rows' KV write goes to the null page, so the block graph keeps its width.
+        num_tokens = num_reqs * self.num_query_per_req
+        if num_tokens < num_tokens_padded:
+            for group in (g for groups in self.attn_groups for g in groups):
+                slots = self.block_tables.slot_mappings[group.kv_cache_group_id]
+                group.get_metadata_builder()._slot_mapping.publish(
+                    F.pad(slots[:num_tokens], (0, num_tokens_padded - num_tokens), value=0)
+                )
+        hidden = self._run_model(num_tokens_padded, *args, **kwargs)
+        block = self.num_query_per_req
+        anchors = self.input_buffers.input_ids[:num_tokens_padded:block].to(torch.int64)
+        proposals = self.model.propose_block(hidden, anchors)
+        self.draft_tokens[:num_reqs] = torch.tensor(proposals[:num_reqs])
+
+    def warm_draft_batches(self) -> None:
+        """The draft forward and proposal at every padded batch _DraftBatchPadding serves.
+
+        Upstream's warmup dummies only reach the draft at their own request counts.
+        """
         block = self.num_query_per_req
         for power in range((self.max_num_reqs - 1).bit_length(), -1, -1):
             num_tokens = (1 << power) * block
             attn_layer.publish_null_slots(num_tokens)
-            ids = torch.full((num_tokens,), self.parallel_drafting_token_id, dtype=torch.int64)
-            ids[::block] = 0
-            with set_forward_context(
-                None, self.vllm_config, num_tokens=num_tokens, slot_mapping={}
-            ):
-                hidden = self.model(
-                    input_ids=convert(ids, self.spyre_device),
-                    positions=convert(torch.arange(block).repeat(1 << power), self.spyre_device),
-                )
-            self.model.propose_block(hidden, ids[::block])
-        self._draft_warmed = True
+            self.input_buffers.input_ids[:num_tokens] = self.parallel_drafting_token_id
+            self.input_buffers.input_ids[:num_tokens:block] = 0
+            self.input_buffers.positions[:num_tokens] = torch.arange(block).repeat(1 << power)
+            self._generate_draft(1 << power, num_tokens, None, {}, None)
+        self.draft_tokens.zero_()

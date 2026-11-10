@@ -713,8 +713,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
-        # Before the wrapper: the table lives on the vision model, and its row count has to
-        # clear every token bucket.
+        # Before the wrapper: the table lives on the vision model. Spare rows follow the
+        # encoder write, not decoder compile_sizes.
         self._install_encoder_output_table()
 
         # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
@@ -978,6 +978,30 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return False
         return bool(supports_multimodal_pruning(model))
 
+    def _encoder_output_write_tokens(
+        self, model: SpyreVisionEncoderMixin, cache_size: int
+    ) -> int:
+        """Largest encoder-output write, in image tokens.
+
+        ``store`` always writes the compiled encoder budget and parks padding on spare
+        rows. Decoder ``compile_sizes`` are the prompt, not that write.
+        """
+        sizes = [cache_size]
+        mm_budget = getattr(self, "mm_budget", None)
+        toks = None
+        if mm_budget is not None:
+            toks = getattr(mm_budget, "mm_max_toks_per_item", None)
+        if toks:
+            sizes.extend(int(toks[m]) for m in model.vision_modalities if m in toks)
+        user = getattr(self.compilation_config, "encoder_cudagraph_token_budgets", None)
+        if user:
+            sizes.extend(int(b) for b in user)
+        largest = max(sizes)
+        step = model.vision_patch_multiple // model.patches_per_token
+        if step > 1:
+            return -(-largest // step) * step
+        return largest
+
     def _install_encoder_output_table(self) -> None:
         """Allocate the on-card encoder-output table and point ``encoder_cache`` at its rows.
 
@@ -1017,14 +1041,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "The encoder output table stores handles; disable enable_mm_embeds, or set "
                 "vision_output_table = False."
             )
-        buckets = ()
-        bucketer = getattr(self, "spyre_shape_bucketer", None)
-        if bucketer is not None:
-            buckets = tuple(bucketer.bucket_sizes)
-        # Whole-budget writes pad onto spare rows. ``max(budgets) - 1`` covers keep=1 of
-        # the largest warmed write. Eager has no budgets, so spare is cache_size - 1.
+        # Whole-budget writes pad onto spare rows. ``max(write) - 1`` covers keep=1 of
+        # the largest warmed encoder budget. Decoder compile_sizes are prompt lengths
+        # (512 when --max-num-batched-tokens is 512); a Ministral image is ~3k tokens.
         # One past that, so a gather is never the whole table (torch-spyre#4033).
-        max_write = max(buckets, default=0) or cache_size
+        max_write = self._encoder_output_write_tokens(model, cache_size)
         spare = max(max_write - 1, 0)
         rows = cache_size + spare + 1
         dtype = self._model_dtype()

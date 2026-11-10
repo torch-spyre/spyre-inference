@@ -358,11 +358,12 @@ Constraints the layout follows:
   one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
   64-wide head's 32-wide halves cannot be sliced.
 - Mixin models keep encoder output on the card in an `EncoderOutputTable`; the cache holds
-  row handles and `embed_input_ids` gathers them. Compiled warmup records one table write
-  per token budget. `--enforce-eager` has no budget warmup, so each new image token count
-  compiles a write while serving (unwatched, like the gather). `SPYRE_COMPILE_GUARD=error`
-  is the compiled-path check. A model that still slices host rows sets
-  `vision_output_table = False` (Granite Vision, #1437).
+  row handles and `embed_input_ids` gathers them. Spare rows are `max(encoder write) - 1`,
+  the compiled vision budget, not decoder `compile_sizes`. Compiled warmup records one
+  table write per token budget. `--enforce-eager` has no budget warmup, so each new image
+  token count compiles a write while serving (unwatched, like the gather).
+  `SPYRE_COMPILE_GUARD=error` is the compiled-path check. A model that still slices host
+  rows sets `vision_output_table = False` (Granite Vision, #1437).
 - Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
 
 ## Attention Backend

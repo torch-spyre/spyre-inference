@@ -466,6 +466,70 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     assert merged == [4, 16]
 
 
+def _runner_for_table_install(*, cache_size: int, decoder_buckets: list[int], max_tokens: int):
+    """A load-time runner: decoder compile_sizes set, encoder manager not built yet."""
+    from vllm.config import CompilationMode
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    model = _FakeVisionModel(max_tokens=max_tokens)
+    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+    runner.model = model
+    runner.mm_budget = SimpleNamespace(
+        encoder_cache_size=cache_size,
+        mm_max_toks_per_item={"image": max_tokens},
+    )
+    runner.scheduler_config = SimpleNamespace(encoder_cache_size=max(decoder_buckets))
+    runner.vllm_config = SimpleNamespace(ec_transfer_config=None)
+    runner.model_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            enable_mm_embeds=False,
+            is_multimodal_pruning_enabled=lambda: False,
+        )
+    )
+    runner.compilation_config = SimpleNamespace(
+        mode=CompilationMode.STOCK_TORCH_COMPILE,
+        encoder_cudagraph_token_budgets=None,
+    )
+    runner.spyre_shape_bucketer = SimpleNamespace(bucket_sizes=decoder_buckets)
+    runner._spyre_device = torch.device("cpu")
+    runner._model_dtype = lambda: torch.float16
+    return runner
+
+
+def test_encoder_table_spare_follows_encoder_budget_not_decoder_buckets():
+    """Ministral WDU on s390x: decoder compile_sizes stop at 512, the encoder pads 840.
+
+    Spare used to be ``max(compile_sizes) - 1`` = 511, so the first image's budget write
+    raised ``Encoder output table has 511 spare rows, this write pads 840``.
+    """
+    keep, extra = 2184, 840
+    budget = keep + extra
+    runner = _runner_for_table_install(
+        cache_size=budget,
+        decoder_buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+        max_tokens=budget,
+    )
+    runner._install_encoder_output_table()
+    table = runner.model.output_table
+    assert table.trash - table.cache_size >= extra
+    handles = table.store(torch.zeros(budget, 8, dtype=torch.float16), keep=keep)
+    assert handles.shape == (keep, 1)
+
+
+def test_encoder_table_spare_covers_a_user_budget_above_the_cache():
+    """Gemma 1120: user encoder budgets can exceed the engine's own largest item."""
+    runner = _runner_for_table_install(
+        cache_size=280,
+        decoder_buckets=[1, 4, 16, 64, 256, 512],
+        max_tokens=280,
+    )
+    runner.compilation_config.encoder_cudagraph_token_budgets = [280, 576, 1152]
+    runner._install_encoder_output_table()
+    spare = runner.model.output_table.trash - runner.model.output_table.cache_size
+    assert spare >= 1151
+
+
 def _prompt(mask_rows: list[int], num_tokens: int = 12):
     is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
     is_multimodal[mask_rows] = True

@@ -102,9 +102,7 @@ def wants_triton(runner: str, mrv2_kernels: str) -> bool:
 
 
 def check(runner: str, mrv2_kernels: str) -> None:
-    """Raise unless HAS_TRITON matches the runner and kernel source. V2 on the host
-    kernels gets past vLLM's "requires Triton" check in Worker.__init__ on every
-    machine; V2 on SPYRE_MRV2_KERNELS=triton without triton-cpu fails here."""
+    """Raise unless vLLM's HAS_TRITON matches the runner and kernel source."""
     from vllm.triton_utils import HAS_TRITON
 
     # importing.py has bound HAS_TRITON, so the patches have done their job.
@@ -126,10 +124,8 @@ def check(runner: str, mrv2_kernels: str) -> None:
 
 @contextlib.contextmanager
 def v2_worker_init() -> Iterator[None]:
-    """Around upstream's Worker.__init__ for V2: its "Model Runner V2 requires Triton"
-    check sees HAS_TRITON=True, since kernels.bind() replaces every kernel MRV2 launches.
-    Entered by the worker itself, in whichever process builds it (the engine core does
-    not rerun check_and_update_config)."""
+    """Pass upstream's "Model Runner V2 requires Triton" check in the worker's own
+    process: kernels.bind() replaces every kernel MRV2 launches."""
     import vllm.v1.worker.gpu_worker as worker_module
 
     saved = worker_module.HAS_TRITON

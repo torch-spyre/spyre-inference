@@ -12,23 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: the single kernel seam for MRV2's Triton kernels.
-
-bind() replaces every Triton kernel MRV2 launches with a host op from csrc/
-(``torch.ops._spyre_C.mrv2_*``), so the V2 runner needs no Triton on any
-architecture. Each launch site in upstream is ``_foo_kernel[grid](...)`` on a
-module global, so assigning a HostKernel over that global reaches every caller.
-The op takes the grid and then the kernel's own arguments by name, so a renamed
-or reordered argument fails the coverage test rather than binding the wrong argument.
-
-Kernels behind features the Spyre platform rejects (mamba align, batch-sharded
-sampling, block/fly verification, adaptive verification) get an UnsupportedKernel
-that names the feature if it is ever reached. Of gpu/spec_decode/, only what XPress
-reaches is bound; the other speculators are refused at config time.
-
-SPYRE_MRV2_KERNELS=triton keeps upstream's Triton kernels on x86 with
-triton-cpu (the parity tests' reference); bind() then binds nothing.
-"""
+"""MRV2: bind() puts a csrc/ host op (``torch.ops._spyre_C.mrv2_*``) over every
+``@triton.jit`` module global MRV2 launches, so V2 needs no Triton on any architecture."""
 
 import importlib
 import inspect
@@ -48,9 +33,8 @@ _PACKAGE = "vllm.v1.worker.gpu"
 # Launch options a Triton launcher accepts beside the kernel's own arguments.
 _LAUNCH_OPTIONS = frozenset({"num_warps", "num_stages", "num_ctas", "maxnreg"})
 
-# "<module>.<kernel>" (relative to vllm/v1/worker, so gpu/... is MRV2's package)
-# -> the csrc op that replaces it. The op's arguments after the grid are the
-# kernel's, in order.
+# "<module>.<kernel>" under vllm/v1/worker -> its csrc op, which takes the grid and then
+# the kernel's own arguments.
 HOST_KERNELS: dict[str, str] = {
     "gpu.input_batch._prepare_prefill_inputs_kernel": "mrv2_prepare_prefill_inputs",
     "gpu.input_batch._prepare_pos_seq_lens_kernel": "mrv2_prepare_pos_seq_lens",
@@ -209,9 +193,7 @@ class UnsupportedKernel:
         return launch
 
 
-# Host-side replacements bound over upstream's, at the modules that import them by name.
-# The logits are already on the host, so V1's sort-free top-k/top-p replaces MRV2's
-# full-vocab sort (or its Triton version), measured on x86 bring-up.
+# Logits are already on the host, so V1's sort-free top-k/top-p replaces MRV2's full sort.
 _TOP_K_TOP_P_SITES = ("gpu.sample.sampler", "gpu.sample.states")
 
 
@@ -267,12 +249,7 @@ _originals: dict[str, object] = {}
 
 
 def bind(force_host: bool = False) -> set[str]:
-    """Bind every HOST_KERNELS / UNSUPPORTED_KERNELS entry and the top-k/top-p override.
-
-    Returns the names bound, so bind_or_raise() and the coverage test can diff
-    them against the full lists. ``force_host`` binds the host ops even under
-    SPYRE_MRV2_KERNELS=triton, for the parity tests.
-    """
+    """Returns the names bound; ``force_host`` binds host ops under =triton too (parity)."""
     bound = set()
     for site in _TOP_K_TOP_P_SITES:
         _module(f"{site}.x").apply_top_k_top_p = spyre_apply_top_k_top_p
@@ -307,8 +284,7 @@ def unbind() -> None:
 
 
 def bind_or_raise() -> None:
-    """Call bind() and raise if any kernel is still unbound, rather than letting
-    it fail at its first launch mid-serving."""
+    """Raise at startup if bind() left a kernel unbound, not at its first launch."""
     expected = {f"{site}.apply_top_k_top_p" for site in _TOP_K_TOP_P_SITES}
     if not use_triton():
         expected |= set(HOST_KERNELS) | set(UNSUPPORTED_KERNELS)

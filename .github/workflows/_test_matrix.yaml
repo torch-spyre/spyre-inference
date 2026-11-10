@@ -39,9 +39,7 @@ on:
         type: string
         default: ''
       use_prebaked_image:
-        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
-        # action). It does not change the override step or any other step.
-        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        description: When true, use the runner image's RPMs and venv as they are (see setup-test-env).
         required: false
         type: boolean
         default: false
@@ -1319,11 +1317,12 @@ jobs:
   # ---------------------------------------------------------------------------
   perf:
     name: Perf benchmarks (vLLM)
-    needs: resolve
+    needs: [resolve, build_kernels]
     if: >-
       ${{ !cancelled()
           && github.event_name != 'pull_request'
-          && needs.resolve.outputs.resolved_test_type == 'perf' }}
+          && needs.resolve.outputs.resolved_test_type == 'perf'
+          && (needs.build_kernels.result == 'success' || needs.build_kernels.result == 'skipped') }}
     runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
     timeout-minutes: 720
     env:
@@ -1332,8 +1331,6 @@ jobs:
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
       RESULTS_DIR: benchmark-results
-      # The dev image's editable spyre-inference tree (keeps .git), installed into its $VIRTUAL_ENV.
-      PREBAKED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
       # The serve configs replay trace files that are not in the repo. Cache
       # them on the same RWX volume as the HuggingFace cache above: it outlives
       # the pod, so the first job to need a trace fetches it and every later job
@@ -1349,76 +1346,22 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
-      # use_prebaked_image is true, so the run uses the image's Spyre stack
-      # as-is. See issue #543.
-      - name: Install Spyre RPMs
-        if: ${{ !inputs.use_prebaked_image }}
-        uses: ./.github/actions/spyre-rpm-install
-
-      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
-      # steps. See .github/scripts/nfs_uv_cache.py.
-      - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Set up the test environment
+        id: env
+        uses: ./.github/actions/setup-test-env
         with:
-          enable-cache: false
-
-      # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
-      - name: uv cache (NFS)
-        if: ${{ !inputs.use_prebaked_image }}
-        uses: ./.github/actions/uv-nfs-cache
-        with:
-          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
-
-      - name: Install override Spyre RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/override-spyre-rpms
-        with:
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          uv_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
+          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
           artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
           artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Gather runner info
-        uses: ./.github/actions/gather-runner-info
-        with:
-          # Echo the exact runner-label selectors this job's runs-on used
-          # (mirrors the perf runs-on expression: the fixed pool labels plus
-          # the per-PR runner_label override, or the standing image label).
-          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
-
-      # Prebaked runs use the image's venv: a cached torch-spyre wheel may be built against other RPMs.
-      - name: Build spyre-inference
-        if: ${{ !inputs.use_prebaked_image }}
-        env:
-          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
-            # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
-            # `uv run` reuses the shared venv instead of re-resolving), but uv rejects
-            # UV_NO_SYNC together with `--frozen` on `uv add` ("cannot be used with
-            # --frozen"). Shadow it to a false value for this one call so the add
-            # succeeds; the surrounding UV_NO_SYNC=1 is unchanged for every other uv run.
-            UV_NO_SYNC=0 uv add --frozen \
-              "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
-            uv sync --verbose --group dev
-          else
-            uv sync --frozen --verbose --group dev
-          fi
-          uv pip show torch
-          uv pip freeze
-
-      - name: Ensure public HF models cached
-        env:
-          HF_HUB_OFFLINE: '0'
-          # Authenticated cache-miss downloads; anonymous Hub requests get rate-limited.
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: uv run .github/cache_config/manage_cache.py --public
+          hf_token: ${{ secrets.HF_TOKEN }}
 
       - name: Run vLLM benchmarks
         id: bench
@@ -1428,8 +1371,7 @@ jobs:
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
           # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
           SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
-          # Prebaked runs use the image's tree: an unbuilt checkout would shadow its spyre_inference._C kernels.
-          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
+          SRC_DIR: ${{ steps.env.outputs.src_dir }}
         run: |
           echo "Running vLLM benchmark suite (TEST_TYPE=perf) from ${SRC_DIR}..."
           make -C "${SRC_DIR}" tests TEST_TYPE=perf RESULTS_DIR="${GITHUB_WORKSPACE}/${RESULTS_DIR}" \
@@ -1447,7 +1389,7 @@ jobs:
           REF_IN: ${{ inputs.ref }}
           REF_NAME: ${{ github.ref_name }}
           REPO: ${{ inputs.repository || github.repository }}
-          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
+          SRC_DIR: ${{ steps.env.outputs.src_dir }}
         run: |
           SHA="$(git -C "${SRC_DIR}" rev-parse HEAD)" || { echo "::warning::could not read the commit of ${SRC_DIR}; recording the checkout's"; SHA="$(git rev-parse HEAD)"; }
           BRANCH="${REF_IN:-${REF_NAME}}"

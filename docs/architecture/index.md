@@ -165,10 +165,7 @@ Three adaptations worth knowing:
   compiled graph and hands each block its own offset-0 row through the `[:, layer_idx, :]`
   the backbone loop already does. A view of the packed tensor carries a different
   `storage_offset` per layer, which torch-spyre guards on, so every layer would compile
-  its own block. The multimodal wrapper allocates its PLE cache on the host as a plain
-  attribute, so `models/gemma4_mm.py` re-registers it as a buffer that follows the model
-  to the device; that runs even text-only, since the default load keeps the wrapper with
-  every modality at 0.
+  its own block.
 
 ### MoE expert weights
 

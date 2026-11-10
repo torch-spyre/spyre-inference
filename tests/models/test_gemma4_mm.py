@@ -472,30 +472,6 @@ def test_tower_is_built_in_the_model_dtype(monkeypatch):
     assert {p.dtype for p in tower.parameters()} == {torch.float16}
 
 
-def test_per_layer_embedding_cache_follows_the_model(monkeypatch):
-    """Upstream allocates the PLE cache as a plain attribute, so `.to()` would leave it behind."""
-    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
-
-    def upstream_init(self, *, vllm_config, prefix=""):
-        nn.Module.__init__(self)
-        self.per_layer_embeddings = torch.zeros(3, 2, 4)
-
-    monkeypatch.setattr(gemma4_mm.Gemma4ForConditionalGeneration, "__init__", upstream_init)
-    monkeypatch.setattr(
-        SpyreGemma4ForConditionalGeneration, "_init_spyre_vision", lambda self: None
-    )
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            dtype=torch.float16, hf_config=SimpleNamespace(vision_config=SimpleNamespace())
-        )
-    )
-    model = SpyreGemma4ForConditionalGeneration(vllm_config=vllm_config)
-
-    assert "per_layer_embeddings" in dict(model.named_buffers())
-    assert "per_layer_embeddings" not in model.state_dict()
-    assert model.to(torch.float16).per_layer_embeddings.dtype == torch.float16
-
-
 @pytest.mark.parametrize("has_image", [True, False])
 def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration

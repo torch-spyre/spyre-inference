@@ -242,16 +242,18 @@ def _run_artifactory_datasets(config, config_file):
     root = _require_env("ARTIFACTORY_DATA_PATH").strip("/")
 
     subdir = spec.get("subdir", "").strip("/")
-    # Mirror the Artifactory layout under the cache root so the path a benchmark
-    # computes from the same subdir resolves without a second mapping.
-    target_dir = Path(dest_dir) / subdir
-    target_dir.mkdir(parents=True, exist_ok=True)
     force = os.getenv("FORCE_DOWNLOAD") == "true"
 
-    print(f"📋 Found {len(files)} dataset(s) to cache into {target_dir}")
+    print(f"📋 Found {len(files)} dataset(s) to cache under {Path(dest_dir)}")
     failed = []
     for entry in files:
         name = entry["name"]
+        # An entry may override the section's subdir.
+        entry_subdir = entry.get("subdir", subdir).strip("/")
+        # Mirror the Artifactory layout under the cache root so the path a
+        # benchmark computes from the same subdir resolves without a mapping.
+        target_dir = Path(dest_dir) / entry_subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
         # str(): YAML reads an all-digit digest as an int, which would never
         # equal the hexdigest and would re-download forever.
         expected = str(entry["sha256"])
@@ -265,7 +267,7 @@ def _run_artifactory_datasets(config, config_file):
                 continue
             print(f"♻️ {name}: sha256 {actual} != {expected}, re-downloading")
 
-        url = f"{base_url}/artifactory/{root}/{subdir}/{name}"
+        url = f"{base_url}/artifactory/{root}/{entry_subdir}/{name}"
         # A partial file under the real name would look like a valid cache entry
         # to the benchmark, so download beside it and rename only after the
         # digest matches. The pid keeps two concurrent writers off one temp file.

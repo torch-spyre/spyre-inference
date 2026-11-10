@@ -57,7 +57,11 @@ _fetch_spec.loader.exec_module(fetch_bench_datasets)
 
 def _dataset_path_defaults() -> dict[str, str]:
     cache = fetch_bench_datasets.cache_dir()
-    return {var: str(cache / spec["path"]) for var, spec in fetch_bench_datasets.ARTIFACTS.items()}
+    defaults = {
+        var: str(cache / spec["path"]) for var, spec in fetch_bench_datasets.ARTIFACTS.items()
+    }
+    defaults.update(fetch_bench_datasets.archive_defaults(cache))
+    return defaults
 
 
 def parse_args():
@@ -172,11 +176,24 @@ def _resolve_dataset_path(config: dict) -> list[str]:
     return [var for var in template.get_identifiers() if var not in env]
 
 
+def _resolve_server_parameters(config: dict) -> None:
+    """Expand env vars in server_parameters: the server starts without a shell,
+    so `allowed-local-media-path: ${VAR}` would reach vllm serve as a literal."""
+    env = {**_dataset_path_defaults(), **os.environ}
+    for key, value in (config.get("server_parameters") or {}).items():
+        if isinstance(value, str) and "$" in value:
+            config["server_parameters"][key] = string.Template(value).safe_substitute(env)
+
+
 def _missing_dataset(config: dict) -> str | None:
     """Dataset path a config needs but which is absent on this host, if any."""
     path = config.get("parameters", {}).get("dataset-path")
     if path and not Path(path).exists():
         return str(path)
+    # A missing media dir fails every image request, like an absent trace.
+    media = config.get("server_parameters", {}).get("allowed-local-media-path")
+    if media and not Path(media).is_dir():
+        return str(media)
     return None
 
 
@@ -213,6 +230,7 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
             continue
         raw_path = str(config.get("parameters", {}).get("dataset-path", ""))
         unresolved = _resolve_dataset_path(config)
+        _resolve_server_parameters(config)
         missing = _missing_dataset(config)
         if missing:
             if unresolved and set(unresolved) <= _OPTIONAL_DATASET_VARS:

@@ -118,3 +118,8 @@ artifactory_datasets:
       sha256: 49a284e3f10027bb430f168a4fba7310d7dcb3147565ffed1bb87d1fc6fe9c18
     - name: tls_results_2025.11.03_e2ee1b0_correct_order.jsonl
       sha256: 9b1cc4d35e3626d1a6bbe0f998caa039b70d694241f25835a2083e1854e14028
+    # Vision dataset archive; only the archive is mirrored, the benchmark
+    # fetcher extracts it. Keep in step with ARCHIVES in fetch_bench_datasets.py.
+    - name: oracle_invoices_2026.11.10.tar.gz
+      subdir: spyre-inference/datasets/vision
+      sha256: 583541f089bba7ea18bdaf7c7c782db0ab58572428ac5663f3d533c28a90d927

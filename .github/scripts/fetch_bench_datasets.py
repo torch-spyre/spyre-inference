@@ -68,6 +68,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 from argparse import ArgumentParser
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -146,6 +147,56 @@ ARTIFACTS = {
 }
 
 DEFAULT_CACHE_DIR = "~/.cache/spyre/artifacts"
+
+# Multi-file datasets: a verified archive of prompts.jsonl (image paths
+# relative to the archive root) plus the images. vLLM's custom_image dataset
+# resolves image_files on the host, not against the jsonl, so the extracted
+# jsonl is rewritten absolute; `media_var` is the extracted directory, for the
+# server's allowed-local-media-path (#1538).
+_DATASETS = "spyre-inference/datasets"
+
+ARCHIVES = {
+    "SPYRE_VISION_DATASET": {
+        "path": f"{_DATASETS}/vision/oracle_invoices_2026.11.10.tar.gz",
+        "sha256": "583541f089bba7ea18bdaf7c7c782db0ab58572428ac5663f3d533c28a90d927",
+        "media_var": "SPYRE_VISION_IMAGES_DATASET",
+    },
+}
+
+
+def extract_dir(cache: Path, spec: dict) -> Path:
+    return Path(str(cache / spec["path"]).removesuffix(".tar.gz"))
+
+
+def archive_defaults(cache: Path = None) -> dict[str, str]:
+    cache = cache or cache_dir()
+    defaults = {}
+    for var, spec in ARCHIVES.items():
+        out = extract_dir(cache, spec)
+        defaults[var] = str(out / "dataset.jsonl")
+        defaults[spec["media_var"]] = str(out)
+    return defaults
+
+
+def materialize(archive: Path, spec: dict) -> tuple[Path, Path]:
+    """Extract a verified archive; return (dataset_jsonl, media_dir)."""
+    out = extract_dir(cache_dir(), spec)
+    source = out / "prompts.jsonl"
+    local = out / "dataset.jsonl"
+    if not out.is_dir() or not source.is_file():
+        with file_lock(archive):
+            if not out.is_dir() or not source.is_file():
+                out.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(archive) as tar:
+                    tar.extractall(out, filter="data")
+    if not source.is_file():
+        raise FetchUnavailable(f"{archive}: extraction is missing prompts.jsonl")
+    rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+    with local.open("w") as handle:
+        for row in rows:
+            row["image_files"] = [str(out / p) for p in row["image_files"]]
+            handle.write(json.dumps(row) + "\n")
+    return local, out
 
 
 def cache_dir() -> Path:
@@ -367,6 +418,47 @@ def main() -> None:
                 # instead of the fetch that could not get it.
                 continue
         print(f"export {var}={path}")
+
+    for var, spec in ARCHIVES.items():
+        media = spec["media_var"]
+        # Same preset rule as the single files, plus the media dir.
+        preset = os.environ.get(var)
+        preset_media = os.environ.get(media)
+        if preset and Path(preset).is_file() and preset_media and Path(preset_media).is_dir():
+            print(f"export {var}={preset}")
+            print(f"export {media}={preset_media}")
+            continue
+
+        archive = destination / spec["path"]
+        if args.command == "env":
+            out = extract_dir(destination, spec)
+            print(f"export {var}={out / 'dataset.jsonl'}")
+            print(f"export {media}={out}")
+            continue
+
+        state = cache_state(archive, spec["sha256"])
+        if state != "ok":
+            if args.command != "fetch":
+                (missing if state == "absent" else corrupt).append(archive)
+                continue
+            if cache_dir_error is not None:
+                unavailable.append((var, cache_dir_error))
+                continue
+            try:
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                with file_lock(archive):
+                    if cache_state(archive, spec["sha256"]) != "ok":
+                        download(spec["path"], archive, spec["sha256"])
+            except (FetchUnavailable, OSError) as exc:
+                unavailable.append((var, exc))
+                continue
+        try:
+            dataset, out = materialize(archive, spec)
+        except (FetchUnavailable, OSError, tarfile.TarError) as exc:
+            unavailable.append((var, exc))
+            continue
+        print(f"export {var}={dataset}")
+        print(f"export {media}={out}")
 
     if unavailable:
         # Loud, but NOT fatal. Most benchmark configs replay no trace and stay

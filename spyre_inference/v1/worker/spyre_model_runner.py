@@ -978,9 +978,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return False
         return bool(supports_multimodal_pruning(model))
 
-    def _encoder_output_write_tokens(
-        self, model: SpyreVisionEncoderMixin, cache_size: int
-    ) -> int:
+    def _encoder_output_write_tokens(self, model: SpyreVisionEncoderMixin, cache_size: int) -> int:
         """Largest encoder-output write, in image tokens.
 
         ``store`` always writes the compiled encoder budget and parks padding on spare

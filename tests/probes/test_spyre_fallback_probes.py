@@ -228,23 +228,12 @@ def test_spyre_index_add_for_mean_pooling(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Fancy indexing (aten::index.Tensor) is unreliable on Spyre for the "
-        "shapes pooling / logits selection need. Related gather bugs: "
-        "torch-spyre#3499 (L3_ADDEARIMM overflow), #3502 (fused two gathers, "
-        "different indices), #3503 (fused two gathers, shared index). "
-        "spyre-inference works around this with host-built indices + "
-        "index_select (CLS/LAST) and CPU D2H before hidden_states[logits_indices]. "
-        "When this probe passes, revisit those workarounds."
-    ),
-)
 def test_spyre_fancy_index_tensor(spyre_device):
     """Row gather via advanced indexing ``hs[idx]`` (aten::index.Tensor).
 
-    Upstream CLSPool / logits selection use this form; we use index_select
-    instead. Probe uses a flat [T, H] activation and 1-D int64 row indices.
+    Upstream CLSPool / logits selection use this form. torch-spyre#5978 runs it
+    eagerly for a single 1-D int32/int64 index on dim 0; other index forms still
+    raise. Probe uses a flat [T, H] activation and 1-D int64 row indices.
     """
     hidden_states = torch.randn(32, 128, dtype=torch.float16, device=spyre_device)
     # CLS-style first-token indices for a few sequences (not a simple arange).
@@ -335,9 +324,7 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
 
     Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
     f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
-    reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
-    (int32 index upcast under aten.index) and test_spyre_scatter_index_row_of_2d_table
-    (torch-spyre#3851).
+    reasons still probed by test_spyre_scatter_index_row_of_2d_table (torch-spyre#3851).
     """
     num_kv_heads = 2
     block_size = 64
@@ -412,29 +399,13 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "compile",
-        pytest.param(
-            "eager",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Subscripting a dense Spyre tensor with an int32 index lowers "
-                    "to aten.index, which upcasts to int64: eager fails with "
-                    "'type conversion from torch.int32 to torch.int64'. Inductor "
-                    "folds the conversion away, so the compiled path is fine."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
-    """`k_pages[idx]` for the page gather: works compiled, fails eager.
+    """`k_pages[idx]` for the page gather with a one-element int32 index.
 
-    This asymmetry is why page_attn_kernel gathers with index_select,
-    which works in both modes.
+    Was strict-xfail in eager: aten.index upcast the int32 index to int64 and failed.
+    torch-spyre#5978 runs a 1-D integer row index eagerly, so both modes work now.
+    page_attn_kernel still gathers with index_select, which works in both modes too.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
     int32_elems_per_stick = 32
@@ -1304,14 +1275,6 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#5976: model.to('spyre') installs a new Parameter for each moved one "
-        "instead of keeping the object, as nn.Module.to does. When this XPASS-es, drop "
-        "_sink_owners and the moe_quant_config rebuild from move_model_to_spyre."
-    ),
-)
 def test_spyre_module_to_keeps_parameter_objects(spyre_device):
     """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
     must see the device tensor after the move, and a reload's in-place write."""

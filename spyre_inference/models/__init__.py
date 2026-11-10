@@ -163,8 +163,10 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     has cached the upstream class of a multimodal architecture such as CLIP.
     """
     from spyre_inference.models import clip, gemma4, muse_glimmer
+    from spyre_inference.models._prelaunch import load_hf_config
 
     register_models()
-    gemma4.force_text_backbone(engine_args)
-    clip.force_disable_chunked_prefill(engine_args)
-    muse_glimmer.force_language_model_only(engine_args)
+    hf_config = load_hf_config(engine_args)
+    gemma4.force_text_backbone(engine_args, hf_config)
+    clip.force_disable_chunked_prefill(engine_args, hf_config)
+    muse_glimmer.disable_vision(engine_args, hf_config)

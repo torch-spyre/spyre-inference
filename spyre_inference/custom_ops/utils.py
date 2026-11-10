@@ -49,8 +49,13 @@ def row_outermost_layout(shape: Sequence[int], dtype: torch.dtype):
     for d in reversed(dims[1:]):
         strides.append(strides[-1] * d)
     strides.reverse()
+    valid_elements = {(i,): d for i, d in enumerate(lead)}
+    valid_elements[(len(lead), len(lead) + 1)] = width
     return SpyreTensorLayout(
-        device_size=dims, stride_map=strides, device_dtype=get_device_dtype(dtype)
+        device_size=dims,
+        stride_map=strides,
+        device_dtype=get_device_dtype(dtype),
+        valid_elements=valid_elements,
     )
 
 
@@ -199,5 +204,6 @@ def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
             device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],
             stride_map=[row_width, elems_per_stick, 1],
             device_dtype=get_device_dtype(probe.dtype),
+            valid_elements={(0,): num_rows, (1, 2): row_width},
         ),
     )

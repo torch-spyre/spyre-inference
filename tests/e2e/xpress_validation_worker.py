@@ -24,6 +24,11 @@ from spyre_inference.v1.spec_decode.dflash import accepted_context_length
 from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
 
+def read_blocks(pages, ids):
+    # Copying the whole tensor would scale with the KV cache, which fills the free card memory.
+    return torch.cat([pages[i : i + 1].to(device="cpu", dtype=torch.float32) for i in ids])
+
+
 class ValidationWorker(TorchSpyreWorker):
     def init_device(self):
         super().init_device()
@@ -238,12 +243,9 @@ class ValidationWorker(TorchSpyreWorker):
         for name, n in chosen:
             cache = caches[name]
             block_size = cache.k_pages.shape[2]
-            ids = self._last_blocks[: (n + block_size - 1) // block_size].long()
+            ids = self._last_blocks[: (n + block_size - 1) // block_size].tolist()
             result[name] = tuple(
-                pages.to(device="cpu", dtype=torch.float32)[ids]
-                .permute(0, 2, 1, 3)
-                .flatten(0, 1)[:n]
-                .contiguous()
+                read_blocks(pages, ids).permute(0, 2, 1, 3).flatten(0, 1)[:n].contiguous()
                 for pages in cache
             )
         torch.save(result, path)

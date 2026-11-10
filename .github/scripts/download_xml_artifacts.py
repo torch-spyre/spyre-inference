@@ -21,9 +21,34 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 ID_ARTIFACTS = {"run-id", "artifact-id"}
+
+
+class UnsafeZipMember(Exception):
+    """A zip member resolves outside the extraction directory."""
+
+
+def assert_zip_confined(zip_path: Path, dest: Path) -> None:
+    """Refuse a zip whose members would escape `dest`.
+
+    `safe_segment()` only guards the artifact name used as the extraction
+    subdir; it says nothing about the member paths inside the downloaded zip.
+    An artifact zip is attacker-controlled (any PR's CI can upload one), so a
+    member with a `..` component or an absolute path could land outside `dest`
+    even though the subdir name was safe. Validate every member before we hand
+    the archive to `unzip`.
+    """
+    base = dest.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            # A drive letter / UNC / absolute member, or one that climbs out
+            # via `..`, resolves outside `base`.
+            target = (dest / name).resolve()
+            if target != base and base not in target.parents:
+                raise UnsafeZipMember(f"{name!r} escapes {base}")
 
 
 def safe_segment(name: str) -> bool:
@@ -47,22 +72,39 @@ def fetch(repo: str, artifact: dict, zip_path: Path, dest: Path, attempts: int) 
     """Download and unzip one artifact; retried whole, since a truncated zip only fails at unzip."""
     for attempt in range(1, attempts + 1):
         shutil.rmtree(dest, ignore_errors=True)
-        for cmd in (
+        dl = subprocess.run(
             ["gh", "api", f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip"],
-            ["unzip", "-q", "-o", str(zip_path), "-d", str(dest)],
-        ):
-            result = subprocess.run(cmd, capture_output=True)
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout[-500:]).decode(errors="replace").strip()
-                print(
-                    f"[retry] {artifact['name']}: {cmd[0]} attempt {attempt}/{attempts} "
-                    f"exited {result.returncode}: {err}"
-                )
-                break
-            if cmd[0] == "gh":
-                zip_path.write_bytes(result.stdout)
+            capture_output=True,
+        )
+        if dl.returncode != 0:
+            err = (dl.stderr or dl.stdout[-500:]).decode(errors="replace").strip()
+            print(
+                f"[retry] {artifact['name']}: gh attempt {attempt}/{attempts} "
+                f"exited {dl.returncode}: {err}"
+            )
         else:
-            return True
+            zip_path.write_bytes(dl.stdout)
+            try:
+                assert_zip_confined(zip_path, dest)
+            except (UnsafeZipMember, zipfile.BadZipFile) as exc:
+                # A traversal member is not a transient failure: do not retry it.
+                print(
+                    f"::warning::Rejecting artifact {artifact['name']!r} "
+                    f"(id={artifact['id']}): {exc}"
+                )
+                shutil.rmtree(dest, ignore_errors=True)
+                return False
+            unz = subprocess.run(
+                ["unzip", "-q", "-o", str(zip_path), "-d", str(dest)],
+                capture_output=True,
+            )
+            if unz.returncode == 0:
+                return True
+            err = (unz.stderr or unz.stdout[-500:]).decode(errors="replace").strip()
+            print(
+                f"[retry] {artifact['name']}: unzip attempt {attempt}/{attempts} "
+                f"exited {unz.returncode}: {err}"
+            )
         if attempt < attempts:
             time.sleep(2**attempt)
     shutil.rmtree(dest, ignore_errors=True)

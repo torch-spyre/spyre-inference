@@ -14,7 +14,6 @@
 
 import functools
 import importlib.metadata
-import math
 import multiprocessing
 import os
 import sys
@@ -76,13 +75,22 @@ def _disable_torch_accelerator() -> None:
 
     # get_memory_info() has a real caller rather than a shutdown one: vLLM sizes its
     # vision-encoder chunking budget with it. Host RAM is the right answer, since the
-    # transients that budget guards run on the host.
+    # transients that budget guards run on the host. The worker names the Spyre device to
+    # size the KV cache, where host RAM would be silently wrong.
     native_memory_info = torch.accelerator.get_memory_info
 
-    def _memory_info(*args, **kwargs) -> tuple[int, int]:
+    def _memory_info(device_index: torch.device | str | int | None = None, /) -> tuple[int, int]:
         try:
-            return native_memory_info(*args, **kwargs)
-        except NotImplementedError:
+            return native_memory_info(device_index)
+        except NotImplementedError as e:
+            if isinstance(device_index, (torch.device, str)) and (
+                torch.device(device_index).type == "spyre"
+            ):
+                raise NotImplementedError(
+                    f"torch-spyre reports no free memory for {device_index}, which the KV "
+                    "cache is sized from. It needs a torch-spyre with getMemoryInfo "
+                    "(torch-spyre#5145)."
+                ) from e
             import psutil
 
             vm = psutil.virtual_memory()
@@ -1003,14 +1011,20 @@ class TorchSpyrePlatform(CpuPlatform):
         # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
         scheduler_config.disable_hybrid_kv_cache_manager = True
 
-        # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
-        # math in CpuPlatform.check_and_update_config is meaningless for us.
-        # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
-        # populate `cache_config.kv_cache_memory_bytes`, which
-        # TorchSpyreWorker.determine_available_memory returns directly.
-        # Skip when the user has explicitly supplied --kv-cache-memory-bytes.
-        if vllm_config.cache_config.kv_cache_memory_bytes is None:
-            os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
+        # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,
+        # overriding the flag; a size would also skip the measurement and hand out a
+        # fixed budget whatever the card has free.
+        cpu_kvcache_space = os.environ.pop("VLLM_CPU_KVCACHE_SPACE", "")
+        if cpu_kvcache_space not in ("", "0"):
+            if vllm_config.cache_config.kv_cache_memory_bytes is not None:
+                raise ValueError(
+                    f"VLLM_CPU_KVCACHE_SPACE={cpu_kvcache_space} and --kv-cache-memory-bytes "
+                    "both set the KV cache size. Unset VLLM_CPU_KVCACHE_SPACE: Spyre ignores it."
+                )
+            logger.warning(
+                "Ignoring VLLM_CPU_KVCACHE_SPACE: Spyre sizes the KV cache from free "
+                "device memory. Pass --kv-cache-memory-bytes for a fixed budget."
+            )
 
         # CpuPlatform turns "uni" into "mp"; remember what was asked for (see _maybe_uniproc).
         requested_backend = parallel_config.distributed_executor_backend
@@ -1019,39 +1033,18 @@ class TorchSpyrePlatform(CpuPlatform):
         super().check_and_update_config(vllm_config)
         _maybe_uniproc(parallel_config, requested_backend)
 
-        # Must run after super(), which sets a block_size default of its own, and before
-        # the num_gpu_blocks_override math below, which reads block_size.
+        # Must run after super(), which sets a block_size default of its own.
         cls._align_block_size(vllm_config)
 
-        # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
-        # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
-        # a single group drawing from the single global BlockPool.
-        # Pooling / encoder-only models have no KV cache — do not size one.
+        # The KV cache is sized from measured device memory via determine_available_memory.
+        # --kv-cache-memory-bytes skips the measurement; --num-gpu-blocks-override replaces
+        # the block count it yields, later, in get_kv_cache_configs.
         cache_config = vllm_config.cache_config
         # Prefix caching on a zero-group config makes vLLM pick HybridKVCacheCoordinator,
         # which asserts it has ≥2 attention groups.
         if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
             logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
             cache_config.enable_prefix_caching = False
-
-        if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
-            if cls._is_pooling_model(vllm_config):
-                logger.info(
-                    "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
-                )
-            else:
-                max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-                max_model_len = vllm_config.model_config.max_model_len
-                blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-                # +1 for BlockPool's reserved null block, which is never allocatable.
-                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1
-                logger.info(
-                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq + 1 null block)",
-                    cache_config.num_gpu_blocks_override,
-                    max_num_seqs,
-                    blocks_per_seq,
-                )
 
         if vllm_config.model_config is not None:
             cls._set_vision_token_limit(vllm_config)

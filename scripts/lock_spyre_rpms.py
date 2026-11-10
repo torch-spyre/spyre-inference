@@ -41,12 +41,11 @@ import json
 import re
 import sys
 import tomllib
-import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
-from resolve_rpms import ARCHES, _env, _match_pattern  # noqa: E402
+from resolve_rpms import ARCHES, _env, _match_pattern, artifactory_open  # noqa: E402
 
 BUNDLE_ARCH = "x86_64"
 # `+<count>.<sha7>_<build>` ends every version this tool can pin.
@@ -64,13 +63,12 @@ class Artifactory:
         self.token = token
 
     def _request(self, path, data=None):
-        req = urllib.request.Request(
+        with artifactory_open(
             f"{self.base_url}/artifactory/{path}",
+            self.token,
             data=data,
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "text/plain"},
             method="POST" if data else "GET",
-        )
-        with urllib.request.urlopen(req) as resp:
+        ) as resp:
             return json.load(resp)
 
     def listing(self, repo, path):

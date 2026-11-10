@@ -66,6 +66,18 @@ def _language_backbones(model: torch.nn.Module) -> NamedModules | None:
             return [(name, module)]
     return None
 
+def non_text_parameter_names(model: torch.nn.Module) -> set[str]:
+    """Names of the parameters outside a multimodal model's language backbone.
+
+    Empty for a text-only model. If the language backbone cannot be isolated, every
+    parameter is returned: the conservative choice for a caller that keeps these on the host.
+    """
+    backbones = _language_backbones(model)
+    if backbones is None:
+        return {name for name, _ in model.named_parameters()}
+    text_ids = {id(p) for _, scope in backbones for p in scope.parameters()}
+    return {name for name, p in model.named_parameters() if id(p) not in text_ids}
+
 
 def text_modules(
     model: torch.nn.Module,

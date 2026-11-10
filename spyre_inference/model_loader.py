@@ -161,22 +161,20 @@ class SpyreModelLoader(BaseModelLoader):
 def _get_host_loaded_param_names(model: nn.Module) -> set[str]:
     """Parameters that must stay on CPU rather than be swapped for an empty Spyre placeholder.
 
-    VocabParallelEmbedding weights are placed by the module's own ``_apply`` after
-    ``model.to(spyre)``; a direct Spyre-to-Spyre copy of a vocab-sized table exceeds
-    the per-core limit, so they must arrive from the host.
+    - VocabParallelEmbedding weights are placed by the module's own ``_apply`` after
+      ``model.to(spyre)``; a direct Spyre-to-Spyre copy of a vocab-sized table exceeds
+      the per-core limit, so they must arrive from the host.
+    - Everything outside a multimodal model's language backbone (vision tower,
+      projector). Their ``process_weights_after_loading`` hooks run eager ops on the
+      weight (e.g. Pixtral pads the patch embedding) and expect a host tensor, as under
+      the stock loader. They are small, so keeping them on the host costs little.
 
-    NOTE: This list covers only what SpyreModelLoader currently supports — TP=1,
-    unquantized, dense, generate-only models. Pooling classifier/reranker heads and
-    vision-tower params are deliberately not listed here; those model classes are
-    excluded from ``load_format=spyre`` at the platform gate
-    (``apply_config_platform_defaults``) until their host-residency needs are mapped.
-    If the gate is widened to include pooling or multimodal models, expand this list
-    to cover their fp32 heads (spyre_pooler._downcast_module_to_fp16, torch-spyre#2971)
-    and any vision-tower params that must not land on Spyre directly.
-    """ 
+    Pooling heads are not listed: pooling runners are excluded at the platform gate
+    (torch-spyre#2971).
+    """
     from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-    names: set[str] = set()
+    from spyre_inference.custom_ops.text_backbone import non_text_parameter_names
+    names = non_text_parameter_names(model)
     for module_name, module in model.named_modules():
         if isinstance(module, VocabParallelEmbedding):
             for param_name in module._parameters:

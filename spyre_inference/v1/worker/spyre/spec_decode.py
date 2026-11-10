@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.worker.model_load import move_model_to_spyre
+from spyre_inference.v1.worker.spyre.attn_groups import split_by_window
 
 
 def plan_drafts(
@@ -77,6 +78,14 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         move_model_to_spyre(model, self.spyre_device)
         model.prepare_for_spyre()
         return model
+
+    def set_attn(self, model_state, kv_cache_config, block_tables, *args, **kwargs) -> None:
+        super().set_attn(model_state, kv_cache_config, block_tables, *args, **kwargs)
+        # As the target's groups (kv_cache.py); the split stays inside each KV cache
+        # group, so the group ids and causality upstream derived above still hold.
+        split_by_window(
+            self.attn_groups, self.attn_vllm_config, self.device, block_tables.block_sizes
+        )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass

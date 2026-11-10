@@ -27,7 +27,6 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
-from vllm.v1.worker.gpu.spec_decode import speculator as upstream_speculator
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
@@ -141,41 +140,6 @@ def test_init_raises_when_the_swap_did_not_apply(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="allocated no Spyre KV pages"):
         kv_cache.init(_runner(torch.device("cpu")), config)
-
-
-def test_the_draft_attention_groups_get_the_window_split(monkeypatch) -> None:
-    """The speculator builds its groups through its own import of init_attn_backend."""
-    split = []
-    monkeypatch.setattr(attn_groups, "init", lambda upstream, *a, **k: split.append(upstream))
-
-    def initialize_kv_cache(self, config, **kwargs):
-        upstream_speculator.init_attn_backend(config, None, None)
-        self.spyre_kv_caches = {"layer": object()}
-
-    monkeypatch.setattr(
-        upstream_model_runner.GPUModelRunner, "initialize_kv_cache", initialize_kv_cache
-    )
-    original = upstream_speculator.init_attn_backend
-    runner = _runner(torch.device("cpu"))
-    runner.speculator = object()
-
-    kv_cache.init(runner, make_fake_kv_cache_config())
-    assert split == [original]
-    assert upstream_speculator.init_attn_backend is original
-
-
-def test_a_bypassed_draft_swap_fails_loudly(monkeypatch) -> None:
-    def initialize_kv_cache(self, config, **kwargs):
-        self.spyre_kv_caches = {"layer": object()}
-
-    monkeypatch.setattr(
-        upstream_model_runner.GPUModelRunner, "initialize_kv_cache", initialize_kv_cache
-    )
-    runner = _runner(torch.device("cpu"))
-    runner.speculator = object()
-
-    with pytest.raises(RuntimeError, match="speculator built its attention groups"):
-        kv_cache.init(runner, make_fake_kv_cache_config())
 
 
 @pytest.mark.parametrize("is_profiling", [False, True])

@@ -216,6 +216,26 @@ def test_warmup_stores_each_row_count_once_and_drafts_every_batch_once(speculato
     assert [len(ids) for ids, _ in speculator.model.forwards] == [4 * BLOCK, 2 * BLOCK, BLOCK]
 
 
+def test_set_attn_splits_the_draft_groups_after_upstream_builds_them(monkeypatch):
+    """The draft's groups come from upstream's set_attn; the override splits them as the
+    runner's own are split, with the page sizes of each KV cache group."""
+    calls = []
+    monkeypatch.setattr(
+        spec_decode.DFlashSpeculator,
+        "set_attn",
+        lambda self, *a: (calls.append("upstream"), setattr(self, "attn_groups", [["g"]])),
+    )
+    monkeypatch.setattr(
+        spec_decode, "split_by_window", lambda groups, *a: calls.append(("split", groups, a))
+    )
+    s = SpyreDFlashSpeculator.__new__(SpyreDFlashSpeculator)
+    s.device = torch.device("cpu")
+    s.vllm_config = SimpleNamespace(attention_config=SimpleNamespace())
+    monkeypatch.setattr(SpyreDFlashSpeculator, "attn_vllm_config", "draft-config")
+    s.set_attn(None, None, SimpleNamespace(block_sizes=[128]), None, None)
+    assert calls == ["upstream", ("split", [["g"]], ("draft-config", s.device, [128]))]
+
+
 def test_the_runner_replaces_upstreams_speculator(monkeypatch):
     def upstream_init(self, vllm_config, device):
         self.device = device

@@ -26,8 +26,10 @@ import pytest
 import torch
 import torch.nn as nn
 from vllm.config import CompilationMode
+from vllm.model_executor.models.interfaces import SupportsEagle3, supports_eagle3
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import set_eagle3_aux_hidden_state_layers
 
 from spyre_inference.v1.worker.spyre import load
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
@@ -36,13 +38,7 @@ from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper, unw
 
 from .fakes import FakeModel
 
-_ALL = (
-    "get_model_loader",
-    "set_eagle3_aux_hidden_state_layers",
-    "init_model_state",
-    "PoolingRunner",
-    "compile_model_with_stock_torch",
-)
+_ALL = ("get_model_loader", "init_model_state", "PoolingRunner", "compile_model_with_stock_torch")
 
 
 def _snapshot() -> dict[str, object]:
@@ -195,23 +191,41 @@ def test_row_buckets_cover_every_verified_draft_row(steps, monkeypatch) -> None:
     assert wrapper._keep_aux_hidden_states_on_device is True
 
 
-def test_the_aux_layers_are_set_on_the_bare_model(monkeypatch, stub_targets) -> None:
-    """Upstream's SupportsEagle3 check is a runtime Protocol, which the wrapper's
-    attribute forwarding doesn't satisfy."""
-    seen = []
-    monkeypatch.setattr(
-        upstream, "set_eagle3_aux_hidden_state_layers", lambda model, *a: seen.append(model)
+class _Eagle3Model(FakeModel, SupportsEagle3):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aux_layers: tuple[int, ...] = ()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.aux_layers = layers
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return (1, 2)
+
+
+def test_upstreams_aux_layer_setup_accepts_an_eagle3_models_wrapper(steps) -> None:
+    """SupportsEagle3 is a runtime Protocol, which attribute forwarding alone doesn't
+    satisfy; upstream's set_eagle3_aux_hidden_state_layers raises on a plain wrapper."""
+    config = _vllm_config()
+    model = _Eagle3Model()
+    wrapper = _wrap(_Loader(model), _runner()).load_model(
+        vllm_config=config, model_config=config.model_config
     )
-    model = FakeModel()
-    wrapper = _SpyreModelWrapper(model, torch.device("cpu"), model_dtype=torch.float16)
-    runner = _runner(
-        use_aux_hidden_state_outputs=True,
-        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    spec = SimpleNamespace(draft_model_config=None)
+
+    set_eagle3_aux_hidden_state_layers(wrapper, spec)
+
+    assert isinstance(wrapper, _SpyreModelWrapper) and model.aux_layers == (1, 2)
+
+
+def test_a_model_without_the_interface_gets_the_plain_wrapper(steps) -> None:
+    config = _vllm_config()
+    wrapper = _wrap(_Loader(FakeModel()), _runner()).load_model(
+        vllm_config=config, model_config=config.model_config
     )
-    with load._patched(runner):
-        upstream.set_eagle3_aux_hidden_state_layers(wrapper, None)
-        _load_through(runner, {"get_model_loader", "init_model_state"})
-    assert seen == [model]
+    assert not supports_eagle3(wrapper)
+    with pytest.raises(RuntimeError, match="EAGLE3 interface"):
+        set_eagle3_aux_hidden_state_layers(wrapper, SimpleNamespace(draft_model_config=None))
 
 
 def test_the_loader_forwards_everything_else() -> None:
@@ -233,8 +247,6 @@ def _load_through(runner, reached: set[str]) -> None:
     """Stand in for upstream's load_model, looking up only the names in ``reached``."""
     if "get_model_loader" in reached:
         upstream.get_model_loader(None)
-    if "set_eagle3_aux_hidden_state_layers" in reached:
-        upstream.set_eagle3_aux_hidden_state_layers(FakeModel(), None)
     if "init_model_state" in reached:
         upstream.init_model_state(None, None, None, None)
     if "PoolingRunner" in reached:
@@ -250,7 +262,6 @@ def stub_targets(monkeypatch):
     monkeypatch.setattr(load, "_SpyreModelLoaderWrapper", lambda loader, runner: None)
     monkeypatch.setattr(load, "resolve_spyre_model_state", lambda *args: None)
     monkeypatch.setattr(SpyrePoolingRunner, "__init__", lambda self, *args: None)
-    monkeypatch.setattr(upstream, "set_eagle3_aux_hidden_state_layers", lambda *args: None)
 
 
 def test_upstreams_stock_compile_is_a_no_op_inside(monkeypatch, stub_targets) -> None:
@@ -269,9 +280,9 @@ def test_upstreams_stock_compile_is_a_no_op_inside(monkeypatch, stub_targets) ->
 )
 def test_a_swap_upstream_bypasses_fails_loudly(stub_targets, bypassed) -> None:
     """A vLLM bump that imports one of these locally would otherwise make the swap a
-    silent no-op: Spyre's loader or model state never installed, the aux layers set on
-    the wrapper (which raises), or a whole-model stock compile over the block graphs."""
-    runner = _runner(is_pooling_model=True, use_aux_hidden_state_outputs=True)
+    silent no-op: Spyre's loader or model state never installed, or a whole-model
+    stock compile over the block graphs."""
+    runner = _runner(is_pooling_model=True)
     reached = set(_ALL) - {bypassed}
     with pytest.raises(RuntimeError, match=bypassed), load._patched(runner):
         _load_through(runner, reached)
@@ -286,8 +297,7 @@ def test_swaps_load_model_may_skip_are_not_required(stub_targets) -> None:
 
 def test_every_swap_is_checked(stub_targets) -> None:
     """A fifth swap without its _required entry would never report a bypass."""
-    runner = _runner(is_pooling_model=True, use_aux_hidden_state_outputs=True)
-    assert set(load._required(runner)) == set(_ALL)
+    assert set(load._required(_runner(is_pooling_model=True))) == set(_ALL)
 
 
 def test_a_bypass_is_reported_when_load_model_then_fails(stub_targets) -> None:
@@ -309,9 +319,7 @@ def test_a_failure_before_any_swap_adds_no_note(stub_targets) -> None:
 
 def test_a_failure_after_the_swaps_ran_adds_no_note(stub_targets) -> None:
     with pytest.raises(ValueError) as info, load._patched(_runner()):
-        _load_through(
-            _runner(), set(_ALL) - {"PoolingRunner", "set_eagle3_aux_hidden_state_layers"}
-        )
+        _load_through(_runner(), set(_ALL) - {"PoolingRunner"})
         raise ValueError("late failure")
     assert not getattr(info.value, "__notes__", None)
 

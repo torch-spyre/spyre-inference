@@ -20,9 +20,9 @@ host, applies the shared fix-ups, moves the model to Spyre, compiles per block a
 returns the _SpyreModelWrapper. Everything upstream builds from ``self.model``
 afterwards (model state, sampler, pooling runner) therefore holds the wrapper.
 init_model_state and PoolingRunner are swapped for their Spyre counterparts for the
-duration of the call, the aux-hidden-state layers are set on the bare model, and
-upstream's own whole-model stock compile is skipped. A speculator's draft loads through
-vLLM's own get_model; the speculator moves it to Spyre (spec_decode.py).
+duration of the call, and upstream's own whole-model stock compile is skipped. A
+speculator's draft loads through vLLM's own get_model; the speculator moves it to
+Spyre (spec_decode.py).
 """
 
 import contextlib
@@ -34,6 +34,7 @@ from vllm.config import CompilationMode, LoadConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
+from vllm.model_executor.models.interfaces import supports_eagle3
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.prompt_logprob import CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE
@@ -53,7 +54,6 @@ from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunn
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _SpyreModelWrapper,
     model_dtype,
-    unwrap_model,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -65,6 +65,32 @@ if TYPE_CHECKING:
     from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
 logger = init_logger(__name__)
+
+
+class _SpyreEagle3ModelWrapper(_SpyreModelWrapper):
+    """The wrapper for a model that serves a hidden-state drafter (EAGLE-3, DFlash).
+
+    SupportsEagle3 is a runtime-checkable Protocol: isinstance looks for its members on
+    the class, so the wrapper's attribute forwarding alone doesn't satisfy it. Declaring
+    them here makes upstream's set_eagle3_aux_hidden_state_layers accept the wrapper,
+    and only for models that implement the interface.
+    """
+
+    supports_eagle3 = True
+
+    @property
+    def has_own_lm_head(self) -> bool:
+        return self._model.has_own_lm_head
+
+    @property
+    def has_own_embed_tokens(self) -> bool:
+        return self._model.has_own_embed_tokens
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self._model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self._model.get_eagle3_default_aux_hidden_state_layers()
 
 
 class _SpyreModelLoaderWrapper:
@@ -113,7 +139,8 @@ class _SpyreModelLoaderWrapper:
                 # Prompt logprobs project the prompt rows in chunks of up to CHUNK_SIZE.
                 chunk = min(PROMPT_LOGPROBS_CHUNK_SIZE, runner.max_num_tokens)
                 row_buckets = sorted({*row_buckets, chunk})
-        return _SpyreModelWrapper(  # ty: ignore[invalid-return-type]
+        wrapper_cls = _SpyreEagle3ModelWrapper if supports_eagle3(model) else _SpyreModelWrapper
+        return wrapper_cls(  # ty: ignore[invalid-return-type]
             compiled,
             runner.spyre_device,
             keep_outputs_on_device=runner.pooling_on_spyre,
@@ -131,7 +158,6 @@ def _required(runner: "SpyreModelRunnerV2") -> dict[str, bool]:
     The keys are the whole set of swaps: _patched refuses a replacement missing here."""
     return {
         "get_model_loader": True,
-        "set_eagle3_aux_hidden_state_layers": runner.use_aux_hidden_state_outputs,
         "init_model_state": True,
         "PoolingRunner": runner.is_pooling_model,
         "compile_model_with_stock_torch": (
@@ -156,11 +182,6 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
         called.add("get_model_loader")
         return _SpyreModelLoaderWrapper(original["get_model_loader"](load_config), runner)
 
-    def unwrapped_aux_layers(model, *args, **kwargs):
-        # The wrapper's attribute forwarding doesn't satisfy the SupportsEagle3 check.
-        called.add("set_eagle3_aux_hidden_state_layers")
-        original["set_eagle3_aux_hidden_state_layers"](unwrap_model(model), *args, **kwargs)
-
     def spyre_init_model_state(vllm_config, model, encoder_cache, device):
         called.add("init_model_state")
         return resolve_spyre_model_state(
@@ -179,7 +200,6 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
 
     replacements = {
         "get_model_loader": wrapped_model_loader,
-        "set_eagle3_aux_hidden_state_layers": unwrapped_aux_layers,
         "init_model_state": spyre_init_model_state,
         "PoolingRunner": _SpyrePoolingRunner,
         "compile_model_with_stock_torch": no_stock_compile,

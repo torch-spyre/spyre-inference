@@ -19,18 +19,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from safetensors.torch import save_file
+from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.config import LoadConfig, ModelConfig, ParallelConfig, VllmConfig
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.utils import WeightsMapper
 
 from spyre_inference.model_loader import (
     SpyreModelLoader,
     _check_all_weights_loaded,
     _get_host_loaded_param_names,
+    _hf_to_vllm_name,
+    _param_name_for,
+    _resolve_module,
+    _shard_plan,
 )
 from spyre_inference.platform import (
     TorchSpyrePlatform,
-    _is_multimodal_config,
     _spyre_loader_supported,
 )
 
@@ -105,25 +112,6 @@ def test_platform_load_format_stays_auto(kwargs):
     vllm_config = _make_vllm_config(**kwargs)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.load_config.load_format == "auto"
-
-
-# ---------------------------------------------------------------------------
-# _is_multimodal_config unit tests
-# ---------------------------------------------------------------------------
-
-
-def test_is_multimodal_config_detects_multimodal():
-    """Both vLLM-native multimodal attributes are recognised."""
-    assert _is_multimodal_config(SimpleNamespace(multimodal_config=object()))
-    assert _is_multimodal_config(SimpleNamespace(is_multimodal_model=True))
-
-
-def test_is_multimodal_config_text_only():
-    """Text-only configs are not treated as multimodal."""
-    assert not _is_multimodal_config(SimpleNamespace())
-    assert not _is_multimodal_config(
-        SimpleNamespace(is_multimodal_model=False, multimodal_config=None)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +268,7 @@ def test_explicit_spyre_load_format_rejected_for_padded_config():
     with pytest.raises(ValueError, match="--load-format spyre is not supported"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
+
 class _FakeMultimodal(nn.Module):
     def __init__(self):
         super().__init__()
@@ -315,3 +304,256 @@ def test_non_text_parameter_names_unisolatable_backbone_is_conservative(monkeypa
     model = _FakeMultimodal()
     monkeypatch.setattr(text_backbone, "_language_backbones", lambda m: None)
     assert text_backbone.non_text_parameter_names(model) == {n for n, _ in model.named_parameters()}
+
+
+def test_load_model_patches_attention_before_building_the_model(monkeypatch):
+    """SpyreModelLoader keeps Attention buffers on the host before any module exists."""
+    import spyre_inference.model_loader as loader_module
+    import spyre_inference.v1.worker.model_load as model_load
+
+    calls = []
+    monkeypatch.setattr(
+        model_load, "keep_attention_buffers_on_host", lambda: calls.append("patched")
+    )
+
+    def stop(**kwargs):
+        calls.append("init")
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(loader_module, "initialize_model", stop)
+    monkeypatch.setattr(loader_module, "_has_safetensors_checkpoint", lambda *a: True)
+    loader = SpyreModelLoader(LoadConfig(load_format="spyre"))
+    with pytest.raises(RuntimeError, match="stop"):
+        loader.load_model(SimpleNamespace(), SimpleNamespace(dtype=torch.float16))
+    assert calls == ["patched", "init"]
+
+
+class _MappedModel(nn.Module):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.": "vision_tower.",
+        }
+    )
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+
+def test_hf_to_vllm_name_applies_the_mapper():
+    model = _MappedModel()
+    assert (
+        _hf_to_vllm_name(model, "model.language_model.embed_tokens.weight")
+        == "language_model.model.embed_tokens.weight"
+    )
+
+
+def test_hf_to_vllm_name_without_a_mapper_is_a_noop():
+    assert (
+        _hf_to_vllm_name(nn.Linear(2, 2), "model.embed_tokens.weight")
+        == "model.embed_tokens.weight"
+    )
+
+
+def test_mistral_format_keys_are_untouched():
+    """Mistral-format keys are renamed inside the model's own load_weights, not the mapper."""
+    assert _param_name_for(_MappedModel(), "tok_embeddings.weight") == "tok_embeddings.weight"
+
+
+def test_param_name_for_resolves_fused_layers():
+    model = _MappedModel()
+    key = "model.vision_tower.transformer.layers.0.attention.q_proj.weight"
+    assert (
+        _param_name_for(model, key) == "vision_tower.transformer.layers.0.attention.qkv_proj.weight"
+    )
+    key = "model.vision_tower.transformer.layers.0.feed_forward.up_proj.weight"
+    assert (
+        _param_name_for(model, key)
+        == "vision_tower.transformer.layers.0.feed_forward.gate_up_proj.weight"
+    )
+
+
+def test_hf_to_vllm_name_matches_the_real_mistral3_mapper():
+    from vllm.model_executor.models.mistral3 import Mistral3ForConditionalGeneration as M
+
+    model = SimpleNamespace(hf_to_vllm_mapper=M.hf_to_vllm_mapper)
+    assert (
+        _hf_to_vllm_name(model, "model.language_model.embed_tokens.weight")
+        == "language_model.model.embed_tokens.weight"
+    )
+    # The pre-4.52 layout already matches vLLM's names and must pass through unchanged.
+    legacy = "language_model.model.embed_tokens.weight"
+    assert _hf_to_vllm_name(model, legacy) == legacy
+
+
+def test_hf_to_vllm_name_matches_the_real_pixtral_mapper():
+    from vllm.model_executor.models.pixtral import PixtralForConditionalGeneration as P
+
+    model = SimpleNamespace(hf_to_vllm_mapper=P.hf_to_vllm_mapper)
+    assert (
+        _hf_to_vllm_name(model, "model.language_model.embed_tokens.weight")
+        == "language_model.model.embed_tokens.weight"
+    )
+    assert (
+        _hf_to_vllm_name(model, "model.vision_tower.transformer.layers.0.attention.q_proj.weight")
+        == "vision_encoder.transformer.layers.0.attention.q_proj.weight"
+    )
+    legacy = "language_model.model.embed_tokens.weight"
+    assert _hf_to_vllm_name(model, legacy) == legacy
+
+
+def test_spyre_loader_supported_rejects_speculative_decoding():
+    """The draft model reuses the target's load_config; drafters need host tensors."""
+    ns = _make_ns()
+    ns.speculative_config = object()
+    assert not _spyre_loader_supported(ns)
+
+
+def test_spyre_loader_supported_accepts_no_speculative_config():
+    ns = _make_ns()
+    ns.speculative_config = None
+    assert _spyre_loader_supported(ns)
+
+
+def _loader_and_config(tmp_path):
+    loader = SpyreModelLoader(LoadConfig(load_format="spyre"))
+    config = SimpleNamespace(model=str(tmp_path), revision=None, dtype=torch.float16)
+    return loader, config
+
+
+def test_load_model_uses_default_loader_for_bin_only_checkpoints(tmp_path, monkeypatch):
+    import spyre_inference.model_loader as loader_module
+
+    (tmp_path / "pytorch_model.bin").write_bytes(b"")
+    seen = {}
+
+    class FakeDefaultLoader:
+        def __init__(self, load_config):
+            seen["load_format"] = load_config.load_format
+
+        def load_model(self, vllm_config, model_config, prefix=""):
+            seen["loaded"] = True
+            return "model"
+
+    monkeypatch.setattr(loader_module, "DefaultModelLoader", FakeDefaultLoader)
+    loader, config = _loader_and_config(tmp_path)
+
+    assert loader.load_model(SimpleNamespace(), config) == "model"
+    assert seen == {"load_format": "auto", "loaded": True}
+    assert loader.load_config.load_format == "spyre"  # the caller's config is untouched
+
+
+def test_load_model_does_not_fall_back_when_safetensors_exist(tmp_path, monkeypatch):
+    import spyre_inference.model_loader as loader_module
+
+    (tmp_path / "model.safetensors").write_bytes(b"")
+
+    def stop(**kwargs):
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(loader_module, "initialize_model", stop)
+    loader, config = _loader_and_config(tmp_path)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        loader.load_model(SimpleNamespace(), config)
+
+
+_PHI3 = {"qkv_proj": ["qkv_proj"], "gate_up_proj": ["gate_up_proj"]}
+_LLAMA = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"]}
+
+
+def _bare(cls, **attrs):
+    """A layer of ``cls`` without running its __init__ (no TP group or device needed)."""
+    layer = cls.__new__(cls)
+    nn.Module.__init__(layer)
+    layer.weight = nn.Parameter(torch.zeros(1))
+    for name, value in attrs.items():
+        setattr(layer, name, value)
+    return layer
+
+
+def _packed_model(mapping):
+    model = nn.Module()
+    model.packed_modules_mapping = mapping
+    model.self_attn, model.mlp = nn.Module(), nn.Module()
+    model.self_attn.qkv_proj = _bare(
+        QKVParallelLinear, head_size=16, num_heads=2, num_kv_heads=2, num_kv_head_replicas=1
+    )
+    model.mlp.gate_up_proj = _bare(MergedColumnParallelLinear)
+    return model
+
+
+def test_resolve_module_reports_no_shard_for_a_fused_checkpoint_key():
+    model = _packed_model(_PHI3)
+    module, shard = _resolve_module(model, "self_attn.qkv_proj.weight")
+    assert module is model.self_attn.qkv_proj and shard is None
+
+
+@pytest.mark.parametrize("mapping", [_PHI3, _LLAMA, {}], ids=["phi3", "llama", "no-mapping"])
+def test_fused_checkpoint_tensors_take_the_host_path(mapping):
+    """A fused qkv / gate_up checkpoint tensor can't be pre-sharded as one contiguous block."""
+    model = _packed_model(mapping)
+    assert _shard_plan(model, "self_attn.qkv_proj.weight", (192, 64), 2, 1) is None
+    assert _shard_plan(model, "mlp.gate_up_proj.weight", (256, 64), 2, 1) is None
+
+
+def test_unfused_checkpoint_tensors_are_still_sharded_on_read():
+    model = _packed_model(_LLAMA)
+    q = _shard_plan(model, "self_attn.q_proj.weight", (64, 64), 2, 1)
+    k = _shard_plan(model, "self_attn.k_proj.weight", (64, 64), 2, 1)
+    gate = _shard_plan(model, "mlp.gate_proj.weight", (128, 64), 2, 1)
+    assert q[1:] == (0, 32, 32) and k[1:] == (0, 32, 32) and gate[1:] == (0, 64, 64)
+
+
+class _TwoLinearModel(nn.Module):
+    """A normal linear layer plus one whose weight must stay on the host."""
+
+    def __init__(self):
+        super().__init__()
+        self.dense = nn.Linear(64, 64, bias=False, dtype=torch.float16)
+        self.fallback = nn.Linear(64, 64, bias=False, dtype=torch.float16)
+
+    def load_weights(self, weights):
+        loaded = set()
+        for name, tensor in weights:
+            self.get_parameter(name).data.copy_(tensor)
+            loaded.add(name)
+        return loaded
+
+
+@pytest.mark.spyre_device
+def test_loader_places_weights_on_the_right_device(tmp_path, monkeypatch, tp_group):
+    """A normal weight is streamed to Spyre, a host-loaded one stays on the CPU, and both
+    hold the checkpoint's values."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    w_dense = torch.randn(64, 64, dtype=torch.float16)
+    w_fallback = torch.randn(64, 64, dtype=torch.float16)
+    ckpt = tmp_path / "model.safetensors"
+    save_file({"dense.weight": w_dense, "fallback.weight": w_fallback}, str(ckpt))
+
+    monkeypatch.setattr(
+        "spyre_inference.model_loader._get_host_loaded_param_names",
+        lambda model: {"fallback.weight"},
+    )
+    monkeypatch.setattr(
+        "spyre_inference.model_loader._resolve_checkpoint_files",
+        lambda model_config, load_config: (str(tmp_path), [str(ckpt)]),
+    )
+
+    model = _TwoLinearModel()
+    # What SpyreModelLoader.load_model does before loading: a Spyre placeholder for every
+    # parameter that is not host-loaded. Creating it also initializes the device.
+    model.dense.weight = nn.Parameter(
+        torch.empty(64, 64, dtype=torch.float16, device="spyre"), requires_grad=False
+    )
+
+    loader = SpyreModelLoader(LoadConfig(load_format="spyre"))
+    loader.load_weights(model, SimpleNamespace(dtype=torch.float16))
+
+    assert model.dense.weight.device.type == "spyre"
+    assert model.fallback.weight.device.type == "cpu"
+    assert torch.allclose(model.dense.weight.cpu(), w_dense, atol=1e-3, rtol=1e-3)
+    assert torch.equal(model.fallback.weight, w_fallback)

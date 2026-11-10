@@ -6,7 +6,6 @@ defaults:
   labels: [power-applications]
   server_health_timeout: 3600
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
   server_parameters:
     load-format: auto

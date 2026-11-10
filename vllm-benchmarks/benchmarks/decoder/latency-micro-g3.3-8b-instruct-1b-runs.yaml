@@ -9,7 +9,6 @@
 
 defaults:
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
   parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b

@@ -27,7 +27,6 @@ tests:
   - test_name: serve_granite-embedding-278m-multilingual_tp1_c64_ci
     labels: [minimal]
     environment_variables:
-      VLLM_CPU_KVCACHE_SPACE: 64
       DTLOG_LEVEL: error
     server_parameters:
       max-num-batched-tokens: 512

@@ -6,7 +6,6 @@
 defaults:
   server_health_timeout: 7200
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
   server_parameters:
     model: mistralai/Ministral-3-14B-Instruct-2512-BF16

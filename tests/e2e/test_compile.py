@@ -218,6 +218,7 @@ def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
 
+@pytest.mark.e2e_smoke
 def test_transformers_backend_encoder_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compiled ``model_impl="transformers"`` encoder embedding matches cached HF refs.
 

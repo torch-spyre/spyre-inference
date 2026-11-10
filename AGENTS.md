@@ -83,17 +83,15 @@ For questions about Spyre architecture, the PyTorch/vLLM stack, or hardware inte
 
 Always use the `prepare-pull-request` skill to clean up the current branch and open a pull request.
 
-## DCO (Developer Certificate of Origin)
+## DCO and Signed Commits
 
-All commits must include a `Signed-off-by` line. Use the `-s` flag or append manually:
+Every commit needs a DCO `Signed-off-by` line (`-s`) and a GPG or SSH signature (`-S`). `main`'s ruleset requires signed commits, so an unsigned commit blocks the PR even with a valid sign-off.
 
 ```bash
-# With git commit
-git commit -s -m "Your commit message"
+git commit -s -S -m "Your commit message"
 
-# Or amend an existing commit
-git commit --amend -s --no-edit
+# Fix the last commit
+git commit --amend -s -S --no-edit
 ```
 
-The sign-off email must match your GitHub email. If they do not match, DCO checks will fail.
-For help configuring git with your GitHub identity, invoke the `github-commit` skill.
+The sign-off email must match your GitHub email, and the signing key must be registered on your GitHub account. Before pushing, `git log --format='%h %G? %s' origin/main..` must not print `N` (unsigned) for any commit. `U` or `E` can still be valid, because `%G?` verifies locally; GitHub's `gh api repos/torch-spyre/spyre-inference/commits/<sha> --jq .commit.verification.verified` is authoritative. For help configuring git identity and signing, invoke the `github-commit` skill.

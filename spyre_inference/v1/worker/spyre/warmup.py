@@ -212,8 +212,7 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
         logger.info("Attention graph recording disabled (CompilationMode.NONE)")
         return
     builders: dict[str, SpyreAttentionMetadataBuilder] = {}
-    # The target's groups also list the draft layers, which share its KV group; the
-    # draft's own builders, installed after the target's, are the ones that serve them.
+    # The target's groups also list the draft layers; the draft's builders serve them.
     draft_groups = getattr(runner.speculator, "attn_groups", [])
     for groups in runner.attn_groups + draft_groups:
         for group in groups:

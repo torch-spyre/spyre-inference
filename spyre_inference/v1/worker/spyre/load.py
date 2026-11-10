@@ -68,13 +68,7 @@ logger = init_logger(__name__)
 
 
 class _SpyreEagle3ModelWrapper(_SpyreModelWrapper):
-    """The wrapper for a model that serves a hidden-state drafter (EAGLE-3, DFlash).
-
-    SupportsEagle3 is a runtime-checkable Protocol: isinstance looks for its members on
-    the class, so the wrapper's attribute forwarding alone doesn't satisfy it. Declaring
-    them here makes upstream's set_eagle3_aux_hidden_state_layers accept the wrapper,
-    and only for models that implement the interface.
-    """
+    """SupportsEagle3 is a runtime Protocol, so __getattr__ forwarding can't satisfy it."""
 
     supports_eagle3 = True
 
@@ -147,7 +141,6 @@ class _SpyreModelLoaderWrapper:
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
             model_dtype=model_dtype(model_config),
-            # The draft's context store reads them on Spyre.
             keep_aux_hidden_states_on_device=runner.use_aux_hidden_state_outputs,
         )
 

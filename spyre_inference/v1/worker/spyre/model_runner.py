@@ -51,7 +51,6 @@ class SpyreModelRunnerV2(GPUModelRunner):
         super().__init__(vllm_config, torch.device("cpu"))
         self.spyre_device = device
         if self.speculator is not None:
-            # Upstream only stores its own here; the platform admits DFlash/XPress alone.
             self.speculator = SpyreDFlashSpeculator(vllm_config, self.device, device)
         # Filled by initialize_kv_cache; warmup records the attention kernels against them.
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}

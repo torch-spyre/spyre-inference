@@ -706,7 +706,6 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            # The runner replaces upstream's speculator with the Spyre DFlash one.
             "speculative decoding other than DFlash/XPress": (
                 vllm_config.speculative_config is not None
                 and not vllm_config.speculative_config.use_dflash()

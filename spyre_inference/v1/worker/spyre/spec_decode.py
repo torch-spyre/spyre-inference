@@ -12,15 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: DFlash/XPress speculator (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py).
+"""MRV2: DFlash/XPress speculator (vllm/v1/worker/gpu/spec_decode/dflash/speculator.py),
+with host bookkeeping and no Triton."""
 
-Upstream's runner drives it unchanged; only propose() differs. It stores the accepted
-target context and drafts one block per request with the Spyre draft model's
-propose_block, all bookkeeping on the host (the runner's device is the CPU), so no
-Triton kernel is launched.
-"""
-
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -37,6 +32,9 @@ from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.worker.model_load import move_model_to_spyre
 from spyre_inference.v1.worker.spyre.attn_groups import split_by_window
 
+if TYPE_CHECKING:
+    from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
+
 
 def plan_drafts(
     query_start_loc: list[int],
@@ -46,12 +44,10 @@ def plan_drafts(
     block: int,
     max_model_len: int,
 ) -> tuple[list[range], list[int | None]]:
-    """Each request's committed target rows, and the first position of its draft block
-    (None when it drafts nothing: a prefill chunk, or a block past max_model_len)."""
+    """Each request's committed rows, and its draft block's first position or None."""
     committed: list[range] = []
     draft_starts: list[int | None] = []
     for i, (start, end) in enumerate(zip(query_start_loc, query_start_loc[1:])):
-        # The rejected rows and the bonus token's uncomputed state are not context.
         valid = end - start - num_rejected[i]
         if not 0 < valid <= end - start:
             raise ValueError(f"Request {i}: {num_rejected[i]} rejected of {end - start} rows")
@@ -63,7 +59,7 @@ def plan_drafts(
 
 
 class SpyreDFlashSpeculator(DFlashSpeculator):
-    """DFlash and XPress drafts: the Spyre draft model refines when it has an XPress head."""
+    model: "SpyreDFlashQwen3ForCausalLM"
 
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, spyre_device: torch.device
@@ -74,15 +70,17 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         self._draft_warmed = False
 
     def load_draft_model(self, target_model: nn.Module, target_attn_layer_names: set[str]):
-        model = super().load_draft_model(target_model, target_attn_layer_names)
+        model = cast(
+            "SpyreDFlashQwen3ForCausalLM",
+            super().load_draft_model(target_model, target_attn_layer_names),
+        )
         move_model_to_spyre(model, self.spyre_device)
         model.prepare_for_spyre()
         return model
 
     def set_attn(self, model_state, kv_cache_config, block_tables, *args, **kwargs) -> None:
         super().set_attn(model_state, kv_cache_config, block_tables, *args, **kwargs)
-        # As the target's groups (kv_cache.py); the split stays inside each KV cache
-        # group, so the group ids and causality upstream derived above still hold.
+        # Splits within each KV cache group, so upstream's group ids and causality hold.
         split_by_window(
             self.attn_groups, self.attn_vllm_config, self.device, block_tables.block_sizes
         )
@@ -116,7 +114,6 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
     ) -> torch.Tensor:
         assert aux_hidden_states, "Spyre DFlash requires the target's auxiliary hidden states"
         num_reqs = input_batch.num_reqs
-        # On Spyre, at the target's padded (bucketed) row count.
         features = torch.cat(aux_hidden_states, dim=-1)
         if dummy_run:
             self._warm(features)
@@ -132,8 +129,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
             self.num_query_per_req,
             self.max_model_len,
         )
-        # The target's own slots for this step; rejected and padded rows write the
-        # reserved null page instead.
+        # Rejected and padded rows write the null page.
         target_slots = slot_mappings[next(iter(self.draft_attn_layer_names))]
         slots = torch.zeros(features.shape[0], dtype=torch.int64)
         for rows in committed:
@@ -145,7 +141,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         active = [i for i, start in enumerate(draft_starts) if start is not None]
         if active and num_speculative_tokens != 0:
             anchors = last_sampled[input_batch.idx_mapping[active].long(), 0]
-            starts = [draft_starts[i] for i in active]
+            starts = [start for start in draft_starts if start is not None]
             self.draft_tokens[active] = torch.tensor(self._draft(active, starts, anchors))
         return self.draft_tokens[:num_reqs]
 
@@ -160,8 +156,6 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
     def _draft(
         self, active: list[int], starts: list[int], anchors: torch.Tensor
     ) -> list[list[int]]:
-        """One non-causal forward over every active request's block, padded to a power of
-        two requests, then the draft model's proposal (and XPress refinement)."""
         block = self.num_query_per_req
         batch = 1 << (len(active) - 1).bit_length()
         num_tokens = batch * block
@@ -169,7 +163,6 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         block_tables = [table[active] for table in self.block_tables.input_block_tables]
 
         positions = torch.zeros(num_tokens, dtype=torch.int64)
-        # Padded rows write the reserved null page.
         slots = torch.zeros(len(block_tables), num_tokens, dtype=torch.int64)
         ids = torch.full((num_tokens,), self.parallel_drafting_token_id, dtype=torch.int64)
         ids[::block] = 0
@@ -213,8 +206,6 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         return self.model.propose_block(hidden, ids[::block])[: len(active)]
 
     def _warm(self, features: torch.Tensor) -> None:
-        """Warmup: the context store at this dummy's row count against the null page, and
-        the draft forward and proposal at every power-of-two batch, once each."""
         rows = features.shape[0]
         if rows not in self._warmed_context_rows:
             positions = torch.zeros(rows, dtype=torch.int64)
@@ -225,7 +216,6 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         block = self.num_query_per_req
         for power in range((self.max_num_reqs - 1).bit_length(), -1, -1):
             num_tokens = (1 << power) * block
-            # The block graph's KV write needs a target, as for the target's dummies.
             attn_layer.publish_null_slots(num_tokens)
             ids = torch.full((num_tokens,), self.parallel_drafting_token_id, dtype=torch.int64)
             ids[::block] = 0

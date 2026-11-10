@@ -55,8 +55,7 @@ def split_by_window(
     device: torch.device,
     kernel_block_sizes: list[int | None],
 ) -> bool:
-    """Split built groups by sliding window in place, building the new groups' metadata
-    builders; True when any group split."""
+    """Split groups by sliding window in place; True when any group split."""
     split_attn_groups_by_window(attn_groups, get_layers_from_vllm_config(vllm_config, Attention))
     # Upstream builds builders before the split, so the groups it creates have none.
     split = False

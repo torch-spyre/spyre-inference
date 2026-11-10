@@ -140,16 +140,22 @@ def _config_tp(config: dict) -> int | None:
     return None
 
 
-def _resolve_dataset_path(config: dict) -> None:
-    """Expand environment variables in a config's `dataset-path`, in place."""
+def _resolve_dataset_path(config: dict) -> list[str]:
+    """Expand environment variables in a config's `dataset-path`, in place.
+
+    Returns the identifiers that neither the environment nor the fetch cache
+    provided, which safe_substitute leaves as literal `${VAR}` or `$VAR` text.
+    """
     parameters = config.get("parameters")
     if not parameters:
-        return
+        return []
     path = parameters.get("dataset-path")
     if not path:
-        return
+        return []
     env = {**_dataset_path_defaults(), **os.environ}
-    parameters["dataset-path"] = string.Template(str(path)).safe_substitute(env)
+    template = string.Template(str(path))
+    parameters["dataset-path"] = template.safe_substitute(env)
+    return [var for var in template.get_identifiers() if var not in env]
 
 
 def _missing_dataset(config: dict) -> str | None:
@@ -160,11 +166,19 @@ def _missing_dataset(config: dict) -> str | None:
     return None
 
 
+# Dataset variables that are optional because nothing provides them yet (#1538).
+# Anything else unresolved is a typo or an unfetched dataset and stays fatal.
+_OPTIONAL_DATASET_VARS = {"SPYRE_VISION_DATASET"}
+
+
 def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
     """Keep configs whose model and TP are selected (empty selects all).
 
     A selected config whose dataset is absent is fatal, not skipped: skipping
     would let a serve-only model job report success while measuring nothing.
+    The exception is a config whose dataset-path names only variables in
+    _OPTIONAL_DATASET_VARS, which nothing provides yet and cannot resolve on
+    any host: that one is skipped with a WARNING.
     """
     selected = []
     missing_datasets = []
@@ -184,9 +198,17 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
             log.info("Skipping %s (tp %d not selected)", config.get("test_name"), tp)
             continue
         raw_path = str(config.get("parameters", {}).get("dataset-path", ""))
-        _resolve_dataset_path(config)
+        unresolved = _resolve_dataset_path(config)
         missing = _missing_dataset(config)
         if missing:
+            if unresolved and set(unresolved) <= _OPTIONAL_DATASET_VARS:
+                log.warning(
+                    "Skipping %s (dataset variable %s is unset and has no "
+                    "default; export the SPYRE_*_DATASET variables to run it)",
+                    config.get("test_name"),
+                    " / ".join(sorted(unresolved)),
+                )
+                continue
             missing_datasets.append((config.get("test_name"), missing, raw_path))
             continue
         selected.append(config)

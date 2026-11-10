@@ -143,3 +143,4 @@ def _init_logging():
 
 
 _init_logging()
+# CI signed-commit test (#1591), do not merge.

@@ -296,7 +296,7 @@ eager form. `lm_head` is never in a block graph either — `compute_logits` is a
 on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)).
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
-grows with layer count (gemma-4-E2B: about 6x the block compile).
+grows with layer count.
 
 ## Vision encoders
 

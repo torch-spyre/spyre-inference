@@ -123,9 +123,18 @@ uv run pytest -m "not upstream" <the test covering this change>
 Deleting comments cannot break code, but the formatter reflows what is left and those
 changes must be committed. Re-run the test so the PR body can honestly claim it.
 
-## 5. Verify commit signoffs
+## 5. Verify commit signoffs and signatures
 
-Ensure all commits have DCO-correct signoffs. Every commit needs `Signed-off-by:` (`-s`) with the email matching GitHub or DCO fails.
+Every commit needs both:
+
+- **DCO sign-off:** `Signed-off-by:` (`-s`), with the email matching GitHub, or DCO fails.
+- **Signature:** a GPG/SSH signature (`-S`). `main` requires signed commits, so an unsigned commit blocks the merge.
+
+```bash
+git log --format='%h %G? %s' origin/main..   # every line must show G
+```
+
+Amend a commit that lacks either with `-s -S` before pushing. If no signing key is set up, run the `github-commit` skill.
 
 ## 6. Push
 

@@ -12,47 +12,152 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""collect_failed_suites.py: a leg whose runner died is retried, and fails the run if it isn't."""
+
 from __future__ import annotations
 
 import pathlib
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import collect_failed_suites as cfs  # noqa: E402
 
-
-def test_safe_segment_accepts_real_artifact_names():
-    assert cfs.safe_segment("failed-suite-1-0")
-    assert cfs.safe_segment("failed-suite-2-11")
-
-
-def test_safe_segment_rejects_traversal_and_separators():
-    assert not cfs.safe_segment("failed-suite-1-../../../../tmp/evil")
-    assert not cfs.safe_segment("failed-suite-1-sub/evil")
-    assert not cfs.safe_segment("..")
-    assert not cfs.safe_segment(".")
-    assert not cfs.safe_segment("")
-    assert not cfs.safe_segment(".hidden")
-    assert not cfs.safe_segment("a\\b")
+INCLUDE = [
+    {"cfg": "Spyre probe tests (shard 1/2)", "test_target": "test-probes-shard-0"},
+    {"cfg": "Spyre probe tests (shard 2/2)", "test_target": "test-probes-shard-1"},
+    {"cfg": "Encoder attention tests", "test_target": "test-encoder-attention"},
+]
+A, B, C = (e["cfg"] for e in INCLUDE)
+PLACEHOLDER = "${{ matrix.cfg }}"
 
 
-def test_download_skips_traversing_name(monkeypatch, tmp_path, capsys):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cfs, "FAILED_SUITES_DIR", pathlib.Path("failed_suites"))
+def _job(cfg: str, conclusion: str | None, retry: bool = False) -> dict:
+    return {
+        "name": f"test / build and run tests ({cfg})" + (" (pod-level retry)" if retry else ""),
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+    }
 
-    calls: list[list[str]] = []
 
-    def fake_run(cmd, *args, **kwargs):
-        calls.append(cmd)
-        raise AssertionError(f"unexpected subprocess call for unsafe name: {cmd}")
+def _passed(*extra: dict) -> cfs.Legs:
+    return cfs.parse(
+        [
+            *(_job(cfg, "success") for cfg in (A, B, C)),
+            _job(PLACEHOLDER, "skipped", retry=True),
+            {"name": "test / Test matrix result", "status": "in_progress", "conclusion": None},
+            *extra,
+        ]
+    )
 
-    monkeypatch.setattr(cfs.subprocess, "run", fake_run)
 
-    evil = "failed-suite-1-" + "../" * 6 + "tmp/evil"
-    cfs.download_and_extract("org/repo", [{"id": 1, "name": evil}])
+def _retried(legs: cfs.Legs) -> list[str]:
+    return [e["cfg"] for e in cfs.retry_matrix(legs, INCLUDE)["include"]]
 
-    out = capsys.readouterr().out
-    assert "::warning::" in out
-    assert "Downloaded 0" in out
-    assert calls == []
-    assert not (tmp_path / "tmp" / "evil").exists()
+
+def test_static_matrix_cfgs_are_unique():
+    cfgs = [e["cfg"] for e in cfs.matrix_include()]
+    assert len(cfgs) == len(set(cfgs))
+
+
+def test_clean_run_retries_nothing_and_verifies():
+    assert _retried(_passed()) == []
+    assert cfs.verify(_passed(), INCLUDE) == []
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", None])
+def test_any_unsuccessful_leg_is_retried_with_its_full_entry(conclusion):
+    legs = _passed(_job(B, conclusion))
+    assert cfs.retry_matrix(legs, INCLUDE) == {"include": [INCLUDE[1]]}
+
+
+def test_leg_missing_from_job_list_is_retried():
+    legs = _passed()
+    del legs.test[C]
+    assert _retried(legs) == [C]
+    assert cfs.verify(legs, INCLUDE) == [
+        f"{C}: did not pass (test: missing, pod-level retry: missing)"
+    ]
+
+
+def test_unretried_failure_fails_verify():
+    errors = cfs.verify(_passed(_job(A, "failure")), INCLUDE)
+    assert errors == [f"{A}: did not pass (test: failure, pod-level retry: missing)"]
+
+
+def test_retry_outcome_decides_verify():
+    assert cfs.verify(_passed(_job(A, "failure"), _job(A, "success", retry=True)), INCLUDE) == []
+    assert cfs.verify(_passed(_job(A, "failure"), _job(A, "failure", retry=True)), INCLUDE)
+
+
+def test_unexpanded_matrix_fails_verify_without_crashing_collect():
+    legs = cfs.parse([_job(PLACEHOLDER, "cancelled"), _job(PLACEHOLDER, "skipped", retry=True)])
+    assert _retried(legs) == []
+    assert cfs.verify(legs, INCLUDE) == ["the `test` matrix never expanded, so no suite ran"]
+
+
+def test_failed_leg_outside_static_matrix_warns_and_fails_verify():
+    legs = _passed(_job("Renamed suite", "failure"))
+    assert _retried(legs) == []
+    assert cfs.verify(legs, INCLUDE) == ["Renamed suite: failed, and is not in the static matrix"]
+
+
+def test_partial_rerun_falls_back_to_earlier_attempt(monkeypatch):
+    attempt1 = [_job(A, "success"), _job(B, "success"), _job(C, "failure")]
+    attempt2 = [_job(C, "success")]
+    monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: attempt2}[a])
+    legs = cfs.load("r", "1", 2, {A, B, C})
+    assert {c: j["conclusion"] for c, j in legs.test.items()} == dict.fromkeys((A, B, C), "success")
+
+
+def test_empty_attempt_falls_back_to_earlier_attempt(monkeypatch):
+    attempt1 = [_job(A, "success"), _job(B, "success"), _job(C, "failure")]
+    attempt2 = [_job(C, "success", retry=True)]
+    monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: attempt2}[a])
+    legs = cfs.load("r", "1", 2, {A, B, C})
+    assert cfs.verify(legs, INCLUDE) == []
+
+
+def test_fallback_keeps_the_earlier_attempts_retry(monkeypatch):
+    attempt1 = [
+        _job(A, "success"),
+        _job(B, "success"),
+        _job(C, "failure"),
+        _job(C, "success", retry=True),
+    ]
+    monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: []}[a])
+    assert cfs.verify(cfs.load("r", "1", 2, {A, B, C}), INCLUDE) == []
+
+
+@pytest.mark.parametrize(
+    "stderr, calls",
+    [
+        ("gh: Not Found (HTTP 404)", 1),
+        ("gh: API rate limit exceeded (HTTP 403)", 6),
+        ("HTTP 502", 6),
+    ],
+)
+def test_list_jobs_fails_fast_only_on_permanent_errors(monkeypatch, stderr, calls):
+    runs = []
+    monkeypatch.setattr(
+        cfs.subprocess,
+        "run",
+        lambda *a, **k: runs.append(1) or SimpleNamespace(returncode=1, stderr=stderr),
+    )
+    monkeypatch.setattr(cfs.time, "sleep", lambda _: None)
+    with pytest.raises(SystemExit):
+        cfs.list_jobs("r", "1", 1)
+    assert len(runs) == calls
+
+
+def test_pending_legs_are_polled_until_complete(monkeypatch):
+    calls = iter([[_job(A, None), _job(B, "success"), _job(C, "success")], _passed_jobs()])
+    monkeypatch.setattr(cfs, "list_jobs", lambda *_: next(calls))
+    monkeypatch.setattr(cfs.time, "sleep", lambda _: None)
+    assert cfs.load("r", "1", 1, {A, B, C}).test[A]["conclusion"] == "success"
+
+
+def _passed_jobs() -> list[dict]:
+    return [_job(cfg, "success") for cfg in (A, B, C)]

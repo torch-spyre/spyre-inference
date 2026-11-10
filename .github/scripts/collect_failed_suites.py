@@ -28,9 +28,10 @@ import glob
 import json
 import os
 import subprocess
+import zipfile
 from pathlib import Path
 
-from download_xml_artifacts import safe_segment
+from download_xml_artifacts import UnsafeZipMember, assert_zip_confined, safe_segment
 
 FAILED_SUITES_DIR = Path("failed_suites")
 
@@ -75,6 +76,11 @@ def download_and_extract(repo: str, artifacts: list[dict]) -> None:
             check=True,
         )
         zip_path.write_bytes(result.stdout)
+        try:
+            assert_zip_confined(zip_path, out_dir)
+        except (UnsafeZipMember, zipfile.BadZipFile) as exc:
+            print(f"::warning::skipping failed-suite artifact {name!r}: {exc}")
+            continue
         subprocess.run(["unzip", "-q", "-o", str(zip_path), "-d", str(out_dir)], check=True)
         downloaded += 1
     print(f"Downloaded {downloaded} failed-suite descriptor(s).")

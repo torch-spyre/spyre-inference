@@ -26,6 +26,8 @@ public_models:
     revision: b968826d9c46dd6066d109eabc6255188de91218
   - repo: UIUC-SSAIL/Qwen3-8B-XPress-b16
     revision: f098ab5bbe4fce37c4a1093266bcd8ad15df5cb5
+  - repo: UIUC-SSAIL/gemma4-26b-a4b-XPress-b16
+    revision: e69e3580df7a7cd76b77e82ef739803fd88ee445
   - mistralai/Mistral-7B-Instruct-v0.3
   - mistralai/Ministral-3-14B-Instruct-2512-BF16
   - BAAI/bge-base-en-v1.5

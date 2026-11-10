@@ -146,6 +146,7 @@ def _run_head_major_attn_test(
     head_size: int = 128,
     kv_cache_dtype: str = "auto",
     kv_scales: tuple[float, float] = (1.0, 1.0),
+    num_blocks: int = 256,
 ) -> None:
     """Validate against the same CPU reference the token-major suite uses.
 
@@ -163,7 +164,6 @@ def _run_head_major_attn_test(
         ref_attn,
     )
 
-    num_blocks = 256
     torch.set_default_device("cpu")
     set_random_seed(0)
 
@@ -898,6 +898,37 @@ def test_head_major_dispatches_by_query_width(
     )
 
     assert sorted(called) == ["decode", "prefill"], called
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_decode_compiles_at_a_prime_page_count(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """The decode kernel gathers page rows from a pool sized by the cache. In the default
+    layout torch-spyre relayouts that pool inside the page loop, and the copy fails to
+    compile at a prime page count above 65536 (114773: eager Qwen2.5-0.5B on a 96 GiB card).
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+
+    _run_head_major_attn_test(
+        seq_lens=[(1, 100)],
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=14,
+        num_kv_heads=2,
+        head_size=64,
+        num_blocks=114773,
+    )
 
 
 # Not named "batched_decode": tests/conftest.py skips those under the tiled walk.

@@ -47,8 +47,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
 logger = init_logger(__name__)
 
 # Spacing of the default query buckets above the decode bucket, capped against
-# max_num_batched_tokens. A decoder's prefill query below the step pads to a power
-# of two from one stick (_MIN_PREFILL_QUERY_BUCKET), one above it to a multiple of it.
+# max_num_batched_tokens. Shorter decoder prefills pad to a power of two from one stick.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 _MIN_PREFILL_QUERY_BUCKET = 64
 
@@ -295,9 +294,8 @@ class SpyreAttnBucketer:
 
         # Default: [1] (the decode-only batch, exempt from query padding by
         # build()) then multiples of a step up to max_num_batched_tokens, the
-        # query lengths a prefill pads up to. A decoder also gets powers of two
-        # below the step, so a short prompt doesn't pad to a whole chunk; pooling
-        # already pads its queries onto the encoder length ladder.
+        # query lengths a prefill pads up to. Pooling skips the powers of two below
+        # the step: it already pads onto the encoder length ladder.
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
         short = (
             ()

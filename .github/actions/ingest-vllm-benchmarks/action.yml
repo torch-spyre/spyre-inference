@@ -120,7 +120,7 @@ runs:
         elif [ -z "${RESULTS_DIR}" ]; then
           echo "::notice::No results-dir provided; skipping ingest."
           echo "configured=false" >> "$GITHUB_OUTPUT"
-        elif [ "$(find "${RESULTS_DIR}" -name '*.json' 2>/dev/null | wc -l)" -eq 0 ]; then
+        elif [ "$(find "${RESULTS_DIR}" -maxdepth 1 -name '*.json' ! -name '*.host_resources.json' 2>/dev/null | wc -l)" -eq 0 ]; then
           echo "::warning::No benchmark JSON in ${RESULTS_DIR}; skipping ingest."
           echo "configured=false" >> "$GITHUB_OUTPUT"
         else

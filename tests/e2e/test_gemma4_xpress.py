@@ -38,7 +38,6 @@ DRAFT_REVISION = "e69e3580df7a7cd76b77e82ef739803fd88ee445"
 def test_gemma4_xpress_generation(monkeypatch, tmp_path, record_property):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64")
     monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,256,2304")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")

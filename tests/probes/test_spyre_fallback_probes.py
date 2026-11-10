@@ -228,23 +228,12 @@ def test_spyre_index_add_for_mean_pooling(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Fancy indexing (aten::index.Tensor) is unreliable on Spyre for the "
-        "shapes pooling / logits selection need. Related gather bugs: "
-        "torch-spyre#3499 (L3_ADDEARIMM overflow), #3502 (fused two gathers, "
-        "different indices), #3503 (fused two gathers, shared index). "
-        "spyre-inference works around this with host-built indices + "
-        "index_select (CLS/LAST) and CPU D2H before hidden_states[logits_indices]. "
-        "When this probe passes, revisit those workarounds."
-    ),
-)
 def test_spyre_fancy_index_tensor(spyre_device):
     """Row gather via advanced indexing ``hs[idx]`` (aten::index.Tensor).
 
-    Upstream CLSPool / logits selection use this form; we use index_select
-    instead. Probe uses a flat [T, H] activation and 1-D int64 row indices.
+    Upstream CLSPool / logits selection use this form. torch-spyre#5978 runs it
+    eagerly for a single 1-D int32/int64 index on dim 0; other index forms still
+    raise. Probe uses a flat [T, H] activation and 1-D int64 row indices.
     """
     hidden_states = torch.randn(32, 128, dtype=torch.float16, device=spyre_device)
     # CLS-style first-token indices for a few sequences (not a simple arange).
@@ -335,9 +324,7 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
 
     Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
     f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
-    reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
-    (int32 index upcast under aten.index) and test_spyre_scatter_index_row_of_2d_table
-    (torch-spyre#3851).
+    reasons still probed by test_spyre_scatter_index_row_of_2d_table (torch-spyre#3851).
     """
     num_kv_heads = 2
     block_size = 64
@@ -412,30 +399,13 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "compile",
-        pytest.param(
-            "eager",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Subscripting a dense Spyre tensor with an int32 index lowers "
-                    "to aten.index, which upcasts to int64: eager fails with "
-                    "'type conversion from torch.int32 to torch.int64'. Inductor "
-                    "folds the conversion away, so the compiled path is fine."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
-    """`k_pages[idx]` for the page gather: works compiled, fails eager (torch-spyre#4334).
+    """`k_pages[idx]` for the page gather with a one-element int32 index.
 
-    The paged attention kernels gather pages this way, which is why SpyreAttentionImpl
-    compiles attention on Spyre even under --enforce-eager. When the eager case XPASSes,
-    `SpyreAttentionImpl._attn_compiled` can honor eager on Spyre too.
+    Was strict-xfail in eager: aten.index upcast the int32 index to int64 and failed.
+    torch-spyre#5978 runs a 1-D integer row index eagerly, so both modes work now. The
+    paged attention kernels subscript with a 2-D index instead; see the probe below.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
     int32_elems_per_stick = 32
@@ -461,6 +431,50 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
         q.cpu(), k_pages_cpu[page].permute(1, 0, 2).unsqueeze(1).transpose(-2, -1)
     )
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "compile",
+        pytest.param(
+            "eager",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=NotImplementedError,
+                reason=(
+                    "torch-spyre#4334: eager aten::index takes only a single 1-D index on "
+                    "dim 0; the compiled path lowers the 2-D one."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_indirect_page_gather_2d_index(spyre_device, mode):
+    """`k_pages[kv_rows]` with a [KV, 1] int32 index, the page gather of page_attn_decode.
+
+    This is why SpyreAttentionImpl compiles attention on Spyre even under --enforce-eager.
+    When the eager case XPASSes, `SpyreAttentionImpl._attn_compiled` can honor eager there.
+    """
+    num_kv_heads, block_size, head_size, num_pages = 8, 64, 128, 16
+    page = 5
+
+    k_pages_cpu, k_pages = _stacked_index_pages(
+        num_pages, num_kv_heads, block_size, head_size, spyre_device
+    )
+    kv_rows_cpu = (page * num_kv_heads + torch.arange(num_kv_heads, dtype=torch.int32)).reshape(
+        num_kv_heads, 1
+    )
+    kv_rows = kv_rows_cpu.to(spyre_device)
+
+    def gather(k_pages, kv_rows):
+        return k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+
+    if mode == "compile":
+        gather = torch.compile(gather, dynamic=False)
+
+    expected = k_pages_cpu[kv_rows_cpu.to(torch.int64)].reshape(num_kv_heads, block_size, head_size)
+    torch.testing.assert_close(gather(k_pages, kv_rows).cpu(), expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

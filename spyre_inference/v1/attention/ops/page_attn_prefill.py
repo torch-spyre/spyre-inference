@@ -79,7 +79,8 @@ def page_attn_prefill_kernel(
         page_index, k_pages, v_pages, mask_tile, q = tiles
 
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
-        # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
+        # residency. index_select, not subscripting, which round-trips the index through the host
+        # in eager.
         page_idx = page_index[0, 0:1]
         k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)

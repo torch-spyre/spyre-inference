@@ -1348,8 +1348,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     The KV store is always compiled. The attention kernels are compiled under
     STOCK_TORCH_COMPILE, and on Spyre under --enforce-eager too: their page gather is a
-    2-D subscript, which lowers to aten.index and fails eager by upcasting the int32
-    index to int64 (torch-spyre#4334). Off Spyre an eager run calls them uncompiled.
+    2-D subscript, and eager aten.index takes only a single 1-D index (torch-spyre#4334,
+    tracked by test_spyre_indirect_page_gather_2d_index). Off Spyre an eager run calls
+    them uncompiled.
     """
 
     # False for layers that keep no KV cache (encoder self-attention).

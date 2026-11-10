@@ -496,6 +496,44 @@ def test_per_layer_embedding_cache_follows_the_model(monkeypatch):
     assert model.to(torch.float16).per_layer_embeddings.dtype == torch.float16
 
 
+@pytest.mark.parametrize("has_image", [True, False])
+def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+
+    layers, width = 2, 3
+    looked_up, embedded = [], []
+
+    def get_per_layer_inputs(ids):
+        looked_up.append(ids.clone())
+        return ids[:, None, None].expand(-1, layers, width).half()
+
+    def embed(ids):
+        embedded.append(ids.clone())
+        return ids[:, None].half()
+
+    model = SpyreGemma4ForConditionalGeneration.__new__(SpyreGemma4ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.register_buffer("per_layer_embeddings", torch.full((6, layers, width), -1.0).half())
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(num_hidden_layers=layers, hidden_size_per_layer_input=width)
+    )
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(get_per_layer_inputs=get_per_layer_inputs)
+    )
+    model.get_language_model = lambda: SimpleNamespace(embed_input_ids=embed)
+
+    input_ids = torch.tensor([5, 7, 9, 11])
+    is_multimodal = torch.tensor([False, has_image, has_image, False])
+    text = model.vision_embed_text(input_ids, is_multimodal)
+
+    ple_ids = torch.tensor([5, 0, 0, 11]) if has_image else input_ids
+    assert torch.equal(looked_up[0], ple_ids)
+    assert torch.equal(embedded[0], input_ids)
+    assert torch.equal(text, input_ids[:, None].half())
+    assert torch.equal(model.per_layer_embeddings[:4, 0, 0], ple_ids.half())
+    assert (model.per_layer_embeddings[4:] == -1).all()
+
+
 def test_upstream_tower_contract_is_unchanged():
     """The Spyre attention and the block call rely on these; diff them on a bump."""
     layer_src = inspect.getsource(modeling_gemma4.Gemma4VisionEncoderLayer.forward)

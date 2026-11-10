@@ -427,3 +427,67 @@ def test_offline_tests_yaml_derives_consistently(config_file):
             continue
         half = parameters["max-model-len"] // 2
         assert parameters[input_key] == parameters[output_key] == half, name
+
+
+# ── engine-arg overrides ──
+
+
+def test_engine_args_parse_and_reject():
+    assert runner.parse_engine_args("max-num-batched-tokens=8192, max-num-seqs=8") == {
+        "max-num-batched-tokens": "8192",
+        "max-num-seqs": "8",
+    }
+    assert runner.parse_engine_args("") == {}
+    for bad in (
+        "max-num-batched-tokens",
+        "Max=1",
+        "a=b c",
+        "a=$(id)",
+        "a='x'",
+        "model=other",
+        "port=9000",
+        "tensor-parallel-size=4",
+        "a=1,a=2",
+    ):
+        with pytest.raises(ValueError):
+            runner.parse_engine_args(bad)
+
+
+def test_engine_args_go_to_the_engine_section_and_rename_the_test(tmp_path):
+    path = _write(
+        tmp_path,
+        [
+            _serve_config("d", test_name="serve_x"),
+            {"test_name": "latency_x", "parameters": {"model": "m", "tensor_parallel_size": 1}},
+        ],
+    )
+    configs = runner._load_configs(path)
+    runner.apply_engine_args(configs, {"max-num-batched-tokens": "8192"})
+    serve, latency = configs
+
+    assert serve["server_parameters"]["max-num-batched-tokens"] == "8192"
+    assert "max-num-batched-tokens" not in serve["parameters"]
+    assert latency["parameters"]["max-num-batched-tokens"] == "8192"
+    assert serve["test_name"].startswith("serve_x_ea-") and latency["test_name"].startswith(
+        "latency_x_ea-"
+    )
+    assert serve["test_name"][-8:] == latency["test_name"][-8:]
+    assert serve["engine_args"] == "max-num-batched-tokens=8192"
+
+
+def test_engine_args_suffix_depends_only_on_the_args():
+    def name(args):
+        configs = [{"test_name": "t", "server_parameters": {}}]
+        runner.apply_engine_args(configs, args)
+        return configs[0]["test_name"]
+
+    assert name({"a": "1", "b": "2"}) == name({"b": "2", "a": "1"})
+    assert name({"a": "1"}) != name({"a": "2"})
+
+
+def test_no_engine_args_leaves_configs_unchanged(tmp_path):
+    path = _write(tmp_path, [_serve_config("d", test_name="serve_x")])
+    configs = runner._load_configs(path)
+    before = yaml.safe_dump(configs)
+    runner.apply_engine_args(configs, {})
+    assert yaml.safe_dump(configs) == before

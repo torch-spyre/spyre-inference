@@ -20,6 +20,7 @@ and executes them.
 """
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -43,6 +44,12 @@ log = logging.getLogger(__name__)
 
 # Valid environment variable name pattern
 ENV_VAR_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+_ENGINE_ARG_KEY = re.compile(r"[a-z][a-z0-9-]*")
+_ENGINE_ARG_VALUE = re.compile(r"[A-Za-z0-9._:/+@-]+")
+# Owned by the runner or by test identity; an override must not move them.
+_FIXED_ENGINE_ARGS = frozenset(
+    {"model", "host", "port", "tensor-parallel-size", "tensor_parallel_size"}
+)
 
 # The scripts are not a package, so load the fetcher by path.
 _FETCH_SCRIPT = Path(__file__).resolve().parent / "fetch_bench_datasets.py"
@@ -105,6 +112,16 @@ def parse_args():
         type=str,
         default="",
         help="comma-separated subset of latency,throughput,serve to run (empty = all)",
+    )
+    parser.add_argument(
+        "--engine-args",
+        type=str,
+        default=os.environ.get("BENCH_ENGINE_ARGS", ""),
+        help="comma-separated key=value engine args set on every selected test, "
+        "e.g. max-num-batched-tokens=8192 (server_parameters for serve, parameters "
+        "for latency/throughput); each overridden test is renamed "
+        "<test_name>_ea-<hash> so it never joins the default test's series "
+        "(default: $BENCH_ENGINE_ARGS)",
     )
     parser.add_argument(
         "--suite",
@@ -249,6 +266,36 @@ def _derive_config(config: dict) -> None:
         config["parameters"].setdefault("model", server_model)
 
 
+def parse_engine_args(raw: str) -> dict[str, str]:
+    """`k=v,k=v` -> {k: v}; raises ValueError on a malformed, fixed or repeated key."""
+    out: dict[str, str] = {}
+    for part in filter(None, (p.strip() for p in (raw or "").split(","))):
+        key, eq, value = part.partition("=")
+        if not eq or not _ENGINE_ARG_KEY.fullmatch(key) or not _ENGINE_ARG_VALUE.fullmatch(value):
+            raise ValueError(f"engine arg {part!r}: expected <lower-case-key>=<value>")
+        if key in _FIXED_ENGINE_ARGS:
+            raise ValueError(
+                f"engine arg {key!r} is set by the test config and cannot be overridden"
+            )
+        if key in out:
+            raise ValueError(f"engine arg {key!r} given twice")
+        out[key] = value
+    return out
+
+
+def apply_engine_args(configs: list, engine_args: dict[str, str]) -> None:
+    """Set `engine_args` on each config's engine section and rename the test, in place."""
+    if not engine_args:
+        return
+    canonical = ",".join(f"{k}={v}" for k, v in sorted(engine_args.items()))
+    suffix = "_ea-" + hashlib.sha256(canonical.encode()).hexdigest()[:8]
+    for config in configs:
+        section = "server_parameters" if "server_parameters" in config else "parameters"
+        config.setdefault(section, {}).update(engine_args)
+        config["test_name"] = config.get("test_name", "unknown") + suffix
+        config["engine_args"] = canonical
+
+
 def _load_configs(config_file: Path) -> list | None:
     """Read a config file -- a bare list of tests, or a `defaults`/`tests`
     mapping whose tests are merged over `defaults`. None if malformed."""
@@ -378,6 +425,7 @@ def run_benchmarks_from_file(
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
+    engine_args: dict[str, str] | None = None,
 ) -> tuple[int, int]:
     """Run all benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -389,6 +437,7 @@ def run_benchmarks_from_file(
         return 0, 1
 
     configs = _select_configs(configs, models, tps)
+    apply_engine_args(configs, engine_args or {})
 
     passed = 0
     failed = 0
@@ -561,6 +610,7 @@ def run_serve_benchmarks_from_file(
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
+    engine_args: dict[str, str] | None = None,
 ) -> tuple[int, int]:
     """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -572,6 +622,7 @@ def run_serve_benchmarks_from_file(
         return 0, 1
 
     configs = _select_configs(configs, models, tps)
+    apply_engine_args(configs, engine_args or {})
 
     passed = 0
     failed = 0
@@ -635,6 +686,13 @@ def main():
     except ValueError:
         log.error("--tps takes comma-separated integers, got %r", args.tps)
         sys.exit(2)
+    try:
+        engine_args = parse_engine_args(args.engine_args)
+    except ValueError as e:
+        log.error("--engine-args: %s", e)
+        sys.exit(2)
+    if engine_args:
+        log.info("Engine args on every selected test: %s", engine_args)
     bench_types = {b.strip().lower() for b in args.bench_types.split(",") if b.strip()}
     unknown = bench_types - set(VALID_BENCH_TYPES)
     if unknown:
@@ -668,6 +726,7 @@ def main():
             aiu_world_size=args.aiu_world_size,
             models=models,
             tps=tps,
+            engine_args=engine_args,
         )
         total_passed += passed
         total_failed += failed
@@ -682,6 +741,7 @@ def main():
             aiu_world_size=args.aiu_world_size,
             models=models,
             tps=tps,
+            engine_args=engine_args,
         )
         total_passed += passed
         total_failed += failed
@@ -696,6 +756,7 @@ def main():
                 aiu_world_size=args.aiu_world_size,
                 models=models,
                 tps=tps,
+                engine_args=engine_args,
             )
             total_passed += passed
             total_failed += failed

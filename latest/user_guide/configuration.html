@@ -2709,9 +2709,8 @@ the ladder it extends, and ignored with a warning when the threshold is above th
 num-sequences bucket. <code>SPYRE_ATTN_KV_LADDER=8_5</code> with
 <code>SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8</code> gets close to plain <code>9_8</code> at large batches for noticeably
 less warmup.</p>
-<p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default; under the
-default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+<p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default), warmup
+records eligible KV-length × num-sequences combinations.
 <code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code> (default: powers of two from 1 to <code>--max-num-seqs</code>) is the
 extra lever there, and the same keep-it-short advice applies.</p>
 <h2 id="kv-cache-size">KV cache size<a class="headerlink" href="#kv-cache-size" title="Permanent link">&para;</a></h2>
@@ -2739,8 +2738,7 @@ setting it to a size next to <code>--kv-cache-memory-bytes</code> is an error.</
 each cached token takes:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>ibm-granite/granite-4.1-8b-fp8<span class="w"> </span>--kv-cache-dtype<span class="w"> </span>fp8
 </span></code></pre></div>
-<p>It needs the default head-major layout (<code>SPYRE_ATTN_KV_LAYOUT=head_major</code>) and a head size
-that is a multiple of 128. Other quantized cache dtypes (<code>fp8_e5m2</code>, <code>fp8_inc</code>, <code>nvfp4</code>,
+<p>It needs a head size that is a multiple of 128. Other quantized cache dtypes (<code>fp8_e5m2</code>, <code>fp8_inc</code>, <code>nvfp4</code>,
 ...) are rejected at startup. Since the KV cache is sized from free device memory (see
 <a href="#kv-cache-size">KV cache size</a>), an fp8 cache fits twice the tokens of an fp16 one.
 Attention still computes in the model dtype: pages are dequantized on read with the

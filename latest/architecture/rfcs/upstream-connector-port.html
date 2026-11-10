@@ -2297,8 +2297,8 @@ no relative performance claim about the memory kinds.</p>
 <li>Select <code>SpyreOffloadingConnector</code> and <code>SpyreOffloadingSpec</code> through existing vLLM configuration.</li>
 <li>Reuse upstream <code>CPUOffloadingManager</code> for local admission, eviction and block bookkeeping.</li>
 <li>Offload and restore the device representation byte-for-byte, without converting through host floats.</li>
-<li>Support dense head-major and token-major model-dtype caches; validate each layout's physical page
-  mapping separately. FP8 acceptance is a separate gate (§6.1, §12), not implied by FP16 success.</li>
+<li>Support the dense head-major model-dtype cache; validate its physical page mapping.
+  FP8 acceptance is a separate gate (§6.1, §12), not implied by FP16 success.</li>
 <li>Preserve the no-connector serving path and avoid an upstream vLLM patch.</li>
 </ul>
 <h3 id="m2-shared-host-memory">M2 — shared host memory<a class="headerlink" href="#m2-shared-host-memory" title="Permanent link">&para;</a></h3>
@@ -2330,25 +2330,18 @@ of that dependency combination.</p>
 <h3 id="31-dense-kv-caches-and-the-ingestion-point">3.1 Dense KV caches and the ingestion point<a class="headerlink" href="#31-dense-kv-caches-and-the-ingestion-point" title="Permanent link">&para;</a></h3>
 <p><code>SpyrePagedKVCache</code> is a named tuple with <strong>two dense tensors</strong>, <code>key</code> and <code>value</code>, per layer.
 It is not two Python lists of separately allocated pages. Each tensor's leading dimension is
-<code>num_blocks</code>, and its remaining dimensions come from the selected attention backend:</p>
+<code>num_blocks</code>, and its remaining dimensions come from the attention backend:</p>
 <table>
 <thead>
 <tr>
 <th>Backend</th>
 <th>Shape of each K or V tensor</th>
-<th>Selection</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>SpyreHeadMajorAttentionBackend</code></td>
-<td><code>[num_blocks, num_kv_heads, block_size, head_size]</code></td>
-<td>Default</td>
-</tr>
-<tr>
 <td><code>SpyreAttentionBackend</code></td>
-<td><code>[num_blocks, block_size, num_kv_heads, head_size]</code></td>
-<td><code>SPYRE_ATTN_KV_LAYOUT=token_major</code></td>
+<td><code>[num_blocks, num_kv_heads, block_size, head_size]</code></td>
 </tr>
 </tbody>
 </table>
@@ -2510,8 +2503,7 @@ request cleanup. Changing only pool construction in the M1 spec is not enough to
 <h2 id="6-component-design">6. Component design<a class="headerlink" href="#6-component-design" title="Permanent link">&para;</a></h2>
 <h3 id="61-spyrekvdmacopier-layout-and-physical-capacity">6.1 <code>SpyreKvDmaCopier</code>: layout and physical capacity<a class="headerlink" href="#61-spyrekvdmacopier-layout-and-physical-capacity" title="Permanent link">&para;</a></h3>
 <p>The copier takes dense K/V tensors plus page identities and validated pool destinations. It must
-preserve the selected backend layout; head-major and token-major pages are not interchangeable even
-when their logical byte counts match. No per-transfer host transpose or float conversion is allowed.</p>
+preserve the backend's head-major layout. No per-transfer host transpose or float conversion is allowed.</p>
 <p>Capacity is based on <strong>physical transfer extents</strong>, not blindly on
 <code>numel() * element_size()</code>, and not on the size of the entire dense layer divided by block count
 without a validated layout mapping. Use the runtime's size/alignment information for the actual
@@ -2538,23 +2530,13 @@ larger chunks or multiple groups is an explicit extension, not demonstrated beha
 <tbody>
 <tr>
 <td>Head-major, model dtype</td>
-<td>Default; normally FP16</td>
+<td>The only layout; normally FP16</td>
 <td>Qualify dense page addressing, padding and raw round-trip.</td>
-</tr>
-<tr>
-<td>Token-major, model dtype</td>
-<td>Explicit opt-in</td>
-<td>Qualify its distinct page mapping; do not use head-major offsets.</td>
 </tr>
 <tr>
 <td>Head-major, <code>fp8</code> / <code>fp8_e4m3</code></td>
 <td>Allocated as <code>torch.float8_e4m3fn</code>; requires <code>head_size % 128 == 0</code></td>
 <td>Separate raw-copy/slot-sizing and end-to-end acceptance gate.</td>
-</tr>
-<tr>
-<td>Token-major, FP8</td>
-<td>Rejected by current attention implementation</td>
-<td>Reject during configuration; do not imply M1 enables it.</td>
 </tr>
 </tbody>
 </table>
@@ -2902,8 +2884,8 @@ for restart/reuse tests. Concurrent device tests require separately assigned har
 <li>[ ] Mock-safe tests cover spec loading, constructor/API drift, manager metrics, dense K/V identity,
   shared-layer aliases, selected groups, per-layer geometry and chunk-factor dispatch. The adapter
   does not call <code>untyped_storage().set_()</code> or copy the device cache to a new buffer.</li>
-<li>[ ] A known-pattern raw page is stored and restored into another page byte-for-byte. Cover both
-  head-major and token-major model-dtype layouts, first/middle/last pages, nonzero view offsets,
+<li>[ ] A known-pattern raw page is stored and restored into another page byte-for-byte. Cover the
+  head-major model-dtype layout, first/middle/last pages, nonzero view offsets,
   padding, multiple K/V heads and adjacent-page canaries. Unsupported extents fail before DMA.</li>
 <li>[ ] Store ordering is tested with pending KV writes; load ordering is tested before attention reads.
   Failure/cancellation, preemption, waits and shutdown do not publish or reuse unfinished transfers.</li>
@@ -2948,7 +2930,7 @@ for restart/reuse tests. Concurrent device tests require separately assigned har
   adjacent-slot canaries, nonzero page offsets and representative head/block geometries.</li>
 <li>[ ] FP8-aware offload tokens match an <strong>FP8 no-offload baseline</strong>, not an FP16 model baseline.
   Shared instances establish identical resolved K/V scales and encoding.</li>
-<li>[ ] Token-major FP8 and any unqualified copy/backend combination are rejected explicitly.</li>
+<li>[ ] Any unqualified copy/backend combination is rejected explicitly.</li>
 </ul>
 <h3 id="persistent-lifecycle-acceptance-for-both-shared-memory-kinds">Persistent lifecycle acceptance, for both shared memory kinds<a class="headerlink" href="#persistent-lifecycle-acceptance-for-both-shared-memory-kinds" title="Permanent link">&para;</a></h3>
 <ul>
@@ -2966,12 +2948,9 @@ for restart/reuse tests. Concurrent device tests require separately assigned har
 <h2 id="13-references">13. References<a class="headerlink" href="#13-references" title="Permanent link">&para;</a></h2>
 <p><strong>Main-branch source at the version basis in §3:</strong></p>
 <ul>
-<li><code>spyre_inference/v1/attention/backends/spyre_attn.py</code>: <code>SpyrePagedKVCache</code>, model-dtype allocation,
-  FP8 eligibility checks.</li>
-<li><code>spyre_inference/v1/attention/backends/spyre_head_major_attn.py</code>: default cache shape, E4M3 allocation
-  and per-layer scale usage.</li>
+<li><code>spyre_inference/v1/attention/backends/spyre_attn.py</code>: <code>SpyrePagedKVCache</code>, cache shape,
+  model-dtype and E4M3 allocation, FP8 eligibility checks and per-layer scale usage.</li>
 <li><code>spyre_inference/v1/worker/kv_cache_setup.py</code>: <code>allocate_spyre_kv_caches</code>.</li>
-<li><code>spyre_inference/envs.py</code>: head-major default and token-major override.</li>
 </ul>
 <p><strong>vLLM <a href="https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be">v0.32.0</a>:</strong></p>
 <ul>

@@ -59,7 +59,7 @@ def main():
             sys.exit(1)
 
     if args.datasets:
-        _run_artifactory_datasets(config, config_file)
+        _run_artifactory_datasets()
     elif args.public:
         _run_public(config, config_file)
     else:
@@ -215,7 +215,7 @@ def _require_env(name):
     return value
 
 
-def _run_artifactory_datasets(config, config_file):
+def _run_artifactory_datasets():
     """Cache artifactory_datasets entries into the shared runner volume.
 
     These files live in Artifactory, not on HuggingFace, so they need a token.
@@ -223,9 +223,16 @@ def _run_artifactory_datasets(config, config_file):
     GitHub withholds every secret, so it can only ever read the cache. This
     dispatch is the writer.
     """
-    spec = config.get("artifactory_datasets") or {}
-    files = spec.get("files", [])
-    if not files:
+    config_file = os.getenv(
+        "ARTIFACTORY_CONFIG_FILE_PATH", ".github/cache_config/artifactory_datasets.yaml"
+    )
+    if not os.path.exists(config_file):
+        print(f"❌ Error: Configuration file '{config_file}' not found.")
+        sys.exit(1)
+    with open(config_file, encoding="utf-8") as f:
+        spec = yaml.safe_load(f) or {}
+    groups = spec.get("artifactory_datasets") or []
+    if not groups:
         print(f"⚠️ Warning: No artifactory_datasets defined in {config_file}.")
         return
 
@@ -241,18 +248,16 @@ def _run_artifactory_datasets(config, config_file):
     token = _require_env("ARTIFACTORY_TOKEN")
     root = _require_env("ARTIFACTORY_DATA_PATH").strip("/")
 
-    subdir = spec.get("subdir", "").strip("/")
     force = os.getenv("FORCE_DOWNLOAD") == "true"
 
+    files = [(group, entry) for group in groups for entry in group.get("files", [])]
     print(f"📋 Found {len(files)} dataset(s) to cache under {Path(dest_dir)}")
     failed = []
-    for entry in files:
+    for group, entry in files:
         name = entry["name"]
-        # An entry may override the section's subdir.
-        entry_subdir = entry.get("subdir", subdir).strip("/")
         # Mirror the Artifactory layout under the cache root so the path a
-        # benchmark computes from the same subdir resolves without a mapping.
-        target_dir = Path(dest_dir) / entry_subdir
+        # benchmark computes from the same path resolves without a mapping.
+        target_dir = Path(dest_dir) / group["path"].strip("/")
         target_dir.mkdir(parents=True, exist_ok=True)
         # str(): YAML reads an all-digit digest as an int, which would never
         # equal the hexdigest and would re-download forever.
@@ -267,7 +272,7 @@ def _run_artifactory_datasets(config, config_file):
                 continue
             print(f"♻️ {name}: sha256 {actual} != {expected}, re-downloading")
 
-        url = f"{base_url}/artifactory/{root}/{entry_subdir}/{name}"
+        url = f"{base_url}/artifactory/{root}/{group['path'].strip('/')}/{name}"
         # A partial file under the real name would look like a valid cache entry
         # to the benchmark, so download beside it and rename only after the
         # digest matches. The pid keeps two concurrent writers off one temp file.

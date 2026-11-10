@@ -84,6 +84,12 @@ _COSINE_MIN = 0.99
             ),
             marks=pytest.mark.e2e_smoke,
         ),
+        # Per-layer embeddings and cross-layer KV sharing.
+        (
+            "google/gemma-4-E2B",
+            "\n\nWhat is the main business of IBM?\n\nWhat is the main business of",
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
+        ),
     ],
     ids=[
         "micro-g3.3",
@@ -91,6 +97,7 @@ _COSINE_MIN = 0.99
         "gemma-3-1b-it",
         "gemma-4-31B-text",
         "gemma-4-moe-nano-text",
+        "gemma-4-E2B-text",
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:

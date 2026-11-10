@@ -31,9 +31,10 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 
 ## Gemma-4: text-only use of a vision checkpoint
 
-Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
-`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and build a vision
-tower — weights to load and graphs to warm up that a text-only workload never runs.
+Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B`,
+`google/gemma-4-26B-A4B`, `google/gemma-4-E2B` and `google/gemma-4-E4B` load as
+`Gemma4ForConditionalGeneration` and build a vision tower — weights to load and graphs to
+warm up that a text-only workload never runs.
 
 To use one of those repositories for text only, pin its decoder architecture:
 

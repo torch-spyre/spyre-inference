@@ -125,9 +125,19 @@ class SpyreMoERecipe:
     layout without selecting top-k a second time.
     """
 
-    activation: Literal["gelu_tanh", "silu"]
+    activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+
+# vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
+# gate and up rows interleaved, [gate0, up0, gate1, ...], as in gpt-oss checkpoints.
+_SWIGLUOAI_LIMIT, _SWIGLUOAI_ALPHA = 7.0, 1.702
+
+
+def deinterleave_gate_up(weight: torch.Tensor) -> torch.Tensor:
+    """``[E, 2M, ...]`` with gate on even rows, up on odd, as ``[gate | up]`` halves."""
+    return torch.cat([weight[:, 0::2], weight[:, 1::2]], dim=1)
 
 
 @dataclass(frozen=True)
@@ -211,6 +221,17 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
             f"Spyre MoE recipe requires activation={recipe.activation!r}, "
             f"got {layer.activation.value!r}."
         )
+    if recipe.activation == "swigluoai":
+        # The constants are vLLM's swigluoai_and_mul, which the layer's own limit/alpha do not
+        # reach on any backend; a model that sets other values would be silently wrong.
+        limit, alpha = moe.swiglu_limit, moe.swiglu_alpha
+        if (limit is not None and limit != _SWIGLUOAI_LIMIT) or (
+            alpha is not None and alpha != _SWIGLUOAI_ALPHA
+        ):
+            raise NotImplementedError(
+                f"Spyre swigluoai uses limit={_SWIGLUOAI_LIMIT} and alpha={_SWIGLUOAI_ALPHA}; "
+                f"the layer asks for limit={limit}, alpha={alpha}."
+            )
     layer = cast("RoutedExperts", layer)
     layer.spyre_moe_recipe = recipe
     layer.spyre_moe_regions = {}
@@ -264,6 +285,11 @@ def _routing_weights(
 def _activation(x: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
     if activation == "gelu_tanh":
         return F.gelu(x, approximate="tanh") * up
+    if activation == "swigluoai":
+        # gpt-oss: (clamp(up, +-limit) + 1) * gate * sigmoid(alpha * gate), gate clamped above.
+        gate = torch.clamp(x, max=_SWIGLUOAI_LIMIT)
+        up = torch.clamp(up, -_SWIGLUOAI_LIMIT, _SWIGLUOAI_LIMIT)
+        return (up + 1) * gate * torch.sigmoid(gate * _SWIGLUOAI_ALPHA)
     return F.silu(x) * up
 
 
@@ -663,7 +689,10 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     _check_pool_layout(
         pool,
         SpyreTensorLayout(
-            [experts, contract, free // eps, eps], [contract * free, free, eps, 1], device_dtype
+            [experts, contract, free // eps, eps],
+            [contract * free, free, eps, 1],
+            device_dtype,
+            {(0,): experts, (1,): contract, (2, 3): free},
         ),
     )
     c4 = contract // chunks
@@ -671,6 +700,7 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
         [experts * chunks, c4, free // eps, eps],
         [c4 * free, free, eps, 1],
         device_dtype,
+        {(0,): experts * chunks, (1,): c4, (2, 3): free},
     )
     return _C.reinterpret_tensor_with_layout(
         pool,
@@ -717,6 +747,8 @@ def _prepare_biases(
     if not hasattr(layer, "w13_bias"):
         return None
     w13_bias = layer.get_parameter("w13_bias").data
+    if layer.spyre_moe_recipe.activation == "swigluoai":
+        w13_bias = deinterleave_gate_up(w13_bias)
     w2_bias = layer.get_parameter("w2_bias").data
     experts, hidden = w2_bias.shape
     # Every rank adds this full down bias before MoERunner's all-reduce, as upstream's
@@ -773,6 +805,8 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # activation lanes multiply zero rows in the down stack. A gate/up bias pads with zeros
     # too, and its padded activation lanes still meet those zero rows.
     pad = -inter % stick
+    if layer.spyre_moe_recipe.activation == "swigluoai":
+        w13 = deinterleave_gate_up(w13)
     # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))

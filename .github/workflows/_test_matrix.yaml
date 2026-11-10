@@ -1332,6 +1332,8 @@ jobs:
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
       RESULTS_DIR: benchmark-results
+      # The dev image's editable spyre-inference tree (keeps .git), installed into its $VIRTUAL_ENV.
+      PREBAKED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
       # The serve configs replay trace files that are not in the repo. Cache
       # them on the same RWX volume as the HuggingFace cache above: it outlives
       # the pod, so the first job to need a trace fetches it and every later job
@@ -1361,10 +1363,9 @@ jobs:
         with:
           enable-cache: false
 
-      # Restore now; the post step ships it back at job end (writers only). No
-      # use_prebaked_image gate here, unlike run-matrix-config: the perf build
-      # below runs `uv sync` unconditionally, so it needs the cache either way.
+      # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
       - name: uv cache (NFS)
+        if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/uv-nfs-cache
         with:
           storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
@@ -1388,7 +1389,9 @@ jobs:
           # the per-PR runner_label override, or the standing image label).
           runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
 
+      # Prebaked runs use the image's venv: a cached torch-spyre wheel may be built against other RPMs.
       - name: Build spyre-inference
+        if: ${{ !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
         run: |
@@ -1425,9 +1428,11 @@ jobs:
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
           # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
           SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
+          # Prebaked runs use the image's tree: an unbuilt checkout would shadow its spyre_inference._C kernels.
+          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
         run: |
-          echo "Running vLLM benchmark suite (TEST_TYPE=perf)..."
-          make tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}" \
+          echo "Running vLLM benchmark suite (TEST_TYPE=perf) from ${SRC_DIR}..."
+          make -C "${SRC_DIR}" tests TEST_TYPE=perf RESULTS_DIR="${GITHUB_WORKSPACE}/${RESULTS_DIR}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
           echo "benchmarks done"
 
@@ -1442,8 +1447,9 @@ jobs:
           REF_IN: ${{ inputs.ref }}
           REF_NAME: ${{ github.ref_name }}
           REPO: ${{ inputs.repository || github.repository }}
+          SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
         run: |
-          SHA="$(git rev-parse HEAD)"
+          SHA="$(git -C "${SRC_DIR}" rev-parse HEAD)" || { echo "::warning::could not read the commit of ${SRC_DIR}; recording the checkout's"; SHA="$(git rev-parse HEAD)"; }
           BRANCH="${REF_IN:-${REF_NAME}}"
           if [[ "${BRANCH}" =~ ^[0-9a-f]{7,40}$ ]]; then
             STATUS="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \

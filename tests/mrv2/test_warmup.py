@@ -120,6 +120,104 @@ def test_a_pooling_dummy_hands_back_device_hidden_states(monkeypatch) -> None:
     assert moved == ["spyre"]
 
 
+def _mm_runner(*, pooling=False, compiled_tower_blocks=0, encoder_only=False, mm=True):
+    wrapper = SimpleNamespace(embedded=[], encoded=[])
+    wrapper.embed_input_ids = lambda ids, *a, **kw: wrapper.embedded.append(ids.shape[0])
+    wrapper.embed_multimodal = lambda **kw: wrapper.encoded.append(kw)
+    model_config = SimpleNamespace(
+        is_encoder_decoder=False,
+        multimodal_config=SimpleNamespace(mm_encoder_only=encoder_only),
+    )
+    return SimpleNamespace(
+        model=wrapper,
+        model_config=model_config,
+        supports_mm_inputs=mm,
+        is_pooling_model=pooling,
+        compiled_tower_blocks=compiled_tower_blocks,
+        vllm_config=None,
+        mm_registry=None,
+        device="cpu",
+    )
+
+
+@pytest.fixture
+def mm_budget(monkeypatch):
+    """MultiModalBudget with image and video widths, one item per batch."""
+
+    class Budget:
+        mm_max_items_per_batch = {"image": 2, "video": 1}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_dummy_encoder_profile_inputs(self, modality, n):
+            return [(modality, n)]
+
+    monkeypatch.setattr(warmup, "MultiModalBudget", Budget)
+    monkeypatch.setattr(
+        warmup,
+        "group_and_batch_mm_kwargs",
+        lambda items, device: [(m, n, {"modality": m, "n": n}) for m, n in items],
+    )
+
+
+def test_a_text_only_model_warms_no_multimodal_path(mm_budget) -> None:
+    runner = _mm_runner(mm=False)
+    warmup._warm_multimodal(runner, [8, 1])
+    assert runner.model.embedded == [] and runner.model.encoded == []
+
+
+def test_a_generative_vlm_warms_the_embedding_and_its_compiled_image_tower(mm_budget) -> None:
+    """Only images: a video expands to a frame count the request sets."""
+    runner = _mm_runner(compiled_tower_blocks=4)
+    warmup._warm_multimodal(runner, [8, 1])
+    assert runner.model.embedded == [8, 1]
+    assert [(b["modality"], b["n"]) for b in runner.model.encoded] == [("image", 1), ("image", 2)]
+
+
+def test_an_eager_tower_on_a_generative_vlm_is_left_alone(mm_budget) -> None:
+    """Its ops compile per op on first use, which the guard expects."""
+    runner = _mm_runner(compiled_tower_blocks=0)
+    warmup._warm_multimodal(runner, [8])
+    assert runner.model.embedded == [8] and runner.model.encoded == []
+
+
+def test_a_pooling_encoder_warms_every_modality_and_no_text_embedding(mm_budget) -> None:
+    """CLIP: an encoder-only model never embeds through embed_input_ids."""
+    runner = _mm_runner(pooling=True, encoder_only=True)
+    warmup._warm_multimodal(runner, [128])
+    assert runner.model.embedded == []
+    assert [(b["modality"], b["n"]) for b in runner.model.encoded] == [
+        ("image", 1),
+        ("image", 2),
+        ("video", 1),
+    ]
+
+
+def test_a_multimodal_encoder_forces_no_rectangle(monkeypatch) -> None:
+    """Its body arrives as inputs_embeds, so it always plans ragged."""
+    forced = []
+
+    def forced_plan(rect=None, ragged=False):
+        forced.append((rect, ragged))
+        return contextlib.nullcontext()
+
+    tables = SimpleNamespace(rectangles=[(64, 2)], tier_groups=[(128, ((64, 2),))])
+    monkeypatch.setattr(warmup, "encoder_shape_tables", lambda config: tables)
+    monkeypatch.setattr(warmup, "encoder_inline_active", lambda: True)
+    monkeypatch.setattr(warmup, "_dummy_run", lambda runner, n, skip_attn: None)
+    runner = SimpleNamespace(model_state=SimpleNamespace(forced_plan=forced_plan), vllm_config=None)
+
+    runner.supports_mm_inputs = True
+    warmup._warm_encoder_inline_paths(runner, {128})
+    assert forced == [(None, True)]
+
+    forced.clear()
+    runner.supports_mm_inputs = False
+    warmup._warm_encoder_inline_paths(runner, {128})
+    assert forced == [((64, 2), False), (None, True)]
+
+
 def test_run_warms_every_logits_row_bucket_including_the_prompt_logprobs_chunk(
     monkeypatch,
 ) -> None:
@@ -145,6 +243,8 @@ def test_run_warms_every_logits_row_bucket_including_the_prompt_logprobs_chunk(
     runner = _runner(buckets=(1, chunk), max_reqs=max_reqs, max_tokens=chunk)
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.pooling_runner = None
+    runner.supports_mm_inputs = False
+    runner.get_model = lambda: None
     runner.spyre_kv_caches = {}
     runner.spyre_device = torch.device("cpu")
     runner.model = wrapper

@@ -27,6 +27,15 @@ import torch
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4Router
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+    replace_as,
+)
 
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
@@ -197,6 +206,25 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
 
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
+
+    @classmethod
+    def get_kv_cache_groups(
+        cls, vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+    ) -> list[KVCacheGroupSpec]:
+        speculative = vllm_config.speculative_config
+        if speculative is None or not speculative.use_dflash():
+            return get_kv_cache_groups(vllm_config, kv_cache_spec)
+        # Full allocation shares a block table without merging target/draft windows.
+        specs = {
+            name: replace_as(spec, FullAttentionSpec, drop=("extra_retained_tokens",))
+            if isinstance(spec, SlidingWindowSpec)
+            else spec
+            for name, spec in kv_cache_spec.items()
+        }
+        uniform = UniformTypeKVCacheSpecs.from_specs(specs)
+        if uniform is None:
+            raise ValueError("Gemma 4 DFlash requires one full-allocation KV cache group")
+        return [KVCacheGroupSpec(list(specs), uniform)]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)

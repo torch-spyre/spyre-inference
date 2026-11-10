@@ -5,7 +5,7 @@ description: >-
   so the static matrix it reads always matches the job names (not inputs.ref, which the legs test).
 inputs:
   args:
-    description: Arguments for collect_failed_suites.py, e.g. "collect 1" or "verify"
+    description: Arguments for collect_failed_suites.py, "collect" or "verify"
     required: true
 outputs:
   matrix:

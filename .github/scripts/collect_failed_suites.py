@@ -57,6 +57,9 @@ def list_jobs(repo: str, run_id: str, attempt: int) -> list[dict]:
         if result.returncode == 0:
             return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         print(result.stderr, file=sys.stderr)
+        # A 4xx other than a rate limit (missing `actions: read`, bad run id) won't clear on retry.
+        if re.search(r"HTTP 4(?!29)\d\d", result.stderr) and "rate limit" not in result.stderr:
+            break
         if i < len(delays):
             time.sleep(delays[i])
     raise SystemExit(f"::error::Could not list the jobs of run attempt {attempt}.")
@@ -139,10 +142,13 @@ def load(repo: str, run_id: str, attempt: int, cfgs: set[str]) -> Legs:
         missing = cfgs - legs.test.keys()
         if not missing:
             break
-        for cfg, job in parse(list_jobs(repo, run_id, earlier)).test.items():
+        earlier_legs = parse(list_jobs(repo, run_id, earlier))
+        for cfg, job in earlier_legs.test.items():
             if cfg in missing:
                 print(f"{cfg}: not listed in attempt {attempt}, using attempt {earlier}")
                 legs.test[cfg] = job
+                if cfg not in legs.retry and cfg in earlier_legs.retry:
+                    legs.retry[cfg] = earlier_legs.retry[cfg]
     return legs
 
 

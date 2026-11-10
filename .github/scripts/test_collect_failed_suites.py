@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -117,6 +118,38 @@ def test_empty_attempt_falls_back_to_earlier_attempt(monkeypatch):
     monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: attempt2}[a])
     legs = cfs.load("r", "1", 2, {A, B, C})
     assert cfs.verify(legs, INCLUDE) == []
+
+
+def test_fallback_keeps_the_earlier_attempts_retry(monkeypatch):
+    attempt1 = [
+        _job(A, "success"),
+        _job(B, "success"),
+        _job(C, "failure"),
+        _job(C, "success", retry=True),
+    ]
+    monkeypatch.setattr(cfs, "list_jobs", lambda repo, run, a: {1: attempt1, 2: []}[a])
+    assert cfs.verify(cfs.load("r", "1", 2, {A, B, C}), INCLUDE) == []
+
+
+@pytest.mark.parametrize(
+    "stderr, calls",
+    [
+        ("gh: Not Found (HTTP 404)", 1),
+        ("gh: API rate limit exceeded (HTTP 403)", 6),
+        ("HTTP 502", 6),
+    ],
+)
+def test_list_jobs_fails_fast_only_on_permanent_errors(monkeypatch, stderr, calls):
+    runs = []
+    monkeypatch.setattr(
+        cfs.subprocess,
+        "run",
+        lambda *a, **k: runs.append(1) or SimpleNamespace(returncode=1, stderr=stderr),
+    )
+    monkeypatch.setattr(cfs.time, "sleep", lambda _: None)
+    with pytest.raises(SystemExit):
+        cfs.list_jobs("r", "1", 1)
+    assert len(runs) == calls
 
 
 def test_pending_legs_are_polled_until_complete(monkeypatch):

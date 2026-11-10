@@ -235,6 +235,7 @@ def _run_head_major_attn_test(
         block_table=block_tables,
         slot_mapping=slot_mapping_t,
         sliding_window=sliding_window,
+        builder_cls=SpyreHeadMajorAttentionBackend.get_builder_cls(),
     )
 
     # After _build_metadata: the impl reads cache_config.block_size at construction.
@@ -849,6 +850,56 @@ def test_head_major_attn_fp8_kv_cache(
         kv_cache_dtype="fp8",
         kv_scales=kv_scales,
     )
+
+
+@pytest.mark.parametrize(
+    ("query_len", "kernel_name"),
+    [(1, "page_attn_decode"), (64, "page_attn_prefill")],
+    ids=["decode", "prefill"],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_one_kernel_serves_every_page_count(
+    default_vllm_config,
+    monkeypatch,
+    query_len,
+    kernel_name,
+    configure_compilation,
+    configure_device,
+):
+    """One compiled per-sequence kernel per query width serves every page count up to
+    max_model_len, a one-page sequence included, and matches the reference."""
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch_spyre._inductor import config as ts_config
+    from torch_spyre._inductor import pass_utils
+
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    if not hasattr(pass_utils, "declared_dims"):
+        pytest.skip("needs symbolic for_each_tile trip counts (torch-spyre#6066)")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    # The default reservation floor of 8 rows would put short sequences on 8 pages.
+    monkeypatch.setattr(ts_config, "min_reserved_dim_size", 2)
+
+    # The fixture's max_model_len 2048 at block 128 declares pages 2..16. Compiled at 16, as
+    # warmup records it, then reused at 1 (walked as 2), 3 and 8.
+    kernel_code = getattr(hm, kernel_name).__code__
+    for kv_len in (2048, query_len + 10, 300, 1000):
+        _run_head_major_attn_test(
+            seq_lens=[(query_len, kv_len)],
+            block_size=128,
+            sliding_window=None,
+            configure_compilation=configure_compilation,
+            configure_device=configure_device,
+        )
+        assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
 
 
 @pytest.mark.parametrize(

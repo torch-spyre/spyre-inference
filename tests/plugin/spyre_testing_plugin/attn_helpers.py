@@ -87,8 +87,9 @@ def _build_metadata(
     sliding_window: int | None = None,
     model_num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
+    builder_cls: type[SpyreAttentionMetadataBuilder] = SpyreAttentionMetadataBuilder,
 ):
-    """Use the real SpyreAttentionMetadataBuilder to construct metadata.
+    """Use the real SpyreAttentionMetadataBuilder (or ``builder_cls``) to construct metadata.
 
     ``model_num_kv_heads`` is what ``model_config.get_num_kv_heads()`` reports, for
     the per-layer-head-count models where that differs from the spec's; it defaults
@@ -124,7 +125,7 @@ def _build_metadata(
             dtype=dtype,
         )
 
-    builder = SpyreAttentionMetadataBuilder(
+    builder = builder_cls(
         kv_cache_spec=kv_cache_spec,
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,

@@ -54,6 +54,10 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
 
+# A one-page walk is its own Dynamo specialization (torch-spyre#6018), so a declared
+# page range starts at two and a one-page sequence walks a masked repeat of its page.
+_MIN_DECLARED_PAGES = 2
+
 
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
@@ -212,6 +216,31 @@ def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     )
 
 
+def _declared_page_range(max_pages: int) -> dict[int, dict[str, int]] | None:
+    """The page range to declare, or None (with the reason logged) to keep the buckets."""
+    from torch_spyre._inductor import config as ts_config
+    from torch_spyre._inductor import pass_utils
+
+    if not hasattr(pass_utils, "declared_dims"):
+        logger.info_once(
+            "Head-major attention keeps its KV buckets: this torch-spyre has no symbolic "
+            "for_each_tile trip counts (torch-spyre#6066)."
+        )
+        return None
+    # torch-spyre refuses a declared minimum below its reservation floor.
+    min_pages = max(_MIN_DECLARED_PAGES, ts_config.min_reserved_dim_size)
+    if not min_pages <= max_pages <= ts_config.max_buckets:
+        logger.info_once(
+            "Head-major attention keeps its KV buckets: %d pages per sequence is outside the "
+            "declarable range [%d, MAX_BUCKETS=%d].",
+            max_pages,
+            min_pages,
+            ts_config.max_buckets,
+        )
+        return None
+    return {0: {"min": min_pages, "max": max_pages, "granularity": 1}}
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -255,7 +284,7 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
+    def __init__(self, vllm_config: VllmConfig, *, declare_pages: bool = False) -> None:
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
@@ -324,6 +353,12 @@ class SpyreAttnBucketer:
         # masked page does, and it lifts the SWA bound _max_active_blocks derives from it.
         if envs.SPYRE_ATTN_KV_LAYOUT == "head_major" and _min_num_kv_heads(vllm_config) == 1:
             self._num_blocks_buckets = sorted({max(2, n) for n in self._num_blocks_buckets})
+
+        # The head-major per-sequence kernels walk a declared page count, so they compile
+        # once per query bucket rather than once per (query, KV) bucket pair.
+        self._page_range: dict[int, dict[str, int]] | None = None
+        if declare_pages:
+            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
 
         validate_kv_ladder_env()
 
@@ -399,6 +434,16 @@ class SpyreAttnBucketer:
     def find_blocks_bucket(self, num_blocks: int) -> int | None:
         return self._round_up(num_blocks, self._num_blocks_buckets)
 
+    @property
+    def page_range(self) -> dict[int, dict[str, int]] | None:
+        """The per-sequence page axis's ``tensor.to(dynamic=...)`` declaration, or None
+        when page counts round onto ``num_blocks_buckets`` instead."""
+        return self._page_range
+
+    def find_declared_pages(self, num_blocks: int) -> int:
+        assert self._page_range is not None
+        return max(num_blocks, self._page_range[0]["min"])
+
     def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
         """The num_blocks buckets batched decode records and dispatches onto at this batch size.
 
@@ -436,7 +481,11 @@ class SpyreAttnBucketer:
         that variant and put a compile back in the serving path.
         """
         out: list[SpyreAttnBucket] = []
-        for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
+        # One kernel per query bucket serves every declared page count.
+        blocks_buckets = self._num_blocks_buckets
+        if self._page_range is not None:
+            blocks_buckets = [blocks_buckets[-1]]
+        for num_blocks in sorted(blocks_buckets, reverse=True):
             max_query_here = num_blocks * self.block_size
             for padded_query_len in sorted(self._query_buckets, reverse=True):
                 if self.min_real_query_len(padded_query_len) > max_query_here:

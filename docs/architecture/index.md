@@ -381,7 +381,7 @@ the write can scatter through a slot-major view of it:
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
+| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets (head-major keeps each sequence's own block count instead, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
 | 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter through a slot-major view of the paged cache (one per tensor, fused); only the slot-index vector is computed host-side and copied over |
 | 3. Page attention | Spyre | Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 4. Write-back | Spyre | Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy |
@@ -395,7 +395,8 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
 per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
 block counts that fit its smallest real query length; variants exceeding the allocated
-page count are skipped. Failed recordings are logged and compile on first use instead.
+page count are skipped. On the head-major layout, where the page table is declared with
+`tensor.to(dynamic=...)`, each query bucket is one variant at the largest block count. Failed recordings are logged and compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default, which under the
 default tiled walk means the head-major layout) warmup enumerates its variants, the
 product of the KV-length (`num_blocks`) and num-sequences buckets; combinations that

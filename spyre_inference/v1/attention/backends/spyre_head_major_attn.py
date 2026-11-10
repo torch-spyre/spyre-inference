@@ -32,6 +32,7 @@ from contextvars import copy_context
 from typing import ClassVar, TypeVar
 
 import torch
+from torch_spyre._C import get_reserved_dims
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -45,6 +46,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
+    SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
@@ -68,26 +70,57 @@ from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
+
+def _walked_pages(page_index_table, mask_stack, page_range) -> int:
+    """The page count to walk: the table's own length, or a bucket's when it is not declared.
+
+    A declared table's length is symbolic, so the trace restates its range and ties the
+    mask stack to it; one compile then serves every page count in the range.
+    """
+    num_blocks = page_index_table.shape[0]
+    if page_range is not None:
+        torch._check(num_blocks >= page_range[0]["min"])
+        torch._check(num_blocks <= page_range[0]["max"])
+        torch._check(mask_stack.shape[0] == num_blocks)
+    return num_blocks
+
+
+def page_attn_prefill(*, page_index_table, mask_stack, page_range, **kwargs):
+    return page_attn_head_major_prefill_kernel(
+        page_index_table=page_index_table,
+        mask_stack=mask_stack,
+        num_blocks=_walked_pages(page_index_table, mask_stack, page_range),
+        **kwargs,
+    )
+
+
+def page_attn_decode(*, page_index_table, mask_stack, page_range, **kwargs):
+    return page_attn_head_major_decode_kernel(
+        page_index_table=page_index_table,
+        mask_stack=mask_stack,
+        num_blocks=_walked_pages(page_index_table, mask_stack, page_range),
+        **kwargs,
+    )
+
+
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
 #
 # The kernels that walk their pages tiled need fullgraph because of ``for_each_tile``.
 _page_attn_prefill_compiled = torch.compile(
-    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+    page_attn_prefill, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
 _page_attn_decode_compiled = torch.compile(
-    page_attn_head_major_decode_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+    page_attn_decode, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
 _batched_decode_compiled = torch.compile(
     batched_decode_head_major_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
 
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
-compile_guard.watch(
-    page_attn_head_major_prefill_kernel, "page attention prefill kernel (head-major)"
-)
-compile_guard.watch(page_attn_head_major_decode_kernel, "page attention decode kernel (head-major)")
+compile_guard.watch(page_attn_prefill, "page attention prefill kernel (head-major)")
+compile_guard.watch(page_attn_decode, "page attention decode kernel (head-major)")
 compile_guard.watch(batched_decode_head_major_kernel, "batched decode kernel (head-major)")
 compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kernel (head-major)")
 
@@ -125,6 +158,10 @@ def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], /, *args, *
     return copy_context().run(run)
 
 
+class SpyreHeadMajorAttentionMetadataBuilder(SpyreAttentionMetadataBuilder):
+    declares_pages: ClassVar[bool] = True
+
+
 class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
     """Head-major variant of the paged KV-cache backend."""
 
@@ -136,6 +173,10 @@ class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SpyreHeadMajorAttentionImpl"]:
         return SpyreHeadMajorAttentionImpl
+
+    @staticmethod
+    def get_builder_cls() -> type[SpyreHeadMajorAttentionMetadataBuilder]:
+        return SpyreHeadMajorAttentionMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -242,6 +283,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             shape = (k_pages.shape[0] * k_pages.shape[1], k_pages.shape[2], k_pages.shape[3])
             self._folded = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._folded
+
+    @staticmethod
+    def _page_range(index_table: torch.Tensor) -> dict[int, dict[str, int]] | None:
+        """The page table's ``tensor.to(dynamic=...)`` declaration, None for a bucketed one."""
+        if index_table.device.type != "spyre":
+            return None
+        return get_reserved_dims(index_table)
 
     def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
@@ -367,6 +415,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             f"index table has {index_table.shape[0]} rows for {num_blocks} blocks"
         )
         scale, v_scale = self._read_scales()
+        page_range = self._page_range(index_table)
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
@@ -380,7 +429,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 page_index_table=index_table,
                 mask_stack=mask_stack,
                 scale=scale,
-                num_blocks=num_blocks,
+                page_range=page_range,
                 padded_query_len=padded_query_len,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -406,7 +455,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             kv_row_pool=kv_row_pool,
             mask_stack=mask_stack,
             scale=scale,
-            num_blocks=num_blocks,
+            page_range=page_range,
             padded_query_len=padded_query_len,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,

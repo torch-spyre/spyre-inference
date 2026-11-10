@@ -94,4 +94,4 @@ git commit -s -S -m "Your commit message"
 git commit --amend -s -S --no-edit
 ```
 
-The sign-off email must match your GitHub email, and the signing key must be registered on your GitHub account. Before pushing, `git log --format='%h %G? %s' origin/main..` should print `G` for every commit. For help configuring git identity and signing, invoke the `github-commit` skill.
+The sign-off email must match your GitHub email, and the signing key must be registered on your GitHub account. Before pushing, `git log --format='%h %G? %s' origin/main..` must not print `N` (unsigned) for any commit. `U` or `E` can still be valid, because `%G?` verifies locally; GitHub's `gh api repos/torch-spyre/spyre-inference/commits/<sha> --jq .commit.verification.verified` is authoritative. For help configuring git identity and signing, invoke the `github-commit` skill.

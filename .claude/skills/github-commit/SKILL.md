@@ -110,11 +110,17 @@ To amend the last commit with a sign-off and signature:
 git commit --amend -s -S --no-edit
 ```
 
-Before pushing, confirm every commit on the branch is signed (`G`) and signed off:
+Before pushing, confirm every commit on the branch is signed and signed off:
 
 ```bash
 git log --format='%h %G? %s' origin/main..
 git log --format='%h %(trailers:key=Signed-off-by,valueonly)' origin/main..
+```
+
+`%G?` verifies against the local keyring, so only `N` (unsigned) is a definite failure. `U` or `E` can be a valid signature git cannot check locally, such as an SSH key with no `gpg.ssh.allowedSignersFile`, or an untrusted or missing GPG key. After pushing, GitHub is authoritative:
+
+```bash
+gh api repos/torch-spyre/spyre-inference/commits/<sha> --jq .commit.verification.verified
 ```
 
 ## 4. Push to your fork

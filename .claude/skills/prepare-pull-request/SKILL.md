@@ -131,7 +131,13 @@ Every commit needs both:
 - **Signature:** a GPG/SSH signature (`-S`). `main` requires signed commits, so an unsigned commit blocks the merge.
 
 ```bash
-git log --format='%h %G? %s' origin/main..   # every line must show G
+git log --format='%h %G? %s' origin/main..
+```
+
+`%G?` checks the signature against the local keyring, not GitHub: `N` means unsigned and must be fixed, while `U` or `E` can still be a valid signature git cannot verify locally (an SSH key with no `gpg.ssh.allowedSignersFile`, or an untrusted or missing GPG key). After pushing, GitHub is the authoritative check:
+
+```bash
+gh api repos/torch-spyre/spyre-inference/commits/<sha> --jq .commit.verification.verified
 ```
 
 Amend a commit that lacks either with `-s -S` before pushing. If no signing key is set up, run the `github-commit` skill.

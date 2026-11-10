@@ -412,8 +412,8 @@ class _SpyreModelWrapper:
         """Move hidden_states onto Spyre for the lm_head custom op.
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
-        `select_rows`), so the tensor handed to compute_logits is on CPU;
+        on CPU (``__call__`` D2Hs the body output), so the tensor handed
+        to compute_logits is on CPU;
         move it onto Spyre for the lm_head matmul. The logits are
         returned on CPU: the head's ``SpyreUnquantizedLMHeadMethod.apply`` keeps them
         on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice

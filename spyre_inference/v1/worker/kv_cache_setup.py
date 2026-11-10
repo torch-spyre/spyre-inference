@@ -96,7 +96,7 @@ def allocate_spyre_kv_caches(
         for layer_name in kv_cache_tensor.layers:
             spec = spec_by_layer[layer_name]
             # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the token-major default.
+            # stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
             kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)

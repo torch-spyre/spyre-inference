@@ -326,9 +326,9 @@ class SpyreAttnBucketer:
         )
 
         # One KV head on one page leaves torch-spyre's codegen no spare dim for the stick
-        # dim, so the head-major decode kernel will not compile there. A second, fully
-        # masked page does, and it lifts the SWA bound _max_active_blocks derives from it.
-        if envs.SPYRE_ATTN_KV_LAYOUT == "head_major" and _min_num_kv_heads(vllm_config) == 1:
+        # dim, so the decode kernel will not compile there. A second, fully masked page
+        # does, and it lifts the SWA bound _max_active_blocks derives from it.
+        if _min_num_kv_heads(vllm_config) == 1:
             self._num_blocks_buckets = sorted({max(2, n) for n in self._num_blocks_buckets})
 
         validate_kv_ladder_env()

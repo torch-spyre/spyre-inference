@@ -182,22 +182,10 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
-    _head_major_backend_path = (
-        "spyre_inference.v1.attention.backends.spyre_head_major_attn.SpyreHeadMajorAttentionBackend"
-    )
-    _KV_LAYOUTS = ("token_major", "head_major")
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     # Largest item a request may carry per vision modality, in tokens.
     _vision_token_limits: ClassVar[dict[str, int]] = {}
-
-    @classmethod
-    def _decoder_backend_path(cls) -> str:
-        """The decoder attention backend for the requested KV cache layout."""
-        layout = envs.SPYRE_ATTN_KV_LAYOUT
-        if layout not in cls._KV_LAYOUTS:
-            raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
-        return cls._head_major_backend_path if layout == "head_major" else cls._backend_path
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -516,7 +504,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 "SpyreEncoderAttentionBackend"
             )
         else:
-            backend_path = cls._decoder_backend_path()
+            backend_path = cls._backend_path
 
         # Register the selected Spyre attention implementation as CUSTOM.
         register_backend(AttentionBackendEnum.CUSTOM, backend_path)

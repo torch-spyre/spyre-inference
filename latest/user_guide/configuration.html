@@ -2491,9 +2491,10 @@ model adaptations, including the Spyre Transformers backend (used for
 </span></code></pre></div>
 <p>See the <a href="../examples/offline_inference/torch_spyre_inference.html">Examples</a> page for more usage patterns.</p>
 <h2 id="gemma-4-text-only-use-of-a-vision-checkpoint">Gemma-4: text-only use of a vision checkpoint<a class="headerlink" href="#gemma-4-text-only-use-of-a-vision-checkpoint" title="Permanent link">&para;</a></h2>
-<p>Every Gemma-4 repository carries a <code>vision_config</code>, so <code>google/gemma-4-31B</code> and
-<code>google/gemma-4-26B-A4B</code> load as <code>Gemma4ForConditionalGeneration</code> and build a vision
-tower — weights to load and graphs to warm up that a text-only workload never runs.</p>
+<p>Every Gemma-4 repository carries a <code>vision_config</code>, so <code>google/gemma-4-31B</code>,
+<code>google/gemma-4-26B-A4B</code>, <code>google/gemma-4-E2B</code> and <code>google/gemma-4-E4B</code> load as
+<code>Gemma4ForConditionalGeneration</code> and build a vision tower — weights to load and graphs to
+warm up that a text-only workload never runs.</p>
 <p>To use one of those repositories for text only, pin its decoder architecture:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">model</span><span class="o">=</span><span class="s2">"google/gemma-4-26B-A4B"</span><span class="p">,</span>

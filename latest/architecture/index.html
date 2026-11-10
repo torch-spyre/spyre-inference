@@ -816,6 +816,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#cross-layer-kv-sharing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-layer KV sharing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#lx-resident-pages" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1803,6 +1814,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#cross-layer-kv-sharing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-layer KV sharing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#lx-resident-pages" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2391,6 +2413,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#cross-layer-kv-sharing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-layer KV sharing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#lx-resident-pages" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2684,12 +2717,12 @@ their own. Registration is lazy — nothing is imported until vLLM resolves the 
 and <code>register_models()</code> first checks every key against vLLM's own registry, so an upstream
 rename fails loudly instead of silently falling through to the unadapted class.</p>
 <p>Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
-<code>embedding_class</code>), the already-built instance is <strong>retyped</strong> to its Spyre subclass — same
+<code>embedding_class</code>; gemma-4 builds its self-decoder inline), the already-built instance is <strong>retyped</strong> to its Spyre subclass — same
 <code>__init__</code>, same parameters and module tree, but a Spyre <code>forward</code> and armed compile
 state. Prefer a documented upstream extension point where one exists: <code>CustomOp.register_oot</code> /
 <code>PluggableLayer.register_oot</code> for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.</p>
-<p>Two adaptations worth knowing:</p>
+<p>Three adaptations worth knowing:</p>
 <ul>
 <li><strong>BERT / RoBERTa</strong> (<code>models/_token_type.py</code>) carry <code>token_type_ids</code> in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of <code>input_ids</code>,
@@ -2697,7 +2730,8 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
   Their word/segment/position gathers and layer norm can form a separate compiled
   embedding prologue when no enclosing graph traces them; RoBERTa's position offset is
   applied on the host before the gather.</li>
-<li><strong>MoE</strong> (<code>moe.py</code>) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
+<li>
+<p><strong>MoE</strong> (<code>moe.py</code>) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
   for an out-of-tree platform (it selects <code>UnquantizedMoeBackend.OOT</code> — no kernel — and
   leaves <code>process_weights_after_loading</code> to the plugin). A <code>CustomOp.register_oot</code>
   replacement for <code>UnquantizedFusedMoEMethod</code> computes the experts in two Spyre forms —
@@ -2720,7 +2754,22 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
   <code>models/gemma4.py</code>). <code>Gemma4DecoderLayer.forward</code> is untouched. <code>SpyreMoERunner</code>, an OOT
   <code>MoERunner</code>, takes vLLM's direct <code>_moe_forward</code> entry — as upstream does on CPU and TPU —
   instead of the opaque <code>torch.ops.vllm.moe_forward</code> custom op, so a compiled block traces
-  the expert forms into its own graph; an eager run dispatches them to compiled regions.</li>
+  the expert forms into its own graph; an eager run dispatches them to compiled regions.</p>
+</li>
+<li>
+<p><strong>Gemma-4 per-layer embeddings</strong> (<code>models/gemma4.py</code>, E2B / E4B) retype the self-decoder
+  to <code>SpyreGemma4SelfDecoderLayers</code>. Its upstream PLE lookup, including the in-vocab mask,
+  always runs in a compiled region, including under <code>--enforce-eager</code>; an enclosing graph
+  absorbs it rather than nesting a compile. The lookup and row-splitting methods cache
+  their compiled callables independently. It cuts the backbone's per-layer rows in one
+  compiled graph and hands each block its own offset-0 row through the <code>[:, layer_idx, :]</code>
+  the backbone loop already does. A view of the packed tensor carries a different
+  <code>storage_offset</code> per layer, which torch-spyre guards on, so every layer would compile
+  its own block. The multimodal wrapper allocates its PLE cache on the host as a plain
+  attribute, so <code>models/gemma4_mm.py</code> re-registers it as a buffer that follows the model
+  to the device; that runs even text-only, since the default load keeps the wrapper with
+  every modality at 0.</p>
+</li>
 </ul>
 <h3 id="moe-expert-weights">MoE expert weights<a class="headerlink" href="#moe-expert-weights" title="Permanent link">&para;</a></h3>
 <p><code>_prepare_layer</code> moves each layer's experts to the device once, as three stacks, and hands
@@ -3066,6 +3115,14 @@ path, the KV store, and the cache's device layout — live under
 the host-side orchestration that calls them. The worker allocates each layer's cache
 through its impl (<code>allocate_pages</code>), so the shape, the layout and the kernels cannot
 disagree.</p>
+<h3 id="cross-layer-kv-sharing">Cross-layer KV sharing<a class="headerlink" href="#cross-layer-kv-sharing" title="Permanent link">&para;</a></h3>
+<p>A layer with a <code>kv_sharing_target_layer_name</code> (gemma-4 E2B / E4B) allocates no cache: the
+runner aliases its target's pages in <code>initialize_kv_cache_tensors</code>. vLLM adds such a layer to
+its target's KV cache group but not to that group's <code>UniformTypeKVCacheSpecs</code>, so the
+per-layer spec lookup in <code>initialize_attn_backend</code> would <code>KeyError</code>; both runners hand the
+attention backend a copy (<code>with_kv_sharing_layer_specs</code>) that maps it to the target's spec,
+leaving the retained config's specs, and so its <code>page_size_bytes</code>, physical. YOCO fast prefill
+(<code>kv_sharing_fast_prefill</code>) swaps in an attention backend Spyre does not provide and is rejected.</p>
 <p>Because attention kernels are <code>dynamic=False</code> too, they are pre-compiled during warmup
 rather than lazily on first use: by default (<code>SPYRE_ATTN_RECORD=1</code>) warmup records
 per-sequence variants from <code>SpyreAttnBucketer.variants()</code>. A query bucket pairs only with

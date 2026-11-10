@@ -212,17 +212,25 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
         logger.info("Attention graph recording disabled (CompilationMode.NONE)")
         return
     builders: dict[str, SpyreAttentionMetadataBuilder] = {}
-    for groups in runner.attn_groups:
+    # The target's groups also list the draft layers, which share its KV group; the
+    # draft's own builders, installed after the target's, are the ones that serve them.
+    draft_groups = getattr(runner.speculator, "attn_groups", [])
+    for groups in runner.attn_groups + draft_groups:
         for group in groups:
             builder = group.metadata_builders[0] if group.metadata_builders else None
             if isinstance(builder, SpyreAttentionMetadataBuilder):
                 builders.update(dict.fromkeys(group.layer_names, builder))
+    causal_by_layer = dict.fromkeys(builders, True)
+    if runner.speculator is not None:
+        draft = runner.speculator.model
+        causal_by_layer.update(
+            zip(draft.get_draft_kv_cache_layer_names(), draft.get_draft_attn_causal(), strict=True)
+        )
     record_attention_graphs(
         runner.compilation_config.static_forward_context,
         runner.spyre_kv_caches,
         builders,
-        # Speculative decoding, whose draft layers can be non-causal, is refused at load.
-        causal_by_layer=dict.fromkeys(builders, True),
+        causal_by_layer=causal_by_layer,
     )
 
 

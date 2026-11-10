@@ -20,7 +20,9 @@ host, applies the shared fix-ups, moves the model to Spyre, compiles per block a
 returns the _SpyreModelWrapper. Everything upstream builds from ``self.model``
 afterwards (model state, sampler, pooling runner) therefore holds the wrapper.
 init_model_state and PoolingRunner are swapped for their Spyre counterparts for the
-duration of the call, and upstream's own whole-model stock compile is skipped.
+duration of the call, the aux-hidden-state layers are set on the bare model, and
+upstream's own whole-model stock compile is skipped. A speculator's draft loads through
+vLLM's own get_model; the speculator moves it to Spyre (spec_decode.py).
 """
 
 import contextlib
@@ -51,6 +53,7 @@ from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunn
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _SpyreModelWrapper,
     model_dtype,
+    unwrap_model,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -103,7 +106,9 @@ class _SpyreModelLoaderWrapper:
         bucketer = SpyreShapeBucketer.for_config(vllm_config)
         row_buckets = []
         if bucketer is not None:
-            row_buckets = logits_row_buckets(bucketer.bucket_sizes, runner.max_num_reqs)
+            row_buckets = logits_row_buckets(
+                bucketer.bucket_sizes, runner.max_num_reqs, runner.num_speculative_steps
+            )
             if model_config.runner_type == "generate" and model_config.max_logprobs != 0:
                 # Prompt logprobs project the prompt rows in chunks of up to CHUNK_SIZE.
                 chunk = min(PROMPT_LOGPROBS_CHUNK_SIZE, runner.max_num_tokens)
@@ -115,6 +120,8 @@ class _SpyreModelLoaderWrapper:
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
             model_dtype=model_dtype(model_config),
+            # The draft's context store reads them on Spyre.
+            keep_aux_hidden_states_on_device=runner.use_aux_hidden_state_outputs,
         )
 
 
@@ -124,6 +131,7 @@ def _required(runner: "SpyreModelRunnerV2") -> dict[str, bool]:
     The keys are the whole set of swaps: _patched refuses a replacement missing here."""
     return {
         "get_model_loader": True,
+        "set_eagle3_aux_hidden_state_layers": runner.use_aux_hidden_state_outputs,
         "init_model_state": True,
         "PoolingRunner": runner.is_pooling_model,
         "compile_model_with_stock_torch": (
@@ -148,6 +156,11 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
         called.add("get_model_loader")
         return _SpyreModelLoaderWrapper(original["get_model_loader"](load_config), runner)
 
+    def unwrapped_aux_layers(model, *args, **kwargs):
+        # The wrapper's attribute forwarding doesn't satisfy the SupportsEagle3 check.
+        called.add("set_eagle3_aux_hidden_state_layers")
+        original["set_eagle3_aux_hidden_state_layers"](unwrap_model(model), *args, **kwargs)
+
     def spyre_init_model_state(vllm_config, model, encoder_cache, device):
         called.add("init_model_state")
         return resolve_spyre_model_state(
@@ -166,6 +179,7 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
 
     replacements = {
         "get_model_loader": wrapped_model_loader,
+        "set_eagle3_aux_hidden_state_layers": unwrapped_aux_layers,
         "init_model_state": spyre_init_model_state,
         "PoolingRunner": _SpyrePoolingRunner,
         "compile_model_with_stock_torch": no_stock_compile,
@@ -216,10 +230,6 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
     if runner.parallel_config.enable_batch_sharded_sampling:
         # Upstream calls model.compute_logits_local, past the wrapper's H2D and row buckets.
         raise NotImplementedError("Batch-sharded sampling is not supported on the Spyre V2 runner.")
-    if runner.speculator is not None:
-        # Upstream loads a draft model through its own loader, outside the swap.
-        raise NotImplementedError("Speculative decoding is not supported on the Spyre V2 runner.")
-
     with _patched(runner):
         GPUModelRunner.load_model(runner, *args, **kwargs)
     # The profiler measures host memory, which Spyre weights don't occupy.

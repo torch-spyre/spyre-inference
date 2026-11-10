@@ -6,15 +6,15 @@ the published `UIUC-SSAIL/Qwen3-8B-XPress-b16` checkpoint directly with
 `Qwen/Qwen3-8B`; checkpoint conversion is not required.
 
 Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
-the V1 runner, up to four active requests, and prefix caching
-disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+either model runner (`SPYRE_MODEL_RUNNER=v1` or `v2`), up to four active
+requests, and prefix caching disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
 The four-request cap reflects the batches validated on Spyre so far. Larger
 batches require additional device validation before raising this limit.
 
 ## Run Qwen3-8B
 
 ```bash
-export SPYRE_MODEL_RUNNER=v1
+export SPYRE_MODEL_RUNNER=v2  # or v1
 export SPYRE_ATTN_QUERY_BUCKETS=1,16,64
 uv run --no-sync vllm serve Qwen/Qwen3-8B \
   --revision b968826d9c46dd6066d109eabc6255188de91218 \

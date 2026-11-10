@@ -50,7 +50,7 @@ print(HAS_TRITON, type(triton).__name__, type(_gather_block_tables_kernel).__nam
 
 def test_x86_has_triton_cpu() -> None:
     """Without the wheel HAS_TRITON is False either way, so on x86 every gate test below
-    would pass without exercising the gate. `uv sync` installs it there."""
+    would pass without exercising the gate. The dev group installs it there."""
     assert platform.machine() != "x86_64" or _HAS_TRITON_CPU
 
 

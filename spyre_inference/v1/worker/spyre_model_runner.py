@@ -64,6 +64,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.mamba_mixer2 import SpyreMambaMixer2
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
@@ -948,6 +949,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs()
         self._record_vision_graphs()
+        self._warm_mamba_kernels()
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:
@@ -1638,8 +1640,39 @@ class TorchSpyreModelRunner(GPUModelRunner):
             static_ctx,
             self.kv_caches,
         )
-        self._spyre_kv_caches = dict(kv_caches)
+        # Mamba layers bind a tuple of state tensors; only paged attention records graphs.
+        self._spyre_kv_caches = {
+            name: cache for name, cache in kv_caches.items() if isinstance(cache, SpyrePagedKVCache)
+        }
         return kv_caches
+
+    @torch.inference_mode()
+    def _warm_mamba_kernels(self) -> None:
+        """Compile every Mamba layer's decode and prefill kernels on the null state slot.
+
+        The decoder dummy runs carry no Mamba metadata, so the op body never runs there.
+        """
+        if self.compilation_config.mode is CompilationMode.NONE:
+            return
+        static_ctx = self.compilation_config.static_forward_context
+        mixers = [layer for layer in static_ctx.values() if isinstance(layer, SpyreMambaMixer2)]
+        if not mixers:
+            return
+        bucketer = self.spyre_shape_bucketer
+        body_buckets = bucketer.bucket_sizes if bucketer is not None else []
+        t0 = time.time()
+        with _set_spyre_compilation_settings(self.vllm_config):
+            for mixer in mixers:
+                mixer.warm_kernels(body_buckets)
+        logger.info(
+            "Mamba kernels warmed for %d layers (body buckets %s, decode buckets %s, "
+            "prefill chunk %d) in %.3fs.",
+            len(mixers),
+            body_buckets,
+            mixers[0].decode_buckets,
+            mixers[0].chunk_size,
+            time.time() - t0,
+        )
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.

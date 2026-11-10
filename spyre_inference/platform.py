@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.attention.backend import AttentionBackend
 else:
     VllmConfig = None
 
@@ -997,7 +998,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
         # KV-cache manager gives every layer its own buffer; SWA is still computed, per
         # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
-        scheduler_config.disable_hybrid_kv_cache_manager = True
+        # Mamba hybrids keep it: their state specs cannot be unified with attention,
+        # and kv_cache_setup gives every layer its own buffer anyway.
+        is_mamba_hybrid = (
+            vllm_config.model_config is not None and vllm_config.model_config.is_hybrid
+        )
+        scheduler_config.disable_hybrid_kv_cache_manager = not is_mamba_hybrid
 
         # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,
         # overriding the flag; a size would also skip the measurement and hand out a
@@ -1033,9 +1039,75 @@ class TorchSpyrePlatform(CpuPlatform):
         if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
             logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
             cache_config.enable_prefix_caching = False
+        # After super(): CpuPlatform resets an SSM state dtype its CPU kernels lack to fp32.
+        if is_mamba_hybrid:
+            cls._apply_mamba_defaults(vllm_config)
 
         if vllm_config.model_config is not None:
             cls._set_vision_token_limit(vllm_config)
+
+    @staticmethod
+    def _apply_mamba_defaults(vllm_config: VllmConfig) -> None:
+        """Mamba state settings the Spyre ``MambaMixer2`` supports.
+
+        Upstream's model hooks run before any platform hook and pick the ``align`` cache
+        mode under prefix caching and, for NemotronH, an fp32 SSM state.
+        """
+        from vllm.model_executor.models.config import MambaModelConfig
+
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            # Prefix caching needs the `align` mode's per-block state checkpoints,
+            # which the Spyre mixer does not write.
+            # TODO: Enable prefix caching
+            logger.info(
+                "Disabling prefix caching: Mamba state caching is not yet supported on Spyre."
+            )
+            cache_config.enable_prefix_caching = False
+
+            # Let upstream derive the `none` mode's one Mamba block per request again.
+            cache_config.mamba_block_size = None
+            MambaModelConfig.verify_and_update_config(vllm_config)
+        # fp32 tensors next to the fp16 state update do not lower on Spyre (mixed
+        # element arrangements); an fp16 state stays accurate over long decodes.
+        for field in ("mamba_cache_dtype", "mamba_ssm_cache_dtype"):
+            if getattr(cache_config, field) not in ("auto", "float16"):
+                logger.info(
+                    "Overriding %s=%s to float16 for Spyre.", field, getattr(cache_config, field)
+                )
+            setattr(cache_config, field, "float16")
+
+    @classmethod
+    def _align_hybrid_block_size(
+        cls, vllm_config: VllmConfig, backend_cls: "type[AttentionBackend]"
+    ) -> None:
+        """Upstream's attention/Mamba page alignment, rounded up to a power-of-two block.
+
+        The Spyre attention buckets need one. As in XPUPlatform's rounding, the padded
+        Mamba page scales with the block, so it still equals an attention page. The
+        caller's ``_check_aligned_block_size`` validates the rounded size.
+        """
+        super()._align_hybrid_block_size(vllm_config, backend_cls)
+        cache_config = vllm_config.cache_config
+        block_size = cache_config.block_size
+        aligned = 1 << (block_size - 1).bit_length()
+        if aligned != block_size:
+            if cache_config.mamba_page_size_padded is not None:
+                cache_config.mamba_page_size_padded = (
+                    cache_config.mamba_page_size_padded // block_size * aligned
+                )
+            logger.info(
+                "Rounding the hybrid KV block size %d up to %d tokens for the Spyre "
+                "attention buckets.",
+                block_size,
+                aligned,
+            )
+            cache_config.block_size = aligned
+        # The engine takes the smallest group block size as the global one, which the
+        # attention builder checks against. Raising only a smaller Mamba block keeps one
+        # Mamba block per request, which is all the `none` cache mode's block table holds.
+        if cache_config.mamba_block_size is not None and cache_config.mamba_block_size < aligned:
+            cache_config.mamba_block_size = aligned
 
     @staticmethod
     def _is_pooling_model(vllm_config: VllmConfig) -> bool:

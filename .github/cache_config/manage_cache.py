@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -215,6 +216,39 @@ def _require_env(name):
     return value
 
 
+def _host(url):
+    return urllib.parse.urlsplit(url).netloc.lower()
+
+
+class _StripAuthOnCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Drop the Artifactory bearer token when a redirect leaves the origin host.
+
+    The stdlib default replays every request header, including Authorization,
+    onto the redirect target. A redirect to another host (a misconfigured
+    reverse proxy, or one injected by a network attacker) would then hand the
+    ARTIFACTORY_TOKEN to that host. Mirrors resolve_rpms.artifactory_open().
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _host(req.full_url) != _host(newurl):
+            new.remove_header("Authorization")
+        return new
+
+
+def artifactory_open(url, token, timeout):
+    """Open a credentialed Artifactory request over HTTPS only.
+
+    Rejects a non-https URL so the bearer token is never sent in the clear,
+    and uses an opener that strips the token on a cross-host redirect.
+    """
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("Artifactory URL must use https, refusing to send token")
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    opener = urllib.request.build_opener(_StripAuthOnCrossHostRedirect)
+    return opener.open(request, timeout=timeout)
+
+
 def _run_artifactory_datasets(config, config_file):
     """Cache artifactory_datasets entries into the shared runner volume.
 
@@ -238,6 +272,12 @@ def _run_artifactory_datasets(config, config_file):
         dest_dir = os.path.join(storage, ".cache", "artifacts")
 
     base_url = _require_env("ARTIFACTORY_BASE_URL").rstrip("/")
+    # Refuse a cleartext base before the token is ever attached: the bearer
+    # credential must never travel over http. Fails the dispatch with a clear
+    # operator message rather than per-file download errors.
+    if urllib.parse.urlsplit(base_url).scheme != "https":
+        print("❌ Error: ARTIFACTORY_BASE_URL must use https (refusing cleartext token).")
+        sys.exit(1)
     token = _require_env("ARTIFACTORY_TOKEN")
     root = _require_env("ARTIFACTORY_DATA_PATH").strip("/")
 
@@ -271,12 +311,13 @@ def _run_artifactory_datasets(config, config_file):
         # digest matches. The pid keeps two concurrent writers off one temp file.
         partial = target.with_name(f"{name}.{os.getpid()}.part")
         try:
-            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
             # Per socket operation, not for the whole transfer, so the 98MB
             # largest file is fine; without it a stalled connection would hang
-            # until the job timeout hours later.
+            # until the job timeout hours later. artifactory_open refuses a
+            # non-https URL and strips the token on a cross-host redirect so the
+            # bearer credential never leaves TLS or the origin host.
             with (
-                urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_S) as response,
+                artifactory_open(url, token, DOWNLOAD_TIMEOUT_S) as response,
                 open(partial, "wb") as handle,
             ):
                 shutil.copyfileobj(response, handle)

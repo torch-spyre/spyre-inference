@@ -3014,6 +3014,13 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>63 (one-hot width)</td>
 </tr>
 <tr>
+<td><code>vision_items_limited_by_tokens</code></td>
+<td>no</td>
+<td>limit items per call by budget tokens and <code>vision_max_items_per_call</code> (then required) instead of upstream's smallest budget</td>
+<td><code>False</code></td>
+<td><code>False</code></td>
+</tr>
+<tr>
 <td><code>vision_pack_tokens</code></td>
 <td>no</td>
 <td>packing stops at the budget covering this; larger items run alone (default <code>None</code>: up to the largest budget)</td>

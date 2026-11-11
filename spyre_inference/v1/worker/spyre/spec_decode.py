@@ -31,6 +31,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 from spyre_inference.v1.worker.model_load import move_model_to_spyre
 from spyre_inference.v1.worker.spyre.attn_groups import split_by_window
 
@@ -78,10 +79,26 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
 
     def set_attn(self, model_state, kv_cache_config, block_tables, *args, **kwargs) -> None:
         super().set_attn(model_state, kv_cache_config, block_tables, *args, **kwargs)
-        # Splits within each KV cache group, so upstream's group ids and causality hold.
+        # Splits within each KV cache group, so upstream's group ids hold.
         split_by_window(
             self.attn_groups, self.attn_vllm_config, self.device, block_tables.block_sizes
         )
+        causal_by_layer = dict(
+            zip(
+                self.model.get_draft_kv_cache_layer_names(),
+                self.model.get_draft_attn_causal(),
+                strict=True,
+            )
+        )
+        for group in (g for groups in self.attn_groups for g in groups):
+            (causal, *mixed) = {causal_by_layer[name] for name in group.layer_names}
+            if mixed:
+                raise ValueError(
+                    f"Draft layers {group.layer_names} share an attention group but differ in "
+                    "causality; Spyre masks per group"
+                )
+            for builder in group.metadata_builders:
+                cast(SpyreAttentionMetadataBuilder, builder).causal_override = causal
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         self.query_cudagraph_manager = _DraftBatchPadding(  # ty: ignore[invalid-assignment]
@@ -162,7 +179,8 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         if num_tokens < num_tokens_padded:
             for group in (g for groups in self.attn_groups for g in groups):
                 slots = self.block_tables.slot_mappings[group.kv_cache_group_id]
-                group.get_metadata_builder()._slot_mapping.publish(
+                builder = cast(SpyreAttentionMetadataBuilder, group.get_metadata_builder())
+                builder._slot_mapping.publish(
                     F.pad(slots[:num_tokens], (0, num_tokens_padded - num_tokens), value=0)
                 )
         hidden = self._run_model(num_tokens_padded, *args, **kwargs)

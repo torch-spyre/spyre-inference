@@ -447,6 +447,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._is_pooling = vllm_config.model_config.runner_type == "pooling"
         self._max_model_len = vllm_config.model_config.max_model_len
         self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
+        # Set for a draft's groups: one KV group can hold both causal and non-causal
+        # draft layers, so upstream's per-KV-group causality can't reach them.
+        self.causal_override: bool | None = None
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
 
@@ -828,6 +831,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # validity mask (the single query at position context_len can only
         # attend to KV positions [0, kv_len) = [0, context_len]), so applying
         # the causal mask to them is a correct no-op.
+        if self.causal_override is not None:
+            causal = self.causal_override
         apply_causal_mask = causal and max_query_len > 1
 
         num_seqs = common_attn_metadata.num_reqs

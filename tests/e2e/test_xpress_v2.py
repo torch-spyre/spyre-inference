@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3-8B with the XPress draft on the V2 runner: greedy output matches the target
-alone, with no compile after warmup and no CPU fallback."""
+"""XPress on the V2 runner: greedy output matches the target alone, with no compile after
+warmup and no CPU fallback."""
 
 import json
 import os
@@ -24,11 +24,7 @@ import pytest
 
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
 
-TARGET = "Qwen/Qwen3-8B"
-TARGET_REVISION = "b968826d9c46dd6066d109eabc6255188de91218"
-DRAFT = "UIUC-SSAIL/Qwen3-8B-XPress-b16"
-DRAFT_REVISION = "f098ab5bbe4fce37c4a1093266bcd8ad15df5cb5"
-PROMPTS = [
+QWEN3_PROMPTS = [
     "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,",
     "What are the main businesses of IBM? Answer in one sentence.",
     "Read the following context. "
@@ -36,11 +32,51 @@ PROMPTS = [
     + "\nName the company described above:",
     "2, 4, 6, 8,",
 ]
-# Different lengths, so the active draft batch shrinks through 4, 2 and 1 as they finish.
-MAX_TOKENS = [48, 40, 24, 32]
+
+CASES = {
+    # Different lengths, so the active draft batch shrinks through 4, 2 and 1 as they finish.
+    "qwen3": dict(
+        target="Qwen/Qwen3-8B",
+        target_revision="b968826d9c46dd6066d109eabc6255188de91218",
+        draft="UIUC-SSAIL/Qwen3-8B-XPress-b16",
+        draft_revision="f098ab5bbe4fce37c4a1093266bcd8ad15df5cb5",
+        engine=dict(
+            max_model_len=512,
+            max_num_seqs=4,
+            max_num_batched_tokens=128,
+            compilation_config={"compile_sizes": [1, 16, 32, 64, 128]},
+        ),
+        env={"SPYRE_ATTN_QUERY_BUCKETS": "1,16,64,128", "SPYRE_MAX_NUM_PARTIAL_PREFILLS": "4"},
+        batches={"single": (QWEN3_PROMPTS[:1], [48]), "batch": (QWEN3_PROMPTS, [48, 40, 24, 32])},
+    ),
+    # A draft of four 2048-token sliding-window layers and one full-attention layer; the
+    # last prompt passes the window.
+    "gemma4": dict(
+        target="google/gemma-4-26B-A4B-it",
+        target_revision="4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+        draft="UIUC-SSAIL/gemma4-26b-a4b-XPress-b16",
+        draft_revision="e69e3580df7a7cd76b77e82ef739803fd88ee445",
+        engine=dict(
+            max_model_len=2304,
+            max_num_seqs=1,
+            max_num_batched_tokens=64,
+            compilation_config={"compile_sizes": [1, 16, 64]},
+            gemma4_text_backbone=True,
+        ),
+        env={"SPYRE_ATTN_QUERY_BUCKETS": "1,16,64", "SPYRE_ATTN_KV_BUCKETS": "128,256,2304"},
+        batches={
+            name: ([prompt], [32])
+            for name, prompt in (
+                ("short", "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,"),
+                ("chunked", ", ".join(str(i) for i in range(1, 37)) + ","),
+                ("past_draft_window", ", ".join(str(i) for i in range(1, 451)) + ","),
+            )
+        },
+    ),
+}
 
 
-def _engine_outputs(speculative: bool) -> dict:
+def _engine_outputs(case_name: str, speculative: bool) -> dict:
     """Runs in the child: the Triton gate binds the runner at vLLM import."""
     import warnings
 
@@ -48,68 +84,81 @@ def _engine_outputs(speculative: bool) -> dict:
     from torch_spyre.ops.fallbacks import FallbackWarning
     from vllm import LLM, SamplingParams
 
+    from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
+
     warnings.simplefilter("error", FallbackWarning)
+    case = CASES[case_name]
+    engine = dict(case["engine"])
+    if engine.pop("gemma4_text_backbone", False):
+        engine["hf_overrides"] = GEMMA4_TEXT_BACKBONE_OVERRIDE
     spec = dict(
         method="dflash",
-        model=DRAFT,
-        revision=DRAFT_REVISION,
+        model=case["draft"],
+        revision=case["draft_revision"],
         num_speculative_tokens=15,
         xpress_topc=128,
     )
     llm = LLM(
-        model=TARGET,
-        revision=TARGET_REVISION,
-        tokenizer_revision=TARGET_REVISION,
+        model=case["target"],
+        revision=case["target_revision"],
+        tokenizer_revision=case["target_revision"],
         dtype="float16",
-        max_model_len=512,
-        max_num_seqs=4,
-        max_num_batched_tokens=128,
         enable_prefix_caching=False,
         disable_log_stats=False,
-        compilation_config={"compile_sizes": [1, 16, 32, 64, 128]},
         speculative_config=spec if speculative else None,
+        **engine,
     )
     outputs = {}
-    for name, count in (("single", 1), ("batch", len(PROMPTS))):
-        params = [SamplingParams(temperature=0.0, max_tokens=n) for n in MAX_TOKENS[:count]]
-        results = llm.generate(PROMPTS[:count], params)
+    for name, (prompts, limits) in case["batches"].items():
+        params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True) for n in limits]
+        results = llm.generate(prompts, params)
         outputs[name] = [list(r.outputs[0].token_ids) for r in results]
+        outputs[name + "_prompt_len"] = [len(r.prompt_token_ids) for r in results]
     metrics = {m.name: getattr(m, "value", None) for m in llm.get_metrics()}
     outputs["drafted"] = metrics.get("vllm:spec_decode_num_draft_tokens")
     outputs["accepted"] = metrics.get("vllm:spec_decode_num_accepted_tokens")
     return outputs
 
 
-def _generate(speculative: bool) -> dict:
+def _generate(case_name: str, speculative: bool) -> dict:
     env = {
         **os.environ,
         "SPYRE_MODEL_RUNNER": "v2",
         "SPYRE_ATTN_KV_LAYOUT": "head_major",
-        "SPYRE_ATTN_QUERY_BUCKETS": "1,16,64,128",
-        "SPYRE_MAX_NUM_PARTIAL_PREFILLS": "4",
         "SPYRE_COMPILE_GUARD": "error",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "36000",
+        **CASES[case_name]["env"],
     }
     mode = "spec" if speculative else "reference"
     result = subprocess.run(
-        [sys.executable, __file__, mode], env=env, capture_output=True, text=True, timeout=7200
+        [sys.executable, __file__, case_name, mode],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=7200,
     )
     lines = [line for line in result.stdout.splitlines() if line.startswith("RESULT ")]
     assert result.returncode == 0 and lines, result.stdout[-4000:] + result.stderr[-6000:]
     return json.loads(lines[-1].removeprefix("RESULT "))
 
 
-def test_qwen3_xpress_on_v2_matches_the_target_alone():
+@pytest.mark.timeout(7200)
+@pytest.mark.parametrize("case_name", list(CASES))
+def test_xpress_on_v2_matches_the_target_alone(case_name):
     from spyre_testing_plugin.pytest_plugin import spyre_hardware_present
 
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
-    reference = _generate(speculative=False)
-    speculative = _generate(speculative=True)
-    assert speculative["single"] == reference["single"]
-    assert speculative["batch"] == reference["batch"]
+    reference = _generate(case_name, speculative=False)
+    speculative = _generate(case_name, speculative=True)
+    for name in CASES[case_name]["batches"]:
+        assert speculative[name] == reference[name], name
     assert speculative["drafted"] and speculative["accepted"] > 0, speculative
+    if case_name == "gemma4":
+        assert speculative["past_draft_window_prompt_len"][0] > 2048
+        # These counting prompts accept over 80% on V1; allow numerical headroom.
+        assert speculative["accepted"] >= 0.5 * speculative["drafted"], speculative
 
 
 if __name__ == "__main__":
-    print("RESULT " + json.dumps(_engine_outputs(sys.argv[1] == "spec")))
+    print("RESULT " + json.dumps(_engine_outputs(sys.argv[1], sys.argv[2] == "spec")))

@@ -179,22 +179,54 @@ def test_warmup_drafts_every_padded_batch_once(speculator):
     assert speculator.draft_tokens.eq(0).all()
 
 
-def test_set_attn_splits_the_draft_groups_after_upstream_builds_them(monkeypatch):
+def _attn_group(*names):
+    return SimpleNamespace(
+        layer_names=list(names), metadata_builders=[SimpleNamespace(causal_override=None)]
+    )
+
+
+def _set_attn(monkeypatch, groups, causal):
+    """set_attn over upstream's, which builds `groups`, for a draft of four layers."""
     calls = []
+
+    def upstream(self, *args):
+        calls.append("upstream")
+        self.attn_groups = groups
+
+    monkeypatch.setattr(spec_decode.DFlashSpeculator, "set_attn", upstream)
     monkeypatch.setattr(
-        spec_decode.DFlashSpeculator,
-        "set_attn",
-        lambda self, *a: (calls.append("upstream"), setattr(self, "attn_groups", [["g"]])),
+        spec_decode, "split_by_window", lambda groups, *a: calls.append(("split", a))
     )
-    monkeypatch.setattr(
-        spec_decode, "split_by_window", lambda groups, *a: calls.append(("split", groups, a))
-    )
+    monkeypatch.setattr(SpyreDFlashSpeculator, "attn_vllm_config", "draft-config")
     s = SpyreDFlashSpeculator.__new__(SpyreDFlashSpeculator)
     s.device = torch.device("cpu")
-    s.vllm_config = SimpleNamespace(attention_config=SimpleNamespace())
-    monkeypatch.setattr(SpyreDFlashSpeculator, "attn_vllm_config", "draft-config")
+    s.model = SimpleNamespace(
+        get_draft_kv_cache_layer_names=lambda: ["d.0", "d.1", "d.2", "d.3"],
+        get_draft_attn_causal=lambda: causal,
+    )
     s.set_attn(None, None, SimpleNamespace(block_sizes=[128]), None, None)
-    assert calls == ["upstream", ("split", [["g"]], ("draft-config", s.device, [128]))]
+    return calls
+
+
+def test_set_attn_splits_the_draft_groups_after_upstream_builds_them(monkeypatch):
+    calls = _set_attn(monkeypatch, [[_attn_group("d.0", "d.1", "d.2", "d.3")]], [False] * 4)
+    assert calls == ["upstream", ("split", ("draft-config", torch.device("cpu"), [128]))]
+
+
+def test_each_draft_group_gets_its_own_layers_causality(monkeypatch):
+    """Gemma 4's draft: causal sliding layers and a non-causal full layer, in one KV group,
+    which upstream's per-KV-group causality would give a single value."""
+    sliding, full = _attn_group("d.0", "d.1", "d.2"), _attn_group("d.3")
+    _set_attn(monkeypatch, [[sliding, full]], [True, True, True, False])
+    assert sliding.metadata_builders[0].causal_override is True
+    assert full.metadata_builders[0].causal_override is False
+
+
+def test_a_group_mixing_causal_and_non_causal_layers_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="differ in causality"):
+        _set_attn(
+            monkeypatch, [[_attn_group("d.0", "d.1", "d.2", "d.3")]], [True, True, True, False]
+        )
 
 
 def test_the_runner_replaces_upstreams_speculator(monkeypatch):

@@ -248,6 +248,8 @@ def compute(
 
     collected: the PR run's JUnit cases. Durations omit skipped tests (e.g. trunk-only
     ones, in this regression-tier run), so only a test JUnit lacks counts as removed.
+    base_only_files: changed by the base branch after the newest baseline; ids that
+    appear or vanish there may be its doing, so they are neither charged nor credited.
     """
     baselines = baselines[:BASELINE_RUNS]
     base_only_files = base_only_files or set()
@@ -266,6 +268,7 @@ def compute(
         and len(v) >= need
         and (collected is None or junit_key(n) not in collected)
         and not _in_skipped_module(n, skipped_modules or set())
+        and n.split("::")[0] not in base_only_files
     }
     new, on_base = [], []
     for nodeid, (seconds, suite) in pr.items():

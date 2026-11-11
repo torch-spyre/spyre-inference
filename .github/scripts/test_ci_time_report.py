@@ -579,3 +579,11 @@ def test_a_collection_skipped_module_is_not_removed():
     # Without a collection skip the same absence is a removal.
     r = ctr.compute(pr, [base] * 5, collected=_collected(pr), skipped_modules=set())
     assert set(r.removed) == {"tests/sub/test_opt.py::test_expensive", "::test_upstream[a]"}
+
+
+def test_a_base_branch_rename_is_neither_charged_nor_credited():
+    # Main renamed a 900 s test after the newest baseline; the PR adds 600 s elsewhere.
+    base = _baseline(**{"tests/shared.py::test_old_name": 900.0})
+    pr = _pr({**_baseline(), "tests/shared.py::test_new_name": 900.0, "tests/c.py::test_pr": 600.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/shared.py"})
+    assert r.removed == {} and r.net_s == 600.0

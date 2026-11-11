@@ -598,7 +598,7 @@ def publish(args, text: str, status: str = "") -> None:
 
 def cmd_report(args) -> None:
     note = ""
-    repo = args.repo or os.environ["GITHUB_REPOSITORY"]
+    repo = args.repo
     if args.run_id:
         run = gh_json(f"/repos/{repo}/actions/runs/{args.run_id}")
         # workflow_run matches by name, which a fork PR can reuse.
@@ -684,7 +684,9 @@ def main() -> None:
     who = rep.add_mutually_exclusive_group(required=True)
     who.add_argument("--run-id", type=int, help="A pull_request test_each_commit run")
     who.add_argument("--pr", type=int, help="A PR number; uses its latest green run")
-    rep.add_argument("--repo", default="", help="owner/name (default: $GITHUB_REPOSITORY)")
+    rep.add_argument(
+        "--repo", default=os.environ.get("GITHUB_REPOSITORY") or "torch-spyre/spyre-inference"
+    )
     rep.add_argument("--post", action="store_true", help="Create or update the PR comment")
     rep.add_argument("--json", default="", help="Also write the report as JSON here")
     rep.add_argument("--summary-file", default="", help="Also append the Markdown report here")

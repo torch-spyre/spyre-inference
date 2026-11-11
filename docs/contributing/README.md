@@ -216,7 +216,7 @@ Using `-s` with `git commit` will automatically add this header.
 
 ### CI time report
 
-After each green CI run on a PR, the `ci-time-report` workflow compares the run's per-test durations with recent runs on the base branch. New tests and new matrix legs count as added time; tests the PR removes count against it. When the net addition is 3% or more of the regression tier's test time, a bot comment lists what was added and asks you to confirm it is intended. Expensive e2e tests should earn their place: prefer a smaller model, fewer parametrizations, or folding the check into a test that already loads the same model. The comment never blocks the merge. PRs against `release-*` branches are skipped, since those branches have no push runs to compare with. To see the numbers for any PR:
+After each green CI run on a PR, the `ci-time-report` workflow compares the run's per-test durations with recent runs on the base branch. New tests and new matrix legs count as added time; tests the PR removes count against it. When the net addition is 3% or more of the regression tier's test time, a bot comment lists what was added and asks you to confirm it is intended. Expensive e2e tests should earn their place: prefer a smaller model, fewer parametrizations, or folding the check into a test that already loads the same model. The comment never blocks the merge. PRs against `release-*` branches are skipped, since those branches have no push runs to compare with. To see the numbers for any PR (needs an authenticated [GitHub CLI](https://cli.github.com/)):
 
 ```bash
 uv run --no-project --with pyyaml python3 .github/scripts/ci_time_report.py report --pr <number>

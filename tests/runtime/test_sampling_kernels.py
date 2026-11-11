@@ -14,6 +14,11 @@
 
 """Fused host sampling kernels ported from vLLM's CPU backend."""
 
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
@@ -272,6 +277,30 @@ def test_gumbel_strided_seeds_match_contiguous() -> None:
     )
     with pytest.raises(RuntimeError, match="seeds must be int64"):
         torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.int())
+
+
+def test_avx2_build_filters_match_pytorch() -> None:
+    """CI runners have AVX512, so they never load _C_AVX2 unless a process asks."""
+    import spyre_inference
+
+    if platform.machine() != "x86_64":
+        pytest.skip("the AVX2 extension is built on x86_64 only")
+    root = Path(spyre_inference.__file__).resolve().parent
+    if not any(root.glob("_C_AVX2*")):
+        pytest.skip("the AVX2 extension is not installed")
+    script = (
+        "import torch\n"
+        "torch.backends.cpu.get_cpu_capability = lambda: 'AVX2'\n"
+        "from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch\n"
+        "from spyre_inference.v1.sample.topk_topp_sampler import apply_top_k_top_p_kernels\n"
+        "x = torch.randn(4, 128)\n"
+        "k = torch.full((4,), 8)\n"
+        "actual = apply_top_k_top_p_kernels(x.clone(), k, None)\n"
+        "expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)\n"
+        "assert torch.equal(actual, expected)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_greedy_nan_matches_argmax() -> None:

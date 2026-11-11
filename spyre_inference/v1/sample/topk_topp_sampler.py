@@ -18,7 +18,10 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
 )
 
-from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
+from spyre_inference.v1.sample.sampling_kernels import (
+    has_sampling_kernels,
+    has_topk_topp_kernels,
+)
 
 
 def apply_top_k_top_p_sort_free(
@@ -58,12 +61,15 @@ def apply_top_k_top_p_kernels(
     value included. Top-p alone is vLLM's CPU kernel, whose cut can differ from a
     full sort by a few boundary tokens.
 
-    Filters float32 contiguous logits in-place; other logits are copied first."""
+    The op masks logits in place, so a tensor that is not float32 and contiguous
+    is copied here. A copy made inside the op would not be the caller's tensor.
+    Serving already passes float32 logits, and then this cast is a no-op. k is
+    read as the int64 vLLM passes; only a non-contiguous k is copied."""
     if k is None and p is None:
         return logits
     logits = logits.to(torch.float32).contiguous()
     if k is not None:
-        k = k.to(torch.int32).contiguous()
+        k = k.contiguous()
     if p is not None:
         p = p.to(torch.float32).contiguous()
     if p is None:
@@ -82,8 +88,10 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
     platform only); Spyre D2Hs logits before sampling, so that host-device sync
     is free and the full-vocab sort it otherwise runs is pure waste. With the
     csrc/ kernels built, ``apply_top_k_top_p_kernels`` filters without a sort or
-    ``topk``. Without them, top-k uses ``topk``, top-p combined with top-k skips
-    the sort too (``apply_top_k_top_p_sort_free``), and top-p alone sorts.
+    ``topk``. A loaded extension that predates those ops, or a checkout that
+    never built them, keeps top-k on ``topk``, top-p combined with top-k on
+    ``apply_top_k_top_p_sort_free``, and top-p alone on a sort. Greedy and the
+    Gumbel draw still use the older ops in that extension.
 
     The draw runs in a fused Gumbel-max kernel that hashes its noise per element
     from a per-row seed rather than materializing a ``[B, V]`` noise tensor.
@@ -103,7 +111,7 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.33.0) with two
         # Spyre changes: sort-free top-k / top-p and a log-space Gumbel draw.
         # Re-sync with upstream on a vLLM bump.
-        if has_sampling_kernels():
+        if has_topk_topp_kernels():
             logits = apply_top_k_top_p_kernels(logits, k, p)
         elif k is not None and p is not None:
             logits = apply_top_k_top_p_sort_free(logits, k, p)

@@ -79,7 +79,12 @@ inline __attribute__((always_inline)) vec_op::FP32Vec16 fast_exp(
 
 #elif defined(__x86_64__) && defined(__AVX2__)
 
-// Same algorithm as the AVX512 path on two 8-lane halves. Needs AVX2 + FMA.
+// Same algorithm as the AVX512 path on two 8-lane halves. FMA is enabled for
+// these two functions only: the rest of the AVX2 extension is built without
+// -mfma, and fast_exp is noinline so those ops stay out of its callers.
+#pragma GCC push_options
+#pragma GCC target("avx2,f16c,fma")
+
 inline __attribute__((always_inline)) __m256 fast_exp8(__m256 x) {
   const __m256 c1 = _mm256_set1_ps(0.999999701f);
   const __m256 c2 = _mm256_set1_ps(0.499991506f);
@@ -121,10 +126,12 @@ inline __attribute__((always_inline)) __m256 fast_exp8(__m256 x) {
   return _mm256_mul_ps(_mm256_mul_ps(poly, pow2), two);
 }
 
-inline __attribute__((always_inline)) vec_op::FP32Vec16 fast_exp(
+__attribute__((noinline)) inline vec_op::FP32Vec16 fast_exp(
     const vec_op::FP32Vec16& vec) {
   return vec_op::FP32Vec16(fast_exp8(vec.reg_low), fast_exp8(vec.reg_high));
 }
+
+#pragma GCC pop_options
 
 #elif defined(__s390x__)
 

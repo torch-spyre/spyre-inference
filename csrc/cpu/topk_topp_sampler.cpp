@@ -25,8 +25,9 @@
 //    value exactly when the pivot search does not land on it;
 //  * top-k + top-p runs top-p exactly on the top-k survivors, instead of
 //    upstream's full-vocab top-p pass.
-// Top-p alone is upstream's kernel: its cut can differ from a full sort by a
-// few boundary tokens.
+// Top-p alone is upstream's kernel, including a row whose k is outside (0, V)
+// in a batch that also has top-k rows. Its cut can differ from a full sort by
+// a few boundary tokens. It does not drop below the requested probability mass.
 
 #include "cpu_fast_exp.hpp"
 #include "cpu_types.hpp"
@@ -549,10 +550,26 @@ static void check_batch_float(const torch::Tensor& t,
 static void check_batch_int(const torch::Tensor& t, const torch::Tensor& logits,
                             const char* name) {
   TORCH_CHECK(t.is_cpu(), name, " must be CPU");
-  TORCH_CHECK(t.dtype() == torch::kInt32, name, " must be int32");
+  // vLLM passes k as int64. int32 stays accepted so a caller that already
+  // narrowed it does not have to copy.
+  TORCH_CHECK(t.dtype() == torch::kInt32 || t.dtype() == torch::kInt64, name,
+              " must be int32 or int64");
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
   TORCH_CHECK(t.dim() == 1 && t.size(0) == logits.size(0), name,
               " must be 1D with size == batch size");
+}
+
+// Row k, clamped into int. A value that does not fit still fails or passes
+// the `0 < k < V` test the same way an in-range value would.
+static int k_at(const torch::Tensor& k, int64_t b) {
+  const int64_t v = k.dtype() == torch::kInt64
+                        ? k.data_ptr<int64_t>()[b]
+                        : static_cast<int64_t>(k.data_ptr<int32_t>()[b]);
+  if (v >= static_cast<int64_t>(std::numeric_limits<int>::max()))
+    return std::numeric_limits<int>::max();
+  if (v <= static_cast<int64_t>(std::numeric_limits<int>::min()))
+    return std::numeric_limits<int>::min();
+  return static_cast<int>(v);
 }
 
 static float binary_search_buffer(const float* buf, int n, float p_val,
@@ -918,6 +935,29 @@ static void top_k_p_row(float* __restrict__ row, int V, int k_val, float p_val,
   }
 }
 
+namespace {
+
+// One scratch set per worker thread, shared by all three ops. Resized only
+// when that thread takes a row, so idle OpenMP threads do not each hold a
+// vocabulary-sized buffer.
+struct RowScratch {
+  std::vector<float> scratch;
+  std::vector<float> outliers;
+  std::vector<std::pair<float, int>> survivors;
+
+  void ensure(int64_t n) {
+    if (static_cast<int64_t>(scratch.size()) < n) scratch.resize(n);
+    if (static_cast<int64_t>(outliers.size()) < n) outliers.resize(n);
+  }
+};
+
+RowScratch& row_scratch() {
+  thread_local RowScratch tls;
+  return tls;
+}
+
+}  // namespace
+
 void cpu_topp_sampling(torch::Tensor& logits, const torch::Tensor& p) {
   check_logits(logits);
   check_batch_float(p, logits, "p");
@@ -929,19 +969,16 @@ void cpu_topp_sampling(torch::Tensor& logits, const torch::Tensor& p) {
   float* lp = logits.data_ptr<float>();
   const float* pp = p.data_ptr<float>();
 
-  // thread_local avoids reallocation across calls; resize skips zero-fill.
   // On POWER and Z, a single row stays on this thread: waking the OpenMP team
   // costs more than filtering it.
 #pragma omp parallel if (B > 1 || !kTrimIdleWork)
   {
-    thread_local std::vector<float> scratch_tls;
-    thread_local std::vector<float> outlier_tls;
-    if ((int64_t)scratch_tls.size() < V) scratch_tls.resize(V);
-    if ((int64_t)outlier_tls.size() < V) outlier_tls.resize(V);
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
-      top_p_row(lp + b * V, V_int, pp[b], scratch_tls.data(),
-                outlier_tls.data());
+      RowScratch& buf = row_scratch();
+      buf.ensure(V);
+      top_p_row(lp + b * V, V_int, pp[b], buf.scratch.data(),
+                buf.outliers.data());
     }
   }
 }
@@ -955,20 +992,18 @@ void cpu_topk_sampling(torch::Tensor& logits, const torch::Tensor& k) {
   const int V_int = static_cast<int>(V);
   if (V == 0) return;
   float* lp = logits.data_ptr<float>();
-  const int* kp = k.data_ptr<int>();
 
 #pragma omp parallel if (B > 1 || !kTrimIdleWork)
   {
-    thread_local std::vector<float> scratch_tls;
-    thread_local std::vector<float> outlier_tls;
-    if ((int64_t)scratch_tls.size() < V) scratch_tls.resize(V);
-    if ((int64_t)outlier_tls.size() < V) outlier_tls.resize(V);
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
-      int kv = kp[b];
-      if (kv > 0 && kv < V_int)
-        top_k_row(lp + b * V, V_int, kv, scratch_tls.data(),
-                  outlier_tls.data());
+      int kv = k_at(k, b);
+      if (kv > 0 && kv < V_int) {
+        RowScratch& buf = row_scratch();
+        buf.ensure(V);
+        top_k_row(lp + b * V, V_int, kv, buf.scratch.data(),
+                  buf.outliers.data());
+      }
     }
   }
 }
@@ -984,26 +1019,24 @@ void cpu_topk_topp_sampling(torch::Tensor& logits, const torch::Tensor& k,
   const int V_int = static_cast<int>(V);
   if (V == 0) return;
   float* lp = logits.data_ptr<float>();
-  const int* kp = k.data_ptr<int>();
   const float* pp = p.data_ptr<float>();
 
 #pragma omp parallel if (B > 1 || !kTrimIdleWork)
   {
-    thread_local std::vector<float> scratch_tls;
-    thread_local std::vector<float> outlier_tls;
-    thread_local std::vector<std::pair<float, int>> survivors_tls;
-    if ((int64_t)scratch_tls.size() < V) scratch_tls.resize(V);
-    if ((int64_t)outlier_tls.size() < V) outlier_tls.resize(V);
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
+      RowScratch& buf = row_scratch();
+      buf.ensure(V);
       float* row = lp + b * V;
-      int kv = kp[b];
+      int kv = k_at(k, b);
       float pv = pp[b];
+      // k outside (0, V) is top-p alone, same approximate kernel as a batch
+      // that has no top-k at all.
       if (kv > 0 && kv < V_int) {
-        top_k_p_row(row, V_int, kv, pv, scratch_tls.data(), outlier_tls.data(),
-                    survivors_tls);
+        top_k_p_row(row, V_int, kv, pv, buf.scratch.data(), buf.outliers.data(),
+                    buf.survivors);
       } else {
-        top_p_row(row, V_int, pv, scratch_tls.data(), outlier_tls.data());
+        top_p_row(row, V_int, pv, buf.scratch.data(), buf.outliers.data());
       }
     }
   }

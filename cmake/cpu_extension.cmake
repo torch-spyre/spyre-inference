@@ -69,8 +69,10 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     "-mavx512vl"
     "-mavx512bw"
     "-mavx512dq")
-  # The AVX2 fast exp in cpu_fast_exp.hpp uses FMA.
-  set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2" "-mfma")
+  # No -mfma here. cpu_fast_exp.hpp enables FMA for the AVX2 exp only, so the
+  # Gumbel and rejection objects keep the instructions they had before, and an
+  # AVX2 host without FMA is not handed an extension full of FMA ops.
+  set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2")
 
   # Both are installed; spyre_inference picks one at import from the host ISA.
   define_extension_target(

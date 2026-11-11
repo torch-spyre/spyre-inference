@@ -290,7 +290,10 @@ def _fake_build(monkeypatch, pr_files, matrices, junit="baseline", legs_with_jun
     def read(repo, a, sfx, parse):
         if a["name"].startswith("durations-data-"):
             return _baseline()
-        return None if junit is None else _collected(_baseline())
+        if junit is None:
+            return None
+        keys = _collected(_baseline() if junit == "baseline" else junit)
+        return ctr.Junit(keys, keys)
 
     monkeypatch.setattr(ctr, "read_artifact", read)
     monkeypatch.setattr(ctr, "baseline_runs", lambda *a: [({"head_sha": "b"}, _baseline())] * 5)
@@ -535,3 +538,29 @@ def test_junit_keys_match_real_pytest_output():
     assert all(ctr.junit_key(n) in cases for n in _PYTEST_IDS)
     # A class on a path-less (upstream) id keeps the empty module component.
     assert ctr.junit_key("::TestUpstream::test_method[p]") == (".TestUpstream", "test_method[p]")
+
+
+def test_junit_tells_executed_from_skipped():
+    xml = b"""<testsuite>
+      <testcase classname="m" name="ran"/>
+      <testcase classname="m" name="xf"><skipped type="pytest.xfail"/></testcase>
+      <testcase classname="m" name="sk"><skipped type="pytest.skip"/></testcase>
+    </testsuite>"""
+    j = ctr.junit_cases(xml)
+    assert j.executed == {("m", "ran"), ("m", "xf")} and ("m", "sk") in j
+
+
+def test_executed_tests_without_durations_give_no_verdict(monkeypatch):
+    # The leg's JUnit shows a test that ran, but its duration file never got written.
+    tip = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    junit = {**_baseline(), "tests/c.py::test_new": 600.0}
+    r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": tip}, junit=junit)
+    assert isinstance(r, str) and "1 tests the PR run executed have no recorded duration" in r
+
+
+def test_a_non_object_durations_file_is_unreadable():
+    try:
+        ctr._durations(b"[]")
+    except ValueError:
+        return
+    raise AssertionError("accepted a list")

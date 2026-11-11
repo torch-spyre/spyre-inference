@@ -129,10 +129,29 @@ class _NoDTD(ET.TreeBuilder):
         raise ValueError("DTD refused")
 
 
-def junit_cases(xml: bytes) -> set[tuple[str, str]]:
-    """(classname, name) of every collected case, skipped ones included."""
+@dataclass
+class Junit:
+    cases: set[tuple[str, str]] = field(default_factory=set)  # collected, skips included
+    executed: set[tuple[str, str]] = field(default_factory=set)  # ran a call phase
+
+    def __contains__(self, key: tuple[str, str]) -> bool:
+        return key in self.cases
+
+    def __or__(self, other: Junit) -> Junit:
+        return Junit(self.cases | other.cases, self.executed | other.executed)
+
+
+def junit_cases(xml: bytes) -> Junit:
     root = ET.fromstring(xml, parser=ET.XMLParser(target=_NoDTD()))
-    return {(c.get("classname") or "", c.get("name") or "") for c in root.iter("testcase")}
+    out = Junit()
+    for c in root.iter("testcase"):
+        key = (c.get("classname") or "", c.get("name") or "")
+        out.cases.add(key)
+        skipped = c.find("skipped")
+        # An xfail runs its call phase, so it has a duration like a pass.
+        if skipped is None or "xfail" in (skipped.get("type") or ""):
+            out.executed.add(key)
+    return out
 
 
 def junit_key(nodeid: str) -> tuple[str, str]:
@@ -411,7 +430,10 @@ def read_artifact(repo: str, artifact: dict, suffix: str, parse):
 
 
 def _durations(blob: bytes) -> dict[str, float]:
-    return clean_durations(json.loads(blob))
+    data = json.loads(blob)
+    if not isinstance(data, dict):
+        raise ValueError("durations must be a JSON object")
+    return clean_durations(data)
 
 
 def read_json_artifact(repo: str, artifact: dict) -> dict[str, float]:
@@ -571,7 +593,14 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
         return "some of the PR run's duration or JUnit artifacts could not be read"
     slices = {name[len("durations-data-") :]: d for name, d in zip(slices_meta, data)}
     pr_tests = merge_pr_legs(slices, suites)
-    collected = set().union(*cases)
+    junit = Junit()
+    for c in cases:
+        junit |= c
+    # A leg can upload JUnit but no durations (the write is best-effort); its tests'
+    # time would silently count as zero.
+    unmeasured = junit.executed - {junit_key(n) for n in pr_tests}
+    if unmeasured:
+        return f"{len(unmeasured)} tests the PR run executed have no recorded duration"
 
     bases = baseline_runs(repo, pr["base"]["ref"], run["created_at"])
     if not bases:
@@ -579,7 +608,7 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr)
     if base_only is None:
         return f"{pr['base']['ref']} moved too far past its newest green baseline run"
-    return compute(pr_tests, [d for _, d in bases], legs, collected, base_only)
+    return compute(pr_tests, [d for _, d in bases], legs, junit.cases, base_only)
 
 
 def find_comment(repo: str, number: int) -> dict | None:

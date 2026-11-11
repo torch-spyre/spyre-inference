@@ -258,6 +258,7 @@ def _matrix(*cfgs):
 
 def _fake_build(monkeypatch, pr_files, matrices, junit="baseline", legs_with_junit=9):
     run = {"id": 1, "head_sha": "head", "created_at": "2026-11-10T12:00:00Z", "run_attempt": 1}
+    run["referenced_workflows"] = [{"path": f"o/r/{ctr.MATRIX_PATH}@merge", "sha": "merge"}]
     pr = {"number": 7, "base": {"ref": "main"}}
     arts = [{"name": "durations-data-0", "id": 1}]
     arts += [{"name": f"junit-t{i}", "id": 2 + i} for i in range(legs_with_junit)]
@@ -286,7 +287,7 @@ def test_new_legs_are_diffed_against_the_merge_base(monkeypatch):
     )
     # The base tip gained a shard since the PR forked.
     tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
-    matrices = {"fork": fork, "head": head, "main": tip}
+    matrices = {"fork": fork, "head": head, "merge": tip}
     r = _fake_build(monkeypatch, {ctr.MATRIX_PATH}, matrices)
     assert r.leg_delta == {"Probes": 1}
     assert r.net_s == ctr.LEG_OVERHEAD_S
@@ -294,7 +295,7 @@ def test_new_legs_are_diffed_against_the_merge_base(monkeypatch):
 
 def test_a_pr_that_leaves_the_matrix_alone_adds_no_legs(monkeypatch):
     tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
-    r = _fake_build(monkeypatch, {"tests/x.py"}, {"main": tip, "head": _matrix()})
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"merge": tip, "head": _matrix()})
     assert r.leg_delta == {} and r.net_s == 0
     assert "unchanged" in ctr.render_summary(r)
 
@@ -363,13 +364,13 @@ def test_read_json_artifact_survives_garbage(monkeypatch):
 def test_a_run_missing_a_legs_junit_is_skipped(monkeypatch):
     # A green run whose second leg never got a runner: no JUnit, so no verdict.
     tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
-    r = _fake_build(monkeypatch, {"tests/x.py"}, {"main": tip}, legs_with_junit=1)
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"merge": tip}, legs_with_junit=1)
     assert isinstance(r, str) and "1 regression legs" in r and "shard 2/2" in r
 
 
 def test_an_unreadable_artifact_is_skipped(monkeypatch):
     tip = _matrix(("Smoke (shard 1/1)", "regression trunk"))
-    r = _fake_build(monkeypatch, {"tests/x.py"}, {"main": tip}, junit=None)
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"merge": tip}, junit=None)
     assert isinstance(r, str) and "could not be read" in r
 
 
@@ -433,3 +434,22 @@ def test_a_new_test_in_a_file_both_sides_changed_is_not_charged():
     pr = _pr({**_baseline(), "tests/shared.py::test_main": 900.0, "tests/shared.py::test_pr": 10.0})
     r = ctr.compute(pr, [_baseline()] * 5, base_only_files={"tests/shared.py"})
     assert r.new == [] and len(r.on_base) == 2 and not r.over
+
+
+def test_slots_decode_with_the_matrix_the_run_executed(monkeypatch):
+    # The base tip has since put "Quality" first; slot 0 of this run was still "Smoke".
+    ran = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    tip = _matrix(("Quality (shard 1/1)", "regression trunk"), ("Smoke (shard 1/1)", "regression"))
+    pr = _pr({**_baseline(), "tests/c.py::test_new": 60.0})
+    monkeypatch.setattr(
+        ctr,
+        "merge_pr_legs",
+        lambda slices, suites: {n: (s, suites["0"]) for n, (s, _) in pr.items()},
+    )
+    r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": ran, "main": tip})
+    assert [t.suite for t in r.new] == ["Smoke"]
+
+
+def test_an_unknown_executed_matrix_gives_no_verdict(monkeypatch):
+    r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": "jobs: {}\n"})
+    assert isinstance(r, str) and "matrix this run executed" in r

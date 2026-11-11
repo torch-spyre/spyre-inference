@@ -508,23 +508,34 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     if not slices_meta:
         return "the PR run recorded no test durations (matrix skipped or handed to Jenkins)"
 
+    # Slots index the matrix the run executed: its merge commit's, which
+    # referenced_workflows pins.
+    ran = [
+        w["sha"]
+        for w in run.get("referenced_workflows") or []
+        if w.get("path", "").split("@")[0].endswith(MATRIX_PATH)
+    ]
+    try:
+        run_legs = matrix_legs(file_at(repo, MATRIX_PATH, ran[0])) if ran else []
+    except subprocess.CalledProcessError:
+        run_legs = []
+    if not run_legs:
+        return "the matrix this run executed could not be read"
     pr_files = pr_changed_files(repo, pr["number"])
-    # The run used the base tip's matrix unless the PR edits it; diff legs against the
-    # merge base so legs the base branch added since don't count as removed.
-    base_legs = matrix_legs(file_at(repo, MATRIX_PATH, pr["base"]["ref"]))
-    head_legs, legs = base_legs, {}
+    legs = {}
     if MATRIX_PATH in pr_files:
-        head_legs = matrix_legs(file_at(repo, MATRIX_PATH, run["head_sha"]))
+        # Against the merge base, so legs the base branch added since don't read as removed.
         cmp = gh_json(f"/repos/{repo}/compare/{pr['base']['ref']}...{run['head_sha']}")
+        head_legs = matrix_legs(file_at(repo, MATRIX_PATH, run["head_sha"]))
         fork_legs = matrix_legs(file_at(repo, MATRIX_PATH, cmp["merge_base_commit"]["sha"]))
         legs = leg_delta(tier_leg_counts(head_legs), tier_leg_counts(fork_legs))
     failed = list(newest_by_name(artifacts, f"failed-suite-{run.get('run_attempt', 1)}-"))
-    suites = slot_suites(head_legs, failed)
+    suites = slot_suites(run_legs, failed)
 
     junit_meta = newest_by_name(artifacts, "junit-")
     # A green run can still miss legs (e.g. a runner that never came up, which the
     # pod-level retry doesn't catch); their tests would read as removed.
-    missing = missing_legs(head_legs, junit_meta)
+    missing = missing_legs(run_legs, junit_meta)
     if missing:
         return f"{len(missing)} {TIER} legs uploaded no JUnit report ({', '.join(missing[:5])})"
     with ThreadPoolExecutor(max_workers=8) as pool:

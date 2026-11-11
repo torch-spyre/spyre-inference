@@ -11,6 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Translated from vLLM's MRV2 Triton kernels (https://github.com/vllm-project/vllm,
+// vllm/v1/worker/gpu), Copyright contributors to the vLLM project, Apache-2.0.
+//
+// philox is translated from Triton's python/triton/language/random.py
+// (https://github.com/triton-lang/triton), Copyright 2018-2020 Philippe Tillet,
+// Copyright 2020-2022 OpenAI, MIT; see LICENSE.triton in this directory.
 
 // MRV2 spec-decode host kernels: the rejection sampler
 // (gpu/spec_decode/rejection_sampler{,_utils}.py) and DFlash input prep

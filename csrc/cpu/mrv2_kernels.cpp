@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Portions adapted from vLLM (https://github.com/vllm-project/vllm),
-// Copyright contributors to the vLLM project, Apache-2.0.
+// Translated from vLLM's MRV2 Triton kernels (https://github.com/vllm-project/vllm,
+// vllm/v1/worker/gpu), Copyright contributors to the vLLM project, Apache-2.0.
+//
+// philox4x32_10 and uint_to_uniform_float are translated from Triton's
+// python/triton/language/random.py (https://github.com/triton-lang/triton),
+// Copyright 2018-2020 Philippe Tillet, Copyright 2020-2022 OpenAI, MIT; see
+// LICENSE.triton in this directory.
 
 // Host replacements for MRV2's Triton kernels (vllm/v1/worker/gpu). Each op
 // takes the launch grid followed by the Triton kernel's own arguments, in

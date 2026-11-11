@@ -58,6 +58,7 @@ _TOP_N = 5
 _SLOW_S = 30.0
 _SUMMARY_ROWS = 200
 _MAX_BASE_COMMITS = 30
+_MAX_BASELINE_PAGES = 5
 
 
 @dataclass
@@ -445,22 +446,24 @@ def latest_pr_run(repo: str, pr: dict) -> dict | None:
 
 
 def baseline_runs(repo: str, branch: str, before: str) -> list[tuple[dict, dict[str, float]]]:
-    runs = gh_json(
-        f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs"
-        f"?branch={urllib.parse.quote(branch, safe='')}&event=push"
-        f"&status=success&per_page=30"
-    )["workflow_runs"]
     out = []
-    for run in runs:
-        if run["created_at"] > before:
-            continue
-        arts = newest_by_name(run_artifacts(repo, run["id"]), "test-durations")
-        art = arts.get("test-durations")
-        if art:
-            data = read_json_artifact(repo, art)
+    query = (
+        f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs"
+        f"?branch={urllib.parse.quote(branch, safe='')}&event=push&status=success"
+        f"&created={urllib.parse.quote('<=' + before, safe='')}&per_page=30"
+    )
+    for page in range(1, _MAX_BASELINE_PAGES + 1):
+        runs = gh_json(f"{query}&page={page}")["workflow_runs"]
+        for run in runs:
+            art = newest_by_name(run_artifacts(repo, run["id"]), "test-durations").get(
+                "test-durations"
+            )
+            data = read_json_artifact(repo, art) if art else {}
             if data:
                 out.append((run, data))
-        if len(out) == BASELINE_RUNS:
+            if len(out) == BASELINE_RUNS:
+                return out
+        if len(runs) < 30:
             break
     return out
 
@@ -488,12 +491,11 @@ def base_only_test_files(
         cmp = gh_json(f"/repos/{repo}/compare/{newest_base_sha}...{pr['base']['ref']}")
     except subprocess.CalledProcessError:
         return None
-    commits = [
-        c
-        for c in cmp.get("commits", [])
-        if c["commit"]["committer"]["date"] <= pr_run["created_at"]
-    ]
-    if cmp.get("total_commits", 0) > _MAX_BASE_COMMITS or len(commits) > _MAX_BASE_COMMITS:
+    listed = cmp.get("commits", [])
+    commits = [c for c in listed if c["commit"]["committer"]["date"] <= pr_run["created_at"]]
+    # The listing is oldest first and capped; it must reach past the PR run to be complete.
+    complete = cmp.get("total_commits", 0) <= len(listed) or len(commits) < len(listed)
+    if not complete or len(commits) > _MAX_BASE_COMMITS:
         return None
     files: set[str] = set()
     for c in commits:

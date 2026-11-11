@@ -424,9 +424,17 @@ def test_base_changed_files_exclude_commits_after_the_pr_run(monkeypatch):
 
 def test_a_far_moved_base_branch_gives_no_verdict(monkeypatch):
     run = {"created_at": "2026-11-10T12:00:00Z"}
+    pr = {"base": {"ref": "main"}}
     old = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
-    _fake_compare(monkeypatch, [old], total=ctr._MAX_BASE_COMMITS + 1)
-    assert ctr.base_only_test_files("o/r", "base", run, {"base": {"ref": "main"}}) is None
+    new = {"sha": "b", "commit": {"committer": {"date": "2026-11-10T13:00:00Z"}}}
+    _fake_compare(monkeypatch, [old] * (ctr._MAX_BASE_COMMITS + 1))
+    assert ctr.base_only_test_files("o/r", "base", run, pr) is None
+    # A truncated listing that never reaches past the PR run is not trusted either.
+    _fake_compare(monkeypatch, [old], total=300)
+    assert ctr.base_only_test_files("o/r", "base", run, pr) is None
+    # Commits merged after the PR run don't count toward the cap.
+    _fake_compare(monkeypatch, [old] + [new] * 40, total=300)
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/shared.py"}
 
 
 def test_a_new_test_in_a_file_both_sides_changed_is_not_charged():
@@ -453,3 +461,24 @@ def test_slots_decode_with_the_matrix_the_run_executed(monkeypatch):
 def test_an_unknown_executed_matrix_gives_no_verdict(monkeypatch):
     r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": "jobs: {}\n"})
     assert isinstance(r, str) and "matrix this run executed" in r
+
+
+def test_baselines_are_searched_before_the_pr_run_and_paged(monkeypatch):
+    queries = []
+    full = [{"id": i} for i in range(30)]  # first page: no durations artifacts kept
+
+    def gh(path, **kw):
+        queries.append(path)
+        return {"workflow_runs": full if "page=1" in path else [{"id": 99}] * 5}
+
+    monkeypatch.setattr(ctr, "gh_json", gh)
+    monkeypatch.setattr(
+        ctr, "run_artifacts", lambda repo, rid: [{"name": "test-durations", "id": rid}]
+    )
+    monkeypatch.setattr(
+        ctr, "read_json_artifact", lambda repo, a: _baseline() if a["id"] == 99 else {}
+    )
+    out = ctr.baseline_runs("o/r", "main", "2026-11-03T23:39:08Z")
+    assert len(out) == ctr.BASELINE_RUNS
+    assert "created=%3C%3D2026-11-03T23%3A39%3A08Z" in queries[0]
+    assert "page=2" in queries[-1]

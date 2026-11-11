@@ -68,15 +68,25 @@ def test_warmup_compiles_every_row_bucket_a_body_bucket_holds():
     assert projected == [1, 2, 4, 16, 16]
 
 
-@pytest.mark.parametrize("num_tokens,skips", [(3, True), (40, False)])
-def test_only_decode_on_its_own_row_bucket_skips_the_gather(monkeypatch, num_tokens, skips):
+@pytest.mark.parametrize(
+    "indices,num_tokens,skips",
+    [
+        ([0, 1, 2], 3, True),
+        ([0, 1, 2], 40, False),
+        # Mixed prefill/decode whose padded rows match its own body bucket still gathers.
+        ([0, 1, 3], 4, False),
+    ],
+)
+def test_only_decode_on_its_own_row_bucket_skips_the_gather(
+    monkeypatch, indices, num_tokens, skips
+):
     runner = object.__new__(mr.TorchSpyreModelRunner)
     runner.model = _wrapper([1, 2, 4], [])
     runner.spyre_shape_bucketer = types.SimpleNamespace(
         warmed_bucket=lambda n: next(b for b in (1, 2, 4, 512) if b >= n)
     )
     monkeypatch.setattr(
-        mr.GPUModelRunner, "_prepare_inputs", lambda *a, **k: (torch.tensor([0, 1, 2]), None, 1)
+        mr.GPUModelRunner, "_prepare_inputs", lambda *a, **k: (torch.tensor(indices), None, 1)
     )
     scheduler_output = types.SimpleNamespace(total_num_scheduled_tokens=num_tokens)
 
@@ -113,7 +123,6 @@ def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
 
     monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", convert)
     monkeypatch.setattr(mr.attn_layer, "publish_null_slots", lambda _: None)
-    monkeypatch.setenv("SPYRE_SAMPLE_ROWS_ON_DEVICE", "1")
     model = lambda **kwargs: device_hidden
     wrapper = mr._SpyreModelWrapper(model, torch.device("spyre"), model_dtype=torch.float16)
 

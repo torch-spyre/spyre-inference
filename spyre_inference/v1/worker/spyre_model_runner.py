@@ -87,7 +87,7 @@ from spyre_inference.v1.pool.encoder_grid import (
     unpad_encoder_grid,
 )
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
-from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.sampler import greedy_sample, install_rank0_sampling
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre, compile_granularity
 from spyre_inference.v1.worker.encoder_grid import (
@@ -615,11 +615,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper(), use_spyre_dflash_proposer():
             super().__init__(vllm_config, torch.device("cpu"))
         # Patch upstream's Sampler in place, so every holder of it (e.g. the
-        # RejectionSampler) takes the host-side draws.
+        # RejectionSampler, which calls it for the bonus token) takes the
+        # host-side draws and, at TP>1, rank 0's tokens.
         self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
             self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
         )
         self.sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]
+        install_rank0_sampling(self.sampler)
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre

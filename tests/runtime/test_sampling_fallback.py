@@ -18,17 +18,20 @@ Runs whether or not the extension is built: every test forces the fallback."""
 
 import inspect
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
+import vllm.distributed.parallel_state as parallel_state
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.v1.sample import sampler, topk_topp_sampler
-from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.sampler import greedy_sample, install_rank0_sampling
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -113,6 +116,91 @@ def test_topk_draw_stays_in_kept_set() -> None:
     k = torch.full((64,), 5)
     out = SpyreTopKTopPSampler("raw_logprobs", False).forward_native(logits.clone(), {}, k, None)[0]
     assert (out.unsqueeze(1) == logits.topk(5).indices).any(dim=1).all()
+
+
+class _TpGroup:
+    def __init__(self, first: bool, world_size: int = 2) -> None:
+        self.world_size = world_size
+        self.is_first_rank = first
+        self.ranks = [3, 4]
+        self.cpu_group = object()
+        self.broadcasts: list[tuple[Any, int]] = []
+
+    def broadcast_object(self, obj: Any, src: int = 0) -> Any:
+        self.broadcasts.append((obj, src))
+        # A real broadcast delivers rank 0's object to every rank.
+        return "lp"
+
+
+def _install_tp(monkeypatch: pytest.MonkeyPatch, group: _TpGroup | None) -> None:
+    monkeypatch.setattr(parallel_state, "_TP", object() if group is not None else None)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+
+
+def test_single_rank_samples_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[torch.Tensor] = []
+
+    def forward(
+        self, logits, sampling_metadata, predict_bonus_token=False, logprobs_mode_override=None
+    ):
+        calls.append(logits)
+        return SamplerOutput(sampled_token_ids=torch.zeros(logits.shape[0], 1, dtype=torch.int32))
+
+    def fail_broadcast(*args: object, **kwargs: object) -> None:
+        raise AssertionError("broadcast")
+
+    monkeypatch.setattr(Sampler, "forward", forward)
+    monkeypatch.setattr(torch.distributed, "broadcast", fail_broadcast)
+
+    layer = Sampler()
+    install_rank0_sampling(layer)
+    logits = torch.zeros(2, 4)
+    _install_tp(monkeypatch, None)
+    out = layer(logits, sampling_metadata=None)  # ty: ignore[invalid-argument-type]
+    assert out.sampled_token_ids.shape == (2, 1)
+    _install_tp(monkeypatch, _TpGroup(first=True, world_size=1))
+    layer(logits, sampling_metadata=None)  # ty: ignore[invalid-argument-type]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["rank0", "other"])
+def test_tp_samples_on_rank0_and_broadcasts_over_cpu_group(
+    monkeypatch: pytest.MonkeyPatch, first: bool
+) -> None:
+    tokens = torch.tensor([[4], [9]], dtype=torch.int32)
+    sampled: list[int] = []
+    tp = _TpGroup(first)
+
+    def forward(
+        self, logits, sampling_metadata, predict_bonus_token=False, logprobs_mode_override=None
+    ):
+        sampled.append(1)
+        return SamplerOutput(
+            sampled_token_ids=tokens.clone(),
+            logprobs_tensors="lp",  # ty: ignore[invalid-argument-type]
+        )
+
+    def broadcast(tensor: torch.Tensor, src: int, group: object) -> None:
+        assert src == tp.ranks[0]
+        assert group is tp.cpu_group
+        if not tp.is_first_rank:
+            tensor.copy_(tokens)
+
+    monkeypatch.setattr(Sampler, "forward", forward)
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+    _install_tp(monkeypatch, tp)
+
+    layer = Sampler()
+    install_rank0_sampling(layer)
+    out = layer(
+        torch.zeros(2, 4),
+        sampling_metadata=None,  # ty: ignore[invalid-argument-type]
+    )
+
+    assert torch.equal(out.sampled_token_ids, tokens)
+    assert out.logprobs_tensors == "lp"
+    assert tp.broadcasts == [("lp" if first else None, 0)]
+    assert sampled == ([1] if first else [])
 
 
 def test_fallback_seeded_requests_are_reproducible() -> None:

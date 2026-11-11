@@ -139,7 +139,7 @@ def test_runner_installs_spyre_topk_sampler() -> None:
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
 
-    from spyre_inference.v1.sample.sampler import greedy_sample
+    from spyre_inference.v1.sample.sampler import _sample_on_one_tp_rank, greedy_sample
     from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
     vllm_config = VllmConfig(
@@ -155,3 +155,4 @@ def test_runner_installs_spyre_topk_sampler() -> None:
     runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
     assert runner.sampler.greedy_sample is greedy_sample
     assert type(runner.sampler.topk_topp_sampler) is SpyreTopKTopPSampler
+    assert runner.sampler.forward.__func__ is _sample_on_one_tp_rank

@@ -22,7 +22,7 @@ from torch._dynamo.testing import CompileCounter
 from torch.utils._config_module import install_config_module
 
 from spyre_inference import envs
-from spyre_inference.v1.attention.backends.spyre_head_major_attn import _run_with_capped_cores
+from spyre_inference.v1.attention.backends.spyre_attn import _run_with_capped_cores
 
 
 def _core_count() -> int:

@@ -265,7 +265,7 @@ def _bare_embedding(cls, *, vocab: int, positions: int, types: int, hidden: int)
     emb.LayerNorm = nn.LayerNorm(hidden, eps=1e-5)
     emb.spyre_token_type_ids = None
     emb.spyre_compile_enabled = False
-    emb.spyre_compiled_kernel = None
+    emb.spyre_compiled_kernels = {}
     return emb
 
 

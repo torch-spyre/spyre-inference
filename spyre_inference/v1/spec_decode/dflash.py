@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +28,7 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.worker.kv_cache_setup import split_attn_groups_by_window
 
 if TYPE_CHECKING:
     from spyre_inference.models.qwen3_dflash import SpyreDFlashQwen3ForCausalLM
@@ -71,12 +73,44 @@ class SpyreDFlashProposer(DFlashProposer):
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None):
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        groups = [[] for _ in kv_cache_config.kv_cache_groups]
+        groups[self.kv_cache_gid] = self.draft_attn_groups
+        split_attn_groups_by_window(
+            groups, self.vllm_config.compilation_config.static_forward_context
+        )
+        self.draft_attn_groups = groups[self.kv_cache_gid]
+        causal_by_layer = dict(
+            zip(
+                self.model.get_draft_kv_cache_layer_names(),
+                self.model.get_draft_attn_causal(),
+                strict=True,
+            )
+        )
+        self._draft_group_causal = []
         # Upstream constructs each builder before appending the other layers.
         # Spyre binds KV write holders at construction, so bind the complete group.
         for group in self.draft_attn_groups:
+            causal = causal_by_layer[group.layer_names[0]]
+            assert all(causal_by_layer[name] == causal for name in group.layer_names)
+            if not causal and not group.backend.supports_non_causal():
+                raise ValueError(
+                    f"{group.backend.get_name()} does not support non-causal DFlash draft attention"
+                )
+            self._draft_group_causal.append(causal)
             group.create_metadata_builders(
                 self.vllm_config, self.device, kernel_block_size=self.block_size
             )
+
+    def build_per_group_and_layer_attn_metadata(self, cad, draft_index=0):
+        per_group, per_layer = [], {}
+        for group, causal in zip(self.draft_attn_groups, self._draft_group_causal, strict=True):
+            metadata = group.build_metadata_for_drafting(
+                common_attn_metadata=replace(cad, causal=causal), draft_index=draft_index
+            )
+            per_group.append(metadata)
+            for name in group.layer_names:
+                per_layer[name] = metadata
+        return per_group, per_layer
 
     def dummy_run(
         self, num_tokens, use_cudagraphs=True, is_graph_capturing=False, slot_mappings=None

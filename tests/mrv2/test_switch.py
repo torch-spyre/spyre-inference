@@ -77,6 +77,69 @@ def test_runner_switch(
     assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == use_v2
 
 
+@pytest.mark.parametrize(
+    ("feature", "configure"),
+    [
+        pytest.param(
+            "speculative decoding",
+            lambda c: setattr(c, "speculative_config", object()),
+            id="spec-decode",
+        ),
+        pytest.param(
+            "batch-sharded sampling",
+            lambda c: setattr(c.parallel_config, "enable_batch_sharded_sampling", True),
+            id="batch-sharded-sampling",
+        ),
+        pytest.param(
+            "cudagraph_mm_encoder",
+            lambda c: setattr(c.compilation_config, "cudagraph_mm_encoder", True),
+            id="cudagraph-mm-encoder",
+        ),
+        pytest.param(
+            "prefill context parallelism",
+            lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
+            id="pcp",
+        ),
+    ],
+)
+def test_unsupported_v2_features_fail_at_startup(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig, feature: str, configure
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    configure(vllm_config)
+
+    with pytest.raises(ValueError, match=f"V2 model runner does not support {feature}"):
+        TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_a_plain_v2_config_passes_the_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_v2_check_and_update_config_runs_the_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    vllm_config.compilation_config.cudagraph_mm_encoder = True
+
+    with pytest.raises(ValueError, match="does not support cudagraph_mm_encoder"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_v1_skips_the_v2_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v1")
+    calls = []
+    record = classmethod(lambda cls, config: calls.append(config))
+    monkeypatch.setattr(TorchSpyrePlatform, "_reject_unsupported_v2_features", record)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert calls == []
+
+
 def test_unknown_runner_is_rejected(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:

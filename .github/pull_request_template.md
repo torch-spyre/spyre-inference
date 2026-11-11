@@ -19,3 +19,4 @@
 - [ ] I have added tests for my changes (if applicable)
 - [ ] I have updated the documentation (if applicable)
 - [ ] My commits include a `Signed-off-by:` line (DCO compliance)
+- [ ] My commits are signed with a GPG or SSH key registered on GitHub (`git commit -S`)

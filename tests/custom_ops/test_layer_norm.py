@@ -55,7 +55,7 @@ def test_spyre_layer_norm_cpu_matches_reference(default_vllm_config, elementwise
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
-    assert layer.spyre_compiled_kernel is None
+    assert not layer.spyre_compiled_kernels
 
 
 @pytest.mark.layer_norm
@@ -86,12 +86,12 @@ def test_spyre_layer_norm_matches_reference_on_spyre(
     actual = layer(x.to("spyre"))
 
     assert actual.device.type == "spyre"
-    assert layer.spyre_compiled_kernel is not None  # lazily compiled and cached
+    assert layer.spyre_compiled_kernels  # lazily compiled and cached
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
-    kernel_after_first_call = layer.spyre_compiled_kernel
+    kernels_after_first_call = dict(layer.spyre_compiled_kernels)
     layer(x.to("spyre"))
-    assert layer.spyre_compiled_kernel is kernel_after_first_call  # reused, not rebuilt
+    assert layer.spyre_compiled_kernels == kernels_after_first_call  # reused, not rebuilt
 
 
 @pytest.mark.layer_norm
@@ -122,7 +122,7 @@ def test_spyre_layer_norm_compiles_in_eager_mode():
         layer = SpyreLayerNorm(64, eps=1e-5).to(torch.float16).to("spyre")
         layer(torch.randn(2, 64, dtype=torch.float16).to("spyre"))
 
-    assert layer.spyre_compiled_kernel is not None
+    assert layer.spyre_compiled_kernels
 
 
 @pytest.mark.layer_norm
@@ -179,7 +179,7 @@ def test_spyre_layer_norm_inline_inside_compiled_graph(default_vllm_config):
     actual = compiled(x.to("spyre"))
 
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
-    assert layer.spyre_compiled_kernel is None
+    assert not layer.spyre_compiled_kernels
 
 
 if __name__ == "__main__":

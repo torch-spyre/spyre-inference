@@ -79,10 +79,16 @@ _COSINE_MIN = 0.99
         pytest.param(
             (
                 "joerunde/gemma-4-moe-nano",
-                " street and ball ball. people's hats off then I account it high time",
+                " street and methodically knocking people's hats off then I account it high time",
                 GEMMA4_TEXT_BACKBONE_OVERRIDE,
             ),
             marks=pytest.mark.e2e_smoke,
+        ),
+        # Per-layer embeddings and cross-layer KV sharing.
+        (
+            "google/gemma-4-E2B",
+            "\n\nWhat is the main business of IBM?\n\nWhat is the main business of",
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
     ],
     ids=[
@@ -91,6 +97,7 @@ _COSINE_MIN = 0.99
         "gemma-3-1b-it",
         "gemma-4-31B-text",
         "gemma-4-moe-nano-text",
+        "gemma-4-E2B-text",
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,3 +255,9 @@ def _assert_compiled_output(
     assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"
     if prompt_logprobs is not None:
         assert output[0].prompt_logprobs, "No prompt logprobs returned!"
+    # Sized from the card's free memory, which far exceeds what the batch needs.
+    cache_config = engine.llm_engine.vllm_config.cache_config
+    batch_blocks = kwargs["max_num_seqs"] * math.ceil(
+        kwargs["max_model_len"] / cache_config.block_size
+    )
+    assert cache_config.num_gpu_blocks > batch_blocks + 1

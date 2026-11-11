@@ -50,6 +50,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
     ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "GptOssForCausalLM": "spyre_inference.models.gpt_oss:SpyreGptOssForCausalLM",
+    "Granite4VisionForConditionalGeneration": (
+        "spyre_inference.models.granite4_vision:SpyreGranite4VisionForConditionalGeneration"
+    ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
@@ -159,8 +163,10 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     has cached the upstream class of a multimodal architecture such as CLIP.
     """
     from spyre_inference.models import clip, gemma4, muse_glimmer
+    from spyre_inference.models._prelaunch import load_hf_config
 
     register_models()
-    gemma4.force_text_backbone(engine_args)
-    clip.force_disable_chunked_prefill(engine_args)
-    muse_glimmer.force_language_model_only(engine_args)
+    hf_config = load_hf_config(engine_args)
+    gemma4.force_text_backbone(engine_args, hf_config)
+    clip.force_disable_chunked_prefill(engine_args, hf_config)
+    muse_glimmer.disable_vision(engine_args, hf_config)

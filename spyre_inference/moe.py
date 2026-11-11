@@ -21,7 +21,9 @@ adapters opt a layer in with a ``SpyreMoERecipe``.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -767,6 +769,67 @@ def _prepare_biases(
     return biases
 
 
+# Routed-expert layers whose preparation runs on a thread; see _prepare_layer_soon.
+_prep_pool: ThreadPoolExecutor | None = None
+_prep_futures: list[Future] = []
+_prep_thread = threading.local()
+
+
+def _prep_thread_count() -> int:
+    if envs.SPYRE_MOE_PREP_THREADS > 0:
+        return envs.SPYRE_MOE_PREP_THREADS
+    # torch's thread count is this worker's share of the CPU budget (threading_config).
+    return min(8, torch.get_num_threads())
+
+
+def _start_prep_thread(device_index: int) -> None:
+    """Same device as the loading thread, and a stream of its own."""
+    torch.spyre.set_device(device_index)
+    _prep_thread.stream = torch.spyre.Stream()
+
+
+def _prepare_on_thread(layer: RoutedExperts) -> None:
+    with torch.spyre.stream(_prep_thread.stream):
+        _prepare_layer(layer)
+
+
+def _prepare_layer_soon(layer: RoutedExperts) -> None:
+    """Prepare one routed-expert layer now, or hand it to a thread.
+
+    Each layer's host relayout and copy to the device are independent of every other
+    layer's, so layers run on SPYRE_MOE_PREP_THREADS threads while loading goes on.
+    The first layer runs here, which also starts the runtime the threads share. The
+    model loader calls ``wait_for_moe_layers`` before anything reads the model.
+    """
+    global _prep_pool
+    threads = _prep_thread_count()
+    if threads <= 1 or _prep_pool is None:
+        _prepare_layer(layer)
+        if threads > 1:
+            _prep_pool = ThreadPoolExecutor(
+                max_workers=threads,
+                thread_name_prefix="spyre-moe-prep",
+                initializer=_start_prep_thread,
+                initargs=(torch.spyre.current_device(),),
+            )
+        return
+    _prep_futures.append(_prep_pool.submit(_prepare_on_thread, layer))
+
+
+def wait_for_moe_layers() -> None:
+    """Wait for the layers handed to threads; re-raise the first failure."""
+    global _prep_pool
+    futures = list(_prep_futures)
+    _prep_futures.clear()
+    try:
+        for future in futures:
+            future.result()
+    finally:
+        if _prep_pool is not None:
+            _prep_pool.shutdown(cancel_futures=True)
+            _prep_pool = None
+
+
 def _prepare_layer(layer: RoutedExperts) -> None:
     from torch_spyre._C import get_elem_in_stick
 
@@ -897,7 +960,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "Spyre MoE backend requires an explicit model-specific recipe; "
                 "this architecture has not opted in."
             )
-        _prepare_layer(cast("RoutedExperts", layer))
+        _prepare_layer_soon(cast("RoutedExperts", layer))
         # MoERunner._forward_impl initializes this lazily. Traced, that check becomes a guard
         # which warmup's first call flips, so the first real request would re-trace the block.
         layer._ensure_moe_quant_config_init()

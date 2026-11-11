@@ -121,6 +121,21 @@ def test_warmup_compiles_every_row_bucket_a_body_bucket_holds(monkeypatch):
     assert projected == [1, 2, 4, 16, 16]
 
 
+def test_warmup_covers_one_row_padded_to_a_two_token_body(monkeypatch):
+    """Without a 1 bucket, a single sampled row on a two-token body gathers [1, 1]."""
+    plain, _, widths = _hidden(monkeypatch, [2, 4])
+    hidden = mr._SpyreHiddenStates.wrap(plain[:2], [2, 4])
+    runner, _ = _runner()
+
+    mr.TorchSpyreModelRunner._warm_sample_row_gathers(runner, hidden, [2, 4])
+    warmed = set(widths)
+    widths.clear()
+    hidden[torch.tensor([1])]
+
+    assert widths == [2]
+    assert set(widths) <= warmed
+
+
 def test_warmup_skips_hidden_states_left_on_the_host(monkeypatch):
     _, _, widths = _hidden(monkeypatch, [1, 2])
     runner, projected = _runner()

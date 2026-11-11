@@ -657,13 +657,8 @@ class TestBatchedDecodeVariants:
 
 
 class TestSingleKvHeadBlockFloor:
-    """A lone KV head on a lone page will not compile under the head-major layout, so
-    the block ladder floors to two -- see the note at the floor."""
-
-    @pytest.fixture(autouse=True)
-    def _head_major(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
-        envs.clear_env_cache()
+    """A lone KV head on a lone page will not compile, so the block ladder floors to
+    two -- see the note at the floor."""
 
     def test_floors_the_ladder_at_one_kv_head(self):
         b = SpyreAttnBucketer(make_config(num_kv_heads=1))
@@ -696,15 +691,6 @@ class TestSingleKvHeadBlockFloor:
         assert min(b.num_blocks_buckets) == 1
 
 
-class TestSingleKvHeadBlockFloorTokenMajor:
-    def test_token_major_keeps_the_single_block_bucket(self, monkeypatch):
-        """Only the head-major decode kernel has the constraint."""
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
-        envs.clear_env_cache()
-        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
-        assert min(b.num_blocks_buckets) == 1
-
-
 class TestSpeculativeVerifyWidth:
     def test_no_speculative_decoding_is_plain_decode(self):
         assert batched_decode_query_len(make_config()) == 1
@@ -729,12 +715,6 @@ class TestSpeculativeVerifyWidth:
         config.speculative_config.parallel_drafting = True
         config.use_v2_model_runner = False
         assert batched_decode_query_len(config) == 1
-
-    def test_token_major_under_tiled_walk_keeps_plain_decode(self, monkeypatch):
-        """Only head-major runs batched decode there, so padding would buy nothing."""
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
-        envs.clear_env_cache()
-        assert batched_decode_query_len(make_config(num_speculative_tokens=3)) == 1
 
     def test_eager_keeps_plain_decode(self):
         config = make_config(num_speculative_tokens=3)

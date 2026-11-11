@@ -97,7 +97,6 @@ def _check_acceptance_metrics(before, after, steps):
 def xpress_engine(monkeypatch):
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64")
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30")

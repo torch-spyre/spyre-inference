@@ -99,6 +99,7 @@ from spyre_inference.v1.worker.encoder_grid import (
 from spyre_inference.v1.worker.kv_cache_setup import (
     allocate_spyre_kv_caches,
     split_attn_groups_by_window,
+    with_kv_sharing_layer_specs,
 )
 from spyre_inference.v1.worker.model_load import (
     fix_padded_model,
@@ -1128,6 +1129,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return builders
 
     def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        kv_cache_config = with_kv_sharing_layer_specs(kv_cache_config, self.shared_kv_cache_layers)
         super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         self._split_attn_groups_by_layer_window()
 

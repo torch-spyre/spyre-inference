@@ -18,6 +18,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from spyre_inference.v1.worker import spyre_model_runner as mr
 
@@ -48,6 +54,40 @@ def test_wrapper_converts_ints_to_int64(monkeypatch):
     assert seen == [torch.int64, torch.int64]
     assert out["input_ids"].dtype == torch.int64
     assert out["positions"].dtype == torch.int64
+
+
+def test_kv_sharing_layer_gets_its_target_spec_for_attention_only(monkeypatch):
+    """Only the attention backend's copy gains the alias; the retained config is unchanged."""
+    owner, sharing = "layers.0.self_attn", "layers.1.self_attn"
+    spec = FullAttentionSpec(block_size=128, num_kv_heads=2, head_size=128, dtype=torch.float16)
+    uniform = UniformTypeKVCacheSpecs.from_specs({owner: spec})
+    assert uniform is not None
+    group = KVCacheGroupSpec(layer_names=[owner, sharing], kv_cache_spec=uniform)
+    config = KVCacheConfig(num_blocks=2, kv_cache_tensors=[], kv_cache_groups=[group])
+    runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)
+    runner.attn_groups = []
+    runner.vllm_config = None
+    seen = []
+    monkeypatch.setattr(
+        mr.GPUModelRunner,
+        "initialize_attn_backend",
+        lambda _self, cfg, is_profiling=False: seen.append(cfg),
+    )
+    monkeypatch.setattr(mr, "split_attn_groups_by_window", lambda *_: None)
+    monkeypatch.setattr("vllm.config.get_layers_from_vllm_config", lambda *_: {})
+
+    runner.shared_kv_cache_layers = {}
+    runner.initialize_attn_backend(config)
+    assert seen.pop() is config
+
+    runner.shared_kv_cache_layers = {sharing: owner}
+    runner.initialize_attn_backend(config)
+    assert seen.pop().kv_cache_groups[0].kv_cache_spec.kv_cache_specs == {
+        owner: spec,
+        sharing: spec,
+    }
+    assert config.kv_cache_groups == [group]
+    assert group.kv_cache_spec is uniform and uniform.kv_cache_specs == {owner: spec}
 
 
 def test_wrapper_recursively_converts_integer_inputs(monkeypatch):

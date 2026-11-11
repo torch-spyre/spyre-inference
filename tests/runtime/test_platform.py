@@ -201,6 +201,23 @@ def test_a_cpu_kv_cache_space_next_to_kv_cache_memory_bytes(
     assert "VLLM_CPU_KVCACHE_SPACE" not in os.environ
 
 
+def test_rejects_kv_sharing_fast_prefill():
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=128,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    cache_config = CacheConfig(block_size=64, kv_sharing_fast_prefill=True)
+
+    with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
+        VllmConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            compilation_config=CompilationConfig(custom_ops=["all"]),
+        )
+
+
 def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):
     from unittest.mock import MagicMock
 

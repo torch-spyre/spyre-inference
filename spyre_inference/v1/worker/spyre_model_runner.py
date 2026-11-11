@@ -98,6 +98,7 @@ from spyre_inference.v1.worker.encoder_grid import (
 from spyre_inference.v1.worker.kv_cache_setup import (
     allocate_spyre_kv_caches,
     split_attn_groups_by_window,
+    with_kv_sharing_layer_specs,
 )
 from spyre_inference.v1.worker.model_load import (
     fix_padded_model,
@@ -412,8 +413,8 @@ class _SpyreModelWrapper:
         """Move hidden_states onto Spyre for the lm_head custom op.
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
-        `select_rows`), so the tensor handed to compute_logits is on CPU;
+        on CPU (``__call__`` D2Hs the body output), so the tensor handed
+        to compute_logits is on CPU;
         move it onto Spyre for the lm_head matmul. The logits are
         returned on CPU: the head's ``SpyreUnquantizedLMHeadMethod.apply`` keeps them
         on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice
@@ -1029,8 +1030,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Nothing else traces the tower before the compile guard arms: the dummy runs
         reach the text body only, and upstream's ``profile_run`` (one pass at
-        ``mm_max_items_per_batch``) never runs, as ``TorchSpyreWorker`` overrides
-        ``determine_available_memory``. Under ``dynamic=False`` every width is its own
+        ``mm_max_items_per_batch``) is a no-op here. Under ``dynamic=False`` every width is its own
         graph, for marked encoder blocks and ``SpyreConv2d`` alike, so each runs here
         (spyre-inference#1182).
 
@@ -1123,6 +1123,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return builders
 
     def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        kv_cache_config = with_kv_sharing_layer_specs(kv_cache_config, self.shared_kv_cache_layers)
         super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         self._split_attn_groups_by_layer_window()
 
@@ -1262,6 +1263,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         bucketer = self.spyre_shape_bucketer
         padded = bucketer.warmed_bucket(num_tokens) if bucketer is not None else None
         return None if padded is None else BatchDescriptor(num_tokens=padded)
+
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        """No forward: only the attention staging buffers, so the KV cache is sized
+        around them.
+
+        Upstream's runs one forward at max_num_tokens before the KV cache exists, and on
+        Spyre the first forward is the trace. Without pages the attention layers trace
+        no KV write (attn_layer resolves its device from the KV cache), so warmup would
+        retrace every block, and an eager model compiles its per-op kernels before
+        warmup's compilation settings apply.
+
+        The staging buffers scale with max_num_batched_tokens (16384 by default for an
+        eager LLM), and warmup allocates them after the KV cache took the measured
+        memory; allocated here, Worker.determine_available_memory counts them instead.
+        """
+        allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):

@@ -214,6 +214,10 @@ When contributing, you must agree to the <gh-file:DCO>. Commits must include a `
 
 Using `-s` with `git commit` will automatically add this header.
 
+### Signed commits
+
+`main` requires signed commits, so every commit must also carry a GPG or SSH signature from a key registered on your GitHub account. Sign with `git commit -s -S`, or set `git config commit.gpgsign true` once. See [GitHub's guide to signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
+
 ## Additional Resources
 
 - [vLLM Documentation](https://docs.vllm.ai/)

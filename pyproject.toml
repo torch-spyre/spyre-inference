@@ -5,7 +5,7 @@ requires = [
   # csrc/ host kernels (setup.py). torch must match the `torch` pin in
   # [project.dependencies]: the extension links libtorch, so an ABI drift fails at import.
   "cmake>=3.26",
-  "torch==2.13.0",
+  "torch==2.14.1",
 ]
 build-backend = "build_backend"
 backend-path  = ["."]
@@ -24,16 +24,16 @@ dependencies = [
     # Direct dep so it's picked up from the pytorch-cpu index. Pinned to the
     # [build-system] torch: the csrc/ extension links libtorch, so wheel consumers
     # must get the exact torch it was built against.
-    "torch==2.13.0",
+    "torch==2.14.1",
 
     # Required at runtime by the transformers image processors (Gemma-4 and
     # Pixtral/Ministral have no PIL fallback). Declared directly rather than
     # relying on a transitive pull: the entry in `override-dependencies` only
     # constrains the version if something else requests torchvision, it does
     # not install it.
-    # 0.28.0 is the release built against torch 2.13.0. Power/Z have no wheels and
+    # 0.29.1 is the release built against torch 2.14.1. Power/Z have no wheels and
     # build it from source (see [tool.uv.sources]).
-    "torchvision==0.28.0",
+    "torchvision==0.29.1",
 
     # vLLM 0.28.0 imports PixtralRotaryEmbedding, which transformers 5.17 renamed to
     # PixtralVisionRotaryEmbedding; vLLM only floors transformers (>=5.5.3), so cap it here.
@@ -99,7 +99,7 @@ override-dependencies = [
     # Declared in [project.dependencies] too; this entry exists to neutralise any
     # version constraint a transitive dep (e.g. transformers) puts on torchvision,
     # so it stays on the release built against the pinned torch.
-    "torchvision==0.28.0",
+    "torchvision==0.29.1",
 
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
@@ -112,8 +112,8 @@ override-dependencies = [
     "ortools>=9.0; platform_machine == 'x86_64'",
 
     # Runtime pin here must match the `uv.extra-build-dependencies.torch-spyre` pin.
-    # Compatible with torch-spyre's `~=2.13.0`
-    "torch==2.13.0",
+    # Compatible with torch-spyre's `~=2.14.0`
+    "torch==2.14.1",
 
     # setuptools is specified as a runtime dep by vllm, make sure it's patched for CVEs
     "setuptools>=82",
@@ -152,8 +152,8 @@ CMAKE_ARGS = "--fresh"
 # Make the Power/Z source build report the same version and torch pin as the
 # vendored metadata below.
 [tool.uv.extra-build-variables.torchvision]
-BUILD_VERSION = "0.28.0"
-PYTORCH_VERSION = "2.13.0"
+BUILD_VERSION = "0.29.1"
+PYTORCH_VERSION = "2.14.1"
 
 # Disable the torch-spyre build-time profiler. This fixes long model load times on Z, but needs further investigation
 [tool.uv.extra-build-variables.torch-spyre]
@@ -168,16 +168,16 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "752115ab288506bc327aa0870bbdddb93f583cc2" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "2c2cda371f0450b6e761396f9ca624d6ab4fedfd" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
-  { git = "https://github.com/pytorch/pytorch", tag = "v2.13.0", marker = "platform_machine == 'ppc64le'" },
+  { git = "https://github.com/pytorch/pytorch", tag = "v2.14.1", marker = "platform_machine == 'ppc64le'" },
   { index = "pytorch-cpu", marker = "platform_machine != 'ppc64le'" },
 ]
 torchvision = [
   # No Power/Z wheels on either index; build from the release tag.
-  { git = "https://github.com/pytorch/vision", tag = "v0.28.0", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
+  { git = "https://github.com/pytorch/vision", tag = "v0.29.1", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
   { index = "pytorch-cpu", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
 ]
 # Testing plugin package
@@ -188,8 +188,8 @@ members = ["tests/plugin"]
 
 [tool.uv.extra-build-dependencies]
 # Pin the same torch version for building torch-spyre and torchvision to avoid any ABI drift
-torch-spyre = ["torch==2.13.0"]
-torchvision = ["torch==2.13.0"]
+torch-spyre = ["torch==2.14.1"]
+torchvision = ["torch==2.14.1"]
 vllm = ["torch"] # Makes uv resolve torch during build-isolation via the sources defined here rather than pypi, avoiding failure on s390x
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
@@ -205,7 +205,7 @@ explicit = true
 # This avoids needing to create a full build environment for torch on every `uv sync`.
 [[tool.uv.dependency-metadata]]
 name = "torch"
-version = "2.13.0a0+gitcf30153"
+version = "2.14.1a0+git5c48869"
 requires-python = ">=3.10"
 requires-dist = [
     "filelock",
@@ -222,14 +222,14 @@ requires-dist = [
 provides-extras = ["optree", "opt-einsum", "pyyaml"]
 
 # Vendored static metadata for the source-built (ppc64le/s390x) torchvision, copied
-# from torchvision 0.28.0 on PyPI.
+# from torchvision 0.29.1 on PyPI.
 [[tool.uv.dependency-metadata]]
 name = "torchvision"
-version = "0.28.0"
+version = "0.29.1"
 requires-python = ">=3.10,!=3.14.1"
 requires-dist = [
     "numpy",
-    "torch==2.13.0",
+    "torch>=2.14.0",
     "pillow!=8.3.*,>=5.3.0",
     "gdown>=4.7.3; extra == 'gdown'",
     "scipy; extra == 'scipy'",
@@ -370,7 +370,7 @@ markers = [
     "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
     "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py, the long-context encoder rerank case, the batched CLIP cases and the speculative-decoding checks); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",
     "rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)",
-    "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
+    "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py, tests/custom_ops/test_parallel_lm_head.py)",
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",

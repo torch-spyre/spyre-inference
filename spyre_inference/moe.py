@@ -691,7 +691,10 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     _check_pool_layout(
         pool,
         SpyreTensorLayout(
-            [experts, contract, free // eps, eps], [contract * free, free, eps, 1], device_dtype
+            [experts, contract, free // eps, eps],
+            [contract * free, free, eps, 1],
+            device_dtype,
+            {(0,): experts, (1,): contract, (2, 3): free},
         ),
     )
     c4 = contract // chunks
@@ -699,6 +702,7 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
         [experts * chunks, c4, free // eps, eps],
         [c4 * free, free, eps, 1],
         device_dtype,
+        {(0,): experts * chunks, (1,): c4, (2, 3): free},
     )
     return _C.reinterpret_tensor_with_layout(
         pool,

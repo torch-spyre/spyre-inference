@@ -19,17 +19,20 @@ decoder, and adds the ``SpyreVisionEncoderMixin`` hooks:
 
 - blocks: ``SpyrePixtralTransformerBlock``, whose attention does RoPE as a matmul and the
   stick-aligned SDPA;
-- inputs: patches laid out offset-major on the host, with each patch's image and position;
+- inputs: each image padded onto a square canvas, one image per call and one token budget
+  per canvas, with each patch's image and position laid out offset-major;
+- patch embedding: a conv2d on the card, its output reordered offset-major;
 - RoPE: cos and sin gathered on the card by position, from a ``GatherTable``;
-- patch embedding: the conv folded into a linear at load time;
 - patch merge: a batched matmul over the offset groups, in place of upstream's ``unfold``.
 
 The encoder is permutation-equivariant while RoPE and the image mask follow the patches, so
-the offset-major order changes how the merge lowers, not the result.
+the offset-major order changes how the merge lowers, not the result. The canvas's padding
+tokens are cropped off on the host.
 """
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -41,7 +44,6 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
-    SEGMENT_ITEMS,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
@@ -52,6 +54,7 @@ from spyre_inference.models._vision_encoder import (
     unbind_items,
 )
 from spyre_inference.multimodal.utils import (
+    STICK,
     align_up,
     linear_weight,
     padded_sdpa,
@@ -61,6 +64,9 @@ from spyre_inference.multimodal.utils import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+# Canvas sides in patches. Multiples of 8, so a canvas's patch count is whole 64-wide sticks.
+CANVAS_SIDES = (8, 16, 24, 32, 48, 64, 80, 96, 112)
 
 
 class SpyrePixtralAttention(pixtral.Attention):
@@ -160,7 +166,7 @@ class SpyrePixtralForConditionalGeneration(
 ):
     """Upstream Pixtral with its vision encoder compiled per token budget."""
 
-    vision_max_items_per_call = SEGMENT_ITEMS
+    vision_max_items_per_call = 1
 
     # --- construction ---
 
@@ -177,9 +183,10 @@ class SpyrePixtralForConditionalGeneration(
         self.out_hidden_size = self.config.text_config.hidden_size
         self._max_side = args.image_size // args.patch_size
         head_dim = args.hidden_size // args.num_attention_heads
-        self._patch_width = align_up(args.num_channels * args.patch_size**2)
+        top = align_up(self._max_side, 8)
+        self._canvas_sides = [s for s in CANVAS_SIDES if s < top] + [top]
         self.vision_buffers = {
-            "patches": VisionBuffer(self._patch_width),
+            "image": VisionBuffer(None, shape_at=self._canvas_shape),
             "segments": segment_buffer(),
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
@@ -200,18 +207,16 @@ class SpyrePixtralForConditionalGeneration(
             )
 
     def process_weights_after_loading(self) -> None:
-        """Reshape the patch-conv and merging weights for the vision graphs, in place, as the
-        Spyre linears do, so one copy of each reaches the card. Runs on the host, before the
-        runner moves the model to the card."""
+        """Detach the patch-conv weight and reshape the merging weight for the vision graphs,
+        in place, so one copy of each reaches the card. Runs on the host, before the runner
+        moves the model to the card."""
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         tower = self.vision_encoder
-        weight = tower.patch_conv.weight.detach().flatten(1)
-        weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
-        # A plain holder, not the conv layer: nothing runs the conv, so the runner must not
-        # place a tiled conv copy of the weight on the card as well.
+        weight = tower.patch_conv.weight.detach()
+        # A plain holder, not the conv layer, so the runner places no tiled conv copy on the card.
         tower.patch_conv = nn.Module()
-        tower.patch_conv.weight = nn.Parameter(weight_t, requires_grad=False)
+        tower.patch_conv.weight = nn.Parameter(weight, requires_grad=False)
         if self.patch_merger is not None:
             layer = self.patch_merger.merging_layer
             merge_weight = offset_major_merge_weight(linear_weight(layer), self._merge)
@@ -234,39 +239,40 @@ class SpyrePixtralForConditionalGeneration(
     # --- SpyreVisionEncoderMixin hooks ---
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
+        """Each image's canvas tokens; ``postprocess_encoder_output`` crops them to the image's."""
         p = self.vision_args.patch_size
         return [
-            (img.shape[-2] // p) * (img.shape[-1] // p) // self.patches_per_token
+            (self._canvas_side(img.shape[-2] // p, img.shape[-1] // p) // self._merge) ** 2
             for img in _images(mm_kwargs)
         ]
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Offset-major patches of every image, each flattened as ``(c, py, px)`` like the conv
-        weight, with its one-hot image and its RoPE position."""
-        images = _images(mm_kwargs)
+        """The image padded at the bottom and right onto its canvas, with each canvas patch's
+        one-hot image (padding patches: the padding segment) and RoPE position."""
+        (img,) = _images(mm_kwargs)
         p, m = self.vision_args.patch_size, self._merge
-        flat_patches, seg, pos = [], [], []
-        for i, img in enumerate(images):
-            c, h, w = img.shape
-            assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
-            hp, wp = h // p, w // p
-            patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
-            flat_patches.append(offset_major(patches.reshape(hp, wp, -1), m))
-            grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
-            pos.append(offset_major(grid, m))
-            seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
-        flat = torch.cat(flat_patches, dim=1).flatten(0, 1).to(torch.float16)
+        c, h, w = img.shape
+        assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
+        hp, wp = h // p, w // p
+        side = self._canvas_side(hp, wp)
+        canvas = torch.zeros(c, side * p, side * p, dtype=torch.float16)
+        canvas[:, :h, :w] = convert(img, device="cpu")
+        grid = torch.zeros(side, side, dtype=torch.int64)
+        grid[:hp, :wp] = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
+        seg = torch.full((side, side), STICK - 1)
+        seg[:hp, :wp] = 0
         return {
-            "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
-            "segments": one_hot_segments(torch.cat(seg, dim=1).flatten()),
-            "positions": torch.cat(pos, dim=1).flatten().to(torch.int64),
+            "image": canvas,
+            "segments": one_hot_segments(offset_major(seg, m).flatten()),
+            "positions": offset_major(grid, m).flatten(),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_encoder
-        # [patch width, D] since process_weights_after_loading.
-        patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
-        x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
+        patch_weight = cast(torch.Tensor, tower.patch_conv.weight)
+        x = F.conv2d(values["image"].unsqueeze(0), patch_weight, stride=self.vision_args.patch_size)
+        x = offset_major(x[0].permute(1, 2, 0), self._merge).flatten(0, 1)
+        x = tower.ln_pre(x.unsqueeze(0))
         mask = segment_mask(values["segments"], x.dtype)
         rope = self.spyre_rope_table.gather(values["positions"])
         freqs_cis = (rope[:, : self._head_dim], rope[:, self._head_dim :])
@@ -286,3 +292,33 @@ class SpyrePixtralForConditionalGeneration(
             merge_weight = cast(torch.Tensor, self.patch_merger.merging_layer.weight)
             x = torch.matmul(x, merge_weight).sum(dim=0)
         return self.vision_language_adapter(x)
+
+    @property
+    def vision_token_budgets(self) -> list[int] | None:
+        return [(s // self._merge) ** 2 for s in self._canvas_sides]
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        assert batch_mm_kwargs is not None and len(indices) == 1, "one canvas per call"
+        p, m = self.vision_args.patch_size, self._merge
+        (img,) = _images(batch_mm_kwargs)
+        hp, wp = img.shape[-2] // p, img.shape[-1] // p
+        side = self._canvas_side(hp, wp) // m
+        tokens = outputs["default"].reshape(side, side, -1)[: hp // m, : wp // m].flatten(0, 1)
+        dest[indices[0]] = tokens.clone() if clone else tokens
+
+    def _canvas_side(self, hp: int, wp: int) -> int:
+        return next(s for s in self._canvas_sides if s >= max(hp, wp))
+
+    def _canvas_shape(self, num_patches: int) -> tuple[int, ...]:
+        side = math.isqrt(num_patches)
+        assert side * side == num_patches, f"{num_patches} patches is not a square canvas"
+        p = self.vision_args.patch_size
+        return (self.vision_args.num_channels, side * p, side * p)

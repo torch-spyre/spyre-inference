@@ -97,7 +97,7 @@ code: "Code layers" {
     grid-gap: 14
 
     cls: "SpyrePixtralForConditionalGeneration\n(SpyreVisionEncoderMixin, PixtralForConditionalGeneration)" {class: model}
-    attrs: "vision_buffers: patches · segments · positions\npatches_per_token = M² · out_hidden_size\nvision_max_items_per_call = 63" {class: model}
+    attrs: "vision_buffers: image canvas · segments · positions\npatches_per_token = M² · out_hidden_size\nvision_max_items_per_call = 1 · vision_token_budgets" {class: model}
     hooks: "vision_item_tokens · vision_inputs (host)\nvision_embed · vision_blocks · vision_project\n(three compiled graphs)" {class: model}
     attn: "SpyrePixtralAttention\nRoPE as a matmul · padded_sdpa\n+ get_input_modality · select_encoder_cudagraph_items" {class: model}
   }
@@ -160,7 +160,7 @@ serving: "2. Serving a step" {
     class: card
     direction: right
     up: "_upload\none H2D" {class: device}
-    embed: "vision_embed\npatches, mask, RoPE gather" {class: device}
+    embed: "vision_embed\npatch conv2d, mask, RoPE gather" {class: device}
     blocks: "vision_blocks ×N" {class: device}
     project: "vision_project\nmerge, adapter" {class: device}
     up -> embed -> blocks -> project

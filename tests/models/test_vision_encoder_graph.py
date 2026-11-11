@@ -208,6 +208,15 @@ def test_inputs_must_be_fp16_with_one_patch_count():
         model.prepare_encoder_cudagraph_replay_buffers({"tokens": [1]}, 0, 0)
 
 
+def test_model_budgets_replace_the_ladder_and_reject_user_budgets():
+    class _FixedBudgets(_FakeVisionModel):
+        vision_token_budgets = [64, 16]
+
+    assert _manager(_FixedBudgets(max_tokens=60)).token_budgets == [16, 64]
+    with pytest.raises(ValueError, match="sets its own encoder budgets"):
+        _manager(_FixedBudgets(max_tokens=60), budgets=[16, 64])
+
+
 def test_items_per_call_cap_splits_the_batch():
     model = _FakeVisionModel()
     type(model).vision_max_items_per_call = 1

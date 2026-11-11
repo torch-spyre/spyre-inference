@@ -60,6 +60,16 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 "mm_encoder_tp_mode='data' is not supported on Spyre; the vision "
                 "encoder runs tensor-parallel with the decoder."
             )
+        # A model whose graphs are keyed by more than the patch count names its own budgets.
+        fixed = model.vision_token_budgets
+        if fixed is not None:
+            if vllm_config.compilation_config.encoder_cudagraph_token_budgets:
+                raise ValueError(
+                    f"{type(model).__name__} sets its own encoder budgets {fixed}; unset "
+                    "compilation_config.encoder_cudagraph_token_budgets."
+                )
+            self.token_budgets = sorted(fixed)
+            self.path_token_budgets = {p: sorted(fixed) for p in self.path_token_budgets}
         # Round every budget up so its patch count is a whole vision_patch_multiple.
         step = model.vision_patch_multiple // model.patches_per_token
 

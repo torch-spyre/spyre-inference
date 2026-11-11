@@ -28,11 +28,12 @@ from spyre_inference.models._vision_encoder import (
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
+    fold_conv_patch_embedding,
     offset_major,
     one_hot_segments,
     segment_buffer,
     segment_mask,
-    unbind_items,
+    split_weight_by_group,
 )
 from spyre_inference.multimodal.utils import (
     align_up,
@@ -61,17 +62,6 @@ def tile_position_ids(patch_mask: torch.Tensor, side: int) -> torch.Tensor:
     bucket_h = torch.bucketize((i // wp) / nb_h, boundaries, right=True)
     bucket_w = torch.bucketize((i % wp) / nb_w, boundaries, right=True)
     return torch.where(patch_mask.flatten(1), bucket_h * side + bucket_w, 0)
-
-
-def group_projection_weight(weight: torch.Tensor, groups: int) -> torch.Tensor:
-    """The connector's ``[D_out, groups * D]`` weight as ``[groups, D, D_out]``, one slice per
-    offset group.
-
-    Upstream's ``pixel_shuffle`` concatenates a window's patches as ``(hi, wi, D)``, so the
-    columns are group-major, unlike a conv merge's ``unfold`` order.
-    """
-    out_dim, in_dim = weight.shape
-    return weight.reshape(out_dim, groups, in_dim // groups).permute(1, 2, 0).contiguous()
 
 
 class SpyreIdefics2VisionAttention(Idefics2VisionAttention):
@@ -134,15 +124,8 @@ class SpyreIdefics3ForConditionalGeneration(
         embeddings = self.model.vision_model.embeddings
 
         # Patch conv -> [patch width, D], as a linear over (c, py, px)-flattened patches.
-        conv = embeddings.patch_embedding
         width = cast(int, self.vision_buffers["patches"].width)
-        weight = conv.weight.detach().flatten(1)
-        weight_t = F.pad(weight, (0, width - weight.shape[1])).t().contiguous()
-        # A plain holder, not the conv layer: nothing runs the conv, so the runner must not
-        # place a tiled conv copy of the weight on the card as well.
-        embeddings.patch_embedding = nn.Module()
-        embeddings.patch_embedding.weight = nn.Parameter(weight_t, requires_grad=False)
-        embeddings.patch_embedding.bias = conv.bias
+        embeddings.patch_embedding = fold_conv_patch_embedding(embeddings.patch_embedding, width)
 
         # Position embedding -> a row-gathered table.
         table = convert(embeddings.position_embedding.weight.detach(), device="cpu")
@@ -153,7 +136,8 @@ class SpyreIdefics3ForConditionalGeneration(
         # Connector projection -> [scale_factor**2, D, D_out], one slice per offset group.
         proj = self.model.connector.modality_projection.proj
         proj.weight = nn.Parameter(
-            group_projection_weight(linear_weight(proj), self.patches_per_token),
+            # ``pixel_shuffle`` concatenates a window's patches as (hi, wi, D): group-major.
+            split_weight_by_group(linear_weight(proj), self.patches_per_token, group_major=True),
             requires_grad=False,
         )
 
@@ -176,24 +160,27 @@ class SpyreIdefics3ForConditionalGeneration(
         tiles, c, h, w = pixel_values.shape
         if tiles > SEGMENT_ITEMS:
             raise ValueError(f"{tiles} tiles in one call; at most {SEGMENT_ITEMS} fit the one-hot")
-        assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
+        if h % (p * m) or w % (p * m):
+            raise ValueError(f"{h}x{w} is not a multiple of {p * m}")
         hp, wp = h // p, w // p
 
         grids = pixel_values.reshape(tiles, c, hp, p, wp, p).permute(0, 2, 4, 1, 3, 5)
-        grids = grids.reshape(tiles, hp, wp, -1)
         pos = tile_position_ids(
             self.model.get_patch_attention_mask(pixel_mask), vision.image_size // p
-        ).reshape(tiles, hp, wp)
-        flat_patches = [offset_major(grids[t], m) for t in range(tiles)]
-        positions = [offset_major(pos[t], m) for t in range(tiles)]
-        segments = [torch.full((m * m, (hp // m) * (wp // m)), t) for t in range(tiles)]
+        )
+        # All tiles at once: stacked along the height, a merge window (m rows, hp % m == 0) never
+        # crosses a tile, so ``offset_major`` yields each group's tokens tile by tile.
+        patches = offset_major(grids.reshape(tiles * hp, wp, -1), m)
+        positions = offset_major(pos.reshape(tiles * hp, wp), m)
+        tokens_per_tile = (hp // m) * (wp // m)
+        tile_ids = torch.arange(tiles).repeat_interleave(tokens_per_tile).repeat(m * m)
 
-        flat = torch.cat(flat_patches, dim=1).flatten(0, 1).to(torch.float16)
+        flat = patches.flatten(0, 1).to(torch.float16)
         width = cast(int, self.vision_buffers["patches"].width)
         return {
             "patches": F.pad(flat, (0, width - flat.shape[1])),
-            "segments": one_hot_segments(torch.cat(segments, dim=1).flatten()),
-            "positions": torch.cat(positions, dim=1).flatten().to(torch.int64),
+            "segments": one_hot_segments(tile_ids),
+            "positions": positions.flatten().to(torch.int64),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:

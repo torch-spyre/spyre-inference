@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
+from spyre_inference.multimodal.utils import STICK
+
 idefics3 = pytest.importorskip("vllm.model_executor.models.idefics3")
 idefics2_vision = pytest.importorskip("vllm.model_executor.models.idefics2_vision_model")
 
@@ -232,15 +234,14 @@ def test_tile_position_ids_match_upstream(partial):
 def test_group_projection_matches_pixel_shuffle_connector(tp_group):
     """Offset-major tokens times the per-offset weight equal ``pixel_shuffle`` plus the
     connector's projection."""
-    from spyre_inference.models._vision_encoder import offset_major
-    from spyre_inference.models.idefics3 import group_projection_weight
+    from spyre_inference.models._vision_encoder import offset_major, split_weight_by_group
 
     config = _config()
     torch.manual_seed(2)
     connector = idefics3.Idefics3Connector(config, quant_config=None, prefix="connector")
     proj = connector.modality_projection.proj
     proj.weight.data.normal_(std=0.05)
-    weight = group_projection_weight(proj.weight.data.clone(), SCALE**2)
+    weight = split_weight_by_group(proj.weight.data.clone(), SCALE**2, group_major=True)
     _finish_weight_loading(connector)
     x = torch.randn(2, SIDE * SIDE, HIDDEN)
     expected = connector(x)
@@ -343,8 +344,10 @@ def test_block_compile_is_honoured(tp_group):
         return gm.forward
 
     block.compile(backend=backend, fullgraph=True, dynamic=False)
-    x = torch.randn(1, 4, HIDDEN)
-    block(x, attention_mask=torch.zeros(1, 1, 4, 4))
+    # As in the pipeline: a whole stick of patches and an additive mask at the input's dtype,
+    # which `padded_sdpa` takes as is (any other length needs a bool keep-mask).
+    x = torch.randn(1, STICK, HIDDEN)
+    block(x, attention_mask=torch.zeros(1, 1, STICK, STICK))
     assert graphs
 
 

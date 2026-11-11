@@ -547,7 +547,7 @@ def test_junit_tells_executed_from_skipped():
       <testcase classname="m" name="sk"><skipped type="pytest.skip"/></testcase>
     </testsuite>"""
     j = ctr.junit_cases(xml)
-    assert j.executed == {("m", "ran"), ("m", "xf")} and ("m", "sk") in j
+    assert j.executed == {("m", "ran")} and ("m", "xf") in j and ("m", "sk") in j
 
 
 def test_executed_tests_without_durations_give_no_verdict(monkeypatch):

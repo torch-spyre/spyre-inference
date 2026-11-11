@@ -132,7 +132,7 @@ class _NoDTD(ET.TreeBuilder):
 @dataclass
 class Junit:
     cases: set[tuple[str, str]] = field(default_factory=set)  # collected, skips included
-    executed: set[tuple[str, str]] = field(default_factory=set)  # ran a call phase
+    executed: set[tuple[str, str]] = field(default_factory=set)  # passed or failed
     # Dotted modules/packages skipped at collection (importorskip): their tests aren't listed.
     skipped_modules: set[str] = field(default_factory=set)
 
@@ -157,8 +157,9 @@ def junit_cases(xml: bytes) -> Junit:
             out.skipped_modules.add(key[1])
             continue
         out.cases.add(key)
-        # An xfail runs its call phase, so it has a duration like a pass.
-        if skipped is None or "xfail" in (skipped.get("type") or ""):
+        # Not xfails: JUnit can't tell a test-body xfail from a setup or run=False one,
+        # which never reaches the call phase; any recorded duration still counts.
+        if skipped is None:
             out.executed.add(key)
     return out
 

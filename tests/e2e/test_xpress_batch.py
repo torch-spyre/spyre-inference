@@ -17,6 +17,7 @@
 import json
 import math
 import os
+import platform
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,15 @@ from test_speculative_decoding import (
 )
 from vllm import LLM, SamplingParams
 
-pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
+pytestmark = [
+    pytest.mark.model_quality,
+    pytest.mark.uses_subprocess,
+    # Same Qwen3 target/draft as test_speculative_decoding (#1603).
+    pytest.mark.skipif(
+        platform.machine() == "ppc64le",
+        reason="Qwen3-8B target/draft excluded on ppc64le (#1603)",
+    ),
+]
 
 
 @pytest.mark.parametrize(

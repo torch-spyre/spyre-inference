@@ -364,7 +364,7 @@ class _SpyreModelWrapper:
 
     @contextmanager
     def outputs_on_host(self):
-        """D2H the outputs for the duration, for upstream's host-side dummy-run gather."""
+        """D2H a device pooler's outputs, for upstream's host-side dummy-run gather."""
         keep = self._keep_outputs_on_device
         object.__setattr__(self, "_keep_outputs_on_device", False)
         try:
@@ -731,7 +731,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
 
-        # CPU-fallback pooling must not opt into the generative output contract.
         bucketer = self.spyre_shape_bucketer
         self.model = _SpyreModelWrapper(
             self.model,
@@ -751,6 +750,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # length would compile a fresh gather.
             # kv_sharing_fast_prefill reads the logits index, which this pads.
             sample_rows_on_device=(
+                # CPU-fallback pooling must not opt into the generative output contract.
                 self.model_config.runner_type == "generate"
                 and bucketer is not None
                 and envs.SPYRE_SAMPLE_ROWS_ON_DEVICE
@@ -1365,6 +1365,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     model.compute_logits(hidden_states)
 
     def _prepare_inputs(self, scheduler_output, *args, **kwargs):
+        # Upstream must only subscript hidden_states with the padded index or slice(None),
+        # then call compute_logits, which consumes pad_sampled_rows' row count.
         logits_indices, *rest = super()._prepare_inputs(scheduler_output, *args, **kwargs)
         if isinstance(self.model, _SpyreModelWrapper) and self.model._sample_rows_on_device:
             num_tokens = scheduler_output.total_num_scheduled_tokens

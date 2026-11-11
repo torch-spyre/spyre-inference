@@ -133,12 +133,18 @@ class _NoDTD(ET.TreeBuilder):
 class Junit:
     cases: set[tuple[str, str]] = field(default_factory=set)  # collected, skips included
     executed: set[tuple[str, str]] = field(default_factory=set)  # ran a call phase
+    # Dotted modules/packages skipped at collection (importorskip): their tests aren't listed.
+    skipped_modules: set[str] = field(default_factory=set)
 
     def __contains__(self, key: tuple[str, str]) -> bool:
         return key in self.cases
 
     def __or__(self, other: Junit) -> Junit:
-        return Junit(self.cases | other.cases, self.executed | other.executed)
+        return Junit(
+            self.cases | other.cases,
+            self.executed | other.executed,
+            self.skipped_modules | other.skipped_modules,
+        )
 
 
 def junit_cases(xml: bytes) -> Junit:
@@ -146,8 +152,11 @@ def junit_cases(xml: bytes) -> Junit:
     out = Junit()
     for c in root.iter("testcase"):
         key = (c.get("classname") or "", c.get("name") or "")
-        out.cases.add(key)
         skipped = c.find("skipped")
+        if not key[0] and skipped is not None and skipped.get("message") == "collection skipped":
+            out.skipped_modules.add(key[1])
+            continue
+        out.cases.add(key)
         # An xfail runs its call phase, so it has a duration like a pass.
         if skipped is None or "xfail" in (skipped.get("type") or ""):
             out.executed.add(key)
@@ -233,6 +242,7 @@ def compute(
     legs: dict[str, int] | None = None,
     collected: set[tuple[str, str]] | None = None,
     base_only_files: set[str] | None = None,
+    skipped_modules: set[str] | None = None,
 ) -> Report:
     """Compare a PR run with baseline runs, newest first.
 
@@ -255,6 +265,7 @@ def compute(
         and n in newest
         and len(v) >= need
         and (collected is None or junit_key(n) not in collected)
+        and not _in_skipped_module(n, skipped_modules or set())
     }
     new, on_base = [], []
     for nodeid, (seconds, suite) in pr.items():
@@ -266,6 +277,14 @@ def compute(
     on_base.sort(key=lambda t: -t.seconds)
     total = statistics.median([sum(b.values()) for b in baselines]) if baselines else 0.0
     return Report(total, len(baselines), new, removed, legs or {}, on_base)
+
+
+def _in_skipped_module(nodeid: str, skipped: set[str]) -> bool:
+    if not skipped:
+        return False
+    module = junit_key(nodeid)[0].split(".")
+    # A path-less (upstream) id can't be placed, so any collection skip covers it.
+    return not module[0] or any(module[: len(m.split("."))] == m.split(".") for m in skipped)
 
 
 def _min(seconds: float) -> str:
@@ -608,7 +627,9 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr)
     if base_only is None:
         return f"{pr['base']['ref']} moved too far past its newest green baseline run"
-    return compute(pr_tests, [d for _, d in bases], legs, junit.cases, base_only)
+    return compute(
+        pr_tests, [d for _, d in bases], legs, junit.cases, base_only, junit.skipped_modules
+    )
 
 
 def find_comment(repo: str, number: int) -> dict | None:

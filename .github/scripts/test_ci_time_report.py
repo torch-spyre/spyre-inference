@@ -564,3 +564,18 @@ def test_a_non_object_durations_file_is_unreadable():
     except ValueError:
         return
     raise AssertionError("accepted a list")
+
+
+def test_a_collection_skipped_module_is_not_removed():
+    # pytest lists an importorskip'd module once, as its collector, never its tests.
+    j = ctr.junit_cases(_PYTEST_JUNIT)
+    assert j.skipped_modules == {"tests.sub.test_opt"} and ("", "tests.sub.test_opt") not in j
+    base = _baseline(
+        **{"tests/sub/test_opt.py::test_expensive": 1200.0, "::test_upstream[a]": 60.0}
+    )
+    pr = _pr({**_baseline(), "tests/c.py::test_new": 600.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), skipped_modules=j.skipped_modules)
+    assert r.removed == {} and r.net_s == 600.0
+    # Without a collection skip the same absence is a removal.
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), skipped_modules=set())
+    assert set(r.removed) == {"tests/sub/test_opt.py::test_expensive", "::test_upstream[a]"}

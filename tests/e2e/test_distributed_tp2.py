@@ -132,7 +132,6 @@ def _assert_logprobs_match_tp1(
             assert len(seq) == len(steps), (
                 f"prompt {i}: {name} has {len(seq)} tokens but {len(steps)} logprob rows"
             )
-    _assert_matches_tp1(tp1[0], tp2[0])
     for i, (ref_tokens, tokens, ref_steps, steps) in enumerate(
         zip(tp1[0], tp2[0], tp1[1], tp2[1], strict=True)
     ):

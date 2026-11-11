@@ -32,6 +32,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -594,7 +595,14 @@ def upsert_comment(repo: str, number: int, body: str, report: Report) -> None:
         cmd = ["gh", "api", "-X", "PATCH", f"/repos/{repo}/issues/comments/{existing['id']}"]
     else:
         cmd = ["gh", "api", "-X", "POST", f"/repos/{repo}/issues/{number}/comments"]
-    subprocess.run(cmd + ["-f", f"body={body}"], capture_output=True, check=True)
+    # The body holds PR-controlled node ids: send it on stdin, and never let a failure's
+    # traceback (which echoes argv) or gh's stderr reach the Actions log.
+    result = subprocess.run(
+        [*cmd, "--input", "-"], input=json.dumps({"body": body}), capture_output=True, text=True
+    )
+    if result.returncode:
+        print(f"::error::could not write the CI time comment (gh exit {result.returncode})")
+        sys.exit(1)
     print(f"{'Updated' if existing else 'Posted'} the CI time comment on PR #{number}.")
 
 

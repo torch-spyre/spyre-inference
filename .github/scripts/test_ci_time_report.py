@@ -203,11 +203,14 @@ def test_summary_lists_new_removed_and_base_only():
     assert "test_new" in s and "test_old" in s and "possibly the base branch's" in s
 
 
-def _fake_gh(monkeypatch, comments):
+def _fake_gh(monkeypatch, comments, write_rc=0):
     calls = []
 
     def run(cmd, **kw):
         calls.append(cmd)
+        if "--input" in cmd:
+            assert "evil" not in " ".join(cmd)
+            return subprocess.CompletedProcess(cmd, write_rc, stdout="", stderr="##[error]evil")
         out = json.dumps([comments]) if "comments?per_page" in cmd[2] else "{}"
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
@@ -502,3 +505,17 @@ def test_baselines_are_searched_before_the_pr_run_and_paged(monkeypatch):
     assert len(out) == ctr.BASELINE_RUNS
     assert "created=%3C%3D2026-11-03T23%3A39%3A08Z" in queries[0]
     assert "page=2" in queries[-1]
+
+
+def test_a_failed_comment_write_logs_no_body(monkeypatch, capsys):
+    _fake_gh(monkeypatch, [], write_rc=1)
+    r = _report(10)
+    body = ctr.render_comment(r).replace("tests/c.py::t", "tests/c.py::t[##[error]evil]")
+    try:
+        ctr.upsert_comment("o/r", 7, body, r)
+    except SystemExit as e:
+        assert e.code == 1
+    else:
+        raise AssertionError("no exit on a failed write")
+    captured = capsys.readouterr()
+    assert "evil" not in captured.out + captured.err

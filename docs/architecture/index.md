@@ -325,16 +325,16 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 
 | Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) |
 |---|---|---|---|---|
-| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, key-padding row, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
 | `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions | valid patches only, offset-major by position; segments; x and y |
-| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | one image's offset-major patches, a zero key-padding row, RoPE positions | valid patches only, offset-major by position; segments; x and y |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, `[1, 1, 1, P]` key-padding mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
 | `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses |
 | `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` |
 | `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default |
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
-| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 1 (so the mask only hides padding) | 63 (one-hot width) |
 | `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
@@ -363,9 +363,11 @@ Constraints the layout follows:
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
   reshape feeding a matmul cannot be laid out.
-- The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
-  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
-  cannot lay out.
+- Pixtral encodes one image per call, so its mask is a `[P]` key-padding row (0 for real
+  patches, `finfo.min / 2` for padding slots) broadcast over queries. Gemma 4 packs images,
+  and its image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the
+  last column reserved for padding slots), not a column-minus-row broadcast, which
+  torch-spyre cannot lay out.
 - RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
   `GatherTable` (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
   one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a

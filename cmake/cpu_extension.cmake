@@ -55,6 +55,7 @@ find_isa(${CPUINFO} "S390" S390_FOUND)
 set(SPYRE_EXT_SRC
   "csrc/cpu/sampling_kernels.cpp"
   "csrc/cpu/spec_decode_utils.cpp"
+  "csrc/cpu/topk_topp_sampler.cpp"
   "csrc/cpu/torch_bindings.cpp")
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
@@ -68,7 +69,8 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     "-mavx512vl"
     "-mavx512bw"
     "-mavx512dq")
-  set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2")
+  # The AVX2 fast exp in cpu_fast_exp.hpp uses FMA.
+  set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2" "-mfma")
 
   # Both are installed; spyre_inference picks one at import from the host ISA.
   define_extension_target(

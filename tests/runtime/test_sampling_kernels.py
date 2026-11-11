@@ -22,7 +22,7 @@ from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import (
     SpyreTopKTopPSampler,
-    apply_top_k_top_p_sort_free,
+    apply_top_k_top_p_kernels,
 )
 
 # Skip, like vLLM's optional extensions, where the kernels are absent (a prebaked image
@@ -103,13 +103,112 @@ def test_topk_sampler_matches_pytorch_reference(k: int | None, p: float | None) 
     out = sampler.forward_native(logits.clone(), {}, k_t, p_t)[0]
 
     # The sampler's own filter, then its per-row seed draw.
-    if k_t is not None and p_t is not None:
-        filtered = apply_top_k_top_p_sort_free(logits.clone(), k_t, p_t)
-    else:
-        filtered = apply_top_k_top_p_pytorch(logits.clone(), k_t, p_t, allow_cpu_sync=True)
+    filtered = apply_top_k_top_p_kernels(logits.clone(), k_t, p_t)
     torch.manual_seed(1)
     seeds = torch.randint(0, 2**62, (rows,), dtype=torch.long)
     assert torch.equal(out, _reference_gumbel_argmax(filtered, seeds))
+
+
+def _tied_logits(rows: int, vocab: int, ties: str) -> torch.Tensor:
+    torch.manual_seed(rows + vocab)
+    x = torch.randn(rows, vocab) * 3
+    if ties == "fp16":  # Spyre logits are fp16: ties at the k-th value are common
+        x = x.half().float()
+    elif ties == "wide":  # one tie spans the whole top-k
+        x[:, 5:305] = 20.0
+    elif ties == "masked":  # a grammar mask leaves few finite tokens
+        x[torch.rand(rows, vocab) < 0.99] = float("-inf")
+    return x
+
+
+def _ks(rows: int, vocab: int) -> torch.Tensor:
+    # Per-row k, with the extremes and a disabled row (k == vocab).
+    k = torch.randint(1, 129, (rows,))
+    k[0], k[-1] = vocab, 1
+    if rows > 2:
+        k[1] = vocab - 1
+    return k
+
+
+# Vocabs off a SIMD-width multiple exercise the kernels' remainder handling.
+@pytest.mark.parametrize("ties", ["none", "fp16", "wide", "masked"])
+@pytest.mark.parametrize("rows", [1, 3, 16])
+@pytest.mark.parametrize("vocab", [7, 32003, 151936])
+def test_topk_filter_matches_pytorch(rows: int, vocab: int, ties: str) -> None:
+    x = _tied_logits(rows, vocab, ties)
+    k = _ks(rows, vocab).clamp(max=vocab)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
+    assert torch.equal(apply_top_k_top_p_kernels(x.clone(), k, None), expected)
+
+
+# Top-p over the top-k survivors: the same kept values as the full sort. When a
+# tie straddles the top-p cut, which tied token survives is arbitrary there.
+@pytest.mark.parametrize("ties", ["none", "fp16", "wide", "masked"])
+@pytest.mark.parametrize("rows", [1, 3, 16])
+@pytest.mark.parametrize("vocab", [7, 32003, 151936])
+def test_topk_topp_filter_matches_pytorch(rows: int, vocab: int, ties: str) -> None:
+    x = _tied_logits(rows, vocab, ties)
+    k = _ks(rows, vocab).clamp(max=vocab)
+    k[0] = 1 if rows == 1 else vocab  # one row is top-p only
+    p = torch.rand(rows) * 0.5 + 0.5
+    p[-1] = 1.0
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_kernels(x.clone(), k, p)
+    topk_rows = k < vocab
+    if ties == "none":
+        assert torch.equal(actual[topk_rows], expected[topk_rows])
+    assert torch.equal(
+        actual[topk_rows].sort(dim=-1).values, expected[topk_rows].sort(dim=-1).values
+    )
+
+
+# Top-p alone is vLLM's kernel: a binary search over probabilities, so its cut
+# may differ from the full sort by a few boundary tokens (vllm#62440's bound).
+@pytest.mark.parametrize("ties", ["none", "fp16", "masked"])
+@pytest.mark.parametrize("rows", [1, 16])
+@pytest.mark.parametrize("vocab", [1024, 32003, 151936])
+def test_topp_filter_close_to_pytorch(rows: int, vocab: int, ties: str) -> None:
+    x = _tied_logits(rows, vocab, ties)
+    p = torch.rand(rows) * 0.9 + 0.1
+    expected = apply_top_k_top_p_pytorch(x.clone(), None, p)
+    actual = apply_top_k_top_p_kernels(x.clone(), None, p)
+    kept = actual > float("-inf")
+    assert torch.equal(actual[kept], x[kept])  # survivors keep their logits
+    assert (kept.sum(dim=-1) > 0).all()
+    diff = ((expected > float("-inf")).sum(dim=-1) - kept.sum(dim=-1)).abs()
+    max_kept = int((expected > float("-inf")).sum(dim=-1).max())
+    assert int(diff.max()) <= max(3, max_kept // 200)
+
+
+def test_filters_handle_degenerate_rows() -> None:
+    vocab = 4099
+    x = torch.randn(4, vocab)
+    x[0] = float("-inf")  # fully masked: untouched
+    x[1] = 1.5  # all tied: top-k keeps every token
+    x[2, :] = float("-inf")
+    x[2, [3, 70, 4000]] = torch.tensor([1.0, 2.0, 3.0])  # fewer finite than k
+    k = torch.full((4,), 10)
+    p = torch.full((4,), 0.9)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
+    assert torch.equal(apply_top_k_top_p_kernels(x.clone(), k, None), expected)
+    out = apply_top_k_top_p_kernels(x.clone(), k, p)
+    assert (out[0] == float("-inf")).all()
+    assert ((out[1:] > float("-inf")).sum(dim=-1) > 0).all()
+    out = apply_top_k_top_p_kernels(x.clone(), None, p)
+    assert (out[0] == float("-inf")).all()
+    assert ((out[1:] > float("-inf")).sum(dim=-1) > 0).all()
+
+
+def test_filters_take_strided_and_fp16_logits() -> None:
+    x = torch.randn(8, 2 * 32000)[:, ::2]
+    assert not x.is_contiguous()
+    k = torch.full((8,), 40, dtype=torch.long)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
+    assert torch.equal(apply_top_k_top_p_kernels(x, k, None), expected)
+    half = x.half()
+    out = apply_top_k_top_p_kernels(half, k, None)
+    assert out.dtype == torch.float32
+    assert torch.equal(out, apply_top_k_top_p_pytorch(half.float(), k, None, allow_cpu_sync=True))
 
 
 def test_gumbel_matches_softmax_distribution() -> None:

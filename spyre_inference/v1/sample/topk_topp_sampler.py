@@ -49,14 +49,41 @@ def apply_top_k_top_p_sort_free(
     return logits.fill_(-float("inf")).scatter_(1, idx, vals)
 
 
+def apply_top_k_top_p_kernels(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """``apply_top_k_top_p_pytorch`` on the csrc/ kernels, with no sort or ``topk``.
+
+    Top-k, alone or before top-p, matches the PyTorch filter, ties with the k-th
+    value included. Top-p alone is vLLM's CPU kernel, whose cut can differ from a
+    full sort by a few boundary tokens.
+
+    Filters float32 contiguous logits in-place; other logits are copied first."""
+    if k is None and p is None:
+        return logits
+    logits = logits.to(torch.float32).contiguous()
+    if k is not None:
+        k = k.to(torch.int32).contiguous()
+    if p is not None:
+        p = p.to(torch.float32).contiguous()
+    if p is None:
+        torch.ops._spyre_C.cpu_topk_sampling(logits, k)  # ty: ignore[invalid-argument-type]
+    elif k is None:
+        torch.ops._spyre_C.cpu_topp_sampling(logits, p)  # ty: ignore[invalid-argument-type]
+    else:
+        torch.ops._spyre_C.cpu_topk_topp_sampling(logits, k, p)  # ty: ignore[invalid-argument-type]
+    return logits
+
+
 class SpyreTopKTopPSampler(TopKTopPSampler):
-    """Sort-free top-k plus a fused Gumbel-max draw for random sampling.
+    """Kernel top-k / top-p plus a fused Gumbel-max draw for random sampling.
 
     Upstream only takes the sort-free top-k path under ``allow_cpu_sync`` (CPU
     platform only); Spyre D2Hs logits before sampling, so that host-device sync
-    is free and the full-vocab sort it otherwise runs is pure waste. Top-p
-    combined with top-k skips the sort too (``apply_top_k_top_p_sort_free``);
-    top-p alone sorts.
+    is free and the full-vocab sort it otherwise runs is pure waste. With the
+    csrc/ kernels built, ``apply_top_k_top_p_kernels`` filters without a sort or
+    ``topk``. Without them, top-k uses ``topk``, top-p combined with top-k skips
+    the sort too (``apply_top_k_top_p_sort_free``), and top-p alone sorts.
 
     The draw runs in a fused Gumbel-max kernel that hashes its noise per element
     from a per-row seed rather than materializing a ``[B, V]`` noise tensor.
@@ -74,9 +101,11 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.33.0) with two
-        # Spyre changes: sort-free top-k (and top-k + top-p) and a log-space
-        # Gumbel draw. Re-sync with upstream on a vLLM bump.
-        if k is not None and p is not None:
+        # Spyre changes: sort-free top-k / top-p and a log-space Gumbel draw.
+        # Re-sync with upstream on a vLLM bump.
+        if has_sampling_kernels():
+            logits = apply_top_k_top_p_kernels(logits, k, p)
+        elif k is not None and p is not None:
             logits = apply_top_k_top_p_sort_free(logits, k, p)
         else:
             logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)

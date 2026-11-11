@@ -512,8 +512,8 @@ def _moe_persistent_in_graph(
             tile_size=1,
             init=init,
         )
-    # Sum, not squeeze: an in-graph all_reduce of a view of a for_each_tile result returns each
-    # rank's own partial on the pinned torch-spyre (torch-spyre#5880, #6008).
+    # Sum, not squeeze: an in-graph all_reduce of a view of a for_each_tile result can leave
+    # each rank with its own partial (torch-spyre#6062).
     return result.sum(dim=0)
 
 

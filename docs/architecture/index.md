@@ -645,9 +645,8 @@ call boundary:
   `hidden_states[logits_indices]` gathers the sampled rows on Spyre, with the index
   padded onto a warmed row bucket in `_prepare_inputs`; a decode step on its own row
   bucket indexes with `slice(None)`, reusing the padded body output with no gather. A
-  pooling model whose pooler
-  runs on Spyre keeps its hidden states there too, and the pooler copies back only the
-  pooled vectors. Every other output, including the eager decoder's, which has no shape
+  pooling model whose pooler runs on Spyre keeps its hidden states there too, and the
+  pooler copies back only the pooled vectors. Every other output, including the eager decoder's, which has no shape
   bucketer, is converted to CPU
 - **`compute_logits`**: projects a gathered row bucket on Spyre directly. Any other
   input, such as a prompt-logprob slice, is padded onto a row bucket on the host and moved

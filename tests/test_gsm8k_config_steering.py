@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from spyre_testing_plugin.pytest_plugin import unsupported_on_current_arch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_LIST = _REPO_ROOT / "tests/plugin/spyre_testing_plugin/gsm8k_configs/models-spyre.txt"
@@ -43,7 +44,8 @@ def _expected_config_ids() -> set[str]:
         line = line.strip()
         if line and not line.startswith("#"):
             ids.add(line.removesuffix(".yaml"))
-    return ids
+    # Collection deselects excluded model families on this arch (#1607).
+    return {i for i in ids if not unsupported_on_current_arch(i)}
 
 
 def _collect_gsm8k_ids(markexpr: str) -> tuple[set[str], str]:

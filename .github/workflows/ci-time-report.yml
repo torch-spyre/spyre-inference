@@ -16,7 +16,6 @@ permissions:
   contents: read
   actions: read          # the PR run's and the baseline runs' artifacts
   pull-requests: write   # comment on the PR
-  issues: write          # PR conversation comments go through the issues API
 
 jobs:
   report:

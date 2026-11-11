@@ -32,6 +32,7 @@ import os
 import re
 import statistics
 import subprocess
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -53,7 +54,9 @@ BOT_LOGIN = "github-actions[bot]"
 RETRY_SUITE = "(pod-level retry)"
 
 _MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
-_MAX_NODEID_CHARS = 300
+# Keys stay whole (truncating could merge distinct ids); only display is shortened.
+_MAX_NODEID_KEY = 4096
+_MAX_NODEID_SHOWN = 300
 _TOP_N = 5
 _SLOW_S = 30.0
 _SUMMARY_ROWS = 200
@@ -114,8 +117,8 @@ def clean_durations(data: object) -> dict[str, float]:
             seconds = float(seconds)
         except (TypeError, ValueError):
             continue
-        if 0 <= seconds < 1e6:
-            out[nodeid[:_MAX_NODEID_CHARS]] = seconds
+        if 0 <= seconds < 1e6 and len(nodeid) <= _MAX_NODEID_KEY:
+            out[nodeid] = seconds
     return out
 
 
@@ -247,7 +250,8 @@ def _min(seconds: float) -> str:
 
 def _code(nodeid: str) -> str:
     # PR-controlled: no backticks or newlines, and pipes break tables.
-    return "`" + re.sub(r"[`\r\n]", "", nodeid).replace("|", "\\|") + "`"
+    shown = nodeid if len(nodeid) <= _MAX_NODEID_SHOWN else nodeid[:_MAX_NODEID_SHOWN] + "…"
+    return "`" + re.sub(r"[`\r\n]", "", shown).replace("|", "\\|") + "`"
 
 
 def _suite_rows(report: Report) -> list[str]:
@@ -283,8 +287,9 @@ def _footnote(report: Report) -> str:
     return (
         f"New tests usually compile cold in a PR run, so their times can be higher than they "
         f"will be on the base branch. Baseline: median of the last {report.baseline_runs} green "
-        f"push runs on the base branch. A new matrix leg counts {_min(LEG_OVERHEAD_S)} of setup. "
-        f"This check is informational and does not block the merge."
+        f"push runs on the base branch, which run the trunk tier. A new matrix leg counts "
+        f"{_min(LEG_OVERHEAD_S)} of setup. This check is informational and does not block "
+        "the merge."
     )
 
 
@@ -354,16 +359,26 @@ def render_summary(report: Report, run_url: str = "") -> str:
     return "\n".join(lines)
 
 
+def _gh_read(cmd: list[str], text: bool):
+    # Reads only; retried because single API calls fail transiently.
+    for attempt in range(3):
+        try:
+            return subprocess.run(cmd, capture_output=True, check=True, text=text).stdout
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
 def gh_json(path: str, paginate: bool = False):
     cmd = ["gh", "api", path]
     if paginate:
         cmd += ["--paginate", "--slurp"]
-    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
-    return json.loads(result.stdout)
+    return json.loads(_gh_read(cmd, text=True))
 
 
 def gh_bytes(path: str) -> bytes:
-    return subprocess.run(["gh", "api", path], capture_output=True, check=True).stdout
+    return _gh_read(["gh", "api", path], text=False)
 
 
 def run_artifacts(repo: str, run_id: int) -> list[dict]:
@@ -695,6 +710,9 @@ def main() -> None:
     rpl.add_argument("files", nargs="+", help="Oldest first")
     rpl.set_defaults(func=cmd_replay)
     args = parser.parse_args()
+    if getattr(args, "post", False) and not args.run_id:
+        # --pr may fall back to an older commit's run; only the workflow's exact run posts.
+        parser.error("--post requires --run-id")
     args.func(args)
 
 

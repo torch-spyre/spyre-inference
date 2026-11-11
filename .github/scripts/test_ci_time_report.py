@@ -117,7 +117,27 @@ def test_clean_durations_drops_garbage():
     }
     assert ctr.clean_durations(raw) == {"ok": 1.5, "int": 2.0}
     assert ctr.clean_durations(["not", "a", "dict"]) == {}
-    assert len(next(iter(ctr.clean_durations({"x" * 5000: 1.0})))) == ctr._MAX_NODEID_CHARS
+    assert ctr.clean_durations({"x" * 5000: 1.0}) == {}
+
+
+def test_long_node_ids_stay_distinct_and_display_shortened():
+    a, b = "t::" + "x" * 400 + "[a]", "t::" + "x" * 400 + "[b]"
+    assert len(ctr.clean_durations({a: 1.0, b: 2.0})) == 2
+    assert ctr._code(a).endswith("…`") and len(ctr._code(a)) < 310
+
+
+def test_reads_retry_transient_failures(monkeypatch):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(ctr.subprocess, "run", run)
+    monkeypatch.setattr(ctr.time, "sleep", lambda s: None)
+    assert ctr.gh_json("/x") == {} and len(calls) == 3
 
 
 def test_suite_name_strips_shard_and_markup():

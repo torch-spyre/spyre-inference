@@ -37,7 +37,7 @@ uv run --no-sync vllm bench latency \
 
 Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace;
 `SPYRE_BATCHED_DECODE=1` is the default; the batched decode path also depends on
-layout, compilation, bucket coverage and allocated KV-cache pages.
+compilation, bucket coverage and allocated KV-cache pages.
 
 ### Which scope to measure
 
@@ -131,11 +131,7 @@ The batched decode kernel needs the `batched_decode_compiled` variant, which set
 `SPYRE_BATCHED_DECODE` for the process (so it cannot be mixed with a per-seq
 variant in one run). Even one decode sequence can use it, provided the build is
 compiled, the sequence/blocks bucket pair resolves, and the padded sequence count
-times blocks per chunk is strictly less than the allocated KV-cache page count. Under
-the default tiled walk the kernel is
-reached on the head-major layout only, which is `--attn-kv-layout`'s default; pairing
-the batched variant with `token_major` is refused up front rather than measured as a
-silent per-seq fallback.
+times blocks per chunk is strictly less than the allocated KV-cache page count.
 
 The batch axis is bucketed like the other two — one bucket per captured batch size,
 so each of `granite33_8b_batched_decode.json`'s 4/8/16/32 captures dispatches to its
@@ -198,7 +194,7 @@ a `_final.csv`.
 `--iterations` separate profiled windows, so they are not comparable to GPU
 wall-clock numbers. Spyre-specific columns: `device_time_memory_us` and
 `memory_share_pct` (memcpy/memset/restickify/d2d-copy share), `cpu_time_ms`,
-`fallback_clean`, `num_outliers`, `span`, `kv_layout`, `kv_write`,
+`fallback_clean`, `num_outliers`, `span`, `kv_write`,
 `attn_path`, `num_decode_seqs`, `padded_num_seqs`, `decode_uniformity`,
 `blocks_per_chunk`, `kernels_attributed`, `kernels_expected`, `late_compile`,
 `num_kv_blocks_iterated`, `padded_query_len`.

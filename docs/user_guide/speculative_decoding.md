@@ -2,8 +2,8 @@
 
 XPress runs a DFlash backbone once, refines a block of draft tokens, and lets
 the target model verify the proposals. The experimental Spyre integration loads
-the published `UIUC-SSAIL/Qwen3-8B-XPress-b16` checkpoint directly with
-`Qwen/Qwen3-8B`; checkpoint conversion is not required.
+published XPress checkpoints directly for Qwen3-8B and Gemma 4 26B A4B;
+checkpoint conversion is not required.
 
 Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
 either model runner (`SPYRE_MODEL_RUNNER=v1` or `v2`), up to four active
@@ -53,6 +53,31 @@ attention buckets, compilation sizes and the default single partial prefill.
 | 3 | 93 |
 | 4 | 124 |
 
+## Run Gemma 4 26B A4B
+
+The Gemma-trained checkpoint uses the same Qwen3 XPress draft architecture,
+with four sliding causal layers and one full non-causal layer. Spyre preserves
+these settings and captures the six target layers specified by the checkpoint.
+Use the text-backbone override to load the target's decoder:
+
+```bash
+export SPYRE_MODEL_RUNNER=v1
+export SPYRE_ATTN_QUERY_BUCKETS=1,16,64
+uv run --no-sync vllm serve google/gemma-4-26B-A4B-it \
+  --revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
+  --tokenizer-revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
+  --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+  --dtype float16 --tensor-parallel-size 1 \
+  --max-num-seqs 1 --max-model-len 256 --max-num-batched-tokens 64 \
+  --no-enable-prefix-caching \
+  --compilation-config '{"compile_sizes": [1, 16, 64]}' \
+  --speculative-config '{"method": "dflash", "model": "UIUC-SSAIL/gemma4-26b-a4b-XPress-b16", "revision": "e69e3580df7a7cd76b77e82ef739803fd88ee445", "num_speculative_tokens": 15, "xpress_topc": 128}'
+```
+
+The explicit `xpress_topc=128` overrides this checkpoint's 512-candidate default.
+The draft shares the target's raw embedding and output-head weights, matching
+upstream; Gemma's embedding scaling and logit softcap remain in the target.
+
 ## Refinement and compatibility
 
 The refiner follows [merged vLLM XPress](https://github.com/vllm-project/vllm/pull/54448):
@@ -98,6 +123,7 @@ CPU-sampling hooks ported to V2's speculator interface. See
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
 uv run --no-sync pytest tests/e2e/test_xpress_feedback.py -m 'not upstream' -s
+uv run --no-sync pytest tests/e2e/test_gemma4_xpress.py -m model_quality -s
 uv run --no-sync pytest \
   tests/e2e/test_speculative_decoding.py tests/e2e/test_xpress_batch.py -m model_quality -s
 ```

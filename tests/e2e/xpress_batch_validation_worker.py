@@ -18,7 +18,7 @@ import hashlib
 from pathlib import Path
 
 import torch
-from xpress_validation_worker import ValidationWorker
+from xpress_validation_worker import ValidationWorker, read_blocks
 
 from spyre_inference.v1.spec_decode.dflash import accepted_context_length
 
@@ -130,12 +130,9 @@ class BatchValidationWorker(ValidationWorker):
             if name in runner.drafter._draft_attn_layer_names and not include_draft:
                 continue
             block_size = pages.k_pages.shape[2]
-            ids = torch.tensor(row["blocks"][: (length + block_size - 1) // block_size])
+            ids = row["blocks"][: (length + block_size - 1) // block_size]
             cache[name] = tuple(
-                tensor.to(device="cpu", dtype=torch.float32)[ids]
-                .permute(0, 2, 1, 3)
-                .flatten(0, 1)[:length]
-                .contiguous()
+                read_blocks(tensor, ids).permute(0, 2, 1, 3).flatten(0, 1)[:length].contiguous()
                 for tensor in pages
             )
         return cache

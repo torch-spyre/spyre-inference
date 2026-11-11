@@ -17,11 +17,17 @@ Test SpyreParallelLMHead custom op correctness against a reference implementatio
 """
 
 import sys
+import warnings
 
 import pytest
 import torch
 import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
+
+# FP8 ``_scaled_mm`` fails to compile for K < 256
+# (``No system in place for splatting of data formats with <16b``).
+_FP8_LM_HEAD_HIDDEN = 256
+_FP8_LM_HEAD_HIDDEN_MM = 4096
 
 
 def reference_lm_head(
@@ -164,15 +170,9 @@ def test_lm_head_oot_dispatch(tp_group):
 
 
 @pytest.mark.parallel_lm_head
-def test_lm_head_fp8_config_accepted(tp_group):
-    """SpyreParallelLMHead accepts Fp8Config without raising.
-
-    Fp8Config.get_quant_method returns None for ParallelLMHead (it only
-    handles LinearBase/Attention), so upstream falls back to
-    UnquantizedEmbeddingMethod, which we then replace with
-    SpyreUnquantizedLMHeadMethod. The LM head always runs FP16 regardless
-    of the checkpoint's quantization config.
-    """
+@pytest.mark.fp8
+def test_lm_head_fp8_config_stays_fp16(tp_group):
+    """``Fp8Config`` never quantizes the head upstream, so neither does Spyre."""
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -181,10 +181,13 @@ def test_lm_head_fp8_config_accepted(tp_group):
         SpyreUnquantizedLMHeadMethod,
     )
 
-    layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
+    layer = ParallelLMHead(
+        128, _FP8_LM_HEAD_HIDDEN, params_dtype=torch.float16, quant_config=Fp8Config()
+    )
 
     assert isinstance(layer, SpyreParallelLMHead)
-    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert type(layer.quant_method) is SpyreUnquantizedLMHeadMethod
+    assert layer.weight.dtype == torch.float16
 
 
 def _apply_tracked(layer):
@@ -543,11 +546,11 @@ def test_projection_compiles_itself_and_matches_eager(tp_group, monkeypatch, spy
         lambda: types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
     )
     compiled_method = SpyreUnquantizedLMHeadMethod()
-    assert compiled_method.spyre_compiled_kernel is None
+    assert not compiled_method.spyre_compiled_kernels
 
     actual = compiled_method.apply(layer, x)
 
-    assert compiled_method.spyre_compiled_kernel is not None, "projection did not compile"
+    assert compiled_method.spyre_compiled_kernels, "projection did not compile"
     assert actual.shape == (rows, vocab_size)
     torch.testing.assert_close(actual.cpu().float(), eager.cpu().float(), atol=1e-2, rtol=1e-2)
 
@@ -580,7 +583,7 @@ def test_projection_stays_eager_inside_an_enclosing_graph(tp_group, monkeypatch)
     out = method.apply(layer, torch.randn(3, 8, dtype=torch.float16))
 
     assert out.shape == (3, 16)
-    assert method.spyre_compiled_kernel is None
+    assert not method.spyre_compiled_kernels
 
 
 def _cpu_gather_worker(rank: int, world_size: int, port: int, shards: list) -> None:
@@ -629,6 +632,366 @@ def spyre_or_cpu_device():
         return torch.device("spyre")
     except Exception:
         return torch.device("cpu")
+
+
+def _fp8_args(strategy: str = "channel", **kwargs):
+    from compressed_tensors.quantization import QuantizationArgs
+
+    return QuantizationArgs(num_bits=8, type="float", strategy=strategy, **kwargs)
+
+
+def _ct_config(target_scheme_map: dict, ignore: list[str] | None = None):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    return CompressedTensorsConfig(
+        target_scheme_map=target_scheme_map, ignore=ignore or [], quant_format="float-quantized"
+    )
+
+
+def _w8a8(weights="channel", *, static_input: bool = False):
+    acts = _fp8_args("tensor", dynamic=False) if static_input else _fp8_args("token", dynamic=True)
+    return {"weights": _fp8_args(weights), "input_activations": acts}
+
+
+def _ct_body_only():
+    """Granite FP8 checkpoints: ``targets: ["Linear"]`` and ``ignore: ["lm_head"]``."""
+    return _ct_config({"Linear": _w8a8()}, ignore=["lm_head"])
+
+
+def _ct_fp8_head(weights="channel", *, static_input: bool = False):
+    """A compressed-tensors checkpoint that also ships its head in FP8."""
+    return _ct_config({"Linear": _w8a8(), "lm_head": _w8a8(weights, static_input=static_input)})
+
+
+def _make_head(quant_config, vocab_size: int = 128, embedding_dim: int = 64):
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.fp8_linear_kernel import register_spyre_fp8_linear_kernel
+
+    register_spyre_fp8_linear_kernel()
+    return ParallelLMHead(
+        vocab_size,
+        embedding_dim,
+        params_dtype=torch.float16,
+        quant_config=quant_config,
+        prefix="lm_head",
+    )
+
+
+def _compile_mode(monkeypatch, compiled: bool) -> None:
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationMode
+
+    from spyre_inference.custom_ops import lazy_compile
+
+    mode = CompilationMode.STOCK_TORCH_COMPILE if compiled else CompilationMode.NONE
+    monkeypatch.setattr(
+        lazy_compile, "get_cached_compilation_config", lambda: SimpleNamespace(mode=mode)
+    )
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize(
+    ("make_config", "compiled", "expected"),
+    [
+        (lambda: None, True, "SpyreUnquantizedLMHeadMethod"),
+        (_ct_body_only, True, "SpyreUnquantizedLMHeadMethod"),
+        (lambda: _ct_config({"Linear": _w8a8()}), True, "SpyreUnquantizedLMHeadMethod"),
+        (_ct_fp8_head, True, "SpyreFp8LMHeadMethod"),
+        (lambda: _ct_fp8_head("tensor"), True, "SpyreFp8LMHeadMethod"),
+        (lambda: _ct_fp8_head(static_input=True), True, "SpyreFp8LMHeadMethod"),
+        (_ct_fp8_head, False, "SpyreFp8LMHeadMethod"),
+    ],
+    ids=[
+        "no-quant",
+        "ct-head-ignored",
+        "ct-head-not-targeted",
+        "ct-fp8-head",
+        "ct-fp8-head-per-tensor",
+        "ct-fp8-head-static-input",
+        "ct-fp8-head-enforce-eager",
+    ],
+)
+def test_construction_follows_the_checkpoint(
+    tp_group, monkeypatch, make_config, compiled, expected
+):
+    """The head is FP8 only when the checkpoint ships it so, as upstream; no card needed."""
+    _compile_mode(monkeypatch, compiled)
+    head = _make_head(make_config())
+    assert type(head.quant_method).__name__ == expected
+    fp8 = expected == "SpyreFp8LMHeadMethod"
+    assert (head.weight.dtype == torch.float8_e4m3fn) is fp8
+
+
+def _scheme(name: str):
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW8A8Fp8,
+        CompressedTensorsW8A16Fp8,
+    )
+
+    if name == "w8a16":
+        return CompressedTensorsW8A16Fp8(_fp8_args(), is_static_input_scheme=False)
+    weights = _fp8_args("block", block_structure=[128, 128]) if name == "block" else _fp8_args(name)
+    return CompressedTensorsW8A8Fp8(weights, is_static_input_scheme=False)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize(
+    ("scheme", "expected"),
+    [("channel", True), ("tensor", True), ("block", False), ("w8a16", False)],
+)
+def test_only_fp8_w8a8_heads_get_the_fp8_method(tp_group, scheme, expected):
+    """The Spyre FP8 head serves FP8 W8A8 with channel or tensor weight scales.
+
+    Asked of the scheme alone: building a head for any other scheme already fails in
+    upstream's kernel selection, which has no Spyre kernel for it.
+    """
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+
+    from spyre_inference.custom_ops.parallel_lm_head import ships_fp8_head
+
+    method = CompressedTensorsLinearMethod(_ct_config({}))
+    head = SimpleNamespace(quant_method=method, scheme=_scheme(scheme))
+    assert ships_fp8_head(head) is expected
+    assert not ships_fp8_head(SimpleNamespace(quant_method=None, scheme=_scheme(scheme)))
+
+
+def _load_checkpoint_head(head, *, seed: int = 0):
+    """Fill the checkpoint parameters as the loader would: an FP8 ``weight`` with
+    per-row scales, zero past the vocab, and return the FP16 weight they encode."""
+    torch.manual_seed(seed)
+    vocab = head.org_vocab_size
+    w = torch.randn(vocab, head.weight.shape[1], dtype=torch.float32) * 0.01
+    scale = w.abs().amax(dim=1, keepdim=True) / torch.finfo(torch.float8_e4m3fn).max
+    q = (w / scale).to(torch.float8_e4m3fn)
+    head.weight.data.zero_()
+    head.weight.data[:vocab].copy_(q)
+    head.weight_scale.data.zero_()
+    head.weight_scale.data[:vocab].copy_(scale.reshape(head.weight_scale.data[:vocab].shape))
+    return (q.float() * scale).to(torch.float16)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("weights", ["channel", "tensor"])
+def test_checkpoint_scales_are_kept_as_loaded(tp_group, monkeypatch, weights):
+    """One scale per row, per-tensor broadcast, values untouched: the weight was quantized
+    against them, so a scale below float16's normal range must not be raised."""
+    from spyre_inference.custom_ops.parallel_lm_head import checkpoint_fp8_scales
+
+    _compile_mode(monkeypatch, True)
+    head = _make_head(_ct_fp8_head(weights), vocab_size=100)
+    head.weight_scale.data.fill_(1e-5)
+    if weights == "channel":
+        head.weight_scale.data[100:] = 0
+    scale = checkpoint_fp8_scales(head)
+    assert scale.dtype == torch.float32
+    assert scale.shape == (head.weight.shape[0],)
+    torch.testing.assert_close(scale[:100], torch.full((100,), 1e-5))
+    if weights == "channel":
+        assert bool((scale[100:] == 0).all())
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("static_input", [False, True])
+def test_fp8_head_keeps_the_checkpoint_weight(tp_group, monkeypatch, static_input):
+    """Loading pads and transposes the checkpoint's FP8 bytes unchanged; nothing is
+    requantized, and the checkpoint parameters are left for a reload."""
+    from spyre_inference.custom_ops import parallel_lm_head
+
+    _compile_mode(monkeypatch, True)
+    # The DMA needs a card; the layout under test does not.
+    monkeypatch.setattr(parallel_lm_head, "_dma_checkpoint_qfp8wt", lambda w: w.contiguous())
+    head = _make_head(_ct_fp8_head(static_input=static_input))
+    _load_checkpoint_head(head)
+    if static_input:
+        head.input_scale.data.copy_(torch.tensor([0.25]))
+    loaded = head.weight.data.clone()
+    head.quant_method.process_weights_after_loading(head)
+
+    rows = loaded.shape[0]
+    padding = head.spyre_row_padding
+    assert head.padded_weight_t.shape == (loaded.shape[1], rows + padding)
+    head_bytes = head.padded_weight_t.view(torch.uint8)
+    assert torch.equal(head_bytes[:, :rows], loaded.t().view(torch.uint8))
+    assert bool((head_bytes[:, rows:] == 0).all())
+    scale = head.padded_weight_scale
+    assert scale.dtype == torch.float16 and scale.shape == (1, rows + padding)
+    assert bool((scale[:, rows:] == 0).all())
+    assert torch.equal(head.weight.data.view(torch.uint8), loaded.view(torch.uint8))
+    if static_input:
+        assert head.padded_input_scale.tolist() == [0.25]
+    else:
+        assert not hasattr(head, "padded_input_scale")
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_head_compiles_under_enforce_eager(tp_group, monkeypatch):
+    """``spyre.scaled_mm`` has no eager kernel, so the projection compiles regardless."""
+    from spyre_inference.custom_ops import lazy_compile
+
+    _compile_mode(monkeypatch, False)
+    head = _make_head(_ct_fp8_head())
+    compiled = []
+    monkeypatch.setattr(
+        lazy_compile.torch,
+        "compile",
+        lambda fn, **kwargs: compiled.append(fn) or (lambda *args, **kw: "compiled"),
+    )
+    assert head.quant_method._project(head, torch.zeros(2, 64)) == "compiled"
+    assert len(compiled) == 1
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_checkpoint_parameters_stay_on_host(tp_group, monkeypatch):
+    """Once loaded, the checkpoint's FP8 weight and scales are runtime-dead: ``.to`` skips
+    them, so a reload writes host tensors, while the runtime scale follows the GEMM."""
+    from spyre_inference.custom_ops import parallel_lm_head
+
+    _compile_mode(monkeypatch, True)
+    monkeypatch.setattr(parallel_lm_head, "_dma_checkpoint_qfp8wt", lambda w: w.contiguous())
+    head = _make_head(_ct_fp8_head())
+    _load_checkpoint_head(head)
+    head.quant_method.process_weights_after_loading(head)
+    moved = []
+    head._apply(lambda t: moved.append(t) or t)
+    moved_ids = {id(t) for t in moved}
+    assert id(head.padded_weight_scale) in moved_ids
+    for name in ("weight", "weight_scale"):
+        assert id(getattr(head, name)) not in moved_ids, name
+        assert name in head._parameters
+
+
+def _build_fp8_lm_head(vocab_size: int, embedding_dim: int, *, seed: int = 42):
+    """A checkpoint FP8 head, loaded: qfp8wt ``padded_weight_t`` on Spyre and
+    ``padded_weight_scale``. Returns the head and the FP16 weight it encodes."""
+    if not spyre_available():
+        pytest.skip("Loading DMAs the head into qfp8wt, which needs Spyre")
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreFp8LMHeadMethod
+
+    layer = _make_head(_ct_fp8_head(), vocab_size, embedding_dim)
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    encoded = _load_checkpoint_head(layer, seed=seed)
+    layer.quant_method.process_weights_after_loading(layer)
+    return layer, encoded
+
+
+def _fp8_lm_head_apply(layer, x):
+    """Call SpyreFp8LMHeadMethod.apply on Spyre; error on silent CPU fallback."""
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        actual = layer.quant_method.apply(layer, x)
+    assert actual.device.type == "spyre", actual.device
+    return actual
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_loading_dmas_qfp8wt(tp_group):
+    """Loading leaves a qfp8wt head on Spyre and a host per-column scale."""
+    layer, _ = _build_fp8_lm_head(128, _FP8_LM_HEAD_HIDDEN)
+    padded_vocab = layer.padded_weight_t.shape[1]
+    assert layer.padded_weight_t.device.type == "spyre"
+    assert layer.padded_weight_t.dtype == torch.float8_e4m3fn
+    assert layer.padded_weight_scale.shape == (1, padded_vocab)
+    assert layer.padded_weight_scale.device.type == "cpu"
+
+    layer.to("spyre")
+    assert layer.padded_weight_scale.device.type == "spyre"
+    assert layer.weight.device.type == "cpu"
+    assert layer.weight_scale.device.type == "cpu"
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_head_dma_round_trips_the_checkpoint_weight(tp_group):
+    """The qfp8wt head read back is the checkpoint's FP8 bytes, padding zero."""
+    layer, _ = _build_fp8_lm_head(49216, _FP8_LM_HEAD_HIDDEN)
+    rows = layer.weight.shape[0]
+    read_back = layer.padded_weight_t.cpu()
+    assert torch.equal(read_back[:, :rows].view(torch.uint8), layer.weight.t().view(torch.uint8))
+    assert bool((read_back[:, rows:].view(torch.uint8) == 0).all())
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_reload_after_the_device_move_still_projects(tp_group):
+    """A reload after ``model.to("spyre")`` rebuilds the head from the host checkpoint
+    parameters and keeps the new scale beside the qfp8wt head."""
+    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
+    layer, encoded = _build_fp8_lm_head(49216, embedding_dim)
+    layer = layer.to("spyre")
+    layer.weight_scale.data.mul_(2)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.padded_weight_scale.device.type == "spyre"
+
+    x = torch.randn(4, embedding_dim, dtype=torch.float16) * 0.01
+    expected = reference_lm_head(x, encoded * 2)
+    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.02, rtol=0.01)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_lm_head_apply_rejects_bias(tp_group):
+    """bias is not supported; raise before any Spyre GEMM."""
+    layer, _ = _build_fp8_lm_head(128, _FP8_LM_HEAD_HIDDEN)
+    x = torch.randn(2, _FP8_LM_HEAD_HIDDEN, dtype=torch.float16)
+    bias = torch.zeros(128, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="embedding_bias"):
+        layer.quant_method.apply(layer, x, bias)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("num_tokens", [1, 4, 7])
+@pytest.mark.parametrize("vocab_size", [49216, 51200])
+def test_fp8_lm_head_apply_matches_reference(tp_group, num_tokens, vocab_size):
+    """SpyreFp8LMHeadMethod.apply matches F.linear on the weight the checkpoint encodes.
+
+    Hidden=4096 so torch-spyre can compile FP8 ``scaled_mm``. Vocab 49216/51200 hits the
+    ``spyre_row_padding`` unpad, and the whole padded vocab is one GEMM. The activation is
+    quantized per token, so the tolerance covers its e4m3 error only.
+    """
+    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
+    layer, encoded = _build_fp8_lm_head(vocab_size, embedding_dim)
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16) * 0.01
+    expected = reference_lm_head(x, encoded)
+
+    layer = layer.to("spyre")
+    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
+
+    assert actual.dtype == torch.float16
+    assert actual.shape == (num_tokens, vocab_size)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_lm_head_apply_rejects_3d(tp_group):
+    """3-D input is rejected with NotImplementedError.
+
+    Column-slice of a ``scaled_mm`` output followed by ``reshape`` reads garbage on
+    Spyre (torch-spyre bug — the 3-D branch is unreachable in serving).
+    """
+    layer, _ = _build_fp8_lm_head(49216, _FP8_LM_HEAD_HIDDEN_MM)
+    x = torch.randn(2, 3, _FP8_LM_HEAD_HIDDEN_MM, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="2-D"):
+        layer.quant_method.apply(layer, x)
 
 
 if __name__ == "__main__":

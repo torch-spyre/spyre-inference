@@ -534,6 +534,27 @@ def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
     assert (model.per_layer_embeddings[4:] == -1).all()
 
 
+@pytest.mark.parametrize("num_tokens", [33, 64])
+def test_ids_outside_mask_on_spyre(num_tokens):
+    """The PLE image-token mask on the card, as ``vision_embed_text`` calls it: a stick-
+    aligned and an unaligned length, and a second mask replayed through the same graph."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.models.gemma4_mm import _ids_outside_mask
+
+    # Nonzero ids up to the top of the 262144-entry vocab, so a dropped mask shows.
+    ids = (torch.arange(num_tokens) * 104729 + 258880) % 262144
+    ids[0], ids[-1] = 0, 262143
+    device_ids = convert(ids, device="spyre")
+    with torch.inference_mode():
+        for modulus in (2, 17):
+            mask = torch.arange(num_tokens) % modulus == 1
+            device_mask = convert(mask, device=device_ids.device, dtype=device_ids.dtype)
+            got = convert(_ids_outside_mask(device_ids, device_mask), device="cpu")
+            assert torch.equal(got, torch.where(mask, 0, ids))
+
+
 def test_upstream_tower_contract_is_unchanged():
     """The Spyre attention and the block call rely on these; diff them on a bump."""
     layer_src = inspect.getsource(modeling_gemma4.Gemma4VisionEncoderLayer.forward)

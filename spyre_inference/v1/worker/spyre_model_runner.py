@@ -320,9 +320,8 @@ def unwrap_model(model: Any) -> nn.Module:
 class _SpyreHiddenStates(torch.Tensor):
     """Select sampled rows on Spyre, reusing the padded body output for decode.
 
-    A 1-D integer index goes through ``select_rows`` on a warmed row bucket rather than
-    ``aten::index.Tensor``, whose host bounds check costs every step and which compiles
-    per index length. Upstream reaches it from ``execute_model``'s
+    A 1-D integer index goes through ``select_rows``, padded onto a warmed row bucket,
+    which a plain ``x[idx]`` cannot do. Upstream reaches it from ``execute_model``'s
     ``hidden_states[logits_indices]`` and ``_dummy_run``'s
     ``hidden_states[logit_indices_device]``. Slices such as
     ``hidden_states[:num_scheduled_tokens]`` and every other op see a plain tensor.
@@ -776,7 +775,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
 
-        # CPU-fallback pooling must not opt into the generative output contract.
         bucketer = self.spyre_shape_bucketer
         self.model = _SpyreModelWrapper(
             self.model,
@@ -795,6 +793,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Without a bucketer (enforce_eager) the body is unpadded, so every prompt
             # length would compile a fresh gather.
             sample_rows_on_device=(
+                # CPU-fallback pooling must not opt into the generative output contract.
                 self.model_config.runner_type == "generate"
                 and bucketer is not None
                 and envs.SPYRE_SAMPLE_ROWS_ON_DEVICE

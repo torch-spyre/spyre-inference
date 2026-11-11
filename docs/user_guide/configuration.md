@@ -86,9 +86,13 @@ pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each 
 no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
 
 The sampled rows are gathered on Spyre, so only the logits are copied to the host.
-Warmup compiles that gather at every row bucket. `SPYRE_SAMPLE_ROWS_ON_DEVICE=0` copies
-every hidden-state row to the host and gathers there instead. Under `--enforce-eager`
-there are no buckets, so the host gather is always used.
+Warmup compiles that gather, and the lm_head on its output, for every row bucket at
+every body bucket it fits in. The lm_head then sees a different device layout than the
+host path gives it, so logits can differ at fp16 rounding level.
+`SPYRE_SAMPLE_ROWS_ON_DEVICE=0` copies every hidden-state row to the host and gathers
+there instead, matching the host path exactly. The host gather is always used without
+buckets (`--enforce-eager` or an empty `compile_sizes`), for prompt-logprob rows, for
+auxiliary hidden-state outputs, and in the V2 model runner.
 
 ## Encoder / pooling compile buckets
 

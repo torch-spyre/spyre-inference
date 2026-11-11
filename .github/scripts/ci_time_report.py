@@ -372,7 +372,7 @@ def run_artifacts(repo: str, run_id: int) -> list[dict]:
 def read_artifact(repo: str, artifact: dict, suffix: str, parse):
     """parse() of the artifact's first *suffix member, or None if unreadable."""
     if artifact.get("size_in_bytes", 0) > _MAX_ARTIFACT_BYTES:
-        print(f"::warning::skipping oversized artifact {artifact['name']}")
+        print(f"::warning::skipping oversized artifact {_plain(artifact['name'])}")
         return None
     blob = gh_bytes(f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip")
     # Read in memory, never extracted; a malformed (fork-written) artifact is skipped.
@@ -383,7 +383,8 @@ def read_artifact(repo: str, artifact: dict, suffix: str, parse):
                 return None
             return parse(zf.read(members[0]))
     except Exception as e:
-        print(f"::warning::skipping unreadable artifact {artifact['name']}: {type(e).__name__}")
+        name = _plain(artifact["name"])
+        print(f"::warning::skipping unreadable artifact {name}: {type(e).__name__}")
         return None
 
 
@@ -558,7 +559,21 @@ def upsert_comment(repo: str, number: int, body: str, report: Report) -> None:
     print(f"{'Updated' if existing else 'Posted'} the CI time comment on PR #{number}.")
 
 
+def publish(args, text: str, status: str = "") -> None:
+    # In Actions the runner parses `::`/`##[` commands anywhere in stdout, and the text
+    # holds PR-controlled node ids: there it goes only to files, stdout gets status.
+    paths = [p for p in (os.environ.get("GITHUB_STEP_SUMMARY"), args.summary_file) if p]
+    for path in paths:
+        with open(path, "a") as f:
+            f.write(text)
+    if not os.environ.get("GITHUB_ACTIONS"):
+        print(text)
+    elif status:
+        print(status)
+
+
 def cmd_report(args) -> None:
+    note = ""
     repo = args.repo or os.environ["GITHUB_REPOSITORY"]
     if args.run_id:
         run = gh_json(f"/repos/{repo}/actions/runs/{args.run_id}")
@@ -580,29 +595,19 @@ def cmd_report(args) -> None:
         pr = gh_json(f"/repos/{repo}/pulls/{args.pr}")
         run = latest_pr_run(repo, pr)
         if run is None:
-            print(f"PR #{args.pr} has no green {WORKFLOW} run yet.")
+            publish(args, f"PR #{args.pr} has no green {WORKFLOW} run yet.\n")
             return
         if run["head_sha"] != pr["head"]["sha"]:
-            print(
+            note = (
                 f"Note: the head {pr['head']['sha'][:12]} has no green run yet; reporting the "
-                f"run of the older commit {run['head_sha'][:12]}.\n"
+                f"run of the older commit {run['head_sha'][:12]}.\n\n"
             )
 
     report = build_report(repo, run, pr)
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if isinstance(report, str):
-        msg = f"## CI time report\n\nSkipped: {report}.\n"
-        print(msg)
-        if summary_path:
-            with open(summary_path, "a") as f:
-                f.write(msg)
+        publish(args, f"{note}## CI time report\n\nSkipped: {report}.\n")
         return
-
-    summary = render_summary(report, run.get("html_url", ""))
-    print(summary)
-    if summary_path:
-        with open(summary_path, "a") as f:
-            f.write(summary)
+    publish(args, note + render_summary(report, run.get("html_url", "")), _headline(report))
     if args.json:
         with open(args.json, "w") as f:
             json.dump(
@@ -658,6 +663,7 @@ def main() -> None:
     rep.add_argument("--repo", default="", help="owner/name (default: $GITHUB_REPOSITORY)")
     rep.add_argument("--post", action="store_true", help="Create or update the PR comment")
     rep.add_argument("--json", default="", help="Also write the report as JSON here")
+    rep.add_argument("--summary-file", default="", help="Also append the Markdown report here")
     rep.set_defaults(func=cmd_report)
     rpl = sub.add_parser("replay", help="Replay the rule over consecutive test-durations.json")
     rpl.add_argument("files", nargs="+", help="Oldest first")

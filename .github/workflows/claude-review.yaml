@@ -123,7 +123,7 @@ jobs:
           out="${RUNNER_TEMP}/ci-time-report.md"
           env -u GITHUB_STEP_SUMMARY uv run --no-project --with pyyaml python3 -I \
             .github/scripts/ci_time_report.py report --repo "${REPO}" --pr "${PR_NUMBER}" \
-            > "${out}" 2>/dev/null || echo "The CI time report is unavailable." > "${out}"
+            --summary-file "${out}" || echo "The CI time report is unavailable." > "${out}"
 
       - name: uv cache (NFS)
         if: env.REVIEW_MODE == 'hardware'

@@ -379,3 +379,23 @@ def test_missing_legs_ignores_other_tiers():
     )
     assert ctr.missing_legs(legs, {}) == ["A (shard 1/1)"]
     assert ctr.missing_legs(legs, {"junit-t0": {}}) == []
+
+
+def test_actions_stdout_never_carries_node_ids(monkeypatch, tmp_path, capsys):
+    evil = "tests/x.py::test_y[##[error file=README.md;line=1]x ::warning::y]"
+    r = ctr.compute(_pr({**_baseline(), evil: 600.0}), [_baseline()] * 5)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    args = type("A", (), {"summary_file": ""})()
+    ctr.publish(args, ctr.render_summary(r), ctr._headline(r))
+    out = capsys.readouterr().out
+    assert "##[" not in out and "::" not in out and out.startswith("This PR adds")
+    assert "##[error" in summary.read_text()
+
+
+def test_local_runs_print_the_report(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    ctr.publish(type("A", (), {"summary_file": ""})(), "## CI time report\n", "status")
+    assert "## CI time report" in capsys.readouterr().out

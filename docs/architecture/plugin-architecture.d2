@@ -45,7 +45,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ATTN: "SpyreHeadMajorAttentionImpl\n(default; SpyreAttentionImpl for\ntoken_major) Spyre kernels;\nhost-side metadata & loop" {
+  ATTN: "SpyreAttentionImpl\nSpyre kernels;\nhost-side metadata & loop" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -91,7 +91,7 @@ attn_detail: "Decoder Attention Pipeline" {
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  S2: "Write K/V on Spyre (compiled):\ntoken-major uses slot-major view;\nhead-major writes per KV head" {
+  S2: "Write K/V on Spyre (compiled):\none write per KV head" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"

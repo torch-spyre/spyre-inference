@@ -71,7 +71,8 @@ def test_decode_reuses_the_body_bucket_without_a_gather(monkeypatch, num_rows):
     assert widths == []
     assert rows.data_ptr() == plain.data_ptr()
     torch.testing.assert_close(rows, plain[:num_rows])
-    assert getattr(rows, "_spyre_padded_rows", rows).shape[0] == size
+    assert rows._spyre_padded_rows.shape[0] == size
+    assert rows._spyre_padded_rows.data_ptr() == plain.data_ptr()
 
 
 @pytest.mark.parametrize("indices", [[2, 0, 1], [0, 0, 2], [1, 2, 3]])
@@ -164,7 +165,6 @@ def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
 
     monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", convert)
     monkeypatch.setattr(mr.attn_layer, "publish_null_slots", lambda _: None)
-    monkeypatch.setenv("SPYRE_SAMPLE_ROWS_ON_DEVICE", "1")
     model = lambda **kwargs: device_hidden
     wrapper = mr._SpyreModelWrapper(model, torch.device("spyre"), model_dtype=torch.float16)
 

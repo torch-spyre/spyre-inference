@@ -9,6 +9,16 @@ Be sure to validate that all new behavior is covered by tests. Additionally, ens
 any added tests are actually run through CI. This includes making sure that tests are
 scheduled on jobs that have the correct number of Spyre cards to execute them.
 
+Check what new tests cost in CI. If the PR has a CI time report comment (its body starts
+with `<!-- ci-time-report -->`), use its numbers; otherwise run
+`uv run --no-project --with pyyaml python3 .github/scripts/ci_time_report.py report --pr __PR_NUMBER__`,
+which prints the minutes each new test took in the PR's latest green CI run and nothing until
+that run exists. For every new e2e, model or multi-card test that takes more than about a
+minute, check whether it covers a code path the existing tests miss. If it does not, raise it
+as an issue and name the cheaper option: a smaller model, fewer parametrizations, folding it
+into an existing test that already loads the same model, or a unit-level test. Leave cheap
+unit tests alone.
+
 If this PR already has open comments, validate that the appropriate changes have been
 made to address them. Reply to these comments either asking for more changes or
 confirming that the comment can be resolved.

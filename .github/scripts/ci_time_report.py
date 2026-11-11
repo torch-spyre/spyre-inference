@@ -1,0 +1,622 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Comment on a PR when its new tests and matrix legs add more than THRESHOLD_PCT of the
+regression tier's CI test time. Informational only, never blocks a PR.
+
+Usage:
+    GH_TOKEN=... python3 ci_time_report.py report --run-id <id> --post
+    GH_TOKEN=... python3 ci_time_report.py report --pr <number>
+    python3 ci_time_report.py replay <test-durations.json>... (oldest first)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import os
+import re
+import statistics
+import subprocess
+import urllib.parse
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+import yaml
+
+THRESHOLD_PCT = 3.0
+BASELINE_RUNS = 5
+REMOVED_MIN_RUNS = 3
+# Median setup cost of one matrix leg (job wall clock minus its test time).
+LEG_OVERHEAD_S = 432.0
+TIER = "regression"
+WORKFLOW = "test_each_commit.yaml"
+MATRIX_PATH = ".github/workflows/_test_matrix.yaml"
+MARKER = "<!-- ci-time-report -->"
+BOT_LOGIN = "github-actions[bot]"
+RETRY_SUITE = "(pod-level retry)"
+
+_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+_MAX_NODEID_CHARS = 300
+_TOP_N = 5
+_SLOW_S = 30.0
+_SUMMARY_ROWS = 200
+
+
+@dataclass
+class NewTest:
+    nodeid: str
+    seconds: float
+    suite: str
+
+
+@dataclass
+class Report:
+    baseline_s: float
+    baseline_runs: int
+    new: list[NewTest]
+    removed: dict[str, float]
+    leg_delta: dict[str, int]
+    on_base: list[NewTest] = field(default_factory=list)
+
+    @property
+    def new_s(self) -> float:
+        return sum(t.seconds for t in self.new)
+
+    @property
+    def removed_s(self) -> float:
+        return sum(self.removed.values())
+
+    @property
+    def legs(self) -> int:
+        return sum(self.leg_delta.values())
+
+    @property
+    def net_s(self) -> float:
+        return self.new_s - self.removed_s + self.legs * LEG_OVERHEAD_S
+
+    @property
+    def pct(self) -> float:
+        return 100.0 * self.net_s / self.baseline_s if self.baseline_s else 0.0
+
+    @property
+    def over(self) -> bool:
+        return self.pct >= THRESHOLD_PCT
+
+
+def clean_durations(data: object) -> dict[str, float]:
+    # A fork PR writes these artifacts: keep only sane {str: seconds} pairs.
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for nodeid, seconds in data.items():
+        if not isinstance(nodeid, str) or isinstance(seconds, bool):
+            continue
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= seconds < 1e6:
+            out[nodeid[:_MAX_NODEID_CHARS]] = seconds
+    return out
+
+
+def _func(nodeid: str) -> str:
+    return nodeid.split("[", 1)[0]
+
+
+def suite_name(cfg: str) -> str:
+    # cfg comes from the PR head and lands in a comment: no mentions, links or pipes.
+    name = re.sub(r"\s*\(shard \d+/\d+\)\s*$", "", cfg)
+    return re.sub(r"[^A-Za-z0-9 ()/=.,_+-]", "", name).strip()[:80] or "(unnamed leg)"
+
+
+def matrix_legs(matrix_yaml: str) -> list[dict]:
+    # Include order is strategy.job-index.
+    doc = yaml.safe_load(matrix_yaml)
+    try:
+        legs = doc["jobs"]["test"]["strategy"]["matrix"]["include"]
+    except (KeyError, TypeError):
+        return []
+    return [leg for leg in legs if isinstance(leg, dict) and isinstance(leg.get("cfg"), str)]
+
+
+def tier_leg_counts(legs: list[dict], tier: str = TIER) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for leg in legs:
+        if tier in str(leg.get("test_types", "")).split():
+            name = suite_name(leg["cfg"])
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def leg_delta(head: dict[str, int], base: dict[str, int]) -> dict[str, int]:
+    return {
+        s: head.get(s, 0) - base.get(s, 0)
+        for s in sorted(set(head) | set(base))
+        if head.get(s, 0) != base.get(s, 0)
+    }
+
+
+def slot_suites(legs: list[dict], failed_suite_names: list[str]) -> dict[str, str]:
+    # retry-<i> indexes collect_failed_suites' retry matrix, built in sorted descriptor order.
+    out = {str(i): suite_name(leg["cfg"]) for i, leg in enumerate(legs)}
+    for i, name in enumerate(sorted(failed_suite_names)):
+        idx = name.rsplit("-", 1)[-1]
+        if idx.isdigit() and int(idx) < len(legs):
+            out[f"retry-{i}"] = suite_name(legs[int(idx)]["cfg"])
+    return out
+
+
+def merge_pr_legs(
+    slices: dict[str, dict[str, float]], suites: dict[str, str]
+) -> dict[str, tuple[float, str]]:
+    out: dict[str, tuple[float, str]] = {}
+    # First attempts before retries, so a retried test keeps its original suite.
+    for slot in sorted(slices, key=lambda s: s.startswith("retry-")):
+        suite = suites.get(slot, RETRY_SUITE if slot.startswith("retry-") else "(unknown leg)")
+        for nodeid, seconds in slices[slot].items():
+            prev = out.get(nodeid)
+            if prev is None:
+                out[nodeid] = (seconds, suite)
+            elif seconds > prev[0]:
+                out[nodeid] = (seconds, prev[1])
+    return out
+
+
+def compute(
+    pr: dict[str, tuple[float, str]],
+    baselines: list[dict[str, float]],
+    legs: dict[str, int] | None = None,
+    pr_files: set[str] | None = None,
+    base_only_files: set[str] | None = None,
+) -> Report:
+    """Compare a PR run with baseline runs, newest first.
+
+    A removal needs the PR to touch the test's file (or re-parametrize it, or the id to
+    have no file): the baseline is the trunk tier, and trunk-gated tests are skipped,
+    so unrecorded, in every regression-tier PR run.
+    """
+    baselines = baselines[:BASELINE_RUNS]
+    base_only_files = base_only_files or set()
+    seen: dict[str, list[float]] = {}
+    for b in baselines:
+        for nodeid, seconds in b.items():
+            seen.setdefault(nodeid, []).append(seconds)
+    need = min(REMOVED_MIN_RUNS, len(baselines))
+    # A test the base branch itself dropped lingers in older baselines.
+    newest = baselines[0] if baselines else {}
+    new_funcs = {_func(n) for n in pr if n not in seen}
+
+    def removable(nodeid: str) -> bool:
+        path = nodeid.split("::")[0]
+        return pr_files is None or not path or path in pr_files or _func(nodeid) in new_funcs
+
+    removed = {
+        n: statistics.median(v)
+        for n, v in seen.items()
+        if n not in pr and n in newest and len(v) >= need and removable(n)
+    }
+    new, on_base = [], []
+    for nodeid, (seconds, suite) in pr.items():
+        if nodeid in seen:
+            continue
+        t = NewTest(nodeid, seconds, suite)
+        (on_base if nodeid.split("::")[0] in base_only_files else new).append(t)
+    new.sort(key=lambda t: -t.seconds)
+    on_base.sort(key=lambda t: -t.seconds)
+    total = statistics.median([sum(b.values()) for b in baselines]) if baselines else 0.0
+    return Report(total, len(baselines), new, removed, legs or {}, on_base)
+
+
+def _min(seconds: float) -> str:
+    return f"{seconds / 60:.1f} min"
+
+
+def _code(nodeid: str) -> str:
+    # PR-controlled: no backticks or newlines, and pipes break tables.
+    return "`" + re.sub(r"[`\r\n]", "", nodeid).replace("|", "\\|") + "`"
+
+
+def _suite_rows(report: Report) -> list[str]:
+    per: dict[str, list[NewTest]] = {}
+    for t in report.new:
+        per.setdefault(t.suite, []).append(t)
+    rows = ["| Suite | Tests | Time in this run |", "|---|--:|--:|"]
+    for suite, tests in sorted(per.items(), key=lambda kv: -sum(t.seconds for t in kv[1])):
+        rows.append(f"| {suite} | {len(tests)} | {_min(sum(t.seconds for t in tests))} |")
+    if report.removed:
+        rows.append(f"| Removed tests | −{len(report.removed)} | −{_min(report.removed_s)} |")
+    for suite, d in report.leg_delta.items():
+        rows.append(
+            f"| {'New' if d > 0 else 'Removed'} matrix legs: {suite} | {d:+d} | "
+            f"{'+' if d > 0 else '−'}{_min(abs(d) * LEG_OVERHEAD_S)} (setup) |"
+        )
+    return rows
+
+
+def _headline(report: Report) -> str:
+    if abs(report.net_s) < 30:
+        return (
+            f"This PR leaves CI test time about unchanged ({report.pct:+.1f}% of the {TIER} tier)."
+        )
+    sign = "adds" if report.net_s > 0 else "removes"
+    return (
+        f"This PR {sign} about {abs(report.net_s) / 60:.1f} minutes of CI test time "
+        f"({report.pct:+.1f}% of the {TIER} tier's {report.baseline_s / 3600:.1f} h)."
+    )
+
+
+def _footnote(report: Report) -> str:
+    return (
+        f"New tests usually compile cold in a PR run, so their times can be higher than they "
+        f"will be on the base branch. Baseline: median of the last {report.baseline_runs} green "
+        f"push runs on the base branch. A new matrix leg counts {_min(LEG_OVERHEAD_S)} of setup. "
+        f"This check is informational and does not block the merge."
+    )
+
+
+def render_comment(report: Report, pr_run_url: str = "", summary_url: str = "") -> str:
+    lines = [MARKER]
+    if report.over:
+        lines += [
+            f"**{_headline(report)}** That is above the {THRESHOLD_PCT:g}% this check flags. "
+            "Please confirm this is intended, or say whether the new tests can be trimmed, "
+            "folded into an existing parametrization, or moved out of the "
+            f"{TIER} tier.",
+            "",
+        ]
+    else:
+        lines += [
+            f"Update: {_headline(report)} That is below the {THRESHOLD_PCT:g}% this check flags, "
+            "so nothing to confirm.",
+            "",
+        ]
+    lines += _suite_rows(report)
+    slow = [t for t in report.new[:_TOP_N] if t.seconds >= _SLOW_S]
+    if slow:
+        lines += ["", "Slowest new tests:", ""]
+        lines += [f"- {_code(t.nodeid)}: {_min(t.seconds)}" for t in slow]
+    links = []
+    if pr_run_url:
+        links.append(f"[PR run]({pr_run_url})")
+    if summary_url:
+        links.append(f"[full list of new and removed tests]({summary_url})")
+    if links:
+        lines += ["", " · ".join(links)]
+    lines += ["", f"<sub>{_footnote(report)}</sub>"]
+    return "\n".join(lines) + "\n"
+
+
+def render_summary(report: Report, run_url: str = "") -> str:
+    lines = ["## CI time report", "", _headline(report)]
+    verdict = "above: the PR gets a comment" if report.over else "below: no new comment"
+    lines.append(f"Comment threshold: {THRESHOLD_PCT:g}% ({verdict}).")
+    if run_url:
+        lines.append(f"PR run: {run_url}")
+    lines += ["", *_suite_rows(report), ""]
+    if report.new:
+        lines += ["### New tests", "", "| Test | Suite | Time |", "|---|---|--:|"]
+        lines += [
+            f"| {_code(t.nodeid)} | {t.suite} | {_min(t.seconds)} |"
+            for t in report.new[:_SUMMARY_ROWS]
+        ]
+        if len(report.new) > _SUMMARY_ROWS:
+            lines.append(f"| … {len(report.new) - _SUMMARY_ROWS} more | | |")
+        lines.append("")
+    if report.removed:
+        lines += ["### Removed tests (baseline time)", "", "| Test | Time |", "|---|--:|"]
+        rem = sorted(report.removed.items(), key=lambda kv: -kv[1])
+        lines += [f"| {_code(n)} | {_min(s)} |" for n, s in rem[:_SUMMARY_ROWS]]
+        lines.append("")
+    if report.on_base:
+        lines += [
+            "### Not counted: new on the base branch",
+            "",
+            f"{len(report.on_base)} new tests "
+            f"({_min(sum(t.seconds for t in report.on_base))}) are in files the base branch "
+            "changed after the newest baseline run, so they belong to the base branch.",
+            "",
+        ]
+    lines += [_footnote(report), ""]
+    return "\n".join(lines)
+
+
+def gh_json(path: str, paginate: bool = False):
+    cmd = ["gh", "api", path]
+    if paginate:
+        cmd += ["--paginate", "--slurp"]
+    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+    return json.loads(result.stdout)
+
+
+def gh_bytes(path: str) -> bytes:
+    return subprocess.run(["gh", "api", path], capture_output=True, check=True).stdout
+
+
+def run_artifacts(repo: str, run_id: int) -> list[dict]:
+    pages = gh_json(f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100", paginate=True)
+    return [a for page in pages for a in page.get("artifacts", []) if not a.get("expired")]
+
+
+def read_json_artifact(repo: str, artifact: dict) -> dict[str, float]:
+    if artifact.get("size_in_bytes", 0) > _MAX_ARTIFACT_BYTES:
+        print(f"::warning::skipping oversized artifact {artifact['name']}")
+        return {}
+    blob = gh_bytes(f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip")
+    # Read in memory, never extracted; a malformed (fork-written) artifact is skipped.
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            members = [m for m in zf.infolist() if m.filename.endswith(".json")]
+            if not members or members[0].file_size > _MAX_ARTIFACT_BYTES:
+                return {}
+            return clean_durations(json.loads(zf.read(members[0])))
+    except Exception as e:
+        print(f"::warning::skipping unreadable artifact {artifact['name']}: {type(e).__name__}")
+        return {}
+
+
+def newest_by_name(artifacts: list[dict], prefix: str) -> dict[str, dict]:
+    # A re-run attempt re-uploads the same names.
+    out: dict[str, dict] = {}
+    for a in sorted(artifacts, key=lambda a: a.get("created_at", "")):
+        if a["name"].startswith(prefix):
+            out[a["name"]] = a
+    return out
+
+
+def file_at(repo: str, path: str, ref: str) -> str:
+    data = gh_json(f"/repos/{repo}/contents/{path}?ref={ref}")
+    return base64.b64decode(data["content"]).decode()
+
+
+def find_pr(repo: str, run: dict) -> dict | None:
+    if not run.get("head_repository"):  # the fork was deleted
+        return None
+    owner = run["head_repository"]["owner"]["login"]
+    head = urllib.parse.quote(f"{owner}:{run['head_branch']}", safe="")
+    pulls = gh_json(f"/repos/{repo}/pulls?state=all&head={head}&per_page=100")
+    head_repo = run["head_repository"]["full_name"]
+    for pr in sorted(pulls, key=lambda p: p["state"] != "open"):
+        if (pr["head"].get("repo") or {}).get("full_name") == head_repo:
+            return pr
+    return None
+
+
+def latest_pr_run(repo: str, pr: dict) -> dict | None:
+    runs = gh_json(
+        f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs?event=pull_request&status=success"
+        f"&branch={urllib.parse.quote(pr['head']['ref'], safe='')}&per_page=30"
+    )["workflow_runs"]
+    head_repo = (pr["head"].get("repo") or {}).get("full_name")
+    mine = [r for r in runs if (r.get("head_repository") or {}).get("full_name") == head_repo]
+    return next((r for r in mine if r["head_sha"] == pr["head"]["sha"]), mine[0] if mine else None)
+
+
+def baseline_runs(repo: str, branch: str, before: str) -> list[tuple[dict, dict[str, float]]]:
+    runs = gh_json(
+        f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs"
+        f"?branch={urllib.parse.quote(branch, safe='')}&event=push"
+        f"&status=success&per_page=30"
+    )["workflow_runs"]
+    out = []
+    for run in runs:
+        if run["created_at"] > before:
+            continue
+        arts = newest_by_name(run_artifacts(repo, run["id"]), "test-durations")
+        art = arts.get("test-durations")
+        if art:
+            data = read_json_artifact(repo, art)
+            if data:
+                out.append((run, data))
+        if len(out) == BASELINE_RUNS:
+            break
+    return out
+
+
+def pr_changed_files(repo: str, number: int) -> set[str]:
+    pages = gh_json(f"/repos/{repo}/pulls/{number}/files?per_page=100", paginate=True)
+    return {
+        name
+        for page in pages
+        for f in page
+        for name in (f["filename"], f.get("previous_filename"))
+        if name
+    }
+
+
+def base_only_test_files(
+    repo: str, newest_base_sha: str, pr_run: dict, pr: dict, pr_files: set[str]
+) -> set[str]:
+    # The PR run tests the merge with the base tip, which may be ahead of the baseline.
+    base = pr["base"]["ref"]
+    try:
+        cmp = gh_json(f"/repos/{repo}/compare/{newest_base_sha}...{base}")
+    except subprocess.CalledProcessError:
+        return set()
+    files: set[str] = set()
+    for c in cmp.get("commits", [])[:30]:
+        if c["commit"]["committer"]["date"] > pr_run["created_at"]:
+            continue
+        detail = gh_json(f"/repos/{repo}/commits/{c['sha']}")
+        files |= {f["filename"] for f in detail.get("files", [])}
+    return {f for f in files - pr_files if f.startswith("tests/")}
+
+
+def build_report(repo: str, run: dict, pr: dict) -> Report | str:
+    artifacts = run_artifacts(repo, run["id"])
+    slices_meta = newest_by_name(artifacts, "durations-data-")
+    if not slices_meta:
+        return "the PR run recorded no test durations (matrix skipped or handed to Jenkins)"
+
+    pr_files = pr_changed_files(repo, pr["number"])
+    # The run used the base tip's matrix unless the PR edits it; diff legs against the
+    # merge base so legs the base branch added since don't count as removed.
+    base_legs = matrix_legs(file_at(repo, MATRIX_PATH, pr["base"]["ref"]))
+    head_legs, legs = base_legs, {}
+    if MATRIX_PATH in pr_files:
+        head_legs = matrix_legs(file_at(repo, MATRIX_PATH, run["head_sha"]))
+        cmp = gh_json(f"/repos/{repo}/compare/{pr['base']['ref']}...{run['head_sha']}")
+        fork_legs = matrix_legs(file_at(repo, MATRIX_PATH, cmp["merge_base_commit"]["sha"]))
+        legs = leg_delta(tier_leg_counts(head_legs), tier_leg_counts(fork_legs))
+    failed = list(newest_by_name(artifacts, f"failed-suite-{run.get('run_attempt', 1)}-"))
+    suites = slot_suites(head_legs, failed)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        data = list(pool.map(lambda a: read_json_artifact(repo, a), slices_meta.values()))
+    slices = {name[len("durations-data-") :]: d for name, d in zip(slices_meta, data)}
+    pr_tests = merge_pr_legs(slices, suites)
+
+    bases = baseline_runs(repo, pr["base"]["ref"], run["created_at"])
+    if not bases:
+        return f"no green push run with test durations on {pr['base']['ref']} to compare against"
+    base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr, pr_files)
+    return compute(pr_tests, [d for _, d in bases], legs, pr_files, base_only)
+
+
+def find_comment(repo: str, number: int) -> dict | None:
+    pages = gh_json(f"/repos/{repo}/issues/{number}/comments?per_page=100", paginate=True)
+    for page in pages:
+        for c in page:
+            if c["user"]["login"] == BOT_LOGIN and c.get("body", "").startswith(MARKER):
+                return c
+    return None
+
+
+def upsert_comment(repo: str, number: int, body: str, report: Report) -> None:
+    existing = find_comment(repo, number)
+    if existing is None and not report.over:
+        return
+    if existing is not None:
+        cmd = ["gh", "api", "-X", "PATCH", f"/repos/{repo}/issues/comments/{existing['id']}"]
+    else:
+        cmd = ["gh", "api", "-X", "POST", f"/repos/{repo}/issues/{number}/comments"]
+    subprocess.run(cmd + ["-f", f"body={body}"], capture_output=True, check=True)
+    print(f"{'Updated' if existing else 'Posted'} the CI time comment on PR #{number}.")
+
+
+def cmd_report(args) -> None:
+    repo = args.repo or os.environ["GITHUB_REPOSITORY"]
+    if args.run_id:
+        run = gh_json(f"/repos/{repo}/actions/runs/{args.run_id}")
+        # workflow_run matches by name, which a fork PR can reuse.
+        if (
+            run.get("path") != f".github/workflows/{WORKFLOW}"
+            or (run.get("repository") or {}).get("full_name") != repo
+        ):
+            print(f"Run {args.run_id} is not this repo's {WORKFLOW}; nothing to report.")
+            return
+        pr = find_pr(repo, run)
+        if pr is None:
+            print(f"No PR has head branch {run['head_branch']}; nothing to report.")
+            return
+        if args.post and pr["head"]["sha"] != run["head_sha"]:
+            print(f"PR #{pr['number']} moved on to {pr['head']['sha'][:12]}; skipping stale run.")
+            return
+    else:
+        pr = gh_json(f"/repos/{repo}/pulls/{args.pr}")
+        run = latest_pr_run(repo, pr)
+        if run is None:
+            print(f"PR #{args.pr} has no green {WORKFLOW} run yet.")
+            return
+        if run["head_sha"] != pr["head"]["sha"]:
+            print(
+                f"Note: the head {pr['head']['sha'][:12]} has no green run yet; reporting the "
+                f"run of the older commit {run['head_sha'][:12]}.\n"
+            )
+
+    report = build_report(repo, run, pr)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if isinstance(report, str):
+        msg = f"## CI time report\n\nSkipped: {report}.\n"
+        print(msg)
+        if summary_path:
+            with open(summary_path, "a") as f:
+                f.write(msg)
+        return
+
+    summary = render_summary(report, run.get("html_url", ""))
+    print(summary)
+    if summary_path:
+        with open(summary_path, "a") as f:
+            f.write(summary)
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(
+                {
+                    "pr": pr["number"],
+                    "run_id": run["id"],
+                    "net_s": report.net_s,
+                    "pct": report.pct,
+                    "over": report.over,
+                    "baseline_s": report.baseline_s,
+                    "legs": report.leg_delta,
+                    "new": [t.__dict__ for t in report.new],
+                    "removed": report.removed,
+                },
+                f,
+                indent=1,
+            )
+    if args.post:
+        summary_url = ""
+        if os.environ.get("GITHUB_RUN_ID"):
+            server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+            summary_url = f"{server}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+        body = render_comment(report, run.get("html_url", ""), summary_url)
+        upsert_comment(repo, pr["number"], body, report)
+
+
+def cmd_replay(args) -> None:
+    runs = []
+    for path in args.files:
+        with open(path) as f:
+            runs.append(clean_durations(json.load(f)))
+    fired = 0
+    for i in range(BASELINE_RUNS, len(runs)):
+        pr = {n: (s, "") for n, s in runs[i].items()}
+        r = compute(pr, runs[i - BASELINE_RUNS : i][::-1])
+        fired += r.over
+        print(
+            f"{args.files[i]}: new {len(r.new)} ({_min(r.new_s)}) removed {len(r.removed)} "
+            f"({_min(r.removed_s)}) net {r.pct:+.1f}%{'  <- comment' if r.over else ''}"
+        )
+    print(
+        f"Would comment on {fired}/{max(0, len(runs) - BASELINE_RUNS)} runs at {THRESHOLD_PCT:g}%."
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    rep = sub.add_parser("report", help="Report on one PR run")
+    who = rep.add_mutually_exclusive_group(required=True)
+    who.add_argument("--run-id", type=int, help="A pull_request test_each_commit run")
+    who.add_argument("--pr", type=int, help="A PR number; uses its latest green run")
+    rep.add_argument("--repo", default="", help="owner/name (default: $GITHUB_REPOSITORY)")
+    rep.add_argument("--post", action="store_true", help="Create or update the PR comment")
+    rep.add_argument("--json", default="", help="Also write the report as JSON here")
+    rep.set_defaults(func=cmd_report)
+    rpl = sub.add_parser("replay", help="Replay the rule over consecutive test-durations.json")
+    rpl.add_argument("files", nargs="+", help="Oldest first")
+    rpl.set_defaults(func=cmd_replay)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

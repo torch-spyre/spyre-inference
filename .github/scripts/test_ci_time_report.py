@@ -519,3 +519,19 @@ def test_a_failed_comment_write_logs_no_body(monkeypatch, capsys):
         raise AssertionError("no exit on a failed write")
     captured = capsys.readouterr()
     assert "evil" not in captured.out + captured.err
+
+
+# Written by pytest 9.2.0 --junitxml for the node ids in _PYTEST_IDS.
+_PYTEST_JUNIT = b"""<testsuites><testsuite name="pytest">
+<testcase classname="tests.test_ids" name="test_operator[torch::op]"/>
+<testcase classname="tests.test_ids.TestK" name="test_m"/>
+<testcase classname="" name="tests.sub.test_opt"><skipped message="collection skipped"/></testcase>
+</testsuite></testsuites>"""
+_PYTEST_IDS = ["tests/test_ids.py::test_operator[torch::op]", "tests/test_ids.py::TestK::test_m"]
+
+
+def test_junit_keys_match_real_pytest_output():
+    cases = ctr.junit_cases(_PYTEST_JUNIT)
+    assert all(ctr.junit_key(n) in cases for n in _PYTEST_IDS)
+    # A class on a path-less (upstream) id keeps the empty module component.
+    assert ctr.junit_key("::TestUpstream::test_method[p]") == (".TestUpstream", "test_method[p]")

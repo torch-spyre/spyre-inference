@@ -136,10 +136,14 @@ def junit_cases(xml: bytes) -> set[tuple[str, str]]:
 
 
 def junit_key(nodeid: str) -> tuple[str, str]:
-    # pytest's junitxml: classname is the dotted module path plus any classes.
-    path, *rest = nodeid.split("::")
+    # pytest's junitxml: classname is the dotted module path plus any classes; the
+    # parametrization, which may itself contain "::", stays whole in the name.
+    address, bracket, params = nodeid.partition("[")
+    path, *rest = address.split("::")
     module = path[:-3].replace("/", ".") if path.endswith(".py") else path
-    return ".".join(p for p in [module, *rest[:-1]] if p), rest[-1] if rest else path
+    if not rest:
+        return "", nodeid
+    return ".".join([module, *rest[:-1]]), rest[-1] + bracket + params
 
 
 def _plain(text: str) -> str:

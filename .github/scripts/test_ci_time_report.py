@@ -249,17 +249,26 @@ def test_comment_lists_only_slow_new_tests_and_links():
 
 
 def _matrix(*cfgs):
-    include = "".join(f"          - cfg: {c}\n            test_types: {t}\n" for c, t in cfgs)
+    include = "".join(
+        f"          - cfg: {c}\n            test_types: {t}\n            test_target: t{i}\n"
+        for i, (c, t) in enumerate(cfgs)
+    )
     return f"jobs:\n  test:\n    strategy:\n      matrix:\n        include:\n{include}"
 
 
-def _fake_build(monkeypatch, pr_files, matrices):
+def _fake_build(monkeypatch, pr_files, matrices, junit="baseline", legs_with_junit=9):
     run = {"id": 1, "head_sha": "head", "created_at": "2026-11-10T12:00:00Z", "run_attempt": 1}
     pr = {"number": 7, "base": {"ref": "main"}}
-    arts = [{"name": "durations-data-0", "id": 1}, {"name": "junit-test-smoke-shard-0", "id": 2}]
+    arts = [{"name": "durations-data-0", "id": 1}]
+    arts += [{"name": f"junit-t{i}", "id": 2 + i} for i in range(legs_with_junit)]
     monkeypatch.setattr(ctr, "run_artifacts", lambda repo, rid: arts)
-    monkeypatch.setattr(ctr, "read_json_artifact", lambda repo, a: _baseline())
-    monkeypatch.setattr(ctr, "read_artifact", lambda repo, a, sfx, parse: _collected(_baseline()))
+
+    def read(repo, a, sfx, parse):
+        if a["name"].startswith("durations-data-"):
+            return _baseline()
+        return None if junit is None else _collected(_baseline())
+
+    monkeypatch.setattr(ctr, "read_artifact", read)
     monkeypatch.setattr(ctr, "baseline_runs", lambda *a: [({"head_sha": "b"}, _baseline())] * 5)
     monkeypatch.setattr(ctr, "pr_changed_files", lambda repo, n: pr_files)
     monkeypatch.setattr(ctr, "base_only_test_files", lambda *a: set())
@@ -349,3 +358,24 @@ def test_read_json_artifact_survives_garbage(monkeypatch):
         zf.writestr("d.json", "[" * 100000)
     monkeypatch.setattr(ctr, "gh_bytes", lambda path: buf.getvalue())
     assert ctr.read_json_artifact("o/r", {"id": 1, "name": "durations-data-0"}) == {}
+
+
+def test_a_run_missing_a_legs_junit_is_skipped(monkeypatch):
+    # A green run whose second leg never got a runner: no JUnit, so no verdict.
+    tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"main": tip}, legs_with_junit=1)
+    assert isinstance(r, str) and "1 regression legs" in r and "shard 2/2" in r
+
+
+def test_an_unreadable_artifact_is_skipped(monkeypatch):
+    tip = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"main": tip}, junit=None)
+    assert isinstance(r, str) and "could not be read" in r
+
+
+def test_missing_legs_ignores_other_tiers():
+    legs = ctr.matrix_legs(
+        _matrix(("A (shard 1/1)", "regression"), ("Smoke e2e (shard 1/1)", "integration"))
+    )
+    assert ctr.missing_legs(legs, {}) == ["A (shard 1/1)"]
+    assert ctr.missing_legs(legs, {"junit-t0": {}}) == []

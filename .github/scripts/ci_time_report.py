@@ -136,10 +136,13 @@ def junit_key(nodeid: str) -> tuple[str, str]:
     return ".".join(p for p in [module, *rest[:-1]] if p), rest[-1] if rest else path
 
 
-def suite_name(cfg: str) -> str:
+def _plain(text: str) -> str:
     # cfg comes from the PR head and lands in a comment: no mentions, links or pipes.
-    name = re.sub(r"\s*\(shard \d+/\d+\)\s*$", "", cfg)
-    return re.sub(r"[^A-Za-z0-9 ()/=.,_+-]", "", name).strip()[:80] or "(unnamed leg)"
+    return re.sub(r"[^A-Za-z0-9 ()/=.,_+-]", "", text).strip()[:80] or "(unnamed leg)"
+
+
+def suite_name(cfg: str) -> str:
+    return _plain(re.sub(r"\s*\(shard \d+/\d+\)\s*$", "", cfg))
 
 
 def matrix_legs(matrix_yaml: str) -> list[dict]:
@@ -384,8 +387,22 @@ def read_artifact(repo: str, artifact: dict, suffix: str, parse):
         return None
 
 
+def _durations(blob: bytes) -> dict[str, float]:
+    return clean_durations(json.loads(blob))
+
+
 def read_json_artifact(repo: str, artifact: dict) -> dict[str, float]:
-    return read_artifact(repo, artifact, ".json", lambda b: clean_durations(json.loads(b))) or {}
+    return read_artifact(repo, artifact, ".json", _durations) or {}
+
+
+def missing_legs(legs: list[dict], junit_meta: dict[str, dict]) -> list[str]:
+    """cfg of every TIER leg without a junit-<test_target> artifact (retries overwrite it)."""
+    return [
+        _plain(leg["cfg"])
+        for leg in legs
+        if TIER in str(leg.get("test_types", "")).split()
+        and f"junit-{leg.get('test_target', '')}" not in junit_meta
+    ]
 
 
 def newest_by_name(artifacts: list[dict], prefix: str) -> dict[str, dict]:
@@ -495,16 +512,23 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     suites = slot_suites(head_legs, failed)
 
     junit_meta = newest_by_name(artifacts, "junit-")
+    # A green run can still miss legs (e.g. a runner that never came up, which the
+    # pod-level retry doesn't catch); their tests would read as removed.
+    missing = missing_legs(head_legs, junit_meta)
+    if missing:
+        return f"{len(missing)} {TIER} legs uploaded no JUnit report ({', '.join(missing[:5])})"
     with ThreadPoolExecutor(max_workers=8) as pool:
-        data = list(pool.map(lambda a: read_json_artifact(repo, a), slices_meta.values()))
+        data = list(
+            pool.map(lambda a: read_artifact(repo, a, ".json", _durations), slices_meta.values())
+        )
         cases = list(
             pool.map(lambda a: read_artifact(repo, a, ".xml", junit_cases), junit_meta.values())
         )
+    if any(d is None for d in data) or any(c is None for c in cases):
+        return "some of the PR run's duration or JUnit artifacts could not be read"
     slices = {name[len("durations-data-") :]: d for name, d in zip(slices_meta, data)}
     pr_tests = merge_pr_legs(slices, suites)
-    collected = set().union(*[c for c in cases if c])
-    if not collected:
-        return "the PR run's JUnit reports could not be read"
+    collected = set().union(*cases)
 
     bases = baseline_runs(repo, pr["base"]["ref"], run["created_at"])
     if not bases:

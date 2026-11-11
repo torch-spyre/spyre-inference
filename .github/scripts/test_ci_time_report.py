@@ -180,7 +180,7 @@ def test_summary_lists_new_removed_and_base_only():
     pr = _pr({**_baseline(), "tests/c.py::test_new": 90.0, "tests/m.py::test_main": 5.0})
     r = ctr.compute(pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/m.py"})
     s = ctr.render_summary(r)
-    assert "test_new" in s and "test_old" in s and "new on the base branch" in s
+    assert "test_new" in s and "test_old" in s and "possibly the base branch's" in s
 
 
 def _fake_gh(monkeypatch, comments):
@@ -399,3 +399,37 @@ def test_local_runs_print_the_report(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     ctr.publish(type("A", (), {"summary_file": ""})(), "## CI time report\n", "status")
     assert "## CI time report" in capsys.readouterr().out
+
+
+def _fake_compare(monkeypatch, commits, total=None, files=("tests/shared.py",)):
+    cmp = {"commits": commits, "total_commits": len(commits) if total is None else total}
+
+    def gh(path, **kw):
+        return cmp if "/compare/" in path else {"files": [{"filename": f} for f in files]}
+
+    monkeypatch.setattr(ctr, "gh_json", gh)
+
+
+def test_base_changed_files_exclude_commits_after_the_pr_run(monkeypatch):
+    run = {"created_at": "2026-11-10T12:00:00Z"}
+    pr = {"base": {"ref": "main"}}
+    before = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
+    after = {"sha": "b", "commit": {"committer": {"date": "2026-11-10T13:00:00Z"}}}
+    _fake_compare(monkeypatch, [before, after], files=("tests/shared.py", "README.md"))
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/shared.py"}
+    _fake_compare(monkeypatch, [after])
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == set()
+
+
+def test_a_far_moved_base_branch_gives_no_verdict(monkeypatch):
+    run = {"created_at": "2026-11-10T12:00:00Z"}
+    old = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
+    _fake_compare(monkeypatch, [old], total=ctr._MAX_BASE_COMMITS + 1)
+    assert ctr.base_only_test_files("o/r", "base", run, {"base": {"ref": "main"}}) is None
+
+
+def test_a_new_test_in_a_file_both_sides_changed_is_not_charged():
+    # The base branch's expensive test and the PR's cheap one land in the same file.
+    pr = _pr({**_baseline(), "tests/shared.py::test_main": 900.0, "tests/shared.py::test_pr": 10.0})
+    r = ctr.compute(pr, [_baseline()] * 5, base_only_files={"tests/shared.py"})
+    assert r.new == [] and len(r.on_base) == 2 and not r.over

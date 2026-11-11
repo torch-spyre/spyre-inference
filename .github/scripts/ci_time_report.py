@@ -57,6 +57,7 @@ _MAX_NODEID_CHARS = 300
 _TOP_N = 5
 _SLOW_S = 30.0
 _SUMMARY_ROWS = 200
+_MAX_BASE_COMMITS = 30
 
 
 @dataclass
@@ -341,11 +342,11 @@ def render_summary(report: Report, run_url: str = "") -> str:
         lines.append("")
     if report.on_base:
         lines += [
-            "### Not counted: new on the base branch",
+            "### Not counted: possibly the base branch's",
             "",
             f"{len(report.on_base)} new tests "
             f"({_min(sum(t.seconds for t in report.on_base))}) are in files the base branch "
-            "changed after the newest baseline run, so they belong to the base branch.",
+            "changed after the newest baseline run, so they may be its tests, not this PR's.",
             "",
         ]
     lines += [_footnote(report), ""]
@@ -476,21 +477,29 @@ def pr_changed_files(repo: str, number: int) -> set[str]:
 
 
 def base_only_test_files(
-    repo: str, newest_base_sha: str, pr_run: dict, pr: dict, pr_files: set[str]
-) -> set[str]:
-    # The PR run tests the merge with the base tip, which may be ahead of the baseline.
-    base = pr["base"]["ref"]
+    repo: str, newest_base_sha: str, pr_run: dict, pr: dict
+) -> set[str] | None:
+    """Test files the base branch changed after the newest baseline, up to the PR run.
+
+    None when the base branch moved too far to list. The PR run tests the merge with the
+    base tip, so a new test in one of these files may be the base branch's, not the PR's.
+    """
     try:
-        cmp = gh_json(f"/repos/{repo}/compare/{newest_base_sha}...{base}")
+        cmp = gh_json(f"/repos/{repo}/compare/{newest_base_sha}...{pr['base']['ref']}")
     except subprocess.CalledProcessError:
-        return set()
+        return None
+    commits = [
+        c
+        for c in cmp.get("commits", [])
+        if c["commit"]["committer"]["date"] <= pr_run["created_at"]
+    ]
+    if cmp.get("total_commits", 0) > _MAX_BASE_COMMITS or len(commits) > _MAX_BASE_COMMITS:
+        return None
     files: set[str] = set()
-    for c in cmp.get("commits", [])[:30]:
-        if c["commit"]["committer"]["date"] > pr_run["created_at"]:
-            continue
+    for c in commits:
         detail = gh_json(f"/repos/{repo}/commits/{c['sha']}")
         files |= {f["filename"] for f in detail.get("files", [])}
-    return {f for f in files - pr_files if f.startswith("tests/")}
+    return {f for f in files if f.startswith("tests/")}
 
 
 def build_report(repo: str, run: dict, pr: dict) -> Report | str:
@@ -534,7 +543,9 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     bases = baseline_runs(repo, pr["base"]["ref"], run["created_at"])
     if not bases:
         return f"no green push run with test durations on {pr['base']['ref']} to compare against"
-    base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr, pr_files)
+    base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr)
+    if base_only is None:
+        return f"{pr['base']['ref']} moved too far past its newest green baseline run"
     return compute(pr_tests, [d for _, d in bases], legs, collected, base_only)
 
 

@@ -33,6 +33,7 @@ import re
 import statistics
 import subprocess
 import urllib.parse
+import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -116,8 +117,23 @@ def clean_durations(data: object) -> dict[str, float]:
     return out
 
 
-def _func(nodeid: str) -> str:
-    return nodeid.split("[", 1)[0]
+class _NoDTD(ET.TreeBuilder):
+    # JUnit XML has no DTD; refusing one closes entity-expansion attacks.
+    def doctype(self, name, pubid, system):
+        raise ValueError("DTD refused")
+
+
+def junit_cases(xml: bytes) -> set[tuple[str, str]]:
+    """(classname, name) of every collected case, skipped ones included."""
+    root = ET.fromstring(xml, parser=ET.XMLParser(target=_NoDTD()))
+    return {(c.get("classname") or "", c.get("name") or "") for c in root.iter("testcase")}
+
+
+def junit_key(nodeid: str) -> tuple[str, str]:
+    # pytest's junitxml: classname is the dotted module path plus any classes.
+    path, *rest = nodeid.split("::")
+    module = path[:-3].replace("/", ".") if path.endswith(".py") else path
+    return ".".join(p for p in [module, *rest[:-1]] if p), rest[-1] if rest else path
 
 
 def suite_name(cfg: str) -> str:
@@ -183,14 +199,13 @@ def compute(
     pr: dict[str, tuple[float, str]],
     baselines: list[dict[str, float]],
     legs: dict[str, int] | None = None,
-    pr_files: set[str] | None = None,
+    collected: set[tuple[str, str]] | None = None,
     base_only_files: set[str] | None = None,
 ) -> Report:
     """Compare a PR run with baseline runs, newest first.
 
-    A removal needs the PR to touch the test's file (or re-parametrize it, or the id to
-    have no file): the baseline is the trunk tier, and trunk-gated tests are skipped,
-    so unrecorded, in every regression-tier PR run.
+    collected: the PR run's JUnit cases. Durations omit skipped tests (e.g. trunk-only
+    ones, in this regression-tier run), so only a test JUnit lacks counts as removed.
     """
     baselines = baselines[:BASELINE_RUNS]
     base_only_files = base_only_files or set()
@@ -201,16 +216,13 @@ def compute(
     need = min(REMOVED_MIN_RUNS, len(baselines))
     # A test the base branch itself dropped lingers in older baselines.
     newest = baselines[0] if baselines else {}
-    new_funcs = {_func(n) for n in pr if n not in seen}
-
-    def removable(nodeid: str) -> bool:
-        path = nodeid.split("::")[0]
-        return pr_files is None or not path or path in pr_files or _func(nodeid) in new_funcs
-
     removed = {
         n: statistics.median(v)
         for n, v in seen.items()
-        if n not in pr and n in newest and len(v) >= need and removable(n)
+        if n not in pr
+        and n in newest
+        and len(v) >= need
+        and (collected is None or junit_key(n) not in collected)
     }
     new, on_base = [], []
     for nodeid, (seconds, suite) in pr.items():
@@ -354,21 +366,26 @@ def run_artifacts(repo: str, run_id: int) -> list[dict]:
     return [a for page in pages for a in page.get("artifacts", []) if not a.get("expired")]
 
 
-def read_json_artifact(repo: str, artifact: dict) -> dict[str, float]:
+def read_artifact(repo: str, artifact: dict, suffix: str, parse):
+    """parse() of the artifact's first *suffix member, or None if unreadable."""
     if artifact.get("size_in_bytes", 0) > _MAX_ARTIFACT_BYTES:
         print(f"::warning::skipping oversized artifact {artifact['name']}")
-        return {}
+        return None
     blob = gh_bytes(f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip")
     # Read in memory, never extracted; a malformed (fork-written) artifact is skipped.
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-            members = [m for m in zf.infolist() if m.filename.endswith(".json")]
+            members = [m for m in zf.infolist() if m.filename.endswith(suffix)]
             if not members or members[0].file_size > _MAX_ARTIFACT_BYTES:
-                return {}
-            return clean_durations(json.loads(zf.read(members[0])))
+                return None
+            return parse(zf.read(members[0]))
     except Exception as e:
         print(f"::warning::skipping unreadable artifact {artifact['name']}: {type(e).__name__}")
-        return {}
+        return None
+
+
+def read_json_artifact(repo: str, artifact: dict) -> dict[str, float]:
+    return read_artifact(repo, artifact, ".json", lambda b: clean_durations(json.loads(b))) or {}
 
 
 def newest_by_name(artifacts: list[dict], prefix: str) -> dict[str, dict]:
@@ -477,16 +494,23 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     failed = list(newest_by_name(artifacts, f"failed-suite-{run.get('run_attempt', 1)}-"))
     suites = slot_suites(head_legs, failed)
 
+    junit_meta = newest_by_name(artifacts, "junit-")
     with ThreadPoolExecutor(max_workers=8) as pool:
         data = list(pool.map(lambda a: read_json_artifact(repo, a), slices_meta.values()))
+        cases = list(
+            pool.map(lambda a: read_artifact(repo, a, ".xml", junit_cases), junit_meta.values())
+        )
     slices = {name[len("durations-data-") :]: d for name, d in zip(slices_meta, data)}
     pr_tests = merge_pr_legs(slices, suites)
+    collected = set().union(*[c for c in cases if c])
+    if not collected:
+        return "the PR run's JUnit reports could not be read"
 
     bases = baseline_runs(repo, pr["base"]["ref"], run["created_at"])
     if not bases:
         return f"no green push run with test durations on {pr['base']['ref']} to compare against"
     base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr, pr_files)
-    return compute(pr_tests, [d for _, d in bases], legs, pr_files, base_only)
+    return compute(pr_tests, [d for _, d in bases], legs, collected, base_only)
 
 
 def find_comment(repo: str, number: int) -> dict | None:

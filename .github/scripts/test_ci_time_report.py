@@ -45,28 +45,32 @@ def test_new_tests_count_against_the_tier():
     assert r.pct == 5.0 and r.over
 
 
+def _collected(nodeids):
+    return {ctr.junit_key(n) for n in nodeids}
+
+
 def test_a_rename_nets_out():
     base = _baseline(**{"tests/c.py::test_x[old]": 300.0})
     pr = _pr({**_baseline(), "tests/c.py::test_x[new]": 300.0})
-    r = ctr.compute(pr, [base] * 5, pr_files={"tests/c.py"})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr))
     assert len(r.new) == 1 and list(r.removed) == ["tests/c.py::test_x[old]"]
     assert r.net_s == 0 and not r.over
 
 
-def test_removed_needs_the_pr_to_touch_the_file():
-    # Trunk-gated tests are skipped, so unrecorded, in a regression-tier PR run.
-    base = _baseline(**{"tests/e2e/test_trunk_only.py::test_defaults": 320.0})
-    r = ctr.compute(_pr(_baseline()), [base] * 5, pr_files={"tests/other.py"})
-    assert r.removed == {}
+def test_a_skipped_test_is_not_removed():
+    # Durations omit skipped tests, e.g. trunk-only ones in a regression-tier PR run.
+    trunk_only = "tests/e2e/test_xpress_batch.py::test_qwen3_xpress_batch_four[defaults]"
+    base = _baseline(**{trunk_only: 320.0})
+    pr = _pr({**_baseline(), "tests/e2e/test_xpress_batch.py::test_new": 600.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected([*pr, trunk_only]))
+    assert r.removed == {} and r.net_s == 600.0
 
 
 def test_removed_needs_the_newest_baseline_and_most_runs():
     gone_on_base = _baseline(**{"tests/c.py::test_old": 300.0})
-    r = ctr.compute(_pr(_baseline()), [_baseline()] + [gone_on_base] * 4, pr_files={"tests/c.py"})
+    r = ctr.compute(_pr(_baseline()), [_baseline()] + [gone_on_base] * 4, collected=set())
     assert r.removed == {}
-    r = ctr.compute(
-        _pr(_baseline()), [gone_on_base] * 2 + [_baseline()] * 3, pr_files={"tests/c.py"}
-    )
+    r = ctr.compute(_pr(_baseline()), [gone_on_base] * 2 + [_baseline()] * 3, collected=set())
     assert r.removed == {}
 
 
@@ -174,7 +178,7 @@ def test_comment_wording_above_and_below():
 def test_summary_lists_new_removed_and_base_only():
     base = _baseline(**{"tests/c.py::test_old": 60.0})
     pr = _pr({**_baseline(), "tests/c.py::test_new": 90.0, "tests/m.py::test_main": 5.0})
-    r = ctr.compute(pr, [base] * 5, pr_files={"tests/c.py"}, base_only_files={"tests/m.py"})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/m.py"})
     s = ctr.render_summary(r)
     assert "test_new" in s and "test_old" in s and "new on the base branch" in s
 
@@ -252,10 +256,10 @@ def _matrix(*cfgs):
 def _fake_build(monkeypatch, pr_files, matrices):
     run = {"id": 1, "head_sha": "head", "created_at": "2026-11-10T12:00:00Z", "run_attempt": 1}
     pr = {"number": 7, "base": {"ref": "main"}}
-    monkeypatch.setattr(
-        ctr, "run_artifacts", lambda repo, rid: [{"name": "durations-data-0", "id": 1}]
-    )
+    arts = [{"name": "durations-data-0", "id": 1}, {"name": "junit-test-smoke-shard-0", "id": 2}]
+    monkeypatch.setattr(ctr, "run_artifacts", lambda repo, rid: arts)
     monkeypatch.setattr(ctr, "read_json_artifact", lambda repo, a: _baseline())
+    monkeypatch.setattr(ctr, "read_artifact", lambda repo, a, sfx, parse: _collected(_baseline()))
     monkeypatch.setattr(ctr, "baseline_runs", lambda *a: [({"head_sha": "b"}, _baseline())] * 5)
     monkeypatch.setattr(ctr, "pr_changed_files", lambda repo, n: pr_files)
     monkeypatch.setattr(ctr, "base_only_test_files", lambda *a: set())
@@ -286,27 +290,34 @@ def test_a_pr_that_leaves_the_matrix_alone_adds_no_legs(monkeypatch):
     assert "unchanged" in ctr.render_summary(r)
 
 
-def test_reparameterized_and_pathless_ids_net_out_from_outside_the_file():
-    base = _baseline(**{"tests/m.py::test_model[old-model]": 300.0, "::test_upstream[a]": 200.0})
-    pr = _pr(
-        {**_baseline(), "tests/m.py::test_model[new-model]": 300.0, "::test_upstream[b]": 200.0}
-    )
-    r = ctr.compute(pr, [base] * 5, pr_files={"tests/plugin/models.py"})
-    assert set(r.removed) == {"tests/m.py::test_model[old-model]", "::test_upstream[a]"}
-    assert r.net_s == 0
+def test_junit_keys_match_pytest_classnames():
+    xml = b"""<testsuites><testsuite>
+      <testcase classname="tests.e2e.test_x" name="test_a[p]"/>
+      <testcase classname="tests.test_y.TestK" name="test_b"><skipped/></testcase>
+      <testcase classname="" name="test_upstream[m]"/>
+    </testsuite></testsuites>"""
+    cases = ctr.junit_cases(xml)
+    for nodeid in [
+        "tests/e2e/test_x.py::test_a[p]",
+        "tests/test_y.py::TestK::test_b",
+        "::test_upstream[m]",
+    ]:
+        assert ctr.junit_key(nodeid) in cases
+
+
+def test_junit_with_a_dtd_is_refused():
+    xml = b'<!DOCTYPE x [<!ENTITY a "aaaa">]><testsuites>&a;</testsuites>'
+    try:
+        ctr.junit_cases(xml)
+    except ValueError:
+        return
+    raise AssertionError("DTD accepted")
 
 
 def test_renamed_file_counts_its_old_path(monkeypatch):
     page = [{"filename": "tests/b.py", "previous_filename": "tests/a.py"}, {"filename": "x"}]
     monkeypatch.setattr(ctr, "gh_json", lambda path, **kw: [page])
-    files = ctr.pr_changed_files("o/r", 1)
-    assert files == {"tests/a.py", "tests/b.py", "x"}
-    r = ctr.compute(
-        _pr({"tests/b.py::test_big": 3000.0, "tests/b.py::test_small": 600.0}),
-        [_baseline()] * 5,
-        pr_files=files,
-    )
-    assert r.net_s == 0
+    assert ctr.pr_changed_files("o/r", 1) == {"tests/a.py", "tests/b.py", "x"}
 
 
 def test_find_comment_ignores_quotes_of_the_marker(monkeypatch):

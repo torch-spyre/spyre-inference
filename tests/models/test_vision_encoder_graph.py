@@ -213,8 +213,73 @@ def test_model_budgets_replace_the_ladder_and_reject_user_budgets():
         vision_token_budgets = [64, 16]
 
     assert _manager(_FixedBudgets(max_tokens=60)).token_budgets == [16, 64]
+    # Fixed budgets count the model's shapes, not placeholder tokens: no largest-item check.
+    assert _manager(_FixedBudgets(max_tokens=300)).token_budgets == [16, 64]
     with pytest.raises(ValueError, match="sets its own encoder budgets"):
         _manager(_FixedBudgets(max_tokens=60), budgets=[16, 64])
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        {"default": {}, "wide": {}},
+        {"default": {"min_token_budget": 16}},
+        {"default": {"allow_zero_tokens": True}},
+    ],
+    ids=["two-paths", "min-budget", "zero-budget"],
+)
+def test_model_budgets_reject_path_config_they_would_drop(paths):
+    from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphPathConfig
+
+    class _FixedBudgets(_FakeVisionModel):
+        vision_token_budgets = [64, 16]
+
+    model = _FixedBudgets(max_tokens=60)
+    config = model.get_encoder_cudagraph_config()
+    path_configs = {name: EncoderCudaGraphPathConfig(**kw) for name, kw in paths.items()}
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, paths=path_configs)
+    with pytest.raises(NotImplementedError, match="one path"):
+        _manager(model)
+
+
+class _WithWholeBuffer(_FakeVisionModel):
+    """Adds a ``[2, patches]`` buffer that is not per patch, like Pixtral's image canvas."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        whole = VisionBuffer(None, shape_at=lambda n: (2, n))
+        self.vision_buffers = {**self.vision_buffers, "whole": whole}
+
+    def vision_inputs(self, mm_kwargs):
+        values = super().vision_inputs(mm_kwargs)
+        patches = values["segments"].shape[0]
+        return {**values, "whole": torch.ones(2, patches, dtype=torch.float16)}
+
+
+def test_whole_buffers_keep_their_own_shape():
+    model = _WithWholeBuffer()
+    bufs = model.prepare_encoder_cudagraph_capture_inputs(
+        16, 1, 1, torch.device("cpu"), torch.float16
+    ).values
+    assert bufs["whole"].shape == (2, 64)
+    copy = model.get_encoder_cudagraph_config().padding_logics["whole"]
+
+    full = model.prepare_encoder_cudagraph_replay_buffers({"tokens": [16]}, 0, 0).values
+    copy(bufs["whole"], full["whole"])
+    assert torch.equal(bufs["whole"], full["whole"])
+    short = model.prepare_encoder_cudagraph_replay_buffers({"tokens": [4]}, 0, 0).values
+    with pytest.raises(ValueError, match="the budget holds"):
+        copy(bufs["whole"], short["whole"])
+    # The patch count comes from the per-patch buffers, not the whole one.
+    assert model.encoder_eager_forward({"tokens": [16]}).shape[0] == 16
+
+
+def test_whole_buffer_must_match_its_shape_at_the_patch_count():
+    model = _WithWholeBuffer()
+    inputs = model.vision_inputs
+    model.vision_inputs = lambda kw: {**inputs(kw), "whole": torch.ones(2, 3, dtype=torch.float16)}
+    with pytest.raises(ValueError, match="64 patches need"):
+        model.prepare_encoder_cudagraph_replay_buffers({"tokens": [16]}, 0, 0)
 
 
 def test_items_per_call_cap_splits_the_batch():

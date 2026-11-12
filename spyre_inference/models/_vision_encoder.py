@@ -494,6 +494,14 @@ class SpyreVisionEncoderMixin:
                 f"vision_inputs must return one patch count and the declared dtypes; got "
                 f"counts {sorted(counts)}, wrong dtype for {wrong}"
             )
+        (count,) = counts
+        for key, value in values.items():
+            shape_at = self.vision_buffers[key].shape_at
+            if shape_at is not None and tuple(value.shape) != tuple(shape_at(count)):
+                raise ValueError(
+                    f"vision_inputs returned {key} of shape {tuple(value.shape)}, but "
+                    f"{count} patches need {tuple(shape_at(count))}"
+                )
         return values
 
 

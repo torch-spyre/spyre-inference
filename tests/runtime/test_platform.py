@@ -1206,3 +1206,16 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
     with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets") as err:
         TorchSpyrePlatform.validate_request(_image_input(256, 281, modality=modality), None)
     assert (err.value.parameter, err.value.value) == ("mm_processor_kwargs", 281)
+
+
+def test_validate_request_omits_the_budget_list_for_fixed_budgets(monkeypatch):
+    """A model that sets its own budgets rejects the user list, so the error must not name it."""
+    from vllm.exceptions import VLLMValidationError
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_vision_token_limits", {"image": 280})
+    monkeypatch.setattr(TorchSpyrePlatform, "_vision_fixed_budgets", True)
+    with pytest.raises(VLLMValidationError) as err:
+        TorchSpyrePlatform.validate_request(_image_input(256, 281), None)
+    assert "encoder_cudagraph_token_budgets" not in str(err.value)

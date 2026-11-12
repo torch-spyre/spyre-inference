@@ -348,7 +348,10 @@ in the encoder's image tokens. The mixin owns the other protocol methods tied to
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
 upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. Pixtral
-overrides `postprocess_encoder_output` to crop the canvas's padding tokens off. Gemma 4
+overrides `postprocess_encoder_output` to crop the canvas's padding tokens off. Square canvases
+keep its compiled shapes to one per canvas size, at two known costs: a wide or tall image is encoded
+at its long side squared (a 1540x308 image runs about 5x its tokens), and a step's images run one
+encoder call each instead of packing into one budget. Gemma 4
 overrides `postprocess_encoder_output` to run its tail on the host in fp32, as upstream does:
 the pooler's `sqrt(hidden_size)` scale can leave the fp16 range, so the scale, standardize and
 `embed_vision` never run on the card, and its graphs end at the pooled vision hidden size. The eager

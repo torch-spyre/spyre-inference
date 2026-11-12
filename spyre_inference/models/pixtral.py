@@ -315,6 +315,11 @@ class SpyrePixtralForConditionalGeneration(
         dest[indices[0]] = tokens.clone() if clone else tokens
 
     def _canvas_side(self, hp: int, wp: int) -> int:
+        # The RoPE table, like upstream's, covers image_size only.
+        if max(hp, wp) > self._max_side:
+            raise ValueError(
+                f"a {hp}x{wp}-patch image exceeds the {self._max_side}-patch image_size limit"
+            )
         return next(s for s in self._canvas_sides if s >= max(hp, wp))
 
     def _canvas_shape(self, num_patches: int) -> tuple[int, ...]:

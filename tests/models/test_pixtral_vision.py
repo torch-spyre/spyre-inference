@@ -44,11 +44,11 @@ def _engine_ir_dispatch():
         yield
 
 
-def _args(num_layers: int = 2) -> "pixtral.VisionEncoderArgs":
+def _args(num_layers: int = 2, image_size: int = 112) -> "pixtral.VisionEncoderArgs":
     return pixtral.VisionEncoderArgs(
         hidden_size=128,
         num_channels=3,
-        image_size=112,
+        image_size=image_size,
         patch_size=PATCH,
         intermediate_size=256,
         num_hidden_layers=num_layers,
@@ -168,6 +168,29 @@ def test_budgets_are_one_per_canvas(tp_group):
     )
     assert bufs.values["image"].shape == (3, 16 * PATCH, 16 * PATCH)
     assert bufs.values["positions"].shape == (256,)
+
+
+def test_top_canvas_outside_the_table_matches_upstream(tp_group):
+    """37 patches a side rounds up to a 40-patch top canvas, which ``CANVAS_SIDES`` lacks, as
+    Ministral-3's 110 round up to 112."""
+    args = _args(image_size=37 * PATCH)
+    model = _spyre_model(args)
+    assert model.vision_token_budgets == [16, 64, 144, 256, 400]
+    torch.manual_seed(4)
+    image = torch.randn(3, 34 * PATCH, 20 * PATCH)
+
+    with torch.inference_mode():
+        (expected,) = _reference(args, [image])
+        (actual,) = model.embed_multimodal(images=[image])
+
+    assert actual.shape == expected.shape
+    assert _cosine(actual, expected) > 0.999
+
+
+def test_image_above_image_size_is_rejected(tp_group):
+    model = _spyre_model(_args())
+    with pytest.raises(ValueError, match="16-patch image_size limit"):
+        model.vision_item_tokens({"images": [torch.randn(3, 18 * PATCH, 2 * PATCH)]})
 
 
 def test_canvas_padding_does_not_leak_into_the_image(tp_group):

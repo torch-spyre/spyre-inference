@@ -68,6 +68,13 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                     f"{type(model).__name__} sets its own encoder budgets {fixed}; unset "
                     "compilation_config.encoder_cudagraph_token_budgets."
                 )
+            paths = self.config.paths.values()
+            if len(paths) > 1 or any(
+                p.allow_zero_tokens or p.min_token_budget is not None for p in paths
+            ):
+                raise NotImplementedError(
+                    "vision_token_budgets supports one path without a minimum or zero budget."
+                )
             self.token_budgets = sorted(fixed)
             self.path_token_budgets = {p: sorted(fixed) for p in self.path_token_budgets}
         # Round every budget up so its patch count is a whole vision_patch_multiple.
@@ -79,9 +86,10 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         self.token_budgets = aligned(self.token_budgets)
         self.path_token_budgets = {p: aligned(b) for p, b in self.path_token_budgets.items()}
         logger.info("Vision encoder budgets: %s", self.path_token_budgets)
-        # Fail at startup rather than compile mid-request when user budgets miss an item.
+        # Fail at startup rather than compile mid-request when user budgets miss an item. Fixed
+        # budgets count the model's own shapes, not placeholder tokens, so the model covers them.
         largest_item = model.get_encoder_cudagraph_budget_range(vllm_config)[1]
-        if self.token_budgets[-1] < largest_item:
+        if fixed is None and self.token_budgets[-1] < largest_item:
             raise ValueError(
                 f"largest encoder budget {self.token_budgets[-1]} is below the largest "
                 f"item ({largest_item} tokens), which would then compile "

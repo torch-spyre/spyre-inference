@@ -57,7 +57,7 @@ def _generate(
     )
     try:
         outs = llm.generate(
-            ["Hello, world!", "The capital of France is"],
+            ["Hello, world!", "Count to ten: one, two, three"],
             SamplingParams(max_tokens=8, temperature=0.0, logprobs=NUM_LOGPROBS, ignore_eos=True),
         )
         tokens = [list(o.outputs[0].token_ids) for o in outs]

@@ -70,8 +70,14 @@ def _checked_route_indices(route, probs, top_k):
     indices = selected.nonzero()[:, 1].reshape(probs.shape[0], top_k)
     weights = probs.float().gather(-1, indices)
     cutoff = torch.topk(probs.float(), top_k, dim=-1).values[:, -1:]
-    assert selected[probs.float() > cutoff].all(), "an expert above the CPU top-k cutoff is missing"
-    assert (weights >= cutoff).all(), "a selected expert is below the CPU top-k cutoff"
+    # The card's fp16 softmax ties experts a few fp16 ulps apart in fp32.
+    slack = 2.0**-8
+    assert selected[probs.float() > cutoff * (1 + slack)].all(), (
+        "an expert above the CPU top-k cutoff is missing"
+    )
+    assert (weights >= cutoff * (1 - slack)).all(), (
+        "a selected expert is below the CPU top-k cutoff"
+    )
     weights = weights / weights.sum(-1, keepdim=True)
     expected = torch.zeros_like(route).scatter_(-1, indices, weights)
     torch.testing.assert_close(route, expected, atol=2e-2, rtol=2e-2)

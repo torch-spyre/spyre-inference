@@ -255,6 +255,32 @@ def test_missing_dataset_aborts_the_run(monkeypatch, tmp_path):
     assert excinfo.value.code == 2
 
 
+@pytest.mark.parametrize("template", ["${SPYRE_VISION_DATASET}", "$SPYRE_VISION_DATASET"])
+def test_dataset_var_without_default_skips_the_entry(monkeypatch, tmp_path, caplog, template):
+    """A var nothing defines (SPYRE_VISION_DATASET, #1538) skips, not aborts, the run."""
+    monkeypatch.delenv("SPYRE_VISION_DATASET", raising=False)
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
+    config = _serve_config(template)
+    runner._derive_config(config)
+
+    with caplog.at_level("WARNING", logger=runner.log.name):
+        assert runner._select_configs([config], set(), set()) == []
+
+    assert "SPYRE_VISION_DATASET" in caplog.text
+
+
+def test_unrecognised_dataset_var_stays_fatal(monkeypatch, tmp_path):
+    """A typo like ${SPYRE_CICS_DATASET} is not an optional var: it aborts."""
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
+    config = _serve_config("${SPYRE_CICS_DATASET}")
+    runner._derive_config(config)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner._select_configs([config], set(), set())
+
+    assert excinfo.value.code == 2
+
+
 def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path):
     """Filtering runs first, so an absent trace only matters for a selected test."""
     monkeypatch.setenv("SPYRE_CICS_DATASET", str(tmp_path / "absent.jsonl"))
@@ -329,6 +355,178 @@ def test_matrix_skips_dev_configs(tmp_path):
     result = matrix.generate_benchmark_matrix(str(tmp_path), [])
 
     assert result["include"] == [{"models": "ci-model"}]
+
+
+# ── CI legs ──
+
+
+def _offline(model: str, tp: int) -> dict:
+    return {"test_name": f"t_{tp}", "parameters": {"model": model, "tensor_parallel_size": tp}}
+
+
+def _legs_files(tmp_path) -> list:
+    latency = tmp_path / "latency-tests.yaml"
+    latency.write_text(yaml.safe_dump([_offline("Org/A", 1), _offline("org/a", 4)]))
+    serve = _write(
+        tmp_path,
+        {
+            "tests": [
+                _serve_config("x", server_parameters={"model": "Org/A", "tensor-parallel-size": 1}),
+                _serve_config("x", server_parameters={"model": "org/b", "tensor-parallel-size": 2}),
+            ]
+        },
+    )
+    return [("latency", latency), ("serve", serve), ("serve", tmp_path / "absent.yaml")]
+
+
+def test_legs_split_by_model_and_tp_on_enough_cards(tmp_path):
+    legs = runner.list_legs(_legs_files(tmp_path), set(), set())
+
+    assert legs == [
+        {"model": "Org/A", "tp": 1, "cards": 1, "key": "org-a-tp1"},
+        {"model": "org/a", "tp": 4, "cards": 4, "key": "org-a-tp4"},
+        {"model": "org/b", "tp": 2, "cards": 2, "key": "org-b-tp2"},
+    ]
+
+
+def test_legs_follow_the_model_and_tp_filters(tmp_path):
+    legs = runner.list_legs(_legs_files(tmp_path), {"org/a"}, {4})
+
+    assert [(leg["model"], leg["tp"]) for leg in legs] == [("org/a", 4)]
+
+
+def test_tp_beyond_the_largest_runner_aborts_the_listing(tmp_path):
+    latency = tmp_path / "latency-tests.yaml"
+    latency.write_text(yaml.safe_dump([_offline("m", 8)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner.list_legs([("latency", latency)], set(), set())
+    assert excinfo.value.code == 2
+
+
+def test_every_ci_config_lands_on_a_leg_with_enough_cards():
+    legs = runner.list_legs(
+        [("latency", LATENCY_TESTS), ("throughput", THROUGHPUT_TESTS), ("serve", SERVE_TESTS)],
+        set(),
+        set(),
+    )
+    cards = {(leg["model"].lower(), leg["tp"]): leg["cards"] for leg in legs}
+    assert len({leg["key"] for leg in legs}) == len(legs)
+
+    for config_file in (LATENCY_TESTS, THROUGHPUT_TESTS, SERVE_TESTS):
+        for config in runner._load_configs(config_file):
+            tp = runner._config_tp(config)
+            assert cards[(runner._config_model(config).lower(), tp)] >= tp, config["test_name"]
+
+
+# ── pinned revisions ──
+
+
+def test_cache_config_pins_are_read():
+    pins = runner._pinned_revisions()
+
+    assert pins["google/gemma-4-26b-a4b"] == "24548b62aa021d562695c04aaf7758a1ea47990b"
+    assert "ibm-ai-platform/micro-g3.3-8b-instruct-1b" not in pins
+
+
+def test_pinned_serve_model_runs_at_its_cached_revision(monkeypatch):
+    monkeypatch.setattr(runner, "_local_snapshot", lambda model, rev: f"/snap/{model}/{rev}")
+    config = _serve_config("x", server_parameters={"model": "Org/M", "tensor-parallel-size": 1})
+    runner._derive_config(config)
+
+    runner._pin_revision(config, {"org/m": "abc"})
+
+    assert config["server_parameters"]["revision"] == "abc"
+    # bench serve has no revision flag, so its tokenizer is the local snapshot.
+    assert config["parameters"]["tokenizer"] == "/snap/Org/M/abc"
+
+
+def test_pinned_offline_model_keeps_an_explicit_revision(monkeypatch):
+    monkeypatch.setattr(runner, "_local_snapshot", lambda model, rev: f"/snap/{rev}")
+    config = _offline("org/m", 1)
+    config["parameters"]["revision"] = "mine"
+
+    runner._pin_revision(config, {"org/m": "abc"})
+
+    assert config["parameters"]["revision"] == "mine"
+    assert config["parameters"]["tokenizer"] == "/snap/mine"
+
+
+def test_unpinned_or_uncached_model_is_left_alone(monkeypatch):
+    monkeypatch.setattr(runner, "_local_snapshot", lambda model, rev: None)
+    unpinned, uncached = _offline("org/x", 1), _offline("org/m", 1)
+
+    runner._pin_revision(unpinned, {"org/m": "abc"})
+    runner._pin_revision(uncached, {"org/m": "abc"})
+
+    assert unpinned["parameters"] == _offline("org/x", 1)["parameters"]
+    assert uncached["parameters"]["revision"] == "abc"
+    assert "tokenizer" not in uncached["parameters"]
+
+
+# ── JUnit ──
+
+
+def test_junit_holds_one_case_per_benchmark(tmp_path):
+    import xml.etree.ElementTree as ET
+
+    path = tmp_path / "out" / "junit.xml"
+    runner.write_junit(
+        path,
+        [
+            runner.BenchResult("latency", "lat_a", "org/a", 1.5),
+            runner.BenchResult("serve", "srv_b", "", 2.0, "exit code 1\n\x1b[31mboom\x1b[0m"),
+        ],
+    )
+
+    suite = ET.parse(path).getroot().find("testsuite")
+    assert (suite.get("tests"), suite.get("failures")) == ("2", "1")
+    passed, failed = suite.findall("testcase")
+    assert (passed.get("classname"), passed.get("name")) == ("vllm_bench.latency", "lat_a")
+    assert passed.find("failure") is None
+    tags = [p.get("value") for p in passed.iter("property")]
+    assert "testtype__perf" in tags and "model__org/a" in tags
+    failure = failed.find("failure")
+    assert failure.get("message") == "exit code 1"
+    assert failure.text == "exit code 1\n[31mboom[0m"
+
+
+def test_main_writes_junit_and_fails_on_a_failed_benchmark(monkeypatch, tmp_path):
+    import xml.etree.ElementTree as ET
+
+    (tmp_path / "latency-tests.yaml").write_text(
+        yaml.safe_dump(
+            [{**_offline("m", 1), "test_name": "ok"}, {**_offline("m", 1), "test_name": "bad"}]
+        )
+    )
+    monkeypatch.setattr(
+        runner, "run_benchmark", lambda **kw: "exit code 1" if kw["test_name"] == "bad" else None
+    )
+    junit = tmp_path / "junit.xml"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_vllm_benchmarks.py",
+            "--configs-dir",
+            str(tmp_path),
+            "--results-dir",
+            str(tmp_path / "results"),
+            "--bench-types",
+            "latency",
+            "--junit-xml",
+            str(junit),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        runner.main()
+
+    assert exc.value.code == 1
+    cases = ET.parse(junit).getroot().iter("testcase")
+    assert {c.get("name"): c.find("failure") is not None for c in cases} == {
+        "ok": False,
+        "bad": True,
+    }
 
 
 # ── the checked-in config ──

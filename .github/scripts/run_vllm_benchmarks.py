@@ -20,6 +20,7 @@ and executes them.
 """
 
 import contextlib
+import datetime
 import importlib.util
 import json
 import logging
@@ -33,7 +34,9 @@ import subprocess
 import sys
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from argparse import ArgumentParser
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -114,6 +117,17 @@ def parse_args():
         "or e.g. 'dev' for <type>-tests-dev.yaml; a bench type with no file "
         "for the suite is skipped, and a suite with no file at all is an error",
     )
+    parser.add_argument(
+        "--junit-xml",
+        type=str,
+        default="",
+        help="write one JUnit testcase per benchmark run to this file (empty = none)",
+    )
+    parser.add_argument(
+        "--list-legs",
+        action="store_true",
+        help="print the CI legs, one per selected (model, tp), as JSON and run nothing",
+    )
     return parser.parse_args()
 
 
@@ -140,16 +154,22 @@ def _config_tp(config: dict) -> int | None:
     return None
 
 
-def _resolve_dataset_path(config: dict) -> None:
-    """Expand environment variables in a config's `dataset-path`, in place."""
+def _resolve_dataset_path(config: dict) -> list[str]:
+    """Expand environment variables in a config's `dataset-path`, in place.
+
+    Returns the identifiers that neither the environment nor the fetch cache
+    provided, which safe_substitute leaves as literal `${VAR}` or `$VAR` text.
+    """
     parameters = config.get("parameters")
     if not parameters:
-        return
+        return []
     path = parameters.get("dataset-path")
     if not path:
-        return
+        return []
     env = {**_dataset_path_defaults(), **os.environ}
-    parameters["dataset-path"] = string.Template(str(path)).safe_substitute(env)
+    template = string.Template(str(path))
+    parameters["dataset-path"] = template.safe_substitute(env)
+    return [var for var in template.get_identifiers() if var not in env]
 
 
 def _missing_dataset(config: dict) -> str | None:
@@ -160,11 +180,19 @@ def _missing_dataset(config: dict) -> str | None:
     return None
 
 
+# Dataset variables that are optional because nothing provides them yet (#1538).
+# Anything else unresolved is a typo or an unfetched dataset and stays fatal.
+_OPTIONAL_DATASET_VARS = {"SPYRE_VISION_DATASET"}
+
+
 def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
     """Keep configs whose model and TP are selected (empty selects all).
 
     A selected config whose dataset is absent is fatal, not skipped: skipping
     would let a serve-only model job report success while measuring nothing.
+    The exception is a config whose dataset-path names only variables in
+    _OPTIONAL_DATASET_VARS, which nothing provides yet and cannot resolve on
+    any host: that one is skipped with a WARNING.
     """
     selected = []
     missing_datasets = []
@@ -184,9 +212,17 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
             log.info("Skipping %s (tp %d not selected)", config.get("test_name"), tp)
             continue
         raw_path = str(config.get("parameters", {}).get("dataset-path", ""))
-        _resolve_dataset_path(config)
+        unresolved = _resolve_dataset_path(config)
         missing = _missing_dataset(config)
         if missing:
+            if unresolved and set(unresolved) <= _OPTIONAL_DATASET_VARS:
+                log.warning(
+                    "Skipping %s (dataset variable %s is unset and has no "
+                    "default; export the SPYRE_*_DATASET variables to run it)",
+                    config.get("test_name"),
+                    " / ".join(sorted(unresolved)),
+                )
+                continue
             missing_datasets.append((config.get("test_name"), missing, raw_path))
             continue
         selected.append(config)
@@ -208,6 +244,46 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
 # Spyre devices are handed out from 0, so TP n takes the first n.
 def _spyre_devices_for_tp(tp: int) -> str:
     return ",".join(str(i) for i in range(tp))
+
+
+_CACHE_CONFIG = Path(__file__).resolve().parents[1] / "cache_config" / "hf_models_and_datasets.yaml"
+
+
+def _pinned_revisions() -> dict[str, str]:
+    """Model -> revision for the models the CI cache holds only at a pinned revision."""
+    try:
+        raw = yaml.safe_load(_CACHE_CONFIG.read_text()) or {}
+    except OSError:
+        return {}
+    entries = (raw.get("public_models") or []) + (raw.get("gated_models") or [])
+    return {
+        e["repo"].lower(): e["revision"]
+        for e in entries
+        if isinstance(e, dict) and e.get("revision")
+    }
+
+
+def _local_snapshot(model: str, revision: str) -> str | None:
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(model, revision=revision, local_files_only=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pin_revision(config: dict, pins: dict[str, str]) -> None:
+    """Run a pinned model at its cached revision: offline, `main` does not resolve for it."""
+    model = _config_model(config)
+    revision = pins.get((model or "").lower())
+    if not model or not revision:
+        return
+    engine = config["server_parameters"] if "server_parameters" in config else config["parameters"]
+    revision = engine.setdefault("revision", revision)
+    # bench serve and throughput load the tokenizer without a revision, so give them the snapshot.
+    snapshot = _local_snapshot(model, revision)
+    if snapshot:
+        config.setdefault("parameters", {}).setdefault("tokenizer", snapshot)
 
 
 def _merge_defaults(defaults: dict, config: dict) -> dict:
@@ -328,6 +404,28 @@ def record_command(cmd: list[str], env_vars: dict[str, str], cmd_file: Path) -> 
 VLLM_CLI = [sys.executable, "-m", "vllm.entrypoints.cli.main"]
 
 
+@dataclass
+class BenchResult:
+    bench_type: str
+    test_name: str
+    model: str
+    seconds: float
+    error: str | None = None
+
+
+def _tail(text: str | None, lines: int = 50) -> str:
+    return "\n".join((text or "").strip().splitlines()[-lines:])
+
+
+def _bench_failure(test_name: str, result: subprocess.CompletedProcess) -> str:
+    """Log a failed `vllm bench` run and return its failure text."""
+    log.error("Test %s failed with exit code %d", test_name, result.returncode)
+    tail = _tail(result.stderr)
+    if tail:
+        log.error("stderr tail:\n%s", tail)
+    return f"exit code {result.returncode}\n{tail}".strip()
+
+
 def run_benchmark(
     bench_type: str,
     test_name: str,
@@ -336,8 +434,8 @@ def run_benchmark(
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
-) -> bool:
-    """Run a single vllm bench command. Returns True on success."""
+) -> str | None:
+    """Run a single vllm bench command. Returns None on success, else the failure text."""
     cmd = [*VLLM_CLI, "bench", bench_type]
     cmd.extend(build_command_args(parameters))
     cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
@@ -361,57 +459,9 @@ def run_benchmark(
         lf.flush()
         result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        log.error("Test %s failed with exit code %d", test_name, result.returncode)
-        if result.stderr:
-            stderr_lines = result.stderr.strip().splitlines()[-50:]
-            log.error("stderr tail:\n%s", "\n".join(stderr_lines))
-        return False
+        return _bench_failure(test_name, result)
     log.info("Test %s passed", test_name)
-    return True
-
-
-def run_benchmarks_from_file(
-    config_file: Path,
-    bench_type: str,
-    results_dir: Path,
-    spyre_devices: str,
-    aiu_world_size: str,
-    models: set[str],
-    tps: set[int],
-) -> tuple[int, int]:
-    """Run all benchmarks from a config file. Returns (passed, failed) counts."""
-    if not config_file.exists():
-        log.info("No %s config found, skipping", config_file.name)
-        return 0, 0
-
-    configs = _load_configs(config_file)
-    if configs is None:
-        return 0, 1
-
-    configs = _select_configs(configs, models, tps)
-
-    passed = 0
-    failed = 0
-    for config in configs:
-        test_name = config.get("test_name", "unknown")
-        parameters = config.get("parameters", {})
-        env_config = config.get("environment_variables", {})
-
-        success = run_benchmark(
-            bench_type=bench_type,
-            test_name=test_name,
-            parameters=parameters,
-            env_config=env_config,
-            results_dir=results_dir,
-            spyre_devices=spyre_devices,
-            aiu_world_size=aiu_world_size,
-        )
-        if success:
-            passed += 1
-        else:
-            failed += 1
-
-    return passed, failed
+    return None
 
 
 def run_serve_benchmark(
@@ -423,8 +473,8 @@ def run_serve_benchmark(
     spyre_devices: str,
     aiu_world_size: str,
     health_timeout: int = 180,
-) -> bool:
-    """Start vllm serve, wait for health, run bench serve, cleanup."""
+) -> str | None:
+    """Serve, wait for health, run bench serve, clean up; None on success, else the failure."""
     # As in run_benchmark: env_config is applied last and overrides the CLI
     # device values.
     env = os.environ.copy()
@@ -460,6 +510,14 @@ def run_serve_benchmark(
             proc.wait()
 
     server_log = results_dir / f"{test_name}_server.log"
+
+    def _server_failure(summary: str) -> str:
+        log.error("%s", summary)
+        text = server_log.read_text() if server_log.exists() else ""
+        if text:
+            log.error("Server log:\n%s", text)
+        return f"{summary}\n{_tail(text)}".strip()
+
     with open(server_log, "w") as server_lf:
         server_lf.write(f"# {server_cmd_line}\n")
         server_lf.flush()
@@ -479,10 +537,9 @@ def run_serve_benchmark(
             deadline = server_start_ts + health_timeout
             while time.monotonic() < deadline:
                 if server_proc.poll() is not None:
-                    log.error("Server process died with exit code %d", server_proc.returncode)
-                    if server_log.exists():
-                        log.error("Server log:\n%s", server_log.read_text())
-                    return False
+                    return _server_failure(
+                        f"Server process died with exit code {server_proc.returncode}"
+                    )
                 try:
                     urllib.request.urlopen(health_url, timeout=2)
                     server_startup_sec = round(time.monotonic() - server_start_ts, 1)
@@ -492,10 +549,7 @@ def run_serve_benchmark(
                     time.sleep(1)
 
             if server_startup_sec is None:
-                log.error("Server did not become healthy within %ds", health_timeout)
-                if server_log.exists():
-                    log.error("Server log:\n%s", server_log.read_text())
-                return False
+                return _server_failure(f"Server did not become healthy within {health_timeout}s")
 
             # Run bench serve
             bench_cmd = [*VLLM_CLI, "bench", "serve"]
@@ -532,11 +586,7 @@ def run_serve_benchmark(
             _kill_server(server_proc)
 
     if result.returncode != 0:
-        log.error("Serve test %s failed with exit code %d", test_name, result.returncode)
-        if result.stderr:
-            stderr_lines = result.stderr.strip().splitlines()[-50:]
-            log.error("stderr tail:\n%s", "\n".join(stderr_lines))
-        return False
+        return _bench_failure(test_name, result)
 
     # `vllm bench serve` only measures the request phase. A local artifact:
     # not in spyre_clickhouse_ingest.vllm's `_SERVE_METRICS`, so it does not
@@ -551,55 +601,134 @@ def run_serve_benchmark(
         log.warning("Could not add server_startup_sec to %s: %s", result_file.name, e)
 
     log.info("Serve test %s passed (server startup %.1fs)", test_name, server_startup_sec)
-    return True
+    return None
 
 
-def run_serve_benchmarks_from_file(
+def run_benchmarks_from_file(
     config_file: Path,
+    bench_type: str,
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
-) -> tuple[int, int]:
-    """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
+) -> list[BenchResult]:
+    """Run every selected benchmark in a config file."""
     if not config_file.exists():
         log.info("No %s config found, skipping", config_file.name)
-        return 0, 0
+        return []
 
     configs = _load_configs(config_file)
     if configs is None:
-        return 0, 1
+        return [BenchResult(bench_type, config_file.name, "", 0.0, "malformed config file")]
 
-    configs = _select_configs(configs, models, tps)
-
-    passed = 0
-    failed = 0
-    for config in configs:
+    pins = _pinned_revisions()
+    results = []
+    for config in _select_configs(configs, models, tps):
         test_name = config.get("test_name", "unknown")
-        server_parameters = config.get("server_parameters", {})
-        bench_parameters = config.get("parameters", {})
+        _pin_revision(config, pins)
         env_config = config.get("environment_variables", {})
-        # Large models pay a one-time warmup compile before /health passes;
-        # let a config bump this past the 180s default.
-        health_timeout = int(config.get("server_health_timeout", 180))
-
-        success = run_serve_benchmark(
-            test_name=test_name,
-            server_parameters=server_parameters,
-            bench_parameters=bench_parameters,
-            env_config=env_config,
-            results_dir=results_dir,
-            spyre_devices=spyre_devices,
-            aiu_world_size=aiu_world_size,
-            health_timeout=health_timeout,
-        )
-        if success:
-            passed += 1
+        start = time.monotonic()
+        if bench_type == "serve":
+            error = run_serve_benchmark(
+                test_name=test_name,
+                server_parameters=config.get("server_parameters", {}),
+                bench_parameters=config.get("parameters", {}),
+                env_config=env_config,
+                results_dir=results_dir,
+                spyre_devices=spyre_devices,
+                aiu_world_size=aiu_world_size,
+                # Large models pay a one-time warmup compile before /health passes;
+                # let a config bump this past the 180s default.
+                health_timeout=int(config.get("server_health_timeout", 180)),
+            )
         else:
-            failed += 1
+            error = run_benchmark(
+                bench_type=bench_type,
+                test_name=test_name,
+                parameters=config.get("parameters", {}),
+                env_config=env_config,
+                results_dir=results_dir,
+                spyre_devices=spyre_devices,
+                aiu_world_size=aiu_world_size,
+            )
+        model = _config_model(config) or ""
+        results.append(BenchResult(bench_type, test_name, model, time.monotonic() - start, error))
+    return results
 
-    return passed, failed
+
+# Spyre runner pools by card count; a leg takes the smallest one its TP fits.
+CARD_POOLS = (1, 2, 4)
+
+
+def list_legs(config_files: list[tuple[str, Path]], models: set[str], tps: set[int]) -> list[dict]:
+    """One CI leg per selected (model, tp), each run on a runner with enough cards."""
+    legs: dict[tuple[str, int], str] = {}
+    for _, config_file in config_files:
+        configs = _load_configs(config_file) if config_file.exists() else []
+        if configs is None:
+            sys.exit(2)
+        for config in configs:
+            model, tp = _config_model(config), _config_tp(config)
+            if not model or (models and model.lower() not in models):
+                continue
+            if tp is None or tp > CARD_POOLS[-1]:
+                log.error(
+                    "%s needs a tensor-parallel-size of 1 to %d",
+                    config.get("test_name"),
+                    CARD_POOLS[-1],
+                )
+                sys.exit(2)
+            if not tps or tp in tps:
+                legs.setdefault((model.lower(), tp), model)
+    return [
+        {
+            "model": model,
+            "tp": tp,
+            "cards": next(n for n in CARD_POOLS if n >= tp),
+            "key": f"{re.sub(r'[^a-z0-9.]+', '-', key).strip('-')}-tp{tp}",
+        }
+        for (key, tp), model in legs.items()
+    ]
+
+
+# Characters XML 1.0 cannot carry, e.g. the ANSI escapes in vLLM's stderr.
+_XML_INVALID = re.compile("[^\t\n\r\x20-퟿-�\U00010000-\U0010ffff]")
+
+
+def write_junit(path: Path, results: list[BenchResult]) -> None:
+    """One testcase per benchmark, read by the same summary and ingest as the pytest legs."""
+    suite = ET.Element(
+        "testsuite",
+        name="vllm-benchmarks",
+        tests=str(len(results)),
+        failures=str(sum(r.error is not None for r in results)),
+        errors="0",
+        skipped="0",
+        time=f"{sum(r.seconds for r in results):.3f}",
+        timestamp=datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+    )
+    arch = re.sub(r"[^a-zA-Z0-9_]", "_", platform.machine() or "").strip("_") or "unknown"
+    for r in results:
+        case = ET.SubElement(
+            suite,
+            "testcase",
+            classname=f"vllm_bench.{r.bench_type}",
+            name=r.test_name,
+            time=f"{r.seconds:.3f}",
+        )
+        # The tags the pytest legs carry (tests/plugin/spyre_testing_plugin/tags.py).
+        tags = [f"platform__{arch}", "testtype__perf"] + ([f"model__{r.model}"] if r.model else [])
+        props = ET.SubElement(case, "properties")
+        for tag in tags:
+            ET.SubElement(props, "property", name="tag", value=tag)
+        if r.error is not None:
+            text = _XML_INVALID.sub("", r.error)
+            ET.SubElement(case, "failure", message=text.splitlines()[0] if text else "").text = text
+    root = ET.Element("testsuites")
+    root.append(suite)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
 
 VALID_BENCH_TYPES = ("latency", "throughput", "serve")
@@ -626,8 +755,6 @@ def main():
 
     args = parse_args()
     configs_dir = Path(args.configs_dir)
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
 
     models = {m.strip().lower() for m in args.models.split(",") if m.strip()}
     try:
@@ -655,61 +782,43 @@ def main():
         )
         sys.exit(2)
 
-    total_passed = 0
-    total_failed = 0
-
-    # Run latency benchmarks
-    if "latency" in bench_types:
-        passed, failed = run_benchmarks_from_file(
-            config_file=config_files["latency"],
-            bench_type="latency",
-            results_dir=results_dir,
-            spyre_devices=args.spyre_devices,
-            aiu_world_size=args.aiu_world_size,
-            models=models,
-            tps=tps,
-        )
-        total_passed += passed
-        total_failed += failed
-
-    # Run throughput benchmarks
-    if "throughput" in bench_types:
-        passed, failed = run_benchmarks_from_file(
-            config_file=config_files["throughput"],
-            bench_type="throughput",
-            results_dir=results_dir,
-            spyre_devices=args.spyre_devices,
-            aiu_world_size=args.aiu_world_size,
-            models=models,
-            tps=tps,
-        )
-        total_passed += passed
-        total_failed += failed
-
-    # Run serve benchmarks (after latency/throughput to avoid port conflicts)
+    # Serve runs after latency/throughput to avoid port conflicts.
+    files = list(config_files.items())
     if "serve" in bench_types:
-        for serve_config in (config_files["serve"], configs_dir / "multimodal-serve-tests.yaml"):
-            passed, failed = run_serve_benchmarks_from_file(
-                config_file=serve_config,
-                results_dir=results_dir,
-                spyre_devices=args.spyre_devices,
-                aiu_world_size=args.aiu_world_size,
-                models=models,
-                tps=tps,
-            )
-            total_passed += passed
-            total_failed += failed
+        files.append(("serve", configs_dir / "multimodal-serve-tests.yaml"))
+
+    if args.list_legs:
+        print(json.dumps(list_legs(files, models, tps)))
+        return
+
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for bench_type, config_file in files:
+        results += run_benchmarks_from_file(
+            config_file=config_file,
+            bench_type=bench_type,
+            results_dir=results_dir,
+            spyre_devices=args.spyre_devices,
+            aiu_world_size=args.aiu_world_size,
+            models=models,
+            tps=tps,
+        )
+    failed = sum(r.error is not None for r in results)
 
     # Summary
     log.info("=== Benchmark Summary ===")
-    log.info("Passed: %d, Failed: %d", total_passed, total_failed)
+    log.info("Passed: %d, Failed: %d", len(results) - failed, failed)
 
     result_files = list(results_dir.glob("*.json"))
     log.info("Result files: %d", len(result_files))
     for f in result_files:
         log.info("  %s", f.name)
 
-    if total_failed > 0:
+    if args.junit_xml:
+        write_junit(Path(args.junit_xml), results)
+
+    if failed:
         sys.exit(1)
 
 

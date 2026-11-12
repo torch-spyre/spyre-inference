@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from spyre_inference.v1.attention.ops import batched_decode_head_major as bdhm
+from spyre_inference.v1.attention.ops import batched_decode as bdhm
 from spyre_inference.v1.attention.ops import tile_loop
 
 BLOCK, HEAD, SCALE = 4, 8, 0.3
@@ -62,7 +62,7 @@ def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap, 
 
 
 def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None):
-    return bdhm.batched_decode_head_major_kernel(
+    return bdhm.batched_decode_kernel(
         query=query,
         rep_row_ids=rep,
         k_pages=k_pages,
@@ -229,7 +229,7 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
     boundaries, including the split-index shape branch; this does not test
     compiled for_each_tile execution or the device's physical index layout.
     """
-    from spyre_inference.v1.attention.backends import spyre_head_major_attn as backend
+    from spyre_inference.v1.attention.backends import spyre_attn as backend
 
     b, bpc, kv, q = 2, 2, 2, 4
     query, rep = _meta(b, bpc, kv, q)
@@ -256,9 +256,9 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", cpu_transfer)
-    monkeypatch.setattr(backend, "USE_FOR_EACH_TILE", split_index)
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", split_index)
     monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", split_index)
-    impl = object.__new__(backend.SpyreHeadMajorAttentionImpl)
+    impl = object.__new__(backend.SpyreAttentionImpl)
     impl._mirror_batched_decode_indices(metadata, torch.device("cpu"))
     assert len(layouts) == int(split_index)
     if split_index:
@@ -293,4 +293,4 @@ def test_temp_split_layout_fields():
 
     layout = temporary_chunk_major_page_index_layout(3, 8)
     assert list(layout.device_size) == [3, 1, 8, 32]
-    assert list(layout.stride_map) == [8, -1, 1, -1]
+    assert list(layout.stride_map) == [8, 0, 1, 0]

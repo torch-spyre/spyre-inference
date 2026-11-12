@@ -933,7 +933,7 @@ SPYRE_AVX2_FMA
 static void top_p_row(float* __restrict__ row, int V, float p_val,
                       float* __restrict__ scratch,
                       float* __restrict__ outlier_buf) {
-  if (p_val >= 1.0f) return;
+  // Callers skip p >= 1 before allocating scratch, so this row is a real cut.
   RowStats st;
   compute_row_stats(row, V, &st);
   _top_p_row_core(row, V, p_val, st, scratch, outlier_buf);

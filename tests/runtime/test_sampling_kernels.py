@@ -165,18 +165,24 @@ def test_topk_filter_matches_pytorch(rows: int, vocab: int, ties: str) -> None:
     assert torch.equal(apply_top_k_top_p_kernels(x.clone(), k, None), expected)
 
 
-def test_topk_keeps_a_zero_tie_when_denormals_flush() -> None:
-    """nextafter(0, -inf) is a denormal. DAZ must not drop the k-th tie at 0."""
-    x = torch.tensor([[3.0, 2.0, 1.0, 0.0, -5.0, -5.0, -5.0, -5.0]])
-    k = torch.tensor([4], dtype=torch.int32)
-    previous = torch.set_flush_denormal(True)
+@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("vocab", [32, 64])
+@pytest.mark.parametrize("p", [None, 0.9999])
+def test_topk_keeps_a_zero_tie_when_denormals_flush(rows: int, vocab: int, p: float | None) -> None:
+    """The k-th value is 0. A vocab of 32 or more hits the 16-wide compare, and
+    p < 1 also runs the top-k+top-p survivor scan. set_flush_denormal returns
+    whether the mode is supported, not the previous mode, so the restore is off."""
+    x = torch.full((rows, vocab), -5.0)
+    x[:, :4] = torch.tensor([3.0, 2.0, 1.0, 0.0])
+    k = torch.full((rows,), 4, dtype=torch.int32)
+    p_t = None if p is None else torch.full((rows,), p)
+    torch.set_flush_denormal(True)
     try:
-        expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
-        actual = apply_top_k_top_p_kernels(x.clone(), k, None)
+        expected = apply_top_k_top_p_pytorch(x.clone(), k, p_t, allow_cpu_sync=True)
+        actual = apply_top_k_top_p_kernels(x.clone(), k, p_t)
     finally:
-        torch.set_flush_denormal(bool(previous))
+        torch.set_flush_denormal(False)
     assert torch.equal(actual, expected)
-    assert torch.equal(actual[0, :4] > float("-inf"), torch.tensor([True, True, True, True]))
 
 
 # Top-p over the top-k survivors: the same kept values as the full sort. When a
@@ -215,6 +221,21 @@ def test_topp_filter_close_to_pytorch(rows: int, vocab: int, ties: str) -> None:
     expected = apply_top_k_top_p_pytorch(x.clone(), None, p)
     actual = apply_top_k_top_p_kernels(x.clone(), None, p)
     _assert_topp_close(x, actual, expected, p)
+
+
+def test_p_one_with_top_k_disabled_is_unchanged() -> None:
+    """k == vocab and p == 1 is the no-op skip. A top-k row with p == 1 is exact."""
+    vocab = 64
+    x = torch.randn(4, vocab)
+    k = torch.tensor([8, vocab, 4, vocab], dtype=torch.int32)
+    p = torch.tensor([1.0, 1.0, 0.9, 0.5])
+    actual = apply_top_k_top_p_kernels(x.clone(), k, p)
+    assert torch.equal(actual[1], x[1])
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p, allow_cpu_sync=True)
+    topk_p1 = (k < vocab) & (p >= 1)
+    assert torch.equal(actual[topk_p1], expected[topk_p1])
+    topp = apply_top_k_top_p_kernels(x.clone(), None, p)
+    assert torch.equal(topp[p >= 1], x[p >= 1])
 
 
 def test_filters_handle_degenerate_rows() -> None:

@@ -159,7 +159,7 @@ def flatten_sampled(g):
     num_reqs, steps = 4, 3
     cu = torch.tensor([0, 4, 6, 10, 11], dtype=torch.int32)
     num_sampled = torch.tensor([3, 2, 4, 1], dtype=torch.int32)
-    sampled = torch.randint(0, 500, (num_reqs, steps + 1), generator=g)
+    sampled = torch.randint(0, 300, (num_reqs, steps + 1), generator=g)
     logits = _logits(g, 11, 300)
     sampler = types.SimpleNamespace(logprobs_mode="raw_logprobs")
     self = types.SimpleNamespace(sampler=sampler, enable_adaptive_verification=False)

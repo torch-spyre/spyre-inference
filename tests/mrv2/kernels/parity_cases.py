@@ -47,8 +47,8 @@ def _m(name: str):
     return importlib.import_module(f"vllm.v1.worker.gpu.{name}")
 
 
-def _ragged(g: torch.Generator, num_reqs: int, max_len: int) -> torch.Tensor:
-    lens = torch.randint(0, max_len + 1, (num_reqs,), generator=g)
+def _ragged(g: torch.Generator, num_reqs: int, max_len: int, min_len: int = 0) -> torch.Tensor:
+    lens = torch.randint(min_len, max_len + 1, (num_reqs,), generator=g)
     lens[0] = max(int(lens[0]), 1)
     return torch.cat([torch.zeros(1, dtype=torch.int64), lens.cumsum(0)]).to(torch.int32)
 
@@ -96,7 +96,8 @@ def prepare_pos_seq_lens(g):
 def combine_sampled_and_draft_tokens(g):
     ib = _m("input_batch")
     max_reqs, num_reqs = 10, 8
-    qsl = _ragged(g, num_reqs, 6)
+    # Every request samples a logit, so every request schedules at least one token.
+    qsl = _ragged(g, num_reqs, 6, min_len=1)
     num_logits_per = torch.ones(num_reqs, dtype=torch.int32)
     cu = torch.cat([torch.zeros(1, dtype=torch.int32), num_logits_per.cumsum(0).to(torch.int32)])
     idx = _perm(g, max_reqs, num_reqs)

@@ -34,7 +34,7 @@ def temporary_chunk_major_page_index_layout(num_chunks: int, entries_per_chunk: 
 
     return SpyreTensorLayout(
         [num_chunks, 1, entries_per_chunk, INT32_ELEMS_PER_STICK],
-        [entries_per_chunk, -1, 1, -1],
+        [entries_per_chunk, 0, 1, 0],
         get_device_dtype(torch.int32),
         {(0,): num_chunks, (2,): entries_per_chunk, (1, 3): 1},
     )

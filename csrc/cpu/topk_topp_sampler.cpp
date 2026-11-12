@@ -50,7 +50,7 @@ constexpr int kBsearchMaxIters = 32;        // binary-search iteration cap
 constexpr int kTernarySearchMaxIters = 18;  // matches Triton
 constexpr float kKDuplicateTol = 1e-9f;     // tie tolerance for top-k (Triton)
 #if defined(__powerpc__) || defined(__s390x__)
-constexpr bool kTrimIdleWork = true;  // skip the team and unused dup counts
+constexpr bool kTrimIdleWork = true;  // skip unused duplicate counts
 #else
 constexpr bool kTrimIdleWork = false;
 #endif
@@ -182,8 +182,10 @@ struct Fp64Acc16 {
   }
 };
 
-// VSX / VXE exp() clamps its input, so exp(-inf) yields ~1e-38 instead of 0.
-// Zero PAD lanes to match the scalar path.
+// VSX exp() clamps its input, so exp(-inf) yields ~1e-38 instead of 0.
+// Zero PAD lanes to match the scalar path. VXE fast_exp already flushes
+// inputs below ln(FLT_MIN) to 0, and the PAD sentinel is far below that.
+#if defined(__powerpc__)
 static inline vec_op::FP32Vec16 zero_pad_lanes(const vec_op::FP32Vec16& v,
                                                const vec_op::FP32Vec16& e) {
   const vf32 pad = vec_splats(kPadSentinel);
@@ -193,6 +195,7 @@ static inline vec_op::FP32Vec16 zero_pad_lanes(const vec_op::FP32Vec16& v,
     out.val[r] = vec_sel(zero, e.reg.val[r], vec_cmpgt(v.reg.val[r], pad));
   return vec_op::FP32Vec16(out);
 }
+#endif  // __powerpc__
 #endif
 
 __attribute__((always_inline)) static inline double sum_gt_to_double(
@@ -773,7 +776,9 @@ static float top_k_threshold(const float* __restrict__ row, int V, int k_val,
 #define SPYRE_AVX2_FMA
 #endif
 
-// Core top-p logic. Receives pre-computed RowStats; does not re-scan the row.
+// Split kept so a resync with vllm#43452 can drop in upstream's body, which
+// its top-k+top-p reuses. This port's top_k_p_row does its own exact cut and
+// does not call this. Both functions keep the FMA target so fast_exp inlines.
 SPYRE_AVX2_FMA
 static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
                             const RowStats& st, float* __restrict__ scratch,
@@ -807,7 +812,7 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
     for (; i + 16 <= V; i += 16) {
       vec_op::FP32Vec16 v16(row + i);
       vec_op::FP32Vec16 e16 = fast_exp(v16 - base16);
-  #if defined(__powerpc__) || defined(__s390x__)
+  #if defined(__powerpc__)
       e16 = zero_pad_lanes(v16, e16);
   #endif
       acc.add(e16);
@@ -832,7 +837,7 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
     for (; i + 16 <= V; i += 16) {
       vec_op::FP32Vec16 v16(row + i);
       vec_op::FP32Vec16 p16 = fast_exp(v16 - base16) * isum16;
-  #if defined(__powerpc__) || defined(__s390x__)
+  #if defined(__powerpc__)
       p16 = zero_pad_lanes(v16, p16);
   #endif
       p16.save(scratch + i);
@@ -984,9 +989,10 @@ void cpu_topp_sampling(torch::Tensor& logits, const torch::Tensor& p) {
   float* lp = logits.data_ptr<float>();
   const float* pp = p.data_ptr<float>();
 
-  // On POWER and Z, a single row stays on this thread: waking the OpenMP team
-  // costs more than filtering it.
-#pragma omp parallel if (B > 1 || !kTrimIdleWork)
+  // One row stays on this thread on every arch. Forking the team first-touches
+  // a V-sized scratch on whichever worker takes the row, and that spike keeps
+  // showing up long after warmup.
+#pragma omp parallel if (B > 1)
   {
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
@@ -1008,7 +1014,7 @@ void cpu_topk_sampling(torch::Tensor& logits, const torch::Tensor& k) {
   if (V == 0) return;
   float* lp = logits.data_ptr<float>();
 
-#pragma omp parallel if (B > 1 || !kTrimIdleWork)
+#pragma omp parallel if (B > 1)
   {
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
@@ -1036,7 +1042,7 @@ void cpu_topk_topp_sampling(torch::Tensor& logits, const torch::Tensor& k,
   float* lp = logits.data_ptr<float>();
   const float* pp = p.data_ptr<float>();
 
-#pragma omp parallel if (B > 1 || !kTrimIdleWork)
+#pragma omp parallel if (B > 1)
   {
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {

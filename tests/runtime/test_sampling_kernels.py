@@ -126,6 +126,24 @@ def _tied_logits(rows: int, vocab: int, ties: str) -> torch.Tensor:
     return x
 
 
+def _assert_topp_close(
+    x: torch.Tensor, actual: torch.Tensor, expected: torch.Tensor, p: torch.Tensor
+) -> None:
+    """Same bound as the top-p kernel's own claim: a few boundary tokens, mass >= p."""
+    finite = torch.isfinite(x).any(dim=-1)
+    if not bool(finite.any()):
+        return
+    x, actual, expected, p = x[finite], actual[finite], expected[finite], p[finite]
+    kept = actual > float("-inf")
+    assert torch.equal(actual[kept], x[kept])  # survivors keep their logits
+    assert (kept.sum(dim=-1) > 0).all()
+    diff = ((expected > float("-inf")).sum(dim=-1) - kept.sum(dim=-1)).abs()
+    max_kept = int((expected > float("-inf")).sum(dim=-1).max())
+    assert int(diff.max()) <= max(3, max_kept // 200)
+    mass = torch.where(kept, x.softmax(-1).double(), 0.0).sum(-1)
+    assert (mass >= p.double() - 1e-6).all()
+
+
 def _ks(rows: int, vocab: int) -> torch.Tensor:
     # Per-row k, with the extremes and a disabled row (k == vocab).
     k = torch.randint(1, 129, (rows,))
@@ -141,7 +159,8 @@ def _ks(rows: int, vocab: int) -> torch.Tensor:
 @pytest.mark.parametrize("vocab", [7, 32003, 151936])
 def test_topk_filter_matches_pytorch(rows: int, vocab: int, ties: str) -> None:
     x = _tied_logits(rows, vocab, ties)
-    k = _ks(rows, vocab).clamp(max=vocab)
+    # Serving passes InputBatch.top_k as int32. The other tests stay on int64.
+    k = _ks(rows, vocab).clamp(max=vocab).to(torch.int32)
     expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
     assert torch.equal(apply_top_k_top_p_kernels(x.clone(), k, None), expected)
 
@@ -165,6 +184,10 @@ def test_topk_topp_filter_matches_pytorch(rows: int, vocab: int, ties: str) -> N
     assert torch.equal(
         actual[topk_rows].sort(dim=-1).values, expected[topk_rows].sort(dim=-1).values
     )
+    # k == vocab is the row cpu_topk_topp_sampling sends to the approximate top-p kernel.
+    topp_only = ~topk_rows
+    if bool(topp_only.any()):
+        _assert_topp_close(x[topp_only], actual[topp_only], expected[topp_only], p[topp_only])
 
 
 # Top-p alone is vLLM's kernel: a binary search over probabilities, so its cut
@@ -177,12 +200,7 @@ def test_topp_filter_close_to_pytorch(rows: int, vocab: int, ties: str) -> None:
     p = torch.rand(rows) * 0.9 + 0.1
     expected = apply_top_k_top_p_pytorch(x.clone(), None, p)
     actual = apply_top_k_top_p_kernels(x.clone(), None, p)
-    kept = actual > float("-inf")
-    assert torch.equal(actual[kept], x[kept])  # survivors keep their logits
-    assert (kept.sum(dim=-1) > 0).all()
-    diff = ((expected > float("-inf")).sum(dim=-1) - kept.sum(dim=-1)).abs()
-    max_kept = int((expected > float("-inf")).sum(dim=-1).max())
-    assert int(diff.max()) <= max(3, max_kept // 200)
+    _assert_topp_close(x, actual, expected, p)
 
 
 def test_filters_handle_degenerate_rows() -> None:
@@ -316,6 +334,8 @@ def test_avx2_build_filters_match_pytorch() -> None:
         "max_kept = int(kept(expected).sum(-1).max())\n"
         "assert int(diff.max()) <= max(3, max_kept // 200)\n"
         "assert (kept(actual).sum(-1) > 0).all()\n"
+        "mass = torch.where(kept(actual), x.softmax(-1).double(), 0.0).sum(-1)\n"
+        "assert (mass >= p.double() - 1e-6).all()\n"
     )
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

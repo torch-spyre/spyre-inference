@@ -704,7 +704,9 @@ same way. That brings back the CPU kernels and drops the full-vocabulary sort:
   mixed batch, uses vLLM's approximate CPU kernel: the kept set can differ from a full
   sort by a few boundary tokens, and it does not drop below the requested probability
   mass. Without those ops, top-k uses `topk`, top-k with top-p uses
-  `apply_top_k_top_p_sort_free`, and top-p alone sorts.
+  `apply_top_k_top_p_sort_free`, and top-p alone sorts. Speculative decoding's
+  `apply_sampling_constraints` is separate from that sampler: it still calls vLLM's
+  `apply_top_k_top_p` and sorts. The shared `Sampler` only covers the token draw.
 
 The kernels live in `csrc/cpu/sampling_kernels.cpp` and `csrc/cpu/topk_topp_sampler.cpp`,
 with the vector exp in `csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from

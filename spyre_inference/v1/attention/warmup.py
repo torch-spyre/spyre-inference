@@ -85,10 +85,17 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer) -> 
     follows finds every compile in this start's caches. A restart already has them:
     then the first variant runs without compiling, and this stops at once.
     """
-    from torch_spyre._inductor.parallel_precompile import (
-        CompileOnlyAbort,
-        fork_inner_compiles,
-    )
+    try:
+        from torch_spyre._inductor.parallel_precompile import (  # ty: ignore[unresolved-import]
+            CompileOnlyAbort,
+            fork_inner_compiles,
+        )
+    except ImportError:
+        logger.warning(
+            "SPYRE_PARALLEL_ATTN_PRECOMPILE needs a torch-spyre with fork_inner_compiles "
+            "(torch-spyre/torch-spyre#6262); compiling the attention variants one by one."
+        )
+        return
 
     layers, seen = [], set()
     for name, kv_cache in kv_caches.items():

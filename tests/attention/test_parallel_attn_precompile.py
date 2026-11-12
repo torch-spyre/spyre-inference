@@ -15,11 +15,11 @@
 """Tests for the parallel attention precompile in warmup (no device needed)."""
 
 import contextlib
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
-from torch_spyre._inductor import parallel_precompile
 
 from spyre_inference.v1.attention import warmup
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
@@ -30,8 +30,18 @@ pytestmark = pytest.mark.attention
 def _run(monkeypatch, cold):
     """Two layers that share their graphs; returns what the precompile did."""
     monkeypatch.setenv("SPYRE_PARALLEL_ATTN_PRECOMPILE", "4")
-    monkeypatch.setattr(
-        parallel_precompile, "fork_inner_compiles", lambda n: contextlib.nullcontext()
+
+    class CompileOnlyAbort(Exception):
+        pass
+
+    # A stand-in for torch-spyre's helper: the compiles run inline, and the test does not
+    # need a torch-spyre that has it.
+    parallel_precompile = SimpleNamespace(
+        CompileOnlyAbort=CompileOnlyAbort,
+        fork_inner_compiles=lambda n: contextlib.nullcontext(),
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch_spyre._inductor.parallel_precompile", parallel_precompile
     )
     resets = []
     monkeypatch.setattr(torch._dynamo, "reset_code", resets.append)

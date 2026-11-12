@@ -2358,7 +2358,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 out=out,
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
-                page_group=_prefill_page_group(num_blocks, self.num_heads, self.head_size),
+                # A group must divide every page count of a declared range.
+                page_group=1
+                if page_range is not None
+                else _prefill_page_group(num_blocks, self.num_heads, self.head_size),
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)

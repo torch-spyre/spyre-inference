@@ -19,15 +19,16 @@ decoder, and adds the ``SpyreVisionEncoderMixin`` hooks:
 
 - blocks: ``SpyrePixtralTransformerBlock``, whose attention does RoPE as a matmul and the
   stick-aligned SDPA;
-- inputs: each image padded onto a square canvas, one image per call and one token budget
-  per canvas, with each patch's image and position laid out offset-major;
-- patch embedding: a conv2d on the card, its output reordered offset-major;
+- inputs: every image's merge blocks laid in order, row by row, onto one canvas, with each
+  patch's image and position laid out offset-major;
+- patch embedding: a conv2d on the card over that canvas, its output reordered offset-major;
 - RoPE: cos and sin gathered on the card by position, from a ``GatherTable``;
 - patch merge: a batched matmul over the offset groups, in place of upstream's ``unfold``.
 
 The encoder is permutation-equivariant while RoPE and the image mask follow the patches, so
-the offset-major order changes how the merge lowers, not the result. The canvas's padding
-tokens are cropped off on the host.
+the offset-major order changes how the merge lowers, not the result. For the same reason, and
+because the conv's stride equals its kernel, a merge block can sit anywhere on the canvas: images
+pack into one call without padding to their shape.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
+    SEGMENT_ITEMS,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
@@ -55,7 +57,6 @@ from spyre_inference.models._vision_encoder import (
 )
 from spyre_inference.multimodal.utils import (
     STICK,
-    align_up,
     linear_weight,
     padded_sdpa,
     rope_perm_matrix,
@@ -65,8 +66,8 @@ from spyre_inference.multimodal.utils import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-# Canvas sides in patches. Multiples of 8, so a canvas's patch count is whole 64-wide sticks.
-CANVAS_SIDES = (8, 16, 24, 32, 48, 64, 80, 96, 112)
+# Merge blocks per canvas row; a budget's padding adds rows at the bottom.
+CANVAS_WIDTH = 32
 
 
 class SpyrePixtralAttention(pixtral.Attention):
@@ -166,7 +167,7 @@ class SpyrePixtralForConditionalGeneration(
 ):
     """Upstream Pixtral with its vision encoder compiled per token budget."""
 
-    vision_max_items_per_call = 1
+    vision_max_items_per_call = SEGMENT_ITEMS
 
     # --- construction ---
 
@@ -183,8 +184,6 @@ class SpyrePixtralForConditionalGeneration(
         self.out_hidden_size = self.config.text_config.hidden_size
         self._max_side = args.image_size // args.patch_size
         head_dim = args.hidden_size // args.num_attention_heads
-        top = align_up(self._max_side, 8)
-        self._canvas_sides = [s for s in CANVAS_SIDES if s < top] + [top]
         self.vision_buffers = {
             "image": VisionBuffer(None, shape_at=self._canvas_shape),
             "segments": segment_buffer(),
@@ -239,32 +238,47 @@ class SpyrePixtralForConditionalGeneration(
     # --- SpyreVisionEncoderMixin hooks ---
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
-        """Each image's canvas tokens; ``postprocess_encoder_output`` crops them to the image's."""
         p = self.vision_args.patch_size
-        return [
-            (self._canvas_side(img.shape[-2] // p, img.shape[-1] // p) // self._merge) ** 2
-            for img in _images(mm_kwargs)
-        ]
+        tokens = []
+        for img in _images(mm_kwargs):
+            hp, wp = img.shape[-2] // p, img.shape[-1] // p
+            # The RoPE table, like upstream's, covers image_size only.
+            if max(hp, wp) > self._max_side:
+                raise ValueError(
+                    f"a {hp}x{wp}-patch image exceeds the {self._max_side}-patch image_size limit"
+                )
+            tokens.append(hp * wp // self.patches_per_token)
+        return tokens
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """The image padded at the bottom and right onto its canvas, with each canvas patch's
-        one-hot image (padding patches: the padding segment) and RoPE position."""
-        (img,) = _images(mm_kwargs)
+        """Every image's merge blocks in order as rows of ``CANVAS_WIDTH`` blocks, padded to a
+        whole row, with each patch's one-hot image and RoPE position."""
+        images = _images(mm_kwargs)
         p, m = self.vision_args.patch_size, self._merge
-        c, h, w = img.shape
-        assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
-        hp, wp = h // p, w // p
-        side = self._canvas_side(hp, wp)
-        canvas = torch.zeros(c, side * p, side * p, dtype=torch.float16)
-        canvas[:, :h, :w] = convert(img, device="cpu")
-        grid = torch.zeros(side, side, dtype=torch.int64)
-        grid[:hp, :wp] = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
-        seg = torch.full((side, side), STICK - 1)
-        seg[:hp, :wp] = 0
+        b = p * m
+        c = images[0].shape[0]
+        blocks, seg, pos = [], [], []
+        for i, img in enumerate(images):
+            _, h, w = img.shape
+            assert h % b == 0 and w % b == 0, f"{h}x{w} is not a multiple of {b}"
+            pixels = convert(img, device="cpu").to(torch.float16)
+            blocks.append(pixels.reshape(c, h // b, b, w // b, b).permute(1, 3, 0, 2, 4))
+            hp, wp = h // p, w // p
+            grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
+            pos.append(offset_major(grid, m))
+            seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
+        flat = torch.cat([x.flatten(0, 1) for x in blocks])
+        n = flat.shape[0]
+        rows = -(-n // CANVAS_WIDTH)
+        pad = rows * CANVAS_WIDTH - n
+        flat = torch.cat([flat, flat.new_zeros(pad, c, b, b)])
+        pos.append(torch.zeros(m * m, pad, dtype=torch.int64))
+        seg.append(torch.full((m * m, pad), STICK - 1))
+        canvas = flat.reshape(rows, CANVAS_WIDTH, c, b, b).permute(2, 0, 3, 1, 4)
         return {
-            "image": canvas,
-            "segments": one_hot_segments(offset_major(seg, m).flatten()),
-            "positions": offset_major(grid, m).flatten(),
+            "image": canvas.reshape(c, rows * b, CANVAS_WIDTH * b),
+            "segments": one_hot_segments(torch.cat(seg, dim=1).flatten()),
+            "positions": torch.cat(pos, dim=1).flatten(),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -294,36 +308,12 @@ class SpyrePixtralForConditionalGeneration(
         return self.vision_language_adapter(x)
 
     @property
-    def vision_token_budgets(self) -> list[int] | None:
-        return [(s // self._merge) ** 2 for s in self._canvas_sides]
-
-    def postprocess_encoder_output(
-        self,
-        outputs: dict[str, torch.Tensor],
-        indices: list[int],
-        per_item_out_tokens: list[int],
-        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
-        clone: bool = False,
-        batch_mm_kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        assert batch_mm_kwargs is not None and len(indices) == 1, "one canvas per call"
-        p, m = self.vision_args.patch_size, self._merge
-        (img,) = _images(batch_mm_kwargs)
-        hp, wp = img.shape[-2] // p, img.shape[-1] // p
-        side = self._canvas_side(hp, wp) // m
-        tokens = outputs["default"].reshape(side, side, -1)[: hp // m, : wp // m].flatten(0, 1)
-        dest[indices[0]] = tokens.clone() if clone else tokens
-
-    def _canvas_side(self, hp: int, wp: int) -> int:
-        # The RoPE table, like upstream's, covers image_size only.
-        if max(hp, wp) > self._max_side:
-            raise ValueError(
-                f"a {hp}x{wp}-patch image exceeds the {self._max_side}-patch image_size limit"
-            )
-        return next(s for s in self._canvas_sides if s >= max(hp, wp))
+    def vision_patch_multiple(self) -> int:
+        return math.lcm(super().vision_patch_multiple, CANVAS_WIDTH * self.patches_per_token)
 
     def _canvas_shape(self, num_patches: int) -> tuple[int, ...]:
-        side = math.isqrt(num_patches)
-        assert side * side == num_patches, f"{num_patches} patches is not a square canvas"
-        p = self.vision_args.patch_size
-        return (self.vision_args.num_channels, side * p, side * p)
+        """The ``[C, H, W]`` canvas holding ``num_patches`` patches in rows of merge blocks."""
+        rows, rem = divmod(num_patches, CANVAS_WIDTH * self.patches_per_token)
+        assert rem == 0, f"{num_patches} patches is not whole canvas rows"
+        b = self.vision_args.patch_size * self._merge
+        return (self.vision_args.num_channels, rows * b, CANVAS_WIDTH * b)

@@ -186,8 +186,6 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Largest item a request may carry per vision modality, in tokens.
     _vision_token_limits: ClassVar[dict[str, int]] = {}
-    # Whether the model sets its own encoder budgets, so the user list is not a remedy.
-    _vision_fixed_budgets: ClassVar[bool] = False
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -740,7 +738,6 @@ class TorchSpyrePlatform(CpuPlatform):
         from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 
         cls._vision_token_limits = {}
-        cls._vision_fixed_budgets = False
         model_config = vllm_config.model_config
         if model_config.enforce_eager or not model_config.is_multimodal_model:
             return
@@ -748,9 +745,6 @@ class TorchSpyrePlatform(CpuPlatform):
         if model_cls is None or not issubclass(model_cls, SpyreVisionEncoderMixin):
             return
         modalities = model_cls.vision_modalities
-        cls._vision_fixed_budgets = (
-            model_cls.vision_token_budgets is not SpyreVisionEncoderMixin.vision_token_budgets
-        )
         user_budgets = vllm_config.compilation_config.encoder_cudagraph_token_budgets
         if user_budgets:
             limit = max(user_budgets)
@@ -800,17 +794,12 @@ class TorchSpyrePlatform(CpuPlatform):
             for placeholder in processed_inputs["mm_placeholders"].get(modality, ()):
                 tokens = placeholder.get_num_embeds()
                 if tokens > limit:
-                    remedy = (
-                        "--mm-processor-kwargs"
-                        if cls._vision_fixed_budgets
-                        else "--mm-processor-kwargs or "
-                        "compilation_config.encoder_cudagraph_token_budgets"
-                    )
                     raise VLLMValidationError(
                         f"An {modality} item of {tokens} tokens is larger than the {limit} this "
                         "server compiled its vision encoder for. Lower max_soft_tokens in the "
-                        f"request's mm_processor_kwargs, or restart the server with a larger "
-                        f"{remedy}.",
+                        "request's mm_processor_kwargs, or restart the server with a larger "
+                        "--mm-processor-kwargs or "
+                        "compilation_config.encoder_cudagraph_token_budgets.",
                         parameter="mm_processor_kwargs",
                         value=tokens,
                     )

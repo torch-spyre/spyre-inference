@@ -63,8 +63,8 @@ class VisionBuffer:
 
     ``pad`` is the value of the slots a budget adds: a scalar, or one ``[width]`` row.
     ``dtype`` is fp16 for activations; integer buffers carry indices (e.g. positions).
-    ``shape_at`` marks a buffer that is not per patch (e.g. a whole image): its full shape at
-    a budget's patch count. It is copied as is, never padded.
+    ``shape_at`` marks a buffer that is not per patch (e.g. an image canvas): its full shape at
+    a patch count. A budget copies it into the leading corner of its own and pads the rest.
     """
 
     width: int | None
@@ -280,7 +280,7 @@ class SpyreVisionEncoderMixin:
             buffer_keys=list(self.vision_buffers),
             out_hidden_size=self.out_hidden_size,
             padding_logics={
-                key: _copy_whole
+                key: partial(_copy_corner, pad=buf.pad)
                 if buf.shape_at is not None
                 else partial(_pad_groups, pad=buf.pad, groups=self.vision_pad_groups)
                 for key, buf in self.vision_buffers.items()
@@ -294,11 +294,6 @@ class SpyreVisionEncoderMixin:
         (e.g. it adds newline tokens) returns its largest item's encoder tokens as the maximum.
         """
         return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
-
-    @property
-    def vision_token_budgets(self) -> list[int] | None:
-        """Exact token budgets replacing upstream's ladder, when each budget is one input shape."""
-        return None
 
     @property
     def vision_pack_tokens(self) -> int | None:
@@ -505,10 +500,12 @@ class SpyreVisionEncoderMixin:
         return values
 
 
-def _copy_whole(dst: torch.Tensor, src: torch.Tensor) -> None:
-    if dst.shape != src.shape:
+def _copy_corner(dst: torch.Tensor, src: torch.Tensor, pad: float | torch.Tensor) -> None:
+    """Copy ``src`` into the leading corner of the larger ``dst``, padding the rest."""
+    if src.dim() != dst.dim() or any(s > d for s, d in zip(src.shape, dst.shape, strict=True)):
         raise ValueError(f"buffer is {tuple(src.shape)}, but the budget holds {tuple(dst.shape)}")
-    dst.copy_(src)
+    dst[:] = pad
+    dst[tuple(slice(0, n) for n in src.shape)].copy_(src)
 
 
 def _pad_groups(

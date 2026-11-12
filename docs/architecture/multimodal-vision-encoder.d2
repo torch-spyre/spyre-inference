@@ -97,7 +97,7 @@ code: "Code layers" {
     grid-gap: 14
 
     cls: "SpyrePixtralForConditionalGeneration\n(SpyreVisionEncoderMixin, PixtralForConditionalGeneration)" {class: model}
-    attrs: "vision_buffers: image canvas · segments · positions\npatches_per_token = M² · out_hidden_size\nvision_max_items_per_call = 1 · vision_token_budgets" {class: model}
+    attrs: "vision_buffers: image canvas · segments · positions\npatches_per_token = M² · out_hidden_size\nvision_max_items_per_call = 63" {class: model}
     hooks: "vision_item_tokens · vision_inputs (host)\nvision_embed · vision_blocks · vision_project\n(three compiled graphs)" {class: model}
     attn: "SpyrePixtralAttention\nRoPE as a matmul · padded_sdpa\n+ get_input_modality · select_encoder_cudagraph_items" {class: model}
   }

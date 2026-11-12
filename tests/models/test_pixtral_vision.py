@@ -14,8 +14,8 @@
 
 """``SpyrePixtralForConditionalGeneration``'s vision pipeline against upstream Pixtral.
 
-The pipeline pads each image onto a square canvas, runs the patch conv and reorders its
-output offset-major, permutes the merger weight and crops the canvas's padding off; these
+The pipeline lays every image's merge blocks onto one canvas, runs the patch conv and
+reorders its output offset-major, permutes the merger weight and pads to a bucket; these
 tests pin each of those to the upstream result on CPU. The on-card twins at the bottom skip
 without a device.
 """
@@ -44,11 +44,11 @@ def _engine_ir_dispatch():
         yield
 
 
-def _args(num_layers: int = 2, image_size: int = 112) -> "pixtral.VisionEncoderArgs":
+def _args(num_layers: int = 2) -> "pixtral.VisionEncoderArgs":
     return pixtral.VisionEncoderArgs(
         hidden_size=128,
         num_channels=3,
-        image_size=image_size,
+        image_size=112,
         patch_size=PATCH,
         intermediate_size=256,
         num_hidden_layers=num_layers,
@@ -128,7 +128,7 @@ def _spyre_model(args, dtype=torch.float16):
 
 def _images() -> list[torch.Tensor]:
     torch.manual_seed(1)
-    # Non-square, so each canvas has padding patches: 8x12 on a 16x16 canvas, 6x4 on 8x8.
+    # 4x6 + 3x2 = 30 merge blocks: one 32-block canvas row, so padding blocks are live.
     return [torch.randn(3, 8 * PATCH, 12 * PATCH), torch.randn(3, 6 * PATCH, 4 * PATCH)]
 
 
@@ -153,38 +153,41 @@ def test_pipeline_matches_upstream(tp_group, num_images):
         assert _cosine(got, want) > 0.999
 
 
-def test_budgets_are_one_per_canvas(tp_group):
-    """Every budget is one square canvas, and an image's tokens are its canvas's."""
+def test_images_pack_into_whole_canvas_rows(tp_group):
+    """Every image's merge blocks share one canvas, padded to whole rows of ``CANVAS_WIDTH``."""
     args = _args()
     model = _spyre_model(args)
-    # image_size 112 / patch 7 = 16 patches a side: canvases 8 and 16, 16 and 64 tokens.
-    assert model.vision_token_budgets == [16, 64]
-    assert model.vision_max_items_per_call == 1
-    assert model.vision_item_tokens({"images": _images()}) == [64, 16]
-    tower = model.vision_encoder
-    assert tower.patch_conv.weight.shape == (args.hidden_size, 3, PATCH, PATCH)
+    block = PATCH * MERGE
+    assert model.vision_patch_multiple == 32 * MERGE**2
+    assert model.vision_item_tokens({"images": _images()}) == [24, 6]
+    assert model.vision_encoder.patch_conv.weight.shape == (args.hidden_size, 3, PATCH, PATCH)
+    values = model.prepare_encoder_cudagraph_replay_buffers({"images": _images()}, 0, 0).values
+    assert values["image"].shape == (3, block, 32 * block)
+    assert values["positions"].shape == (32 * MERGE**2,)
     bufs = model.prepare_encoder_cudagraph_capture_inputs(
         64, 1, 1, torch.device("cpu"), torch.float16
-    )
-    assert bufs.values["image"].shape == (3, 16 * PATCH, 16 * PATCH)
-    assert bufs.values["positions"].shape == (256,)
+    ).values
+    assert bufs["image"].shape == (3, 2 * block, 32 * block)
 
 
-def test_top_canvas_outside_the_table_matches_upstream(tp_group):
-    """37 patches a side rounds up to a 40-patch top canvas, which ``CANVAS_SIDES`` lacks, as
-    Ministral-3's 110 round up to 112."""
-    args = _args(image_size=37 * PATCH)
-    model = _spyre_model(args)
-    assert model.vision_token_budgets == [16, 64, 144, 256, 400]
-    torch.manual_seed(4)
-    image = torch.randn(3, 34 * PATCH, 20 * PATCH)
+def test_packed_images_wrap_across_canvas_rows(tp_group):
+    """6 + 56 + 8 merge blocks on 32-block rows: the second image starts mid-row and wraps
+    onto the next, and the third straddles two rows."""
+    args = _args()
+    torch.manual_seed(5)
+    images = [
+        torch.randn(3, 6 * PATCH, 4 * PATCH),
+        torch.randn(3, 16 * PATCH, 14 * PATCH),
+        torch.randn(3, 2 * PATCH, 16 * PATCH),
+    ]
 
     with torch.inference_mode():
-        (expected,) = _reference(args, [image])
-        (actual,) = model.embed_multimodal(images=[image])
+        expected = _reference(args, images)
+        actual = _spyre_model(args).embed_multimodal(images=images)
 
-    assert actual.shape == expected.shape
-    assert _cosine(actual, expected) > 0.999
+    assert [t.shape for t in actual] == [t.shape for t in expected]
+    for got, want in zip(actual, expected, strict=True):
+        assert _cosine(got, want) > 0.999
 
 
 def test_image_above_image_size_is_rejected(tp_group):
@@ -193,17 +196,24 @@ def test_image_above_image_size_is_rejected(tp_group):
         model.vision_item_tokens({"images": [torch.randn(3, 18 * PATCH, 2 * PATCH)]})
 
 
-def test_canvas_padding_does_not_leak_into_the_image(tp_group):
-    """The same image on a larger canvas gives the same tokens: padding patches have their own
-    segment."""
+def test_padding_does_not_leak_into_images(tp_group):
+    """Bucket padding must not change any image's embedding: padding blocks have their own
+    segment, the canvas pads whole rows, and each offset group pads at its own tail."""
     model = _spyre_model(_args(num_layers=1))
-    image = _images()[1]
+    images = _images()
+    values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
+    padding = model.get_encoder_cudagraph_config().padding_logics
+
+    def run(num_patches):
+        bufs = model._vision_empty(num_patches)
+        for key, src in values.items():
+            padding[key](bufs[key], src)
+        return model.encoder_cudagraph_forward(bufs)
 
     with torch.inference_mode():
-        (tight,) = model.embed_multimodal(images=[image])
-        model._canvas_sides = [16]
-        (loose,) = model.embed_multimodal(images=[image])
-    torch.testing.assert_close(tight, loose, atol=1e-3, rtol=1e-3)
+        tight, loose = run(128), run(384)
+    n = sum(model.vision_item_tokens({"images": images}))
+    torch.testing.assert_close(tight[:n], loose[:n], atol=1e-3, rtol=1e-3)
 
 
 def test_offset_major_merge_matches_upstream_merger(tp_group):
@@ -321,26 +331,21 @@ def test_pipeline_matches_upstream_on_spyre(tp_group):
         assert _cosine(got, want) > 0.995
 
 
-@pytest.mark.parametrize("image_index", [0, 1], ids=["canvas16", "canvas8"])
-def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, image_index):
-    """The compiled graphs at one canvas's budget, fed and cropped the way the manager does."""
+@pytest.mark.parametrize("token_budget", [32, 64])
+def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
+    """The three compiled graphs at one bucket, fed the way the manager feeds them."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     args = _args()
-    image = _images()[image_index]
-    batch = {"images": [image]}
+    images = _images()
     model = _spyre_model(args).to("spyre")
     model.compile_vision_graphs()
-    (tokens,) = model.vision_item_tokens(batch)
 
     with torch.inference_mode():
-        (expected,) = _reference(args, [image])
-        out = model.encoder_cudagraph_forward(_padded_device_inputs(model, [image], tokens))
-    dest: list[torch.Tensor | None] = [None]
-    model.postprocess_encoder_output({"default": out}, [0], [tokens], dest, batch_mm_kwargs=batch)
-    assert dest[0] is not None and dest[0].shape == expected.shape
-    assert _cosine(dest[0], expected) > 0.995
+        expected = torch.cat(_reference(args, images))
+        out = model.encoder_cudagraph_forward(_padded_device_inputs(model, images, token_budget))
+    assert _cosine(out[: expected.shape[0]], expected) > 0.995
 
 
 def _padded_device_inputs(model, images, token_budget):
@@ -362,10 +367,10 @@ def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group):
         pytest.skip("Spyre device not available")
 
     args = _args()
-    images = _images()[:1]
+    images = _images()
     model = _spyre_model(args).to("spyre")
-    (tokens,) = model.vision_item_tokens({"images": images})
-    inputs = _padded_device_inputs(model, images, token_budget=tokens)
+    inputs = _padded_device_inputs(model, images, token_budget=64)
+    tokens = sum(model.vision_item_tokens({"images": images}))
 
     with torch.inference_mode():
         eager = model.encoder_cudagraph_forward(inputs)[:tokens]

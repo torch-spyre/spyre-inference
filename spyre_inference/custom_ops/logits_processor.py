@@ -18,6 +18,7 @@ from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 from spyre_inference import envs
+from spyre_inference.v1.sample import device_random
 
 from .lazy_compile import CompileOutermost, maybe_compile
 from .utils import convert
@@ -26,6 +27,28 @@ from .vocab_parallel_embedding import promote_tied_lm_head
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
+    def forward(self, lm_head, hidden_states, embedding_bias=None, skip_gather=False):
+        """An all-random batch leaves its logits on the card.
+
+        The runner draws there and copies back ids. Every other batch takes the
+        host path, which copies the full rows in ``_apply_head``. Soft-cap and
+        scale run here, before the draw, as they do after ``_get_logits`` upstream.
+        """
+        if (
+            device_random.sampling_active()
+            and not skip_gather
+            and not self.logits_as_input
+            and lm_head.tp_size <= 1
+        ):
+            promote_tied_lm_head(lm_head)
+            logits = LogitsProcessor._apply_head(self, lm_head, hidden_states, embedding_bias)
+            if self.soft_cap is not None:
+                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+            if self.scale != 1.0:
+                logits = logits * self.scale
+            return logits
+        return super().forward(lm_head, hidden_states, embedding_bias, skip_gather)
+
     def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
         """Project through the lm_head, then D2H the logits on the single-card path.
 
@@ -34,7 +57,8 @@ class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
         Upstream only calls ``_gather_logits`` when ``tp_size > 1``, so with a
         single card the logits would otherwise stay on Spyre and the sampler's
         ``logits.to(torch.float32)`` crashes torch-spyre's ``copy_from_d2d``.
-        Move them to CPU here so downstream sampling always gets CPU logits.
+        Move them to CPU here. The device-random ``forward`` bypasses this and
+        leaves the rows on the card.
         """
         # A model may hand us its embedding table as the head; give it a padded `Wᵀ`
         # on the first call, where the head's identity is finally unambiguous.

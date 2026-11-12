@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
+    SPYRE_DEVICE_RANDOM: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
@@ -133,6 +134,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shards are gathered on the CPU. Needs OMP_WAIT_POLICY=PASSIVE (spinning OpenMP
     # threads otherwise slow the next step).
     "SPYRE_LOGITS_CPU_GATHER": lambda: os.getenv("SPYRE_LOGITS_CPU_GATHER", "0") == "1",
+    # When "1", an all-random batch with no penalties, masks, logprobs or structured
+    # outputs draws on the card and copies back only the token ids. One host uniform
+    # per row, then an inverse CDF. Requires torch-spyre #5853 (cumsum) and #5856
+    # (fp16 upcast). Top-k also needs #5846 and, past k = 128, #5854. Top-p needs the
+    # device sort from #5854. Off until those land. Single card only. Tokens match the
+    # softmax distribution, not the host Gumbel kernel.
+    "SPYRE_DEVICE_RANDOM": lambda: os.getenv("SPYRE_DEVICE_RANDOM", "0") == "1",
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
     # instead of topping itself up with a short chunk of the next. Any non-positive

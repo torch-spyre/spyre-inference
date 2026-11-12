@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -57,3 +59,26 @@ def test_sweep_reaches_the_rounded_up_width(monkeypatch, max_num_seqs, expected)
 def test_sweep_never_exceeds_the_available_rows(monkeypatch):
     """A body smaller than the rounded-up width has nothing to gather from."""
     assert max(_swept_widths(monkeypatch, ROWS * 4)) <= ROWS
+
+
+def test_unpack_warms_pooler_on_the_recompacted_output(monkeypatch):
+    """LAST pools after the grid gather, which can change the hidden-state layout."""
+    from spyre_inference.v1.worker import spyre_model_runner as mr
+
+    hidden = torch.arange(ROWS * HIDDEN).reshape(HIDDEN, ROWS).t()
+    packed = hidden.contiguous()
+    seen = []
+
+    def gather(source, indices):
+        assert source is hidden
+        assert indices.numel() == ROWS
+        return packed
+
+    monkeypatch.setattr(mr, "select_rows", gather)
+    runner = SimpleNamespace(
+        _pooling_on_spyre=True,
+        _encoder_rectangles=[(ROWS // 4, 4)],
+        _warm_pooler_row_widths=seen.append,
+    )
+    mr.TorchSpyreModelRunner._warm_encoder_unpack(runner, hidden)
+    assert len(seen) == 1 and seen[0] is packed

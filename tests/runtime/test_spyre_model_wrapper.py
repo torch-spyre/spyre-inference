@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.nn as nn
 from vllm.v1.kv_cache_interface import (
@@ -26,6 +29,54 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from spyre_inference.v1.worker import spyre_model_runner as mr
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_pooling_dummy_preserves_device_output_and_clears_capture(monkeypatch, fail):
+    original = torch.arange(24, dtype=torch.float32).reshape(4, 6).t()
+    assert not original.is_contiguous()
+
+    class Model(nn.Module):
+        def forward(self):
+            return original
+
+    wrapper = mr._SpyreModelWrapper(
+        Model(), torch.device("cpu"), keep_outputs_on_device=True, model_dtype=torch.float32
+    )
+    runner = object.__new__(mr.TorchSpyreModelRunner)
+    runner.model = wrapper
+    runner.model_config = SimpleNamespace(runner_type="pooling")
+    runner._spyre_device = torch.device("cpu")
+    monkeypatch.setattr(mr.attn_layer, "publish_null_slots", lambda _: None)
+    monkeypatch.setattr(
+        "spyre_inference.custom_ops.utils.convert",
+        lambda t, device=None, dtype=None: t.contiguous().clone(),
+    )
+
+    def upstream(self, num_tokens, **kwargs):
+        assert kwargs["force_attention"]
+        host = self.model()
+        assert host is not original and host.is_contiguous()
+        if fail:
+            raise RuntimeError("dummy failed")
+        return host, host[-1:]
+
+    monkeypatch.setattr(mr.GPUModelRunner, "_dummy_run", upstream)
+    if fail:
+        with pytest.raises(RuntimeError, match="dummy failed"):
+            runner._dummy_run(6)
+    else:
+        # Use a fake Spyre conversion that preserves the captured tensor: CPU is
+        # only standing in for a device whose layout we cannot construct here.
+        monkeypatch.setattr(mr, "convert", lambda t, device: t)
+        hidden, last = runner._dummy_run(6)
+        assert hidden is original
+        torch.testing.assert_close(last, original[-1:])
+    assert wrapper._keep_outputs_on_device
+    assert not wrapper._capture_device_output
+    assert wrapper._device_output is None
+    assert not hasattr(wrapper._model, "_device_output")
+    assert wrapper() is original
 
 
 def test_wrapper_converts_ints_to_int64(monkeypatch):

@@ -15,26 +15,27 @@
 """Loads the host sampling kernels built from csrc/ (``torch.ops._spyre_C``)."""
 
 import platform
+from collections.abc import Mapping
 
 import torch
 from vllm.logger import init_logger
 
+# What cmake/cpu_extension.cmake passes for _C. AVX512F alone is Knights
+# Landing, which has no VL/BW/DQ and would SIGILL in this build.
+_AVX512_BUILD_FLAGS = ("avx512_f", "avx512_vl", "avx512_bw", "avx512_dq")
 
-def _cpuinfo_flags() -> set[str]:
-    """Hardware flags from ``/proc/cpuinfo``. Empty when that file is absent.
 
-    This is not ``ATEN_CPU_CAPABILITY``. Pinning ATen's dispatch level must not
-    hide an extension the CPU can run: rejection sampling has no Python path.
+def isa_from_capabilities(caps: Mapping[str, object]) -> tuple[bool, bool]:
+    """``(avx512, avx2_fma)`` from ``torch.cpu.get_capabilities()``.
+
+    That map comes from cpuinfo and ignores ``ATEN_CPU_CAPABILITY``. Pinning
+    ATen's dispatch level must not hide an extension the CPU can run: rejection
+    sampling has no Python path. ``avx512`` is the four flags ``_C`` is compiled
+    with. ``avx2_fma`` is AVX2 plus FMA3, which ``_C_AVX2`` needs.
     """
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
-            for line in cpuinfo:
-                key, _, value = line.partition(":")
-                if key.strip() == "flags":
-                    return set(value.split())
-    except OSError:
-        return set()
-    return set()
+    avx512 = all(bool(caps.get(flag)) for flag in _AVX512_BUILD_FLAGS)
+    avx2_fma = bool(caps.get("avx2") and caps.get("fma3"))
+    return avx512, avx2_fma
 
 
 def sampling_extension_name(machine: str, *, avx512: bool, avx2_fma: bool) -> str:
@@ -52,21 +53,12 @@ def sampling_extension_name(machine: str, *, avx512: bool, avx2_fma: bool) -> st
     return "_C"
 
 
-def _host_has_avx512() -> bool:
-    is_avx512 = getattr(torch.cpu, "_is_avx512_supported", None)
-    return bool(is_avx512()) if is_avx512 is not None else False
-
-
-def _host_has_avx2_fma() -> bool:
-    flags = _cpuinfo_flags()
-    return "avx2" in flags and "fma" in flags
-
-
 try:
+    _avx512, _avx2_fma = isa_from_capabilities(torch.cpu.get_capabilities())
     _extension = sampling_extension_name(
         platform.machine(),
-        avx512=_host_has_avx512(),
-        avx2_fma=_host_has_avx2_fma(),
+        avx512=_avx512,
+        avx2_fma=_avx2_fma,
     )
     if _extension == "_C_AVX2":
         import spyre_inference._C_AVX2  # noqa: F401  # ty: ignore[unresolved-import]

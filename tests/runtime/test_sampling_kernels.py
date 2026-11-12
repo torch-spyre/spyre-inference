@@ -291,7 +291,11 @@ def test_avx2_build_filters_match_pytorch() -> None:
     script = (
         "import sys\n"
         "import torch\n"
-        "torch.cpu._is_avx512_supported = lambda: False\n"
+        "torch.cpu.get_capabilities = lambda: {\n"
+        "    'avx2': True, 'fma3': True,\n"
+        "    'avx512_f': False, 'avx512_vl': False,\n"
+        "    'avx512_bw': False, 'avx512_dq': False,\n"
+        "}\n"
         "import spyre_inference.v1.sample.sampling_kernels  # noqa: F401\n"
         "assert 'spyre_inference._C_AVX2' in sys.modules\n"
         "assert 'spyre_inference._C' not in sys.modules\n"

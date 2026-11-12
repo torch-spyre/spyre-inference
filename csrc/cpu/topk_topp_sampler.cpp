@@ -765,7 +765,8 @@ static float top_k_threshold(const float* __restrict__ row, int V, int k_val,
 }
 
 // On the AVX2 build these two carry the FMA target so fast_exp can inline into
-// the V-length loops. Callers stay compiled without -mfma.
+// the V-length loops. The file is compiled with -mno-fma; a bare -mavx2 does
+// not clear FMA when GCC defaults to x86-64-v3.
 #if defined(__x86_64__) && defined(__AVX2__) && !defined(__AVX512F__)
 #define SPYRE_AVX2_FMA __attribute__((target("avx2,f16c,fma")))
 #else

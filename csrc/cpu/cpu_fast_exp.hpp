@@ -82,7 +82,9 @@ inline __attribute__((always_inline)) vec_op::FP32Vec16 fast_exp(
 // Same algorithm as the AVX512 path on two 8-lane halves. The pragma defines
 // __FMA__ so the fmadd intrinsics exist; the target attribute matches the one
 // on _top_p_row_core and top_p_row, which is what lets this inline there. The
-// AVX2 extension is built without -mfma, so Gumbel and rejection stay clear.
+// AVX2 extension is built with -mno-fma: omitting -mfma is not enough when GCC
+// defaults to x86-64-v3, which leaves FMA on after -mavx2. Gumbel and rejection
+// stay clear of it.
 #pragma GCC push_options
 #pragma GCC target("avx2,f16c,fma")
 

@@ -69,11 +69,12 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     "-mavx512vl"
     "-mavx512bw"
     "-mavx512dq")
-  # No -mfma here. FMA is a function attribute on the AVX2 exp and the two
-  # top-p row functions that inline it, so the Gumbel and rejection objects
-  # keep the instructions they had before. The loader still skips _C_AVX2
-  # when the CPU has no FMA.
-  set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2")
+  # -mno-fma, not merely leaving -mfma off. A GCC that defaults to
+  # -march=x86-64-v3 already has FMA on, and -mavx2 does not clear it, so
+  # top-k was emitting vfmadd with no function attribute. The AVX2 exp and
+  # the two top-p row functions opt back in with a target attribute. The
+  # loader still skips _C_AVX2 when the CPU has no FMA.
+  set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2" "-mno-fma")
 
   # Both are installed; spyre_inference picks one at import from the host ISA.
   define_extension_target(

@@ -1206,3 +1206,41 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
     with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets") as err:
         TorchSpyrePlatform.validate_request(_image_input(256, 281, modality=modality), None)
     assert (err.value.parameter, err.value.value) == ("mm_processor_kwargs", 281)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        (None, None, None),
+        ("runner_type", "pooling", "serves no pooling routes"),
+        ("tokenizer_mode", "mistral", "tokenizer_mode='mistral'"),
+        ("config_format", "mistral", "config_format='mistral'"),
+    ],
+)
+@pytest.mark.parametrize("rust", [True, False])
+def test_rust_frontend_rejects_what_it_cannot_serve(monkeypatch, field, value, match, rust):
+    """The Rust frontend has no pooling routes and no mistral renderer or config loader;
+    the Python one serves all three."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            max_model_len=1,
+            dtype=torch.float16,
+            trust_remote_code=True,
+        ),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    if field is not None:
+        object.__setattr__(vllm_config.model_config, field, value)
+    if rust:
+        monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    else:
+        monkeypatch.delenv("VLLM_USE_RUST_FRONTEND", raising=False)
+
+    if rust and match is not None:
+        with pytest.raises(ValueError, match=f"{match}.*Unset VLLM_USE_RUST_FRONTEND"):
+            TorchSpyrePlatform.check_and_update_config(vllm_config)
+    else:
+        TorchSpyrePlatform.check_and_update_config(vllm_config)

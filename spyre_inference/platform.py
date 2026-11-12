@@ -788,21 +788,30 @@ class TorchSpyrePlatform(CpuPlatform):
     ) -> None:
         if processed_inputs["type"] != "multimodal":
             return
-        from vllm.exceptions import VLLMValidationError
+        for modality, placeholders in processed_inputs["mm_placeholders"].items():
+            for placeholder in placeholders:
+                cls.check_vision_item(modality, placeholder.get_num_embeds())
 
-        for modality, limit in cls._vision_token_limits.items():
-            for placeholder in processed_inputs["mm_placeholders"].get(modality, ()):
-                tokens = placeholder.get_num_embeds()
-                if tokens > limit:
-                    raise VLLMValidationError(
-                        f"An {modality} item of {tokens} tokens is larger than the {limit} this "
-                        "server compiled its vision encoder for. Lower max_soft_tokens in the "
-                        "request's mm_processor_kwargs, or restart the server with a larger "
-                        "--mm-processor-kwargs or "
-                        "compilation_config.encoder_cudagraph_token_budgets.",
-                        parameter="mm_processor_kwargs",
-                        value=tokens,
-                    )
+    @classmethod
+    def check_vision_item(cls, modality: str, tokens: int) -> None:
+        """Reject a multimodal item larger than the vision encoder was compiled for.
+
+        Shared by ``validate_request``, which only the Python frontend calls, and the
+        engine-side check in ``TorchSpyreScheduler``, which every frontend reaches.
+        """
+        limit = cls._vision_token_limits.get(modality)
+        if limit is not None and tokens > limit:
+            from vllm.exceptions import VLLMValidationError
+
+            raise VLLMValidationError(
+                f"An {modality} item of {tokens} tokens is larger than the {limit} this "
+                "server compiled its vision encoder for. Lower max_soft_tokens in the "
+                "request's mm_processor_kwargs, or restart the server with a larger "
+                "--mm-processor-kwargs or "
+                "compilation_config.encoder_cudagraph_token_budgets.",
+                parameter="mm_processor_kwargs",
+                value=tokens,
+            )
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
@@ -834,6 +843,28 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"Spyre does not support ALiBi attention, which "
                     f"{vllm_config.model_config.model} uses."
                 )
+
+            # The Rust frontend reads the raw CLI args, so a config it cannot serve would
+            # only fail after warmup. The supervisor builds its config before launching
+            # the engine, so this raises there first.
+            import vllm.envs as vllm_envs
+
+            if vllm_envs.VLLM_USE_RUST_FRONTEND:
+                model_config = vllm_config.model_config
+                if cls._is_pooling_model(vllm_config):
+                    raise ValueError(
+                        f"{model_config.model} is a pooling model, and the Rust frontend "
+                        "(VLLM_USE_RUST_FRONTEND=1) serves no pooling routes (embeddings, "
+                        "score, rerank, classify), so every request would get a 404. Unset "
+                        "VLLM_USE_RUST_FRONTEND to serve it."
+                    )
+                for field in ("tokenizer_mode", "config_format"):
+                    if getattr(model_config, field) == "mistral":
+                        raise ValueError(
+                            f"The Rust frontend (VLLM_USE_RUST_FRONTEND=1) does not support "
+                            f"{field}='mistral'. Unset VLLM_USE_RUST_FRONTEND, or serve an "
+                            "HF-format checkpoint and tokenizer."
+                        )
 
             # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)

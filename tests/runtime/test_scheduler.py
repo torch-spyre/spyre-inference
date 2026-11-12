@@ -26,8 +26,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config.multimodal import MultiModalConfig
+from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -157,3 +162,86 @@ def test_streaming_slots_counted_as_occupancy(monkeypatch, num_streaming):
     scheduler.schedule()
     # One decode in `running`, the streaming slots, and one free prefill slot.
     assert seen == [2 + num_streaming]
+
+
+def _engine_request(*items: tuple[str, int]) -> EngineCoreRequest:
+    """A request carrying one multimodal item per (modality, num_embeds) pair."""
+    mm_features = [
+        MultiModalFeatureSpec(
+            data=None,
+            modality=modality,
+            identifier=f"{modality}-{i}",
+            mm_position=PlaceholderRange(offset=0, length=tokens),
+        )
+        for i, (modality, tokens) in enumerate(items)
+    ]
+    return EngineCoreRequest(
+        request_id="r0",
+        prompt_token_ids=list(range(PROMPT_LEN)),
+        mm_features=mm_features or None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+
+@pytest.fixture
+def gemma4_scheduler(monkeypatch):
+    """gemma-4 as served on Spyre: video capped at 0 by the prelaunch override, images
+    up to the 280 tokens the encoder compiled for."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    scheduler = _scheduler()
+    # After _scheduler(): building its VllmConfig resets the limits for the text model.
+    monkeypatch.setattr(TorchSpyrePlatform, "_vision_token_limits", {"image": 280, "video": 280})
+    object.__setattr__(
+        scheduler.vllm_config.model_config,
+        "multimodal_config",
+        MultiModalConfig(limit_per_prompt={"video": 0}),
+    )
+    return scheduler
+
+
+@pytest.mark.parametrize("items", [(), (("image", 280),), (("image", 64), ("image", 256))])
+def test_validate_request_accepts_what_the_worker_runs(gemma4_scheduler, items):
+    gemma4_scheduler.validate_request(_engine_request(*items))
+
+
+def test_validate_request_rejects_an_image_above_the_compiled_budget(gemma4_scheduler):
+    with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets") as err:
+        gemma4_scheduler.validate_request(_engine_request(("image", 64), ("image", 281)))
+    assert err.value.value == 281
+
+
+def test_validate_request_rejects_a_disabled_modality(gemma4_scheduler):
+    with pytest.raises(VLLMValidationError, match="does not accept video input"):
+        gemma4_scheduler.validate_request(_engine_request(("video", 16)))
+
+
+def test_validate_request_rejects_any_item_on_a_text_only_model():
+    with pytest.raises(VLLMValidationError, match="does not accept image input"):
+        _scheduler().validate_request(_engine_request(("image", 16)))
+
+
+def test_mm_embeds_pass_a_zero_limit(gemma4_scheduler):
+    gemma4_scheduler.vllm_config.model_config.multimodal_config.enable_mm_embeds = True
+    gemma4_scheduler.validate_request(_engine_request(("video", 16)))
+
+
+def test_engine_core_validates_before_admission(gemma4_scheduler):
+    """The check runs in preprocess_add_request, whose VLLMValidationError EngineCoreProc
+    turns into a per-request FinishReason.ERROR instead of a fatal engine error."""
+    engine_core = SimpleNamespace(
+        scheduler=gemma4_scheduler,
+        mm_receiver_cache=None,
+        request_block_hasher=None,
+    )
+    with pytest.raises(VLLMValidationError, match="video"):
+        EngineCore.preprocess_add_request(engine_core, _engine_request(("video", 16)))
+
+    request, _ = EngineCore.preprocess_add_request(engine_core, _engine_request(("image", 256)))
+    assert isinstance(request, Request)
+    assert request.request_id == "r0"

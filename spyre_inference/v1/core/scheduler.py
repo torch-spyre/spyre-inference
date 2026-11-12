@@ -14,10 +14,38 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+
+from vllm.exceptions import VLLMValidationError
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreRequest
 
 from spyre_inference import envs
+
+
+def _validate_before_admission() -> None:
+    """Run ``TorchSpyreScheduler.validate_request`` on each request EngineCore receives.
+
+    It hooks ``preprocess_add_request``, the step EngineCoreProc runs on its input thread:
+    a ``VLLMValidationError`` raised there finishes only that request, with
+    ``FinishReason.ERROR`` and the message, whereas one from ``add_request`` or later
+    kills the engine with every in-flight request.
+    """
+    from vllm.v1.engine.core import EngineCore
+
+    original = EngineCore.preprocess_add_request
+    if getattr(original, "_spyre_patched", False):
+        return
+
+    @functools.wraps(original)
+    def preprocess_add_request(self, request: EngineCoreRequest):
+        if isinstance(self.scheduler, TorchSpyreScheduler):
+            self.scheduler.validate_request(request)
+        return original(self, request)
+
+    preprocess_add_request._spyre_patched = True
+    EngineCore.preprocess_add_request = preprocess_add_request  # ty: ignore[invalid-assignment]
 
 
 class TorchSpyreScheduler(Scheduler):
@@ -37,6 +65,32 @@ class TorchSpyreScheduler(Scheduler):
             if self.vllm_config.model_config.runner_type == "pooling"
             else envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
         )
+        _validate_before_admission()
+
+    def validate_request(self, request: EngineCoreRequest) -> None:
+        """Reject multimodal items the worker cannot run.
+
+        ``TorchSpyrePlatform.validate_request`` covers the Python frontend only; the Rust
+        one skips it and never sees the limits ``apply_prelaunch_overrides`` sets, but the
+        engine's config carries them.
+        """
+        from spyre_inference.platform import TorchSpyrePlatform
+
+        mm_config = self.vllm_config.model_config.multimodal_config
+        for feature in request.mm_features or ():
+            # Upstream lets precomputed embeddings past a zero limit under enable_mm_embeds.
+            if mm_config is None or (
+                not mm_config.enable_mm_embeds
+                and mm_config.get_limit_per_prompt(feature.modality) == 0
+            ):
+                raise VLLMValidationError(
+                    f"This server does not accept {feature.modality} input.",
+                    parameter="messages",
+                    value=feature.modality,
+                )
+            TorchSpyrePlatform.check_vision_item(
+                feature.modality, feature.mm_position.get_num_embeds()
+            )
 
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         if self.max_num_partial_prefills <= 0:

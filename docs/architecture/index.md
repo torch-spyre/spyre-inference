@@ -644,7 +644,9 @@ call boundary:
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
 - **Output**: a generative model's hidden states stay on Spyre. Upstream's
   `hidden_states[logits_indices]` is routed through `select_rows`, which gathers the
-  sampled rows on Spyre onto a warmed row bucket; a decode step whose indices are the
+  sampled rows on Spyre onto a warmed row bucket (the padded sampled-row counts the lm_head
+  compiles for, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets));
+  a decode step whose indices are the
   identity reuses the padded body output with no gather. A pooling model whose pooler
   runs on Spyre keeps its hidden states there too, and the pooler copies back only the
   pooled vectors. Every other output, including the eager decoder's, which has no shape

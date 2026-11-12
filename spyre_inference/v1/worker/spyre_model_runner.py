@@ -351,7 +351,7 @@ class _SpyreHiddenStates(torch.Tensor):
 
     def _gather_rows(self, row_indices: torch.Tensor) -> torch.Tensor:
         source = self.as_subclass(torch.Tensor)
-        idx = row_indices.to(device="cpu", dtype=torch.int64)
+        idx = row_indices.long()
         num_rows = idx.numel()
         buckets = self._row_buckets
         pos = bisect.bisect_left(buckets, num_rows)
@@ -366,8 +366,9 @@ class _SpyreHiddenStates(torch.Tensor):
             if padded_rows != num_rows:
                 idx = torch.cat([idx, idx[-1:].expand(padded_rows - num_rows)])
             rows = select_rows(source, idx)
-        # Marks the rows ``compute_logits`` may project on Spyre without a host round trip.
-        out = cast(Any, rows[:num_rows])
+        # A plain view of the real rows. ``_spyre_padded_rows`` carries the padded gather, which
+        # already sits on a warmed row bucket, so ``compute_logits`` projects it on Spyre as is.
+        out: Any = rows[:num_rows]
         out._spyre_padded_rows = rows
         return out
 
@@ -794,9 +795,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # length would compile a fresh gather.
             sample_rows_on_device=(
                 # CPU-fallback pooling must not opt into the generative output contract.
-                self.model_config.runner_type == "generate"
-                and bucketer is not None
-                and envs.SPYRE_SAMPLE_ROWS_ON_DEVICE
+                self.model_config.runner_type == "generate" and bucketer is not None
             ),
             keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
         )
@@ -1399,8 +1398,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if rows <= hidden_states.shape[0]:
                 indices = torch.arange(rows, dtype=torch.int64)
                 model.compute_logits(hidden_states[indices])
-                # Mixed prefill/decode can gather on an exact body bucket, even at two
-                # rows: without a 1 bucket, one sampled row pads to [1, 1].
+                # On an exact body bucket, arange takes the decode path and reuses the body.
+                # A mixed step can still gather there: tokens [1, 1, 2] give a 4-token body
+                # and index [0, 1, 3], padded to [0, 1, 3, 3]. Warm that gather with a
+                # reversed index; it compiles per shape, not per value. From two rows up:
+                # without a 1 bucket, one sampled row pads to [1, 1].
                 if rows == hidden_states.shape[0] and rows > 1:
                     model.compute_logits(hidden_states[indices.flip(0)])
 

@@ -82,15 +82,14 @@ The body pads the packed token count to the next `compile_sizes` bucket, and war
 dummies every bucket. The lm_head sits outside every body graph and compiles its own, so
 it needs the same treatment: it projects one row per *sampled* request, a width that
 would otherwise take every value in `1..--max-num-seqs` as requests finish. Those rows
-pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each width, so
-no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
+pad onto *row buckets*: the `compile_sizes` buckets capped at `--max-num-seqs` times one
+plus the number of speculative tokens, for example `{1, 2, 4, 8}` at `--max-num-seqs 8`.
+Warmup projects each width, so no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
 
 The sampled rows are gathered on Spyre, so only the logits are copied to the host.
 Warmup compiles that gather, and the lm_head on its output, for every row bucket at
 every body bucket it fits in. The lm_head then sees a different device layout than the
-host path gives it, so logits can differ at fp16 rounding level.
-`SPYRE_SAMPLE_ROWS_ON_DEVICE=0` copies every hidden-state row to the host and gathers
-there instead, matching the host path exactly. The host gather is always used without
+host path gives it, so logits can differ at fp16 rounding level. The host gather is used without
 buckets (`--enforce-eager` or an empty `compile_sizes`), for prompt-logprob rows, for
 auxiliary hidden-state outputs, and in the V2 model runner.
 

@@ -252,18 +252,24 @@ def bind(force_host: bool = False) -> set[str]:
     """Returns the names bound; ``force_host`` binds host ops under =triton too (parity)."""
     bound = set()
     for site in _TOP_K_TOP_P_SITES:
-        _module(f"{site}.x").apply_top_k_top_p = spyre_apply_top_k_top_p
+        module = _module(f"{site}.x")
+        _originals.setdefault(f"{site}.apply_top_k_top_p", module.apply_top_k_top_p)
+        module.apply_top_k_top_p = spyre_apply_top_k_top_p
         bound.add(f"{site}.apply_top_k_top_p")
     if use_triton() and not force_host:
         return bound
 
     for name, op_name in HOST_KERNELS.items():
         module, attr = _module(name), name.rpartition(".")[2]
+        if not hasattr(module, attr):  # renamed or removed upstream: bind_or_raise names it
+            continue
         _originals.setdefault(name, getattr(module, attr))
         setattr(module, attr, HostKernel(name, _host_op(op_name), op_params(op_name)))
         bound.add(name)
     for name, feature in UNSUPPORTED_KERNELS.items():
         module, attr = _module(name), name.rpartition(".")[2]
+        if not hasattr(module, attr):
+            continue
         _originals.setdefault(name, getattr(module, attr))
         setattr(module, attr, UnsupportedKernel(name, feature))
         bound.add(name)
@@ -272,8 +278,12 @@ def bind(force_host: bool = False) -> set[str]:
     from vllm.triton_utils import triton
 
     if not hasattr(triton, "next_power_of_2"):
-        triton.next_power_of_2 = lambda n: 1 if n <= 1 else 1 << (int(n) - 1).bit_length()
+        triton.next_power_of_2 = _next_power_of_2
     return bound
+
+
+def _next_power_of_2(n: int) -> int:
+    return 1 if n <= 1 else 1 << (int(n) - 1).bit_length()
 
 
 def unbind() -> None:
@@ -281,6 +291,10 @@ def unbind() -> None:
     for name, original in _originals.items():
         setattr(_module(name), name.rpartition(".")[2], original)
     _originals.clear()
+    from vllm.triton_utils import triton
+
+    if getattr(triton, "next_power_of_2", None) is _next_power_of_2:
+        del triton.next_power_of_2
 
 
 def bind_or_raise() -> None:

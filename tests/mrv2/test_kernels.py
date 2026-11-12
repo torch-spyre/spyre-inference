@@ -15,6 +15,8 @@
 """kernels.py's seam: HostKernel launches like a Triton kernel, bind_or_raise()
 enforces the full list, and unsupported features fail loudly."""
 
+import re
+
 import pytest
 import torch
 
@@ -34,18 +36,15 @@ def test_unsupported_kernel_names_the_feature() -> None:
         kernel[(1,)](0)
 
 
-def test_bind_or_raise_names_a_kernel_bind_left_unbound(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bind_or_raise_names_a_kernel_missing_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(kernels, "use_triton", lambda: False)
-    monkeypatch.setattr(kernels, "HOST_KERNELS", {"a": "op"})
-    monkeypatch.setattr(kernels, "UNSUPPORTED_KERNELS", {"b": "feature"})
-    monkeypatch.setattr(
-        kernels,
-        "bind",
-        lambda: {"a", *(f"{s}.apply_top_k_top_p" for s in kernels._TOP_K_TOP_P_SITES)},
-    )
-
-    with pytest.raises(RuntimeError, match=r"\['b'\]"):
-        kernels.bind_or_raise()
+    renamed = "gpu.input_batch._renamed_kernel"
+    monkeypatch.setitem(kernels.HOST_KERNELS, renamed, "mrv2_post_update")
+    try:
+        with pytest.raises(RuntimeError, match=re.escape(renamed)):
+            kernels.bind_or_raise()
+    finally:
+        kernels.unbind()
 
 
 def test_bind_then_unbind_restores_upstream() -> None:
@@ -60,14 +59,30 @@ def test_bind_then_unbind_restores_upstream() -> None:
     assert input_batch._post_update_kernel is original
 
 
-def test_placeholder_next_power_of_2() -> None:
+def test_unbind_restores_top_k_top_p_and_triton_placeholder() -> None:
     from vllm.triton_utils import triton
+    from vllm.triton_utils.importing import TritonPlaceholder
+    from vllm.v1.worker.gpu.sample import sampler, states
 
     try:
         kernels.bind(force_host=True)
     finally:
         kernels.unbind()
-    assert [triton.next_power_of_2(n) for n in (0, 1, 2, 3, 1000, 1024)] == [1, 1, 2, 4, 1024, 1024]
+    assert sampler.apply_top_k_top_p is not kernels.spyre_apply_top_k_top_p
+    assert states.apply_top_k_top_p is not kernels.spyre_apply_top_k_top_p
+    if isinstance(triton, TritonPlaceholder):
+        assert not hasattr(triton, "next_power_of_2")
+
+
+def test_placeholder_next_power_of_2() -> None:
+    from vllm.triton_utils import triton
+
+    try:
+        kernels.bind(force_host=True)
+        powers = [triton.next_power_of_2(n) for n in (0, 1, 2, 3, 1000, 1024)]
+    finally:
+        kernels.unbind()
+    assert powers == [1, 1, 2, 4, 1024, 1024]
 
 
 @pytest.mark.parametrize("use_k", [True, False])

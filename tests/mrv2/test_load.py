@@ -172,6 +172,29 @@ def test_row_buckets_cover_the_prompt_logprobs_chunk(
     assert wrapper._logits_row_buckets == want
 
 
+@pytest.mark.parametrize(
+    ("runner_type", "bucketed", "want"),
+    [
+        pytest.param("generate", True, True, id="generate"),
+        pytest.param("generate", False, False, id="unbucketed"),
+        pytest.param("pooling", True, False, id="pooling"),
+    ],
+)
+def test_a_bucketed_decoder_selects_sampled_rows_on_spyre(
+    steps, monkeypatch, runner_type, bucketed, want
+) -> None:
+    """As V1 does, so only the logits cross to the host, not the whole body output."""
+    bucketer = SimpleNamespace(bucket_sizes=[4, 512]) if bucketed else None
+    monkeypatch.setattr(load.SpyreShapeBucketer, "for_config", staticmethod(lambda c: bucketer))
+    config = _vllm_config(runner_type)
+
+    wrapper = _wrap(_Loader(FakeModel()), _runner()).load_model(
+        vllm_config=config, model_config=config.model_config
+    )
+
+    assert wrapper._sample_rows_on_device is want
+
+
 def test_the_loader_forwards_everything_else() -> None:
     loader = _wrap(_Loader(FakeModel()), _runner())
     assert loader.load_config == "load-config"

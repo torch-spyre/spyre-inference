@@ -52,8 +52,13 @@ from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManag
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _set_spyre_compilation_settings,
     _SpyreModelWrapper,
+    warm_sample_row_gathers,
 )
-from spyre_inference.v1.worker.spyre_shape_bucketer import SpyreShapeBucketer, encoder_shape_tables
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    SpyreShapeBucketer,
+    encoder_shape_tables,
+    logits_row_buckets,
+)
 
 if TYPE_CHECKING:
     from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
@@ -234,6 +239,10 @@ def run(runner: "SpyreModelRunnerV2") -> None:
     t0 = time.time()
     # Under inference_mode like MRV2's execute_model: grad mode is a guard on every
     # compiled graph, so warming outside it misses each one at serving time.
+    bucketer = SpyreShapeBucketer.for_config(runner.vllm_config)
+    row_widths = (
+        [] if bucketer is None else logits_row_buckets(bucketer.bucket_sizes, runner.max_num_reqs)
+    )
     with _set_spyre_compilation_settings(runner.vllm_config), torch.inference_mode():
         widest = None
         for call in calls:
@@ -242,7 +251,9 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             )
             if runner.pooling_runner is not None:
                 _warm_pooling(runner, hidden_states)
-            elif widest is None:
+                continue
+            warm_sample_row_gathers(cast(_SpyreModelWrapper, runner.model), hidden_states, row_widths)
+            if widest is None:
                 widest = sample_hidden_states
         if runner.pooling_runner is not None and not runner.model_config.enforce_eager:
             _warm_encoder_inline_paths(runner, {c.num_tokens for c in calls})

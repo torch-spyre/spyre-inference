@@ -229,10 +229,11 @@ def _declared_page_range(max_pages: int) -> dict[int, dict[str, int]] | None:
         return None
     # torch-spyre refuses a declared minimum below its reservation floor.
     min_pages = max(_MIN_DECLARED_PAGES, ts_config.min_reserved_dim_size)
-    if not min_pages <= max_pages <= ts_config.max_buckets:
+    # A range with min == max would specialize to a constant and fail to trace.
+    if not min_pages < max_pages <= ts_config.max_buckets:
         logger.info_once(
             "Head-major attention keeps its KV buckets: %d pages per sequence is outside the "
-            "declarable range [%d, MAX_BUCKETS=%d].",
+            "declarable range (%d, MAX_BUCKETS=%d].",
             max_pages,
             min_pages,
             ts_config.max_buckets,

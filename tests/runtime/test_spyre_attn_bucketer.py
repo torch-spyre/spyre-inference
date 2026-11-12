@@ -767,6 +767,14 @@ class TestDeclaredPages:
         assert b.page_range[0]["min"] == 8
         assert b.find_declared_pages(3) == 8
 
+    def test_a_context_at_the_reservation_floor_keeps_the_buckets(self):
+        from torch_spyre._inductor import config as ts_config
+
+        with ts_config.patch(min_reserved_dim_size=8):
+            b = SpyreAttnBucketer(make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is None
+        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+
     def test_a_context_above_max_buckets_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=4096 + BLOCK_SIZE), declare_pages=True)
         assert b.page_range is None

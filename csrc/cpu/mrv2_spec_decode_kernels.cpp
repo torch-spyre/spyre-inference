@@ -15,9 +15,9 @@
 // Translated from vLLM's MRV2 Triton kernels (https://github.com/vllm-project/vllm,
 // vllm/v1/worker/gpu), Copyright contributors to the vLLM project, Apache-2.0.
 //
-// philox is translated from Triton's python/triton/language/random.py
-// (https://github.com/triton-lang/triton), Copyright 2018-2020 Philippe Tillet,
-// Copyright 2020-2022 OpenAI, MIT; see LICENSE.triton in this directory.
+// philox is Philox4x32-10 (Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3",
+// SC'11), following Triton's tl.rand (python/triton/language/random.py) so the outputs
+// match it bit for bit.
 
 // MRV2 spec-decode host kernels: the rejection sampler
 // (gpu/spec_decode/rejection_sampler{,_utils}.py) and DFlash input prep

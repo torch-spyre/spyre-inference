@@ -2370,21 +2370,24 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
         pytest.skip("needs symbolic for_each_tile trip counts (torch-spyre#6066)")
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
     envs.clear_env_cache()
-    # The default reservation floor of 8 rows would put short sequences on 8 pages.
-    monkeypatch.setattr(ts_config, "min_reserved_dim_size", 2)
-
     # The fixture's max_model_len 2048 at block 128 declares pages 2..16. Compiled at 16, as
     # warmup records it, then reused at 1 (walked as 2), 3 and 8.
     kernel_code = getattr(spyre_attn, kernel_name).__code__
-    for kv_len in (2048, query_len + 10, 300, 1000):
-        _run_spyre_attn_test(
-            seq_lens=[(query_len, kv_len)],
-            block_size=128,
-            sliding_window=None,
-            configure_compilation=configure_compilation,
-            configure_device=configure_device,
-        )
-        assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
+    # The default reservation floor of 8 rows would put short sequences on 8 pages. Not
+    # monkeypatch: its undo deletes a config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=2):
+        for kv_len in (2048, query_len + 10, 300, 1000):
+            _run_spyre_attn_test(
+                seq_lens=[(query_len, kv_len)],
+                block_size=128,
+                sliding_window=None,
+                configure_compilation=configure_compilation,
+                configure_device=configure_device,
+                # 8 x 128 query heads keep prefill page grouping eligible.
+                num_query_heads=8,
+                num_kv_heads=2,
+            )
+            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
 
 
 @pytest.mark.parametrize(

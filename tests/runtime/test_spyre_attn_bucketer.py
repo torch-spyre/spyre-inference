@@ -737,14 +737,15 @@ class TestDeclaredPages:
     """The per-sequence page axis is declared, not bucketed, where it fits."""
 
     @pytest.fixture(autouse=True)
-    def _needs_declared_dims(self, monkeypatch):
+    def _needs_declared_dims(self):
         from torch_spyre._inductor import config as ts_config
         from torch_spyre._inductor import pass_utils
 
         if not hasattr(pass_utils, "declared_dims"):
             pytest.skip("needs symbolic for_each_tile trip counts (torch-spyre#6066)")
-        monkeypatch.setattr(ts_config, "min_reserved_dim_size", 2)
-        monkeypatch.setattr(ts_config, "max_buckets", 32)
+        # Not monkeypatch: its undo deletes a config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=2, max_buckets=32):
+            yield
 
     def test_one_variant_per_query_bucket(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
@@ -757,11 +758,11 @@ class TestDeclaredPages:
         assert b.page_range == {0: {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}}
         assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [2, 2, 7, 32]
 
-    def test_the_reservation_floor_raises_the_walked_minimum(self, monkeypatch):
+    def test_the_reservation_floor_raises_the_walked_minimum(self):
         from torch_spyre._inductor import config as ts_config
 
-        monkeypatch.setattr(ts_config, "min_reserved_dim_size", 8)
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        with ts_config.patch(min_reserved_dim_size=8):
+            b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
         assert b.page_range is not None
         assert b.page_range[0]["min"] == 8
         assert b.find_declared_pages(3) == 8

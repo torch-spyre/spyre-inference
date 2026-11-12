@@ -37,6 +37,7 @@ from vllm.v1.worker.utils import request_memory
 from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
+from spyre_inference.numa_pinning import pin_to_card_node
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
@@ -54,6 +55,8 @@ class SpyreWorkerV2(TorchSpyreWorker):
 
     def init_device(self) -> None:
         apply_in_process_threading(self.parallel_config)
+        # First, so the runtime's threads and the host copies of the weights start there.
+        pin_to_card_node(self.parallel_config, _get_spyre_pcie_address(self.local_rank))
 
         # The env vars spyreccl reads. `setdefault` leaves torchrun-supplied
         # values intact.

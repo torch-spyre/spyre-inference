@@ -124,6 +124,7 @@ jobs:
       SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
       ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
       ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+      ARTIFACTORY_DATASETS_PATH: ${{ secrets.ARTIFACTORY_DATASETS_PATH }}
       ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
 
     steps:

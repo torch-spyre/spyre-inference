@@ -139,6 +139,9 @@ on:
       # and selected configs fail if their required trace remains absent.
       ARTIFACTORY_DATA_PATH:
         required: false
+      # Datasets-specific root; falls back to ARTIFACTORY_DATA_PATH when unset.
+      ARTIFACTORY_DATASETS_PATH:
+        required: false
       # ClickHouse connection for the perf job's benchmark ingest. A run without
       # them (any non-perf run, or perf with CLICKHOUSE_HOST unset) skips ingest.
       CLICKHOUSE_HOST:
@@ -1380,6 +1383,7 @@ jobs:
       SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
       ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
       ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+      ARTIFACTORY_DATASETS_PATH: ${{ secrets.ARTIFACTORY_DATASETS_PATH }}
       ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

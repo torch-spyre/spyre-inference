@@ -54,11 +54,12 @@ Env:
   SPYRE_BENCH_DATA_DIR   cache dir (default ~/.cache/spyre/artifacts). CI points
                          this at the shared PVC the runners mount.
   ARTIFACTORY_BASE_URL   artifact store base, e.g. https://<host>
-  ARTIFACTORY_DATA_PATH  repo-relative ROOT that every artifact path below hangs
-                         off, e.g. <repo>/spyredata/components. Each ARTIFACTS
-                         entry adds its own path under this root, so a new
-                         dataset or artifact needs a table entry, not a new
-                         secret.
+  ARTIFACTORY_DATASETS_PATH  repo-relative ROOT that every dataset path hangs
+                             off, e.g. <repo>/ai-sw-accel-datasets. Falls back
+                             to ARTIFACTORY_DATA_PATH when unset, so the
+                             migration is one secret away from a no-op.
+  ARTIFACTORY_DATA_PATH      the general artifacts ROOT, used for datasets too
+                             until ARTIFACTORY_DATASETS_PATH is set.
   ARTIFACTORY_TOKEN      bearer token (only needed when something must be fetched)
 """
 
@@ -228,6 +229,13 @@ def _require(var: str) -> str:
     return value
 
 
+def datasets_root() -> str:
+    """Root every dataset path hangs off, falling back to the artifacts root."""
+    return (os.environ.get("ARTIFACTORY_DATASETS_PATH") or _require("ARTIFACTORY_DATA_PATH")).strip(
+        "/"
+    )
+
+
 @contextmanager
 def file_lock(path: Path):
     """Hold an exclusive lock for one dataset, so parallel jobs fetch it once.
@@ -255,12 +263,12 @@ def file_lock(path: Path):
 def download(rel_path: str, dest: Path, expected_sha: str) -> None:
     """Fetch one artifact into `dest`, verifying the digest before it is published.
 
-    `rel_path` is relative to ARTIFACTORY_DATA_PATH. Downloads to a `.part`
+    `rel_path` is relative to the datasets root. Downloads to a `.part`
     sibling and renames only after the digest matches, so an interrupted run can
     never leave a short file that later looks cached.
     """
     base = _require("ARTIFACTORY_BASE_URL").rstrip("/")
-    root = _require("ARTIFACTORY_DATA_PATH").strip("/")
+    root = datasets_root()
     token = _require("ARTIFACTORY_TOKEN")
     url = f"{base}/artifactory/{root}/{rel_path.lstrip('/')}"
 

@@ -15,6 +15,7 @@
 // Portions adapted from vLLM (https://github.com/vllm-project/vllm),
 // Copyright contributors to the vLLM project, Apache-2.0.
 
+#include "cpu_fast_exp.hpp"
 #include "cpu_types.hpp"
 
 #include <torch/all.h>
@@ -46,6 +47,63 @@ static inline double gumbel_from_bits(uint64_t bits) {
   return -std::log(-std::log(u));
 }
 
+static inline double one_minus_u_from_bits(uint64_t bits) {
+  return (double((1ULL << 53) - 1 - bits) + 0.5) * 0x1.0p-53;
+}
+
+// Exact step. x + g > best_x + best_g is (x - best_x) + g > best_g. Adding g
+// into a 1e38 logit loses it in double ULP, so ties at the float max would
+// always keep the lower index.
+static inline void consider_token(const float* row, uint64_t key, int64_t i,
+                                  double& best_logit, double& best_g,
+                                  int64_t& best_idx) {
+  const double dx = double(row[i]) - best_logit;
+  // The noise is bounded; this also skips every -inf.
+  if (dx + GUMBEL_MAX <= best_g) return;
+  const uint64_t bits = noise_bits(key, i);
+  // Wins iff -log u < exp(dx - best_g); -log u >= 1 - u rejects most tokens
+  // with one exp instead of two logs.
+  if (one_minus_u_from_bits(bits) >= std::exp(dx - best_g)) return;
+  const double g = gumbel_from_bits(bits);
+  if (dx + g > best_g) {
+    best_logit = row[i];
+    best_g = g;
+    best_idx = i;
+  }
+}
+
+// Above this, casting the threshold to float can move exp by more than the
+// margin below, so the chunk stays on the exact step.
+constexpr double kGumbelFloatThresh = 2048.0;
+// fast_exp is a few ulp, and the threshold loses a fraction of a float ulp.
+// One percent covers both. A closer token is rechecked with std::exp.
+constexpr double kGumbelExpMargin = 1.01;
+
+#if defined(__x86_64__) && defined(__AVX2__) && !defined(__AVX512F__)
+#define SPYRE_AVX2_FMA __attribute__((target("avx2,f16c,fma")))
+#else
+#define SPYRE_AVX2_FMA
+#endif
+
+// exp(logit - threshold) for 16 lanes. The AVX2 build keeps FMA off in this
+// file; this helper opts in so fast_exp can inline.
+SPYRE_AVX2_FMA
+static void gumbel_approx_exp16(const float* logits, double threshold,
+                                float* out) {
+  using spyre_cpu::fast_exp;
+  const vec_op::FP32Vec16 x(logits);
+  const vec_op::FP32Vec16 t(static_cast<float>(threshold));
+  fast_exp(x - t).save(out);
+}
+
+// True only when one_minus_u is far enough above the approximation that the
+// exact exp would reject too. A low approximation falls through to the exact
+// step, so a winner is never dropped.
+static inline bool approx_rejects(double one_minus_u, float e) {
+  if (!(e >= 0.f) || !std::isfinite(e)) return false;
+  return one_minus_u > double(e) * kGumbelExpMargin;
+}
+
 static void fused_gumbel_argmax_row(int64_t* __restrict__ output,
                                     const float* __restrict__ row,
                                     uint64_t seed, int64_t vocab_size) {
@@ -61,29 +119,36 @@ static void fused_gumbel_argmax_row(int64_t* __restrict__ output,
     return;
   }
 
-  // Compare in (logit, noise) space: x + g > best_x + best_g is
-  // (x - best_x) + g > best_g. Adding g into a 1e38 logit loses it in
-  // double ULP, so ties at the float max would always keep the lower index.
   double best_logit = row[first];
   double best_g = gumbel_from_bits(noise_bits(key, first));
   int64_t best_idx = first;
-  for (int64_t i = first + 1; i < vocab_size; ++i) {
-    const double dx = double(row[i]) - best_logit;
-    // Exact pruning: the noise is bounded; also skips every -inf.
-    if (dx + GUMBEL_MAX <= best_g) continue;
-    const uint64_t bits = noise_bits(key, i);
-    // Wins iff -log u < exp(dx - best_g); -log u >= 1 - u rejects most
-    // tokens with one exp instead of two logs.
-    const double one_minus_u =
-        (double((1ULL << 53) - 1 - bits) + 0.5) * 0x1.0p-53;
-    if (one_minus_u >= std::exp(dx - best_g)) continue;
-    const double g = gumbel_from_bits(bits);
-    if (dx + g > best_g) {
-      best_logit = row[i];
-      best_g = g;
-      best_idx = i;
+  int64_t i = first + 1;
+  // The best only gets stricter inside a chunk, so an exp from the chunk's
+  // starting threshold rejects fewer tokens, never a real winner.
+  for (; i + 16 <= vocab_size;) {
+    const double threshold = best_logit + best_g;
+    if (threshold > kGumbelFloatThresh || threshold < -kGumbelFloatThresh) {
+      for (int lane = 0; lane < 16; ++lane, ++i)
+        consider_token(row, key, i, best_logit, best_g, best_idx);
+      continue;
+    }
+    // A masked row is almost all -inf. The noise bound drops a whole chunk
+    // before the exp, which is the exact per-token prune.
+    const float chunk_max = vec_op::FP32Vec16(row + i).reduce_max();
+    if (double(chunk_max) + GUMBEL_MAX <= threshold) {
+      i += 16;
+      continue;
+    }
+    float e[16];
+    gumbel_approx_exp16(row + i, threshold, e);
+    for (int lane = 0; lane < 16; ++lane, ++i) {
+      if (approx_rejects(one_minus_u_from_bits(noise_bits(key, i)), e[lane]))
+        continue;
+      consider_token(row, key, i, best_logit, best_g, best_idx);
     }
   }
+  for (; i < vocab_size; ++i)
+    consider_token(row, key, i, best_logit, best_g, best_idx);
   *output = best_idx;
 }
 

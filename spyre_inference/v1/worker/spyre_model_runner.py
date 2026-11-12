@@ -368,7 +368,8 @@ class _SpyreHiddenStates(torch.Tensor):
             rows = select_rows(source, idx)
         # A plain view of the real rows. ``_spyre_padded_rows`` carries the padded gather, which
         # already sits on a warmed row bucket, so ``compute_logits`` projects it on Spyre as is.
-        out: Any = rows[:num_rows]
+        # The cast only lets the type checker accept that extra attribute on a Tensor.
+        out = cast(Any, rows[:num_rows])
         out._spyre_padded_rows = rows
         return out
 

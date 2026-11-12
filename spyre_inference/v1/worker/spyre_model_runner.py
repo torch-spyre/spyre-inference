@@ -234,8 +234,6 @@ class _SlotMappingKernelShim:
         TOTAL_CP_WORLD_SIZE: int = 1,
         TOTAL_CP_RANK: int = 0,
         CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
-        *args: Any,
-        **kwargs: Any,
     ) -> None:
         _compute_slot_mapping_impl(
             num_tokens,

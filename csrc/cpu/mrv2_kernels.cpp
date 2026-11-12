@@ -608,10 +608,11 @@ std::pair<int64_t, acc_t> gumbel_row(const scalar_t* row, int64_t begin, int64_t
         }
       }
     } else {
-      // Greedy: a running max, then one scan for its first index.
+      // Greedy: a running max, then one scan for its first index. max_ps returns its
+      // second operand on NaN, so vmax goes second to skip NaN logits as Triton does.
       __m512 vmax = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
       int64_t w = v;
-      for (; w + 16 <= end; w += 16) vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(row + w));
+      for (; w + 16 <= end; w += 16) vmax = _mm512_max_ps(_mm512_loadu_ps(row + w), vmax);
       const float m = _mm512_reduce_max_ps(vmax);
       if (m > best) {
         for (int64_t i = v; i + 16 <= end; i += 16) {
@@ -747,7 +748,8 @@ void mrv2_min_p(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
 #if defined(__AVX512F__)
         if constexpr (std::is_same_v<scalar_t, float>) {
           __m512 vm = _mm512_set1_ps(kNegInf);
-          for (; v + 16 <= hi; v += 16) vm = _mm512_max_ps(vm, _mm512_loadu_ps(row + v));
+          // vm second: max_ps returns its second operand on NaN, so NaN logits are skipped.
+          for (; v + 16 <= hi; v += 16) vm = _mm512_max_ps(_mm512_loadu_ps(row + v), vm);
           m = _mm512_reduce_max_ps(vm);
         }
 #endif

@@ -309,13 +309,29 @@ def temperature(g):
     return lambda s: gb.apply_temperature(**s), state
 
 
-def _gumbel(g, use_fp64: bool, apply_temperature: bool, is_drafting: bool):
+def _with_nans(g, logits: torch.Tensor, rows: list[int], argmax_row: int) -> torch.Tensor:
+    """A NaN in each of ``rows``; ``argmax_row`` also gets one 48 tokens (three AVX-512
+    chunks, the same lane) after its argmax, where a lane-wise running max forgets it."""
+    cols = torch.randint(0, logits.shape[1], (len(rows),), generator=g)
+    logits[torch.tensor(rows), cols] = float("nan")
+    logits[argmax_row, 5] = 60.0
+    logits[argmax_row, 5 + 48] = float("nan")
+    return logits
+
+
+def _gumbel(
+    g, use_fp64: bool, apply_temperature: bool, is_drafting: bool, dtype=torch.float32, nan=False
+):
     gb = _m("sample.gumbel")
     num_tokens, vocab = 9, 5000
     logits = _logits(g, num_tokens, vocab)
     logits[3] = float("-inf")
     logits[4, 100] = 50.0
     logits[5, 10:20] = 30.0
+    if nan:
+        # Only the greedy row: under noise, triton-cpu's NaN handling has no single answer.
+        logits = _with_nans(g, logits, rows=[0], argmax_row=0)
+    logits = logits.to(dtype)
     state = dict(
         logits=logits,
         expanded_idx_mapping=torch.tensor([0, 1, 2, 3, 4, 5, 2, 6, 1], dtype=torch.int32),
@@ -342,6 +358,21 @@ def gumbel_sample_temperature_drafting(g):
 @case("gpu.sample.gumbel._gumbel_sample_kernel")
 def gumbel_sample_fp64(g):
     return _gumbel(g, use_fp64=True, apply_temperature=True, is_drafting=False)
+
+
+@case("gpu.sample.gumbel._gumbel_sample_kernel")
+def gumbel_sample_nan_logits(g):
+    return _gumbel(g, use_fp64=False, apply_temperature=True, is_drafting=False, nan=True)
+
+
+@case("gpu.sample.gumbel._gumbel_sample_kernel")
+def gumbel_sample_fp16_logits(g):
+    return _gumbel(g, False, apply_temperature=True, is_drafting=False, dtype=torch.float16)
+
+
+@case("gpu.sample.gumbel._gumbel_sample_kernel")
+def gumbel_sample_bf16_logits(g):
+    return _gumbel(g, False, apply_temperature=True, is_drafting=False, dtype=torch.bfloat16)
 
 
 def _gumbel_logits_cache(g, per_token_col: bool, source: bool):
@@ -379,6 +410,13 @@ def min_p(g):
         min_p=torch.tensor([0.0, 0.1, 0.5, 0.01], dtype=torch.float32),
     )
     return lambda s: mp.apply_min_p(**s), state
+
+
+@case("gpu.sample.min_p._min_p_kernel")
+def min_p_nan_logits(g):
+    run, state = min_p(g)
+    state["logits"] = _with_nans(g, state["logits"], rows=[0, 1, 2, 3, 4], argmax_row=1)
+    return run, state
 
 
 @case("gpu.sample.penalties._penalties_kernel", "gpu.sample.penalties._bincount_kernel")
@@ -503,6 +541,17 @@ def bad_words(g):
 def topk_scores(g):
     lp = _m("sample.logprob")
     logits = _logits(g, 5, 9000)
+    sampled = torch.randint(0, 9000, (5,), generator=g)
+    return lambda s: lp.compute_topk_scores(logits, 4, sampled), {}
+
+
+@case(
+    "gpu.sample.logprob._topk_log_softmax_kernel",
+    "gpu.sample.logprob._ranks_kernel",
+)
+def topk_scores_nan_logits(g):
+    lp = _m("sample.logprob")
+    logits = _with_nans(g, _logits(g, 5, 9000), rows=[0, 1, 2, 3, 4], argmax_row=0)
     sampled = torch.randint(0, 9000, (5,), generator=g)
     return lambda s: lp.compute_topk_scores(logits, 4, sampled), {}
 

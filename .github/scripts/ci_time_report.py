@@ -63,6 +63,15 @@ _SLOW_S = 30.0
 _SUMMARY_ROWS = 200
 _MAX_BASE_COMMITS = 30
 _MAX_BASELINE_PAGES = 5
+_NEWER_RUNS = 3
+# Outside tests/, files that change which ids collect (dependency pins, markers, registry).
+_COLLECTION_INPUTS = {
+    "pyproject.toml",
+    "uv.lock",
+    "spyre-rpms.lock",
+    "Makefile",
+    "spyre_inference/models/__init__.py",
+}
 
 
 @dataclass
@@ -244,13 +253,17 @@ def compute(
     collected: set[tuple[str, str]] | None = None,
     base_only_files: set[str] | None = None,
     skipped_modules: set[str] | None = None,
+    newer: list[dict[str, float]] | None = None,
 ) -> Report:
     """Compare a PR run with baseline runs, newest first.
 
     collected: the PR run's JUnit cases. Durations omit skipped tests (e.g. trunk-only
     ones, in this regression-tier run), so only a test JUnit lacks counts as removed.
-    base_only_files: changed by the base branch after the newest baseline; ids that
+    base_only_files: changed by the base branch after its newest green run; ids that
     appear or vanish there may be its doing, so they are neither charged nor credited.
+    newer: green base-branch runs that started while the PR ran, newest first. Any id in
+    them is the base branch's (an open PR's tests aren't on it), and the newest one shows
+    what the base branch still runs.
     """
     baselines = baselines[:BASELINE_RUNS]
     base_only_files = base_only_files or set()
@@ -260,7 +273,8 @@ def compute(
             seen.setdefault(nodeid, []).append(seconds)
     need = min(REMOVED_MIN_RUNS, len(baselines))
     # A test the base branch itself dropped lingers in older baselines.
-    newest = baselines[0] if baselines else {}
+    newest = (newer or baselines or [{}])[0]
+    known = set(seen).union(*(newer or []))
     removed = {
         n: statistics.median(v)
         for n, v in seen.items()
@@ -273,7 +287,7 @@ def compute(
     }
     new, on_base = [], []
     for nodeid, (seconds, suite) in pr.items():
-        if nodeid in seen:
+        if nodeid in known:
             continue
         t = NewTest(nodeid, seconds, suite)
         (on_base if nodeid.split("::")[0] in base_only_files else new).append(t)
@@ -518,12 +532,15 @@ def latest_pr_run(repo: str, pr: dict) -> dict | None:
     return next((r for r in mine if r["head_sha"] == pr["head"]["sha"]), mine[0] if mine else None)
 
 
-def baseline_runs(repo: str, branch: str, before: str) -> list[tuple[dict, dict[str, float]]]:
+def baseline_runs(
+    repo: str, branch: str, created: str, limit: int = BASELINE_RUNS
+) -> list[tuple[dict, dict[str, float]]]:
+    """Green push runs with durations, newest first; created is "<=time" or "from..to"."""
     out = []
     query = (
         f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs"
         f"?branch={urllib.parse.quote(branch, safe='')}&event=push&status=success"
-        f"&created={urllib.parse.quote('<=' + before, safe='')}&per_page=30"
+        f"&created={urllib.parse.quote(created, safe='')}&per_page=30"
     )
     for page in range(1, _MAX_BASELINE_PAGES + 1):
         runs = gh_json(f"{query}&page={page}")["workflow_runs"]
@@ -534,7 +551,7 @@ def baseline_runs(repo: str, branch: str, before: str) -> list[tuple[dict, dict[
             data = read_json_artifact(repo, art) if art else {}
             if data:
                 out.append((run, data))
-            if len(out) == BASELINE_RUNS:
+            if len(out) == limit:
                 return out
         if len(runs) < 30:
             break
@@ -552,28 +569,42 @@ def pr_changed_files(repo: str, number: int) -> set[str]:
     }
 
 
-def base_only_test_files(
-    repo: str, newest_base_sha: str, pr_run: dict, pr: dict
-) -> set[str] | None:
-    """Test files the base branch changed after the newest baseline, up to the PR run.
+def collection_input(path: str) -> bool:
+    """Whether a file can change which test ids are collected outside its own module."""
+    if path.startswith("tests/data/"):  # reference outputs, not collection
+        return False
+    if path.startswith("tests/"):
+        return not re.fullmatch(r"test_[^/]*\.py", path.rsplit("/", 1)[-1])
+    return path in _COLLECTION_INPUTS or path.startswith("spyre_inference/config/")
 
-    None when the base branch moved too far to list. The PR run tests the merge with the
-    base tip, so a new test in one of these files may be the base branch's, not the PR's.
+
+def base_only_test_files(repo: str, newest_base_sha: str, pr_run: dict, pr: dict) -> set[str] | str:
+    """Test modules the base branch changed after the newest baseline, up to the PR run.
+
+    The PR run tests the merge with the base tip, so a test id that appears or vanishes in
+    one of them may be the base branch's doing. A string is the reason no attribution is
+    possible: the base moved too far, or changed what collects (conftest, the test plugin's
+    model lists, dependency pins), which renames ids in files it never touched.
     """
+    too_far = f"{pr['base']['ref']} moved too far past its newest green baseline run"
     try:
         cmp = gh_json(f"/repos/{repo}/compare/{newest_base_sha}...{pr['base']['ref']}")
     except subprocess.CalledProcessError:
-        return None
+        return too_far
     listed = cmp.get("commits", [])
     commits = [c for c in listed if c["commit"]["committer"]["date"] <= pr_run["created_at"]]
     # The listing is oldest first and capped; it must reach past the PR run to be complete.
     complete = cmp.get("total_commits", 0) <= len(listed) or len(commits) < len(listed)
     if not complete or len(commits) > _MAX_BASE_COMMITS:
-        return None
+        return too_far
     files: set[str] = set()
     for c in commits:
         detail = gh_json(f"/repos/{repo}/commits/{c['sha']}")
         files |= {f["filename"] for f in detail.get("files", [])}
+    inputs = sorted(f for f in files if collection_input(f))
+    if inputs:
+        shown = ", ".join(_plain(f) for f in inputs[:3])
+        return f"{pr['base']['ref']} changed test collection inputs ({shown}) after the baseline"
     return {f for f in files if f.startswith("tests/")}
 
 
@@ -633,14 +664,23 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
     if unmeasured:
         return f"{len(unmeasured)} tests the PR run executed have no recorded duration"
 
-    bases = baseline_runs(repo, pr["base"]["ref"], run["created_at"])
+    bases = baseline_runs(repo, pr["base"]["ref"], "<=" + run["created_at"])
     if not bases:
         return f"no green push run with test durations on {pr['base']['ref']} to compare against"
-    base_only = base_only_test_files(repo, bases[0][0]["head_sha"], run, pr)
-    if base_only is None:
-        return f"{pr['base']['ref']} moved too far past its newest green baseline run"
+    # Base runs that started while the PR ran: what the live report sees, also on replay.
+    window = f"{run['created_at']}..{run['updated_at']}"
+    newer = baseline_runs(repo, pr["base"]["ref"], window, _NEWER_RUNS)
+    base_only = base_only_test_files(repo, (newer or bases)[0][0]["head_sha"], run, pr)
+    if isinstance(base_only, str):
+        return base_only
     return compute(
-        pr_tests, [d for _, d in bases], legs, junit.cases, base_only, junit.skipped_modules
+        pr_tests,
+        [d for _, d in bases],
+        legs,
+        junit.cases,
+        base_only,
+        junit.skipped_modules,
+        [d for _, d in newer],
     )
 
 

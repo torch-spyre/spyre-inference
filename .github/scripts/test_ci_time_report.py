@@ -280,7 +280,8 @@ def _matrix(*cfgs):
 
 
 def _fake_build(monkeypatch, pr_files, matrices, junit="baseline", legs_with_junit=9):
-    run = {"id": 1, "head_sha": "head", "created_at": "2026-11-10T12:00:00Z", "run_attempt": 1}
+    run = {"id": 1, "head_sha": "head", "run_attempt": 1}
+    run |= {"created_at": "2026-11-10T12:00:00Z", "updated_at": "2026-11-10T13:00:00Z"}
     run["referenced_workflows"] = [{"path": f"o/r/{ctr.MATRIX_PATH}@merge", "sha": "merge"}]
     pr = {"number": 7, "base": {"ref": "main"}}
     arts = [{"name": "durations-data-0", "id": 1}]
@@ -428,7 +429,7 @@ def test_local_runs_print_the_report(monkeypatch, capsys):
     assert "## CI time report" in capsys.readouterr().out
 
 
-def _fake_compare(monkeypatch, commits, total=None, files=("tests/shared.py",)):
+def _fake_compare(monkeypatch, commits, total=None, files=("tests/test_shared.py",)):
     cmp = {"commits": commits, "total_commits": len(commits) if total is None else total}
 
     def gh(path, **kw):
@@ -442,8 +443,8 @@ def test_base_changed_files_exclude_commits_after_the_pr_run(monkeypatch):
     pr = {"base": {"ref": "main"}}
     before = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
     after = {"sha": "b", "commit": {"committer": {"date": "2026-11-10T13:00:00Z"}}}
-    _fake_compare(monkeypatch, [before, after], files=("tests/shared.py", "README.md"))
-    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/shared.py"}
+    _fake_compare(monkeypatch, [before, after], files=("tests/test_shared.py", "README.md"))
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/test_shared.py"}
     _fake_compare(monkeypatch, [after])
     assert ctr.base_only_test_files("o/r", "base", run, pr) == set()
 
@@ -454,19 +455,25 @@ def test_a_far_moved_base_branch_gives_no_verdict(monkeypatch):
     old = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
     new = {"sha": "b", "commit": {"committer": {"date": "2026-11-10T13:00:00Z"}}}
     _fake_compare(monkeypatch, [old] * (ctr._MAX_BASE_COMMITS + 1))
-    assert ctr.base_only_test_files("o/r", "base", run, pr) is None
+    assert "moved too far" in ctr.base_only_test_files("o/r", "base", run, pr)
     # A truncated listing that never reaches past the PR run is not trusted either.
     _fake_compare(monkeypatch, [old], total=300)
-    assert ctr.base_only_test_files("o/r", "base", run, pr) is None
+    assert "moved too far" in ctr.base_only_test_files("o/r", "base", run, pr)
     # Commits merged after the PR run don't count toward the cap.
     _fake_compare(monkeypatch, [old] + [new] * 40, total=300)
-    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/shared.py"}
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/test_shared.py"}
 
 
 def test_a_new_test_in_a_file_both_sides_changed_is_not_charged():
     # The base branch's expensive test and the PR's cheap one land in the same file.
-    pr = _pr({**_baseline(), "tests/shared.py::test_main": 900.0, "tests/shared.py::test_pr": 10.0})
-    r = ctr.compute(pr, [_baseline()] * 5, base_only_files={"tests/shared.py"})
+    pr = _pr(
+        {
+            **_baseline(),
+            "tests/test_shared.py::test_main": 900.0,
+            "tests/test_shared.py::test_pr": 10.0,
+        }
+    )
+    r = ctr.compute(pr, [_baseline()] * 5, base_only_files={"tests/test_shared.py"})
     assert r.new == [] and len(r.on_base) == 2 and not r.over
 
 
@@ -504,7 +511,7 @@ def test_baselines_are_searched_before_the_pr_run_and_paged(monkeypatch):
     monkeypatch.setattr(
         ctr, "read_json_artifact", lambda repo, a: _baseline() if a["id"] == 99 else {}
     )
-    out = ctr.baseline_runs("o/r", "main", "2026-11-03T23:39:08Z")
+    out = ctr.baseline_runs("o/r", "main", "<=2026-11-03T23:39:08Z")
     assert len(out) == ctr.BASELINE_RUNS
     assert "created=%3C%3D2026-11-03T23%3A39%3A08Z" in queries[0]
     assert "page=2" in queries[-1]
@@ -583,9 +590,13 @@ def test_a_collection_skipped_module_is_not_removed():
 
 def test_a_base_branch_rename_is_neither_charged_nor_credited():
     # Main renamed a 900 s test after the newest baseline; the PR adds 600 s elsewhere.
-    base = _baseline(**{"tests/shared.py::test_old_name": 900.0})
-    pr = _pr({**_baseline(), "tests/shared.py::test_new_name": 900.0, "tests/c.py::test_pr": 600.0})
-    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/shared.py"})
+    base = _baseline(**{"tests/test_shared.py::test_old_name": 900.0})
+    pr = _pr(
+        {**_baseline(), "tests/test_shared.py::test_new_name": 900.0, "tests/c.py::test_pr": 600.0}
+    )
+    r = ctr.compute(
+        pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/test_shared.py"}
+    )
     assert r.removed == {} and r.net_s == 600.0
 
 
@@ -627,3 +638,39 @@ def test_a_skipped_report_posts_nothing_new(monkeypatch):
 def test_the_skip_note_names_the_reason():
     body = ctr.render_skipped("2 regression legs uploaded no JUnit report", "https://x/runs/1")
     assert body.startswith(ctr.MARKER + "\n") and "2 regression legs" in body and "PR run" in body
+
+
+def test_collection_inputs():
+    for path in [
+        "uv.lock",
+        "pyproject.toml",
+        "tests/conftest.py",
+        "tests/plugin/spyre_testing_plugin/upstream_tests.yaml",
+        "tests/e2e/models.txt",
+        "spyre_inference/config/model_configs.yaml",
+        "spyre_inference/models/__init__.py",
+    ]:
+        assert ctr.collection_input(path), path
+    for path in ["tests/e2e/test_x.py", "spyre_inference/platform.py", "docs/a.md"]:
+        assert not ctr.collection_input(path), path
+
+
+def test_a_base_dependency_bump_gives_no_verdict(monkeypatch):
+    # Main bumped vLLM after the newest baseline: upstream test ids change with no tests/ edit.
+    run = {"created_at": "2026-11-10T12:00:00Z"}
+    old = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
+    _fake_compare(monkeypatch, [old], files=("pyproject.toml", "uv.lock"))
+    reason = ctr.base_only_test_files("o/r", "base", run, {"base": {"ref": "main"}})
+    assert isinstance(reason, str) and "pyproject.toml" in reason and "uv.lock" in reason
+
+
+def test_ids_a_newer_base_run_has_are_the_base_branchs():
+    # Main bumped vLLM after the baseline, renaming upstream ids; its next green run,
+    # which landed after the PR run started, already has them.
+    base = _baseline(**{"::test_upstream[old]": 300.0})
+    newer = _baseline(**{"::test_upstream[new]": 300.0})
+    pr = _pr({**_baseline(), "::test_upstream[new]": 300.0, "tests/c.py::test_pr": 60.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), newer=[newer])
+    assert [t.nodeid for t in r.new] == ["tests/c.py::test_pr"]
+    # And what the newest base run dropped is not the PR's removal.
+    assert r.removed == {} and r.net_s == 60.0

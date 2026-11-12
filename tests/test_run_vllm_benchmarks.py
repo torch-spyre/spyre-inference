@@ -256,25 +256,16 @@ def test_missing_dataset_aborts_the_run(monkeypatch, tmp_path):
     assert excinfo.value.code == 2
 
 
-@pytest.mark.parametrize("template", ["${SPYRE_VISION_DATASET}", "$SPYRE_VISION_DATASET"])
-def test_dataset_var_without_default_skips_the_entry(monkeypatch, tmp_path, caplog, template):
-    """A var nothing defines (SPYRE_VISION_DATASET, #1538) skips, not aborts, the run."""
+def test_unset_dataset_var_falls_back_to_the_archive(monkeypatch, tmp_path):
+    """The vision var has a fetch-cache default now, so unset resolves and an
+    absent file is fatal like any other trace, not a skip."""
     monkeypatch.delenv("SPYRE_VISION_DATASET", raising=False)
     monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
-    config = _serve_config(template)
-    runner._derive_config(config)
+    config = _serve_config("${SPYRE_VISION_DATASET}")
+    runner._resolve_dataset_path(config)
 
-    with caplog.at_level("WARNING", logger=runner.log.name):
-        assert runner._select_configs([config], set(), set()) == []
-
-    assert "SPYRE_VISION_DATASET" in caplog.text
-
-
-def test_unrecognised_dataset_var_stays_fatal(monkeypatch, tmp_path):
-    """A typo like ${SPYRE_CICS_DATASET} is not an optional var: it aborts."""
-    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
-    config = _serve_config("${SPYRE_CICS_DATASET}")
-    runner._derive_config(config)
+    expected = tmp_path / "spyre-inference/datasets/vision/oracle_invoices_2026.11.10/dataset.jsonl"
+    assert config["parameters"]["dataset-path"] == str(expected)
 
     with pytest.raises(SystemExit) as excinfo:
         runner._select_configs([config], set(), set())

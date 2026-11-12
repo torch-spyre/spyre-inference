@@ -132,6 +132,17 @@ def _images() -> list[torch.Tensor]:
     return [torch.randn(3, 8 * PATCH, 12 * PATCH), torch.randn(3, 6 * PATCH, 4 * PATCH)]
 
 
+def _wrap_images() -> list[torch.Tensor]:
+    torch.manual_seed(5)
+    # 6 + 56 + 8 merge blocks on 32-block rows: the second image starts mid-row and wraps onto
+    # the next, and the third straddles two rows.
+    return [
+        torch.randn(3, 6 * PATCH, 4 * PATCH),
+        torch.randn(3, 16 * PATCH, 14 * PATCH),
+        torch.randn(3, 2 * PATCH, 16 * PATCH),
+    ]
+
+
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(
         a.float().flatten(), b.float().flatten(), dim=0
@@ -171,15 +182,8 @@ def test_images_pack_into_whole_canvas_rows(tp_group):
 
 
 def test_packed_images_wrap_across_canvas_rows(tp_group):
-    """6 + 56 + 8 merge blocks on 32-block rows: the second image starts mid-row and wraps
-    onto the next, and the third straddles two rows."""
     args = _args()
-    torch.manual_seed(5)
-    images = [
-        torch.randn(3, 6 * PATCH, 4 * PATCH),
-        torch.randn(3, 16 * PATCH, 14 * PATCH),
-        torch.randn(3, 2 * PATCH, 16 * PATCH),
-    ]
+    images = _wrap_images()
 
     with torch.inference_mode():
         expected = _reference(args, images)
@@ -331,14 +335,19 @@ def test_pipeline_matches_upstream_on_spyre(tp_group):
         assert _cosine(got, want) > 0.995
 
 
-@pytest.mark.parametrize("token_budget", [32, 64])
-def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
-    """The three compiled graphs at one bucket, fed the way the manager feeds them."""
+@pytest.mark.parametrize(
+    ("image_set", "token_budget"),
+    [("one-row", 32), ("one-row", 64), ("wrap", 96)],
+    ids=["one-row-32", "one-row-64", "wrap-96"],
+)
+def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, image_set, token_budget):
+    """The three compiled graphs at one bucket, fed the way the manager feeds them; ``wrap``
+    fills three canvas rows with images that cross row ends."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     args = _args()
-    images = _images()
+    images = _images() if image_set == "one-row" else _wrap_images()
     model = _spyre_model(args).to("spyre")
     model.compile_vision_graphs()
 

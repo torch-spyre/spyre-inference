@@ -59,12 +59,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class VisionBuffer:
-    """One encoder input, ``[P]`` or ``[P, width]`` over ``P`` patch slots.
+    """One encoder input: ``[P]`` or ``[P, width]`` over ``P`` patch slots, or with ``shape_at``
+    one whole tensor.
 
     ``pad`` is the value of the slots a budget adds: a scalar, or one ``[width]`` row.
     ``dtype`` is fp16 for activations; integer buffers carry indices (e.g. positions).
     ``shape_at`` marks a buffer that is not per patch (e.g. an image canvas): its full shape at
-    a patch count. A budget copies it into the leading corner of its own and pads the rest.
+    a patch count. ``vision_inputs`` returns it at exactly ``shape_at(P)``; a budget copies it
+    into the leading corner of its own and pads the rest.
     """
 
     width: int | None
@@ -146,7 +148,8 @@ class SpyreVisionEncoderMixin:
 
     # --- 1. What a model provides ---
 
-    # Host inputs by name, each ``[P]`` or ``[P, width]``: fp16 activations or integer indices.
+    # Host inputs by name, each ``[P]``, ``[P, width]`` or ``shape_at(P)``: fp16 activations or
+    # integer indices.
     vision_buffers: dict[str, VisionBuffer]
     # Patches per image token: the merge or pool factor (``M**2``), 1 if none.
     patches_per_token: int
@@ -157,14 +160,16 @@ class SpyreVisionEncoderMixin:
         """Image tokens each item in ``mm_kwargs`` produces, in item order.
 
         Computed on the host from the item shapes. ``sum(tokens) * patches_per_token`` must equal
-        the patch count ``vision_inputs`` returns for the same items.
+        the patch count ``vision_inputs`` returns for the same items, before any trailing padding
+        it adds up to a whole ``vision_patch_multiple``.
         """
         raise NotImplementedError
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Host-side preparation: one unpadded tensor per ``vision_buffers`` key, of its dtype.
 
-        All tensors share one patch count; the mixin pads them to a budget. When
+        The per-patch tensors share one patch count ``P``, and a ``shape_at`` tensor is
+        ``shape_at(P)``; the mixin pads them to a budget. When
         ``vision_project`` merges or pools, lay patches out offset-major (``offset_major``).
         Put everything that depends on values here (patching, position gathers, image ids), so
         the device graphs depend on shapes only.
@@ -333,7 +338,8 @@ class SpyreVisionEncoderMixin:
     ) -> EncoderCudaGraphReplayBuffers:
         """The validated ``vision_inputs`` of one packed batch. Replaces upstream's, whose
         buffers would not match ``vision_buffers``."""
-        return EncoderCudaGraphReplayBuffers(values=dict(self._checked_inputs(mm_kwargs)))
+        values, _ = self._checked_inputs(mm_kwargs)
+        return EncoderCudaGraphReplayBuffers(values=dict(values))
 
     def encoder_cudagraph_forward(
         self, inputs: dict[str, torch.Tensor], path: str = "default"
@@ -370,10 +376,7 @@ class SpyreVisionEncoderMixin:
         Serves ``enforce_eager`` and the profiling run before warmup. Unreached once compiled:
         the manager's startup check makes the largest budget cover every item.
         """
-        values = self._checked_inputs(mm_kwargs)
-        num_patches = next(
-            v.shape[0] for k, v in values.items() if self.vision_buffers[k].shape_at is None
-        )
+        values, num_patches = self._checked_inputs(mm_kwargs)
         padded = self._vision_empty(align_up(num_patches, self.vision_patch_multiple))
         padding = self.get_encoder_cudagraph_config().padding_logics
         for key, src in values.items():
@@ -474,8 +477,9 @@ class SpyreVisionEncoderMixin:
             out[key][:] = buf.pad
         return out
 
-    def _checked_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """``vision_inputs``, validated: every declared key, its declared dtype, one patch count."""
+    def _checked_inputs(self, mm_kwargs: dict[str, Any]) -> tuple[dict[str, torch.Tensor], int]:
+        """``vision_inputs``, validated (every declared key, its declared dtype, one patch count),
+        and that patch count."""
         values = self.vision_inputs(mm_kwargs)
         if set(values) != set(self.vision_buffers):
             raise ValueError(
@@ -497,7 +501,7 @@ class SpyreVisionEncoderMixin:
                     f"vision_inputs returned {key} of shape {tuple(value.shape)}, but "
                     f"{count} patches need {tuple(shape_at(count))}"
                 )
-        return values
+        return values, count
 
 
 def _copy_corner(dst: torch.Tensor, src: torch.Tensor, pad: float | torch.Tensor) -> None:

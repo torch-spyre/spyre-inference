@@ -57,6 +57,7 @@ from spyre_inference.models._vision_encoder import (
 )
 from spyre_inference.multimodal.utils import (
     STICK,
+    align_up,
     linear_weight,
     padded_sdpa,
     rope_perm_matrix,
@@ -269,8 +270,8 @@ class SpyrePixtralForConditionalGeneration(
             seg.append(torch.full((m * m, (hp // m) * (wp // m)), i))
         flat = torch.cat([x.flatten(0, 1) for x in blocks])
         n = flat.shape[0]
-        rows = -(-n // CANVAS_WIDTH)
-        pad = rows * CANVAS_WIDTH - n
+        padded = align_up(n, CANVAS_WIDTH)
+        pad, rows = padded - n, padded // CANVAS_WIDTH
         flat = torch.cat([flat, flat.new_zeros(pad, c, b, b)])
         pos.append(torch.zeros(m * m, pad, dtype=torch.int64))
         seg.append(torch.full((m * m, pad), STICK - 1))

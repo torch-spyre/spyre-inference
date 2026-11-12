@@ -98,6 +98,7 @@ from spyre_inference.v1.worker.encoder_grid import (
 from spyre_inference.v1.worker.kv_cache_setup import (
     allocate_spyre_kv_caches,
     split_attn_groups_by_window,
+    with_kv_sharing_layer_specs,
 )
 from spyre_inference.v1.worker.model_load import (
     fix_padded_model,
@@ -412,8 +413,8 @@ class _SpyreModelWrapper:
         """Move hidden_states onto Spyre for the lm_head custom op.
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
-        `select_rows`), so the tensor handed to compute_logits is on CPU;
+        on CPU (``__call__`` D2Hs the body output), so the tensor handed
+        to compute_logits is on CPU;
         move it onto Spyre for the lm_head matmul. The logits are
         returned on CPU: the head's ``SpyreUnquantizedLMHeadMethod.apply`` keeps them
         on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice
@@ -1122,6 +1123,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return builders
 
     def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        kv_cache_config = with_kv_sharing_layer_specs(kv_cache_config, self.shared_kv_cache_layers)
         super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         self._split_attn_groups_by_layer_window()
 

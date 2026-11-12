@@ -16,8 +16,7 @@
 transformers>=5.16 heterogeneous-config issue) while leaving a real multimodal
 Gemma4Config (populated vision_config/audio_config) alone, so vLLM's own
 Gemma4ForConditionalGeneration can resolve normally. No card needed: this is pure
-EngineArgs/config-object plumbing, mocked at the vllm.transformers_utils.config.get_config
-seam `force_text_backbone` imports locally.
+EngineArgs/config-object plumbing, with the checkpoint config stubbed.
 """
 
 from types import SimpleNamespace
@@ -50,26 +49,17 @@ def _engine_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _patch_get_config(monkeypatch, hf_config):
-    monkeypatch.setattr(
-        "vllm.transformers_utils.config.get_config",
-        lambda *args, **kwargs: hf_config,
-    )
-
-
 @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text"])
-def test_force_text_backbone_applies_for_pure_text_checkpoint(monkeypatch, model_type):
+def test_force_text_backbone_applies_for_pure_text_checkpoint(model_type):
     """A plain text checkpoint (no vision_config/audio_config) still gets the fix."""
     hf_config = SimpleNamespace(model_type=model_type, vision_config=None, audio_config=None)
-    _patch_get_config(monkeypatch, hf_config)
-
     engine_args = _engine_args()
-    force_text_backbone(engine_args)
+    force_text_backbone(engine_args, hf_config)
 
     assert engine_args.hf_overrides == GEMMA4_TEXT_BACKBONE_OVERRIDE
 
 
-def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeypatch):
+def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config():
     """A vision checkpoint must keep its architectures -- forcing the text backbone would
     strip the tower. It needs no override at all: the head-dim repair runs from the
     platform hook."""
@@ -78,15 +68,13 @@ def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeyp
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
         audio_config=None,
     )
-    _patch_get_config(monkeypatch, hf_config)
-
     engine_args = _engine_args()
-    force_text_backbone(engine_args)
+    force_text_backbone(engine_args, hf_config)
 
     assert engine_args.hf_overrides is None
 
 
-def test_audio_only_checkpoint_is_rejected(monkeypatch):
+def test_audio_only_checkpoint_is_rejected():
     """Falling through to the text backbone would silently drop the tower, leaving a
     model that looks fine but ignores its audio inputs."""
     hf_config = SimpleNamespace(
@@ -94,23 +82,19 @@ def test_audio_only_checkpoint_is_rejected(monkeypatch):
         vision_config=None,
         audio_config=SimpleNamespace(model_type="gemma4_audio"),
     )
-    _patch_get_config(monkeypatch, hf_config)
-
     with pytest.raises(NotImplementedError, match="audio is not supported"):
-        force_text_backbone(_engine_args())
+        force_text_backbone(_engine_args(), hf_config)
 
 
-def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch):
+def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path():
     """Both towers present: the vision path still works, so it loads, with audio refused."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
         audio_config=SimpleNamespace(model_type="gemma4_audio"),
     )
-    _patch_get_config(monkeypatch, hf_config)
-
     engine_args = _engine_args(limit_mm_per_prompt={"image": 2})
-    force_text_backbone(engine_args)
+    force_text_backbone(engine_args, hf_config)
 
     assert engine_args.hf_overrides is None
     assert engine_args.limit_mm_per_prompt == {"image": 2, "video": 0, "audio": 0}
@@ -118,44 +102,38 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
 
 # A dict without "count" takes vLLM's default of 999, so it enables the modality too.
 @pytest.mark.parametrize("limit", [1, {"count": 2}, {}])
-def test_an_explicit_audio_limit_fails_at_startup(monkeypatch, limit):
+def test_an_explicit_audio_limit_fails_at_startup(limit):
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
         audio_config=SimpleNamespace(model_type="gemma4_audio"),
     )
-    _patch_get_config(monkeypatch, hf_config)
-
     with pytest.raises(NotImplementedError, match="audio input is not supported"):
-        force_text_backbone(_engine_args(limit_mm_per_prompt={"audio": limit}))
+        force_text_backbone(_engine_args(limit_mm_per_prompt={"audio": limit}), hf_config)
 
 
-def test_vision_checkpoint_refuses_video_per_request(monkeypatch):
+def test_vision_checkpoint_refuses_video_per_request():
     """Capped at 0, so the frontend rejects a video request instead of the worker crashing."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
         audio_config=None,
     )
-    _patch_get_config(monkeypatch, hf_config)
-
     engine_args = _engine_args()
-    force_text_backbone(engine_args)
+    force_text_backbone(engine_args, hf_config)
 
     assert engine_args.limit_mm_per_prompt == {"video": 0}
 
 
 @pytest.mark.parametrize("limit", [1, {"count": 2}, {"num_frames": 32, "width": 512}])
-def test_an_explicit_video_limit_fails_at_startup(monkeypatch, limit):
+def test_an_explicit_video_limit_fails_at_startup(limit):
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
         audio_config=None,
     )
-    _patch_get_config(monkeypatch, hf_config)
-
     with pytest.raises(NotImplementedError, match="video input is not supported"):
-        force_text_backbone(_engine_args(limit_mm_per_prompt={"video": limit}))
+        force_text_backbone(_engine_args(limit_mm_per_prompt={"video": limit}), hf_config)
 
 
 def test_repair_head_dim_access_reaches_the_nested_text_config():
@@ -182,12 +160,10 @@ def test_repair_head_dim_access_ignores_an_unrelated_config():
     assert not hasattr(config, "allow_global_per_layer_attribute_access")
 
 
-def test_force_text_backbone_ignores_unrelated_model_type(monkeypatch):
+def test_force_text_backbone_ignores_unrelated_model_type():
     hf_config = SimpleNamespace(model_type="llama", vision_config=None, audio_config=None)
-    _patch_get_config(monkeypatch, hf_config)
-
     engine_args = _engine_args()
-    force_text_backbone(engine_args)
+    force_text_backbone(engine_args, hf_config)
 
     assert engine_args.hf_overrides is None
 
@@ -235,23 +211,19 @@ def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
     )
 
 
-def test_force_text_backbone_respects_user_supplied_hf_overrides(monkeypatch):
-    """Skipped entirely (not even a get_config call) when the user already set
-    hf_overrides. Safe because the head-dim repair no longer rides on this override:
-    `repair_head_dim_access` runs from the platform hook, so a user override -- a dict
-    such as GEMMA4_TEXT_BACKBONE_OVERRIDE included -- still gets it.
+def test_force_text_backbone_respects_user_supplied_hf_overrides():
+    """A user's hf_overrides wins over the text-backbone default. Safe because the head-dim
+    repair no longer rides on this override: `repair_head_dim_access` runs from the
+    platform hook, so a user override -- a dict such as GEMMA4_TEXT_BACKBONE_OVERRIDE
+    included -- still gets it.
     """
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("get_config should not be called when hf_overrides is already set")
-
-    monkeypatch.setattr("vllm.transformers_utils.config.get_config", _boom)
+    hf_config = SimpleNamespace(model_type="gemma4_text", vision_config=None, audio_config=None)
 
     def _user_override(config):
         return config
 
     engine_args = _engine_args(hf_overrides=_user_override)
-    force_text_backbone(engine_args)
+    force_text_backbone(engine_args, hf_config)
 
     assert engine_args.hf_overrides is _user_override
 
@@ -282,12 +254,15 @@ def test_moe_checkpoint_without_experts_raises(monkeypatch, flag, raises):
     """Either flag makes upstream build the MoE block, so either has to trip the check
     when no layer exposes `experts`; a dense checkpoint configures none and is fine."""
     from torch import nn
-    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4SelfDecoderLayers
 
     def parent_init(self, *, vllm_config, prefix=""):
         nn.Module.__init__(self)
         self.config = SimpleNamespace(**({flag: True} if flag else {}))
-        self.model = SimpleNamespace(layers=[SimpleNamespace(experts=None)])
+        decoder = Gemma4SelfDecoderLayers.__new__(Gemma4SelfDecoderLayers)
+        nn.Module.__init__(decoder)
+        decoder.embed_tokens_per_layer = None
+        self.model = SimpleNamespace(self_decoder=decoder, layers=[SimpleNamespace(experts=None)])
 
     monkeypatch.setattr(Gemma4ForCausalLM, "__init__", parent_init)
     if raises:

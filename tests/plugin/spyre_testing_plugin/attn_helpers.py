@@ -87,9 +87,8 @@ def _build_metadata(
     sliding_window: int | None = None,
     model_num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
-    builder_cls: type[SpyreAttentionMetadataBuilder] = SpyreAttentionMetadataBuilder,
 ):
-    """Use the real SpyreAttentionMetadataBuilder (or ``builder_cls``) to construct metadata.
+    """Use the real SpyreAttentionMetadataBuilder to construct metadata.
 
     ``model_num_kv_heads`` is what ``model_config.get_num_kv_heads()`` reports, for
     the per-layer-head-count models where that differs from the spec's; it defaults
@@ -125,7 +124,7 @@ def _build_metadata(
             dtype=dtype,
         )
 
-    builder = builder_cls(
+    builder = SpyreAttentionMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,
@@ -265,7 +264,8 @@ def ref_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables_np[i, :num_kv_blocks]
 
-        # Pages are token-major, so dim 0 of the concat is the token axis.
+        # ref_attn takes [num_blocks, block_size, KV, D] pages, so dim 0 of the concat is
+        # the token axis.
         k_blocks = [key_cache[idx] for idx in block_indices]
         v_blocks = [value_cache[idx] for idx in block_indices]
         k = torch.cat(k_blocks, dim=0)[:kv_len]  # [kv_len, num_kv_heads, head_size]

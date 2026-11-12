@@ -31,9 +31,10 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 
 ## Gemma-4: text-only use of a vision checkpoint
 
-Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
-`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and build a vision
-tower — weights to load and graphs to warm up that a text-only workload never runs.
+Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B`,
+`google/gemma-4-26B-A4B`, `google/gemma-4-E2B` and `google/gemma-4-E4B` load as
+`Gemma4ForConditionalGeneration` and build a vision tower — weights to load and graphs to
+warm up that a text-only workload never runs.
 
 To use one of those repositories for text only, pin its decoder architecture:
 
@@ -257,15 +258,14 @@ num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
 `SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
 less warmup.
 
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
-default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), warmup
+records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
-#### Head-major: one per-sequence kernel for every page count
+#### One per-sequence kernel for every page count
 
-On the head-major layout the per-sequence kernels do not bucket the KV axis: they compile once
+The per-sequence kernels do not bucket the KV axis: they compile once
 per query bucket and walk each sequence's own page count, from two pages (a one-page sequence
 walks a masked repeat) up to `--max-model-len`. The page table and mask stack are moved with
 torch-spyre's `tensor.to("spyre", dynamic=...)`. The KV buckets above still apply, and warmup
@@ -312,8 +312,7 @@ each cached token takes:
 vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
-It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
 ...) are rejected at startup. Since the KV cache is sized from free device memory (see
 [KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
 Attention still computes in the model dtype: pages are dequantized on read with the

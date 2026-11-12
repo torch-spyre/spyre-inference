@@ -149,7 +149,7 @@ def pad_row_count_to_bucket(row_indices: torch.Tensor) -> tuple[torch.Tensor, in
 
 
 def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
-    """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
+    """Row gather via ``index_select``.
 
     ``row_indices`` may be 1-D (CLS/LAST, unpack) or ``[B, L]`` (pack), on CPU
     or already on ``hidden_states.device``. Spyre has no int64 index kernel.
@@ -159,12 +159,11 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
     if device.type != "spyre":
         return torch.index_select(hidden_states, 0, flat_idx.to(device=device, dtype=torch.long))
 
-    source = hidden_states.clone() if hidden_states.storage_offset() != 0 else hidden_states
     # A one-row gather lowers to an identity op dbo-opt cannot schedule.
     if hidden_states.shape[0] == 1 and flat_idx.numel() == 1:
-        return source
+        return hidden_states.clone() if hidden_states.storage_offset() != 0 else hidden_states
     indices = convert(flat_idx.to(torch.int32), device)
-    return torch.index_select(source, 0, indices)
+    return torch.index_select(hidden_states, 0, indices)
 
 
 class SpyreCLSPool(CLSPool):

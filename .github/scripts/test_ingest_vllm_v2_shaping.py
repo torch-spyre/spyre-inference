@@ -466,3 +466,31 @@ def test_the_leg_artifact_carries_the_ci_tags(mod, monkeypatch):
         ("spyre-inference@abc123def456", "main")
     ]
     assert (seen["event"], seen["branch"], seen["sha"]) == ("push", "main", "abc123def4567890")
+
+
+# --- parallel perf legs sharing one run_id -------------------------------------------------
+
+
+def test_a_keyed_leg_dedups_on_its_own_key(mod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mod, "write_benchmarks", lambda *a, **k: calls.append(k))
+
+    mod._write_v2_benchmarks(_Client(), "v2", [_flat()], _RUN, "org-m-tp4")
+    mod._write_v2_benchmarks(_Client(), "v2", [_flat()], _RUN)
+
+    assert calls == [{"row_props": {"upload_id": "org-m-tp4"}, "append": True}, {}]
+
+
+@pytest.mark.parametrize(
+    ("leg_key", "state", "supersede"),
+    [("org-m-tp4", "failed", True), ("org-m-tp4", "passed", False), ("", "failed", False)],
+)
+def test_only_a_failed_keyed_leg_supersedes_the_verdict(
+    mod, monkeypatch, leg_key, state, supersede
+):
+    seen = {}
+    monkeypatch.setattr(mod, "insert_artifact_result", lambda *a, **k: seen.update(k) or True)
+
+    _artifact_write(mod, [_flat()], monkeypatch, state=state, leg_key=leg_key)
+
+    assert seen["supersede"] is supersede

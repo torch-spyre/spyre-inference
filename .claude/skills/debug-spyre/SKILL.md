@@ -329,7 +329,7 @@ When you see odd code in this repo, it usually exists because of one of these. B
 
 | Limitation | How code in this repo works around it |
 |---|---|
-| Indexed reads/writes lower only in specific forms | Gathers go through `index_select` with a stick-aligned int32 index, writes through `index_copy_` in a compiled graph (eager `index_copy_` falls back to CPU), and an indexed tensor is placed with the indexed dim outermost (`place_row_gathered`, `slot_major_kv_layout`); boolean-mask `index_put` is replaced by host scatter + `torch.where` |
+| Indexed reads/writes lower only in specific forms | Gathers go through `index_select` with a stick-aligned int32 index, writes through `index_copy_` in a compiled graph (eager `index_copy_` falls back to CPU), and an indexed tensor is placed with the indexed dim outermost (`place_row_gathered`, `head_major_kv_layout`); boolean-mask `index_put` is replaced by host scatter + `torch.where` |
 | No in-device transpose + contiguous | Compute permutations on CPU where possible, or interleave `transpose + contiguous` against ops that tolerate non-contiguous inputs |
 | No simultaneous dtype + device conversion | `custom_ops/utils.py::convert` does the dtype change on CPU first, then moves to Spyre |
 | `torch.compile` recompiles on shape change | Modules pre-align inputs to fixed bucket sizes (e.g. KV-length alignment, query-chunk size) so the same compiled kernel is reused |

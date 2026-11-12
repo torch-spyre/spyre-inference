@@ -59,8 +59,53 @@ jobs:
         id: label
         uses: ./.github/actions/detect-integration-test-label
 
+  # Fails fast when a PR commit is not signed+verified: main's ruleset rejects such a PR
+  # anyway, and re-signing rewrites every SHA and re-runs the whole matrix, so the Spyre
+  # runs before the fix are wasted. PR-only: merge_group/push commits are signed by GitHub.
+  # Fails OPEN whenever the answer is inconclusive (API error, GitHub's verifier down, PR
+  # past the endpoint's 250-commit cap) -- the ruleset still enforces signatures at merge.
+  signed-commits:
+    name: Check commits are signed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check commit signatures
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          NUM_COMMITS: ${{ github.event.pull_request.commits }}
+        run: |
+          set -uo pipefail
+          if [ "$NUM_COMMITS" -gt 250 ]; then
+            echo "::warning::PR has ${NUM_COMMITS} commits, more than the API lists -- skipping the signature check"
+            exit 0
+          fi
+          if ! unverified=$(gh api --paginate "repos/${REPO}/pulls/${PR}/commits" \
+                 --jq '.[] | select(.commit.verification.verified | not) | "\(.sha[:12]) \(.commit.verification.reason)"'); then
+            echo "::warning::could not list PR commits -- skipping the signature check"
+            exit 0
+          fi
+          # gpgverify_error/unavailable mean GitHub's verifier failed, not the signature.
+          unsigned=$(grep -Ev ' gpgverify_(error|unavailable)$' <<<"$unverified")
+          if [ -n "$unsigned" ]; then
+            echo "::error::unsigned or unverified commits (main requires signed commits):"
+            echo "$unsigned"
+            echo "Re-sign with 'git commit --amend -s -S --no-edit' (or 'git rebase -S') and force-push."
+            exit 1
+          fi
+          if [ -n "$unverified" ]; then
+            echo "::warning::GitHub could not verify some signatures right now -- not blocking:"
+            echo "$unverified"
+            exit 0
+          fi
+          echo "all PR commits are signed and verified"
+
   test:
-    needs: detect-label
+    needs: [detect-label, signed-commits]
     if: needs.detect-label.outputs.labeled != 'true'
     uses: ./.github/workflows/_test_matrix.yaml
     secrets: inherit
@@ -81,7 +126,7 @@ jobs:
   run-spyre-unit-tests:
     name: run spyre unit tests
     runs-on: ubuntu-latest
-    needs: [detect-label, test]
+    needs: [detect-label, signed-commits, test]
     # Never gated on the label: a skipped REQUIRED check is reported as MISSING rather
     # than green, which blocks the merge-queue entry outright.
     if: always()
@@ -89,6 +134,7 @@ jobs:
       - name: Check all suites passed
         run: |-
           if ${{ contains(needs.detect-label.result, 'failure') || contains(needs.detect-label.result, 'cancelled') ||
+                 contains(needs.signed-commits.result, 'failure') || contains(needs.signed-commits.result, 'cancelled') ||
                  contains(needs.test.result, 'failure') || contains(needs.test.result, 'cancelled') }}; then
             echo "One or more test suites failed."
             exit 1

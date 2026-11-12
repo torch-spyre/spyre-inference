@@ -424,6 +424,12 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         model_config = vllm_config.model_config
         model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Upstream allocates the PLE cache (E2B/E4B) on the host as a plain attribute, which
+        # does not follow the model to Spyre; a buffer does.
+        ple = getattr(self, "per_layer_embeddings", None)
+        if ple is not None:
+            del self.per_layer_embeddings
+            self.register_buffer("per_layer_embeddings", ple, persistent=False)
         self._init_spyre_vision()
 
     def _init_spyre_vision(self) -> None:

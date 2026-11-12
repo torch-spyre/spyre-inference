@@ -225,21 +225,21 @@ def _report(minutes):
 def test_no_comment_below_threshold_without_a_previous_one(monkeypatch):
     calls = _fake_gh(monkeypatch, [])
     r = _report(0.5)
-    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r)
+    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r.over)
     assert all("POST" not in c and "PATCH" not in c for c in calls)
 
 
 def test_posts_once_then_edits_in_place(monkeypatch):
     calls = _fake_gh(monkeypatch, [])
     r = _report(10)
-    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r)
+    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r.over)
     assert any("POST" in c and "/repos/o/r/issues/7/comments" in c for c in calls)
 
     mine = {"id": 99, "user": {"login": ctr.BOT_LOGIN}, "body": ctr.MARKER + "\nold"}
     spoof = {"id": 5, "user": {"login": "someone"}, "body": ctr.MARKER}
     calls = _fake_gh(monkeypatch, [spoof, mine])
     r = _report(0.5)  # back under: still edits the existing comment
-    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r)
+    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r.over)
     assert any("PATCH" in c and "/repos/o/r/issues/comments/99" in c for c in calls)
 
 
@@ -515,7 +515,7 @@ def test_a_failed_comment_write_logs_no_body(monkeypatch, capsys):
     r = _report(10)
     body = ctr.render_comment(r).replace("tests/c.py::t", "tests/c.py::t[##[error]evil]")
     try:
-        ctr.upsert_comment("o/r", 7, body, r)
+        ctr.upsert_comment("o/r", 7, body, r.over)
     except SystemExit as e:
         assert e.code == 1
     else:
@@ -587,3 +587,43 @@ def test_a_base_branch_rename_is_neither_charged_nor_credited():
     pr = _pr({**_baseline(), "tests/shared.py::test_new_name": 900.0, "tests/c.py::test_pr": 600.0})
     r = ctr.compute(pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/shared.py"})
     assert r.removed == {} and r.net_s == 600.0
+
+
+def _skip_run(monkeypatch, comments):
+    run = {
+        "path": f".github/workflows/{ctr.WORKFLOW}",
+        "repository": {"full_name": "o/r"},
+        "head_sha": "h",
+        "html_url": "https://x/runs/1",
+    }
+    pr = {"number": 7, "head": {"sha": "h"}}
+    monkeypatch.setattr(ctr, "find_pr", lambda repo, r: pr)
+    monkeypatch.setattr(ctr, "build_report", lambda repo, r, p: "a leg uploaded no JUnit report")
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    calls = _fake_gh(monkeypatch, comments)
+
+    def gh(path, **kw):
+        return run if "/actions/runs/" in path else [comments]
+
+    monkeypatch.setattr(ctr, "gh_json", gh)
+    args = type(
+        "A", (), {"repo": "o/r", "run_id": 1, "post": True, "json": "", "summary_file": ""}
+    )()
+    ctr.cmd_report(args)
+    return calls
+
+
+def test_a_skipped_report_rewrites_an_earlier_comment(monkeypatch):
+    mine = {"id": 99, "user": {"login": ctr.BOT_LOGIN}, "body": ctr.MARKER + "\nplease confirm"}
+    calls = _skip_run(monkeypatch, [mine])
+    assert any("PATCH" in c and "/repos/o/r/issues/comments/99" in c for c in calls)
+
+
+def test_a_skipped_report_posts_nothing_new(monkeypatch):
+    calls = _skip_run(monkeypatch, [])
+    assert all("POST" not in c and "PATCH" not in c for c in calls)
+
+
+def test_the_skip_note_names_the_reason():
+    body = ctr.render_skipped("2 regression legs uploaded no JUnit report", "https://x/runs/1")
+    assert body.startswith(ctr.MARKER + "\n") and "2 regression legs" in body and "PR run" in body

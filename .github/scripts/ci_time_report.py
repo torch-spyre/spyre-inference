@@ -372,6 +372,14 @@ def render_comment(report: Report, pr_run_url: str = "", summary_url: str = "") 
     return "\n".join(lines) + "\n"
 
 
+def render_skipped(reason: str, pr_run_url: str = "") -> str:
+    link = f" ([PR run]({pr_run_url}))" if pr_run_url else ""
+    return (
+        f"{MARKER}\nUpdate: the CI time report for the latest run{link} was skipped: {reason}. "
+        "The numbers posted earlier may no longer apply; the next green run reports again.\n"
+    )
+
+
 def render_summary(report: Report, run_url: str = "") -> str:
     lines = ["## CI time report", "", _headline(report)]
     verdict = "above: the PR gets a comment" if report.over else "below: no new comment"
@@ -645,9 +653,10 @@ def find_comment(repo: str, number: int) -> dict | None:
     return None
 
 
-def upsert_comment(repo: str, number: int, body: str, report: Report) -> None:
+def upsert_comment(repo: str, number: int, body: str, create: bool) -> None:
+    """Edit the bot's comment, or post one when create is set."""
     existing = find_comment(repo, number)
-    if existing is None and not report.over:
+    if existing is None and not create:
         return
     if existing is not None:
         cmd = ["gh", "api", "-X", "PATCH", f"/repos/{repo}/issues/comments/{existing['id']}"]
@@ -711,6 +720,11 @@ def cmd_report(args) -> None:
     report = build_report(repo, run, pr)
     if isinstance(report, str):
         publish(args, f"{note}## CI time report\n\nSkipped: {report}.\n")
+        if args.post:
+            # Don't leave an earlier "please confirm" standing for numbers that may be gone.
+            upsert_comment(
+                repo, pr["number"], render_skipped(report, run.get("html_url", "")), False
+            )
         return
     publish(args, note + render_summary(report, run.get("html_url", "")), _headline(report))
     if args.json:
@@ -736,7 +750,7 @@ def cmd_report(args) -> None:
             server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
             summary_url = f"{server}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
         body = render_comment(report, run.get("html_url", ""), summary_url)
-        upsert_comment(repo, pr["number"], body, report)
+        upsert_comment(repo, pr["number"], body, create=report.over)
 
 
 def cmd_replay(args) -> None:

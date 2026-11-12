@@ -90,6 +90,11 @@ from pathlib import Path
 # credentials of its own, say) can fetch per artifact rather than the whole table.
 _TRACES = "spyre-inference/vllm-bench-data/converted_traces/2025.11.03_e2ee1b0_reordered"
 
+# Power workloads (RAG, entity-extraction emails, embedding queries, Oracle
+# invoices). The Oracle jsonl names its images by host-absolute path, so the
+# Oracle_images/ tree must be fetched or mounted separately.
+_POWER = "spyre-inference/datasets/power"
+
 ARTIFACTS = {
     "SPYRE_AIOPS_DATASET": {
         "path": f"{_TRACES}/aiops_results_2025.11.03_e2ee1b0_correct_order.jsonl",
@@ -142,6 +147,22 @@ ARTIFACTS = {
     "SPYRE_TLS_DATASET": {
         "path": f"{_TRACES}/tls_results_2025.11.03_e2ee1b0_correct_order.jsonl",
         "sha256": "9b1cc4d35e3626d1a6bbe0f998caa039b70d694241f25835a2083e1854e14028",
+    },
+    "SPYRE_RAG_DATASET": {
+        "path": f"{_POWER}/RAG_16_prompts.jsonl",
+        "sha256": "ef98b6f7565613d5f5e96b40c7bfeafffc8287453de6925ef3394c32af77eff4",
+    },
+    "SPYRE_EE_EMAILS_DATASET": {
+        "path": f"{_POWER}/EE_32emails_2k.jsonl",
+        "sha256": "15eab95a9af3b8ede2291b81b43adcb991eada1b93c6c09eaff7ef92d3613333",
+    },
+    "SPYRE_QUESTIONS_100K_DATASET": {
+        "path": f"{_POWER}/questions_100K.jsonl",
+        "sha256": "08d267278fd7b4a217dbbc68fbafdfd0596ca4da0e41a587cad53bdc995a5e00",
+    },
+    "SPYRE_ORACLE_VISION_DATASET": {
+        "path": f"{_POWER}/Oracle_images/10_invoice_images.jsonl",
+        "sha256": "d43ab0f67782d374afc34236fa153a04cfe2e518133d04bc071cd2787dcf124f",
     },
 }
 

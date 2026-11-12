@@ -611,25 +611,17 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
     def vision_embed_text(
         self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
     ) -> torch.Tensor:
-        # Upstream masks the image ids with an eager bool `where`, which does not lower on
-        # Spyre; an integer mask inside one graph does.
-        if self.per_layer_embeddings is None or is_multimodal is None:
-            return super().vision_embed_text(input_ids, is_multimodal)
-        if is_multimodal.any():
+        # Upstream masks the image ids for the PLE lookup with an eager bool `where`, which
+        # does not lower on Spyre; mask them here in one graph and hand upstream text only.
+        # The merge overwrites the image rows, so their token-0 text embedding never shows.
+        if (
+            self.per_layer_embeddings is not None
+            and is_multimodal is not None
+            and is_multimodal.any()
+        ):
             mask = convert(is_multimodal, device=input_ids.device, dtype=input_ids.dtype)
-            ple_input_ids = _ids_outside_mask(input_ids, mask)
-        else:
-            ple_input_ids = input_ids
-        per_layer_inputs = cast(
-            torch.Tensor, self.language_model.model.get_per_layer_inputs(ple_input_ids)
-        )
-        text_config = self.config.text_config
-        per_layer_inputs = per_layer_inputs.reshape(
-            -1, text_config.num_hidden_layers, text_config.hidden_size_per_layer_input
-        )
-        self.per_layer_embeddings[: per_layer_inputs.shape[0]].copy_(per_layer_inputs)
-        # Image ids are in the text vocabulary, and the merge overwrites their rows.
-        return self.get_language_model().embed_input_ids(input_ids)
+            input_ids = _ids_outside_mask(input_ids, mask)
+        return super().vision_embed_text(input_ids, None)
 
 
 @torch.compile(backend="inductor", fullgraph=True, dynamic=False)

@@ -165,6 +165,20 @@ def test_topk_filter_matches_pytorch(rows: int, vocab: int, ties: str) -> None:
     assert torch.equal(apply_top_k_top_p_kernels(x.clone(), k, None), expected)
 
 
+def test_topk_keeps_a_zero_tie_when_denormals_flush() -> None:
+    """nextafter(0, -inf) is a denormal. DAZ must not drop the k-th tie at 0."""
+    x = torch.tensor([[3.0, 2.0, 1.0, 0.0, -5.0, -5.0, -5.0, -5.0]])
+    k = torch.tensor([4], dtype=torch.int32)
+    previous = torch.set_flush_denormal(True)
+    try:
+        expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
+        actual = apply_top_k_top_p_kernels(x.clone(), k, None)
+    finally:
+        torch.set_flush_denormal(bool(previous))
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual[0, :4] > float("-inf"), torch.tensor([True, True, True, True]))
+
+
 # Top-p over the top-k survivors: the same kept values as the full sort. When a
 # tie straddles the top-p cut, which tied token survives is arbitrary there.
 @pytest.mark.parametrize("ties", ["none", "fp16", "wide", "masked"])

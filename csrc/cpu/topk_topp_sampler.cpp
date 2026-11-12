@@ -302,25 +302,31 @@ __attribute__((always_inline)) static inline int count_within_tol(
   return n;
 }
 
+// kInclusive keeps threshold itself. Top-k needs that: nextafter(kth, -inf) is
+// a denormal when kth is 0, and a DAZ compare then treats it as zero and drops
+// the tie. The other callers want a strict cut.
+template <bool kInclusive = false>
 __attribute__((always_inline)) static inline void mask_write_below(
     float* row, int V, float threshold, float fill) {
   int i = 0;
 #if defined(__AVX512F__)
+  constexpr int kCmp = kInclusive ? _CMP_GE_OQ : _CMP_GT_OQ;
   const vec_op::FP32Vec16 cutoff16(threshold);
   const vec_op::FP32Vec16 f16(fill);
   for (; i + 16 <= V; i += 16) {
     vec_op::FP32Vec16 v16(row + i);
-    __mmask16 keep = _mm512_cmp_ps_mask(v16.reg, cutoff16.reg, _CMP_GT_OQ);
+    __mmask16 keep = _mm512_cmp_ps_mask(v16.reg, cutoff16.reg, kCmp);
     vec_op::FP32Vec16(_mm512_mask_blend_ps(keep, f16.reg, v16.reg))
         .save(row + i);
   }
 #elif defined(__AVX2__)
+  constexpr int kCmp = kInclusive ? _CMP_GE_OQ : _CMP_GT_OQ;
   const vec_op::FP32Vec16 cutoff16(threshold);
   const vec_op::FP32Vec16 f16(fill);
   for (; i + 16 <= V; i += 16) {
     vec_op::FP32Vec16 v16(row + i);
-    __m256 klo = _mm256_cmp_ps(v16.reg_low, cutoff16.reg_low, _CMP_GT_OQ);
-    __m256 khi = _mm256_cmp_ps(v16.reg_high, cutoff16.reg_high, _CMP_GT_OQ);
+    __m256 klo = _mm256_cmp_ps(v16.reg_low, cutoff16.reg_low, kCmp);
+    __m256 khi = _mm256_cmp_ps(v16.reg_high, cutoff16.reg_high, kCmp);
     vec_op::FP32Vec16(_mm256_blendv_ps(f16.reg_low, v16.reg_low, klo),
                       _mm256_blendv_ps(f16.reg_high, v16.reg_high, khi))
         .save(row + i);
@@ -331,12 +337,17 @@ __attribute__((always_inline)) static inline void mask_write_below(
   for (; i + 16 <= V; i += 16) {
     for (int r = 0; r < 4; ++r) {
       const vf32 v = vec_xl(0, row + i + 4 * r);
-      vec_xst(vec_sel(fv, v, vec_cmpgt(v, cutoff)), 0, row + i + 4 * r);
+      const auto keep =
+          kInclusive ? vec_cmpge(v, cutoff) : vec_cmpgt(v, cutoff);
+      vec_xst(vec_sel(fv, v, keep), 0, row + i + 4 * r);
     }
   }
 #endif
-  for (; i < V; ++i)
-    if (!(row[i] > threshold)) row[i] = fill;
+  for (; i < V; ++i) {
+    const bool drop =
+        kInclusive ? !(row[i] >= threshold) : !(row[i] > threshold);
+    if (drop) row[i] = fill;
+  }
 }
 
 // Vectorised max/min/finite-count over row[0..V). PAD lanes (<= pad_sentinel)
@@ -416,42 +427,52 @@ __attribute__((always_inline)) static inline void vec_max_min_with_pad_blend(
 }
 
 // Whether any of buf[0..16) exceeds threshold.
+template <bool kInclusive = false>
 __attribute__((always_inline)) static inline bool any_above16(const float* buf,
                                                               float threshold) {
 #if defined(__AVX512F__)
+  constexpr int kCmp = kInclusive ? _CMP_GE_OQ : _CMP_GT_OQ;
   return _mm512_cmp_ps_mask(_mm512_loadu_ps(buf), _mm512_set1_ps(threshold),
-                            _CMP_GT_OQ) != 0;
+                            kCmp) != 0;
 #elif defined(__AVX2__)
+  constexpr int kCmp = kInclusive ? _CMP_GE_OQ : _CMP_GT_OQ;
   const __m256 cutoff = _mm256_set1_ps(threshold);
-  const __m256 lo = _mm256_cmp_ps(_mm256_loadu_ps(buf), cutoff, _CMP_GT_OQ);
-  const __m256 hi = _mm256_cmp_ps(_mm256_loadu_ps(buf + 8), cutoff, _CMP_GT_OQ);
+  const __m256 lo = _mm256_cmp_ps(_mm256_loadu_ps(buf), cutoff, kCmp);
+  const __m256 hi = _mm256_cmp_ps(_mm256_loadu_ps(buf + 8), cutoff, kCmp);
   return _mm256_movemask_ps(_mm256_or_ps(lo, hi)) != 0;
 #elif defined(__powerpc__) || defined(__s390x__)
   const vf32 cutoff = vec_splats(threshold);
-  return vec_any_gt(vec_xl(0, buf), cutoff) ||
-         vec_any_gt(vec_xl(16, buf), cutoff) ||
-         vec_any_gt(vec_xl(32, buf), cutoff) ||
-         vec_any_gt(vec_xl(48, buf), cutoff);
+  if constexpr (kInclusive) {
+    return vec_any_ge(vec_xl(0, buf), cutoff) ||
+           vec_any_ge(vec_xl(16, buf), cutoff) ||
+           vec_any_ge(vec_xl(32, buf), cutoff) ||
+           vec_any_ge(vec_xl(48, buf), cutoff);
+  } else {
+    return vec_any_gt(vec_xl(0, buf), cutoff) ||
+           vec_any_gt(vec_xl(16, buf), cutoff) ||
+           vec_any_gt(vec_xl(32, buf), cutoff) ||
+           vec_any_gt(vec_xl(48, buf), cutoff);
+  }
 #else
   for (int r = 0; r < 16; ++r)
-    if (buf[r] > threshold) return true;
+    if (kInclusive ? buf[r] >= threshold : buf[r] > threshold) return true;
   return false;
 #endif
 }
 
 // Calls f(i, buf[i]) for each buf[i] > threshold, in order. Spyre: skips
 // 16-wide chunks with none, since the callers keep a small fraction.
-template <typename F>
+template <bool kInclusive = false, typename F>
 __attribute__((always_inline)) static inline void for_each_above(
     const float* buf, int n, float threshold, F&& f) {
   int j = 0;
   for (; j + 16 <= n; j += 16) {
-    if (!any_above16(buf + j, threshold)) continue;
+    if (!any_above16<kInclusive>(buf + j, threshold)) continue;
     for (int r = j; r < j + 16; ++r)
-      if (buf[r] > threshold) f(r, buf[r]);
+      if (kInclusive ? buf[r] >= threshold : buf[r] > threshold) f(r, buf[r]);
   }
   for (; j < n; ++j)
-    if (buf[j] > threshold) f(j, buf[j]);
+    if (kInclusive ? buf[j] >= threshold : buf[j] > threshold) f(j, buf[j]);
 }
 
 __attribute__((always_inline)) static inline int gather_outliers(
@@ -904,8 +925,8 @@ static void top_k_row(float* __restrict__ row, int V, int k_val,
   const float neg_inf = -std::numeric_limits<float>::infinity();
   const float kth = top_k_threshold(row, V, k_val, st, outlier_buf, scratch);
   if (kth == neg_inf) return;
-  // v >= kth is v > its predecessor.
-  mask_write_below(row, V, std::nextafter(kth, neg_inf), neg_inf);
+  // Keep the tie at kth. A predecessor compare is a denormal when kth is 0.
+  mask_write_below<true>(row, V, kth, neg_inf);
 }
 
 SPYRE_AVX2_FMA
@@ -928,15 +949,23 @@ static void top_k_p_row(float* __restrict__ row, int V, int k_val, float p_val,
   const float neg_inf = -std::numeric_limits<float>::infinity();
   RowStats st;
   compute_row_stats(row, V, &st);
-  // v >= kth is v > its predecessor; with no cut, every v > -inf survives.
-  const float below_kth = std::nextafter(
-      top_k_threshold(row, V, k_val, st, outlier_buf, scratch), neg_inf);
-  mask_write_below(row, V, below_kth, neg_inf);
+  const float kth =
+      top_k_threshold(row, V, k_val, st, outlier_buf, scratch);
+  // Keep v >= kth. nextafter(kth, -inf) is a denormal at 0, and DAZ drops it.
+  if (kth != neg_inf) mask_write_below<true>(row, V, kth, neg_inf);
+  // Mixed batches pass p = 1 for a top-k-only row. Collecting survivors first
+  // is a second pass over V.
+  if (p_val >= 1.0f) return;
   survivors.clear();
-  for_each_above(row, V, below_kth,
-                 [&](int i, float v) { survivors.emplace_back(v, i); });
+  if (kth == neg_inf) {
+    for_each_above(row, V, neg_inf,
+                   [&](int i, float v) { survivors.emplace_back(v, i); });
+  } else {
+    for_each_above<true>(row, V, kth,
+                         [&](int i, float v) { survivors.emplace_back(v, i); });
+  }
   const int m = static_cast<int>(survivors.size());
-  if (p_val >= 1.0f || m <= 1) return;
+  if (m <= 1) return;
 
   std::sort(survivors.begin(), survivors.end(),
             [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
@@ -996,6 +1025,8 @@ void cpu_topp_sampling(torch::Tensor& logits, const torch::Tensor& p) {
   {
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
+      // p >= 1 keeps the row. Don't grow this thread's scratch to V for it.
+      if (pp[b] >= 1.0f) continue;
       RowScratch& buf = row_scratch();
       buf.ensure(V);
       top_p_row(lp + b * V, V_int, pp[b], buf.scratch.data(),
@@ -1046,14 +1077,18 @@ void cpu_topk_topp_sampling(torch::Tensor& logits, const torch::Tensor& k,
   {
 #pragma omp for schedule(dynamic, 1)
     for (int64_t b = 0; b < B; ++b) {
-      RowScratch& buf = row_scratch();
-      buf.ensure(V);
       float* row = lp + b * V;
       int kv = k_at(k, b);
       float pv = pp[b];
+      const bool topk = kv > 0 && kv < V_int;
+      // No top-k and p >= 1 is a no-op. A top-k row with p >= 1 still needs
+      // the scratch for the k-th value.
+      if (!topk && pv >= 1.0f) continue;
+      RowScratch& buf = row_scratch();
+      buf.ensure(V);
       // k outside (0, V) is top-p alone, same approximate kernel as a batch
       // that has no top-k at all.
-      if (kv > 0 && kv < V_int) {
+      if (topk) {
         top_k_p_row(row, V_int, kv, pv, buf.scratch.data(), buf.outliers.data(),
                     buf.survivors);
       } else {

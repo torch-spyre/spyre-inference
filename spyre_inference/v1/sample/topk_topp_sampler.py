@@ -55,11 +55,12 @@ def apply_top_k_top_p_sort_free(
 def apply_top_k_top_p_kernels(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
-    """``apply_top_k_top_p_pytorch`` on the csrc/ kernels, with no sort or ``topk``.
+    """``apply_top_k_top_p_pytorch`` on the csrc/ kernels.
 
-    Top-k, alone or before top-p, matches the PyTorch filter, ties with the k-th
+    Top-k alone matches the PyTorch filter with no sort, ties with the k-th
     value included. Top-p alone is vLLM's CPU kernel, whose cut can differ from a
-    full sort by a few boundary tokens.
+    full sort by a few boundary tokens. Top-k together with top-p sorts the k
+    survivors and cuts those exactly, so a large k is close to a full-vocab sort.
 
     The op masks logits in place, so a tensor that is not float32 and contiguous
     is copied here. A copy made inside the op would not be the caller's tensor.
@@ -88,9 +89,9 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
     Upstream only takes the sort-free top-k path under ``allow_cpu_sync`` (CPU
     platform only); Spyre D2Hs logits before sampling, so that host-device sync
     is free and the full-vocab sort it otherwise runs is pure waste. With the
-    csrc/ kernels built, ``apply_top_k_top_p_kernels`` filters without a sort or
-    ``topk``. A loaded extension that predates those ops, or a checkout that
-    never built them, keeps top-k on ``topk``, top-p combined with top-k on
+    csrc/ kernels built, top-k and top-p alone do not sort. Top-k together with
+    top-p sorts the k survivors. A loaded extension that predates those ops, or a
+    checkout that never built them, keeps top-k on ``topk``, top-p combined with top-k on
     ``apply_top_k_top_p_sort_free``, and top-p alone on a sort. Greedy and the
     Gumbel draw still use the older ops in that extension.
 
@@ -110,7 +111,7 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.33.0) with two
-        # Spyre changes: sort-free top-k / top-p and a log-space Gumbel draw.
+        # Spyre changes: kernel top-k / top-p and a log-space Gumbel draw.
         # Re-sync with upstream on a vLLM bump.
         if has_topk_topp_kernels():
             logits = apply_top_k_top_p_kernels(logits, k, p)

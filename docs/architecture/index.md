@@ -699,8 +699,9 @@ same way. That brings back the CPU kernels and drops the full-vocabulary sort:
   single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
   scan.
 - **Top-k / top-p** — with the filter ops loaded, `apply_top_k_top_p_kernels` masks in
-  place. Top-k keeps every tie with the k-th value. Top-k together with top-p then cuts
-  top-p exactly on those survivors. Top-p alone, including a row whose k is disabled in a
+  place. Top-k keeps every tie with the k-th value and does not sort. Top-k together
+  with top-p sorts those survivors and cuts top-p exactly on them, so a k near the
+  vocabulary size is close to a full sort. Top-p alone, including a row whose k is disabled in a
   mixed batch, uses vLLM's approximate CPU kernel: the kept set can differ from a full
   sort by a few boundary tokens, and it does not drop below the requested probability
   mass. Without those ops, top-k uses `topk`, top-k with top-p uses

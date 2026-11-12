@@ -664,7 +664,7 @@ def test_a_base_dependency_bump_gives_no_verdict(monkeypatch):
     assert isinstance(reason, str) and "pyproject.toml" in reason and "uv.lock" in reason
 
 
-def test_ids_a_newer_base_run_has_are_the_base_branchs():
+def test_ids_in_a_newer_base_run_belong_to_the_base_branch():
     # Main bumped vLLM after the baseline, renaming upstream ids; its next green run,
     # which landed after the PR run started, already has them.
     base = _baseline(**{"::test_upstream[old]": 300.0})

@@ -14,7 +14,7 @@
 
 """
 Comment on a PR when its new tests and matrix legs add more than THRESHOLD_PCT of the
-regression tier's CI test time. Informational only, never blocks a PR.
+base branch's CI test time. Informational only, never blocks a PR.
 
 Usage:
     GH_TOKEN=... python3 ci_time_report.py report --run-id <id> --post
@@ -334,13 +334,11 @@ def _suite_rows(report: Report) -> list[str]:
 
 def _headline(report: Report) -> str:
     if abs(report.net_s) < 30:
-        return (
-            f"This PR leaves CI test time about unchanged ({report.pct:+.1f}% of the {TIER} tier)."
-        )
+        return f"This PR leaves CI test time unchanged ({report.pct:+.1f}% of the base branch's)."
     sign = "adds" if report.net_s > 0 else "removes"
     return (
         f"This PR {sign} about {abs(report.net_s) / 60:.1f} minutes of CI test time "
-        f"({report.pct:+.1f}% of the {TIER} tier's {report.baseline_s / 3600:.1f} h)."
+        f"({report.pct:+.1f}% of the base branch's {report.baseline_s / 3600:.1f} h)."
     )
 
 

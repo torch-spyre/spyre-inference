@@ -79,7 +79,7 @@ _COSINE_MIN = 0.99
         pytest.param(
             (
                 "joerunde/gemma-4-moe-nano",
-                " street and methodically knocking people's hats off then I account it high time",
+                " street and nothing I account it high time to sea as I quietly take. This",
                 GEMMA4_TEXT_BACKBONE_OVERRIDE,
             ),
             marks=pytest.mark.e2e_smoke,

@@ -550,8 +550,8 @@ static void check_batch_float(const torch::Tensor& t,
 static void check_batch_int(const torch::Tensor& t, const torch::Tensor& logits,
                             const char* name) {
   TORCH_CHECK(t.is_cpu(), name, " must be CPU");
-  // vLLM passes k as int64. int32 stays accepted so a caller that already
-  // narrowed it does not have to copy.
+  // vLLM's InputBatch.top_k is int32. int64 stays accepted so a caller that
+  // widened it does not have to copy.
   TORCH_CHECK(t.dtype() == torch::kInt32 || t.dtype() == torch::kInt64, name,
               " must be int32 or int64");
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
@@ -592,7 +592,8 @@ static float binary_search_buffer(const float* buf, int n, float p_val,
 
 static void scan_pivot_stats(const float* buf, int n, float pivot, float tol,
                              int min_above_for_dups, int* num_above,
-                             float* min_above, int* num_at_min) {
+                             float* min_above, int* num_at_min,
+                             bool count_dups = true) {
   float ma = std::numeric_limits<float>::infinity();
   int na = 0;
   int i = 0;
@@ -649,12 +650,15 @@ static void scan_pivot_stats(const float* buf, int n, float pivot, float tol,
   }
   *num_above = na;
   *min_above = ma;
-  // count_within_tol runs over the full buf; elements below pivot are all
-  // < min_above, so only ULP-equal values fall within kKDuplicateTol and
-  // are legitimately counted as boundary duplicates.
-  *num_at_min = (kTrimIdleWork && na < min_above_for_dups)
-                    ? 0
-                    : count_within_tol(buf, n, ma, tol);
+  // The k-th check only needs num_above. count_within_tol is a second pass
+  // over buf, so skip it when the caller discards the duplicate count.
+  if (!count_dups || (kTrimIdleWork && na < min_above_for_dups)) {
+    *num_at_min = 0;
+    return;
+  }
+  // Elements below pivot are all < min_above, so only ULP-equal values fall
+  // within kKDuplicateTol and are legitimately counted as boundary duplicates.
+  *num_at_min = count_within_tol(buf, n, ma, tol);
 }
 
 static float ternary_search_topk(const float* buf, int n, int k, float lo,
@@ -724,7 +728,7 @@ static float kth_largest(const float* buf, int n, int k, float lo, float hi,
     float unused_min;
     scan_pivot_stats(buf, n, dup_value, kKDuplicateTol,
                      std::numeric_limits<int>::max(), &n_gt, &unused_min,
-                     &unused_dup);
+                     &unused_dup, false);
     if (n_gt < k) return dup_value;
   }
   int m = 0;
@@ -760,7 +764,16 @@ static float top_k_threshold(const float* __restrict__ row, int V, int k_val,
   return kth_largest(row, V, k_val, st.min_l, st.max_l, scratch);
 }
 
+// On the AVX2 build these two carry the FMA target so fast_exp can inline into
+// the V-length loops. Callers stay compiled without -mfma.
+#if defined(__x86_64__) && defined(__AVX2__) && !defined(__AVX512F__)
+#define SPYRE_AVX2_FMA __attribute__((target("avx2,f16c,fma")))
+#else
+#define SPYRE_AVX2_FMA
+#endif
+
 // Core top-p logic. Receives pre-computed RowStats; does not re-scan the row.
+SPYRE_AVX2_FMA
 static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
                             const RowStats& st, float* __restrict__ scratch,
                             float* __restrict__ outlier_buf) {
@@ -889,6 +902,7 @@ static void top_k_row(float* __restrict__ row, int V, int k_val,
   mask_write_below(row, V, std::nextafter(kth, neg_inf), neg_inf);
 }
 
+SPYRE_AVX2_FMA
 static void top_p_row(float* __restrict__ row, int V, float p_val,
                       float* __restrict__ scratch,
                       float* __restrict__ outlier_buf) {

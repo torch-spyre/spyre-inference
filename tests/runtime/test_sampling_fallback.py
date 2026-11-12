@@ -64,13 +64,12 @@ def _meta(rows: int, k: int | None, p: float | None, greedy: bool = False) -> Sa
 
 
 def test_avx2_without_fma_does_not_load_the_fma_build() -> None:
-    # ATen reports "NO AVX" when FMA3 is missing, including an AVX2-only host.
-    assert sampling_extension_name("x86_64", "AVX512") == "_C"
-    assert sampling_extension_name("x86_64", "AVX2") == "_C_AVX2"
+    assert sampling_extension_name("x86_64", avx512=True, avx2_fma=True) == "_C"
+    assert sampling_extension_name("x86_64", avx512=False, avx2_fma=True) == "_C_AVX2"
     with pytest.raises(ImportError):
-        sampling_extension_name("x86_64", "NO AVX")
-    assert sampling_extension_name("ppc64le", "VSX") == "_C"
-    assert sampling_extension_name("s390x", "Z VECTOR") == "_C"
+        sampling_extension_name("x86_64", avx512=False, avx2_fma=False)
+    assert sampling_extension_name("ppc64le", avx512=False, avx2_fma=False) == "_C"
+    assert sampling_extension_name("s390x", avx512=False, avx2_fma=False) == "_C"
 
 
 @pytest.mark.parametrize("rows", [1, 8])

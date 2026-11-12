@@ -79,13 +79,15 @@ inline __attribute__((always_inline)) vec_op::FP32Vec16 fast_exp(
 
 #elif defined(__x86_64__) && defined(__AVX2__)
 
-// Same algorithm as the AVX512 path on two 8-lane halves. FMA is enabled for
-// these two functions only: the rest of the AVX2 extension is built without
-// -mfma, and fast_exp is noinline so those ops stay out of its callers.
+// Same algorithm as the AVX512 path on two 8-lane halves. The pragma defines
+// __FMA__ so the fmadd intrinsics exist; the target attribute matches the one
+// on _top_p_row_core and top_p_row, which is what lets this inline there. The
+// AVX2 extension is built without -mfma, so Gumbel and rejection stay clear.
 #pragma GCC push_options
 #pragma GCC target("avx2,f16c,fma")
 
-inline __attribute__((always_inline)) __m256 fast_exp8(__m256 x) {
+__attribute__((target("avx2,f16c,fma"), always_inline)) inline __m256 fast_exp8(
+    __m256 x) {
   const __m256 c1 = _mm256_set1_ps(0.999999701f);
   const __m256 c2 = _mm256_set1_ps(0.499991506f);
   const __m256 c3 = _mm256_set1_ps(0.166676521f);
@@ -126,8 +128,8 @@ inline __attribute__((always_inline)) __m256 fast_exp8(__m256 x) {
   return _mm256_mul_ps(_mm256_mul_ps(poly, pow2), two);
 }
 
-__attribute__((noinline)) inline vec_op::FP32Vec16 fast_exp(
-    const vec_op::FP32Vec16& vec) {
+__attribute__((target("avx2,f16c,fma"), always_inline)) inline vec_op::FP32Vec16
+fast_exp(const vec_op::FP32Vec16& vec) {
   return vec_op::FP32Vec16(fast_exp8(vec.reg_low), fast_exp8(vec.reg_high));
 }
 

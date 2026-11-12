@@ -63,8 +63,9 @@ def apply_top_k_top_p_kernels(
 
     The op masks logits in place, so a tensor that is not float32 and contiguous
     is copied here. A copy made inside the op would not be the caller's tensor.
-    Serving already passes float32 logits, and then this cast is a no-op. k is
-    read as the int64 vLLM passes; only a non-contiguous k is copied."""
+    Serving already passes float32 logits, and then this cast is a no-op. vLLM's
+    ``InputBatch.top_k`` is int32; int64 is accepted too. Only a non-contiguous
+    k is copied."""
     if k is None and p is None:
         return logits
     logits = logits.to(torch.float32).contiguous()

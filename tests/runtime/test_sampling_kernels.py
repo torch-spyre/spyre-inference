@@ -289,15 +289,29 @@ def test_avx2_build_filters_match_pytorch() -> None:
     if not any(root.glob("_C_AVX2*")):
         pytest.skip("the AVX2 extension is not installed")
     script = (
+        "import sys\n"
         "import torch\n"
-        "torch.backends.cpu.get_cpu_capability = lambda: 'AVX2'\n"
+        "torch.cpu._is_avx512_supported = lambda: False\n"
+        "import spyre_inference.v1.sample.sampling_kernels  # noqa: F401\n"
+        "assert 'spyre_inference._C_AVX2' in sys.modules\n"
+        "assert 'spyre_inference._C' not in sys.modules\n"
         "from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch\n"
         "from spyre_inference.v1.sample.topk_topp_sampler import apply_top_k_top_p_kernels\n"
-        "x = torch.randn(4, 128)\n"
+        "def kept(t):\n"
+        "    return t > float('-inf')\n"
+        "x = torch.randn(4, 32003)\n"
         "k = torch.full((4,), 8)\n"
-        "actual = apply_top_k_top_p_kernels(x.clone(), k, None)\n"
-        "expected = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)\n"
-        "assert torch.equal(actual, expected)\n"
+        "p = torch.full((4,), 0.9)\n"
+        "for kk, pp in ((k, None), (k, p)):\n"
+        "    actual = apply_top_k_top_p_kernels(x.clone(), kk, pp)\n"
+        "    expected = apply_top_k_top_p_pytorch(x.clone(), kk, pp, allow_cpu_sync=True)\n"
+        "    assert torch.equal(actual, expected)\n"
+        "actual = apply_top_k_top_p_kernels(x.clone(), None, p)\n"
+        "expected = apply_top_k_top_p_pytorch(x.clone(), None, p, allow_cpu_sync=True)\n"
+        "diff = (kept(expected).sum(-1) - kept(actual).sum(-1)).abs()\n"
+        "max_kept = int(kept(expected).sum(-1).max())\n"
+        "assert int(diff.max()) <= max(3, max_kept // 200)\n"
+        "assert (kept(actual).sum(-1) > 0).all()\n"
     )
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

@@ -20,26 +20,53 @@ import torch
 from vllm.logger import init_logger
 
 
-def sampling_extension_name(machine: str, capability: str) -> str:
+def _cpuinfo_flags() -> set[str]:
+    """Hardware flags from ``/proc/cpuinfo``. Empty when that file is absent.
+
+    This is not ``ATEN_CPU_CAPABILITY``. Pinning ATen's dispatch level must not
+    hide an extension the CPU can run: rejection sampling has no Python path.
+    """
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+            for line in cpuinfo:
+                key, _, value = line.partition(":")
+                if key.strip() == "flags":
+                    return set(value.split())
+    except OSError:
+        return set()
+    return set()
+
+
+def sampling_extension_name(machine: str, *, avx512: bool, avx2_fma: bool) -> str:
     """Which csrc build this host may load: ``_C`` or ``_C_AVX2``.
 
-    ATen reports ``AVX2`` only when FMA3 is present too, and ``AVX512`` only
-    with FMA3 as well. An AVX2 host without FMA therefore comes back as
-    ``NO AVX`` and gets no x86 extension, instead of ``_C_AVX2``. Power and Z
-    always use ``_C``.
+    ``avx512`` and ``avx2_fma`` are hardware facts. ``_C_AVX2`` needs AVX2 and
+    FMA; without FMA its exp would SIGILL. Power and Z always use ``_C``.
     """
     if machine == "x86_64":
-        if capability == "AVX512":
+        if avx512:
             return "_C"
-        if capability == "AVX2":
+        if avx2_fma:
             return "_C_AVX2"
-        raise ImportError(f"host CPU capability {capability!r} cannot run the x86 sampling kernels")
+        raise ImportError("host CPU cannot run the x86 sampling kernels")
     return "_C"
+
+
+def _host_has_avx512() -> bool:
+    is_avx512 = getattr(torch.cpu, "_is_avx512_supported", None)
+    return bool(is_avx512()) if is_avx512 is not None else False
+
+
+def _host_has_avx2_fma() -> bool:
+    flags = _cpuinfo_flags()
+    return "avx2" in flags and "fma" in flags
 
 
 try:
     _extension = sampling_extension_name(
-        platform.machine(), torch.backends.cpu.get_cpu_capability()
+        platform.machine(),
+        avx512=_host_has_avx512(),
+        avx2_fma=_host_has_avx2_fma(),
     )
     if _extension == "_C_AVX2":
         import spyre_inference._C_AVX2  # noqa: F401  # ty: ignore[unresolved-import]

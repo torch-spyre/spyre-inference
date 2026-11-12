@@ -69,9 +69,10 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     "-mavx512vl"
     "-mavx512bw"
     "-mavx512dq")
-  # No -mfma here. cpu_fast_exp.hpp enables FMA for the AVX2 exp only, so the
-  # Gumbel and rejection objects keep the instructions they had before, and an
-  # AVX2 host without FMA is not handed an extension full of FMA ops.
+  # No -mfma here. FMA is a function attribute on the AVX2 exp and the two
+  # top-p row functions that inline it, so the Gumbel and rejection objects
+  # keep the instructions they had before. The loader still skips _C_AVX2
+  # when the CPU has no FMA.
   set(CXX_COMPILE_FLAGS_AVX2 ${CXX_COMPILE_FLAGS} "-mavx2")
 
   # Both are installed; spyre_inference picks one at import from the host ISA.

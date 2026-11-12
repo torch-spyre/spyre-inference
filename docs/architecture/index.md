@@ -709,8 +709,9 @@ The kernels live in `csrc/cpu/sampling_kernels.cpp` and `csrc/cpu/topk_topp_samp
 with the vector exp in `csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from
 `setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
 so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
-AVX2 fallback (`_C_AVX2`). `v1/sample/sampling_kernels.py` loads `_C` when ATen reports
-`AVX512` and `_C_AVX2` when it reports `AVX2`, which it does only if FMA3 is present too.
+AVX2 fallback (`_C_AVX2`). `v1/sample/sampling_kernels.py` loads `_C` when cpuinfo
+has AVX512 and `_C_AVX2` when it has AVX2 and FMA but not AVX512. The check ignores
+`ATEN_CPU_CAPABILITY`, so pinning ATen's dispatch level keeps the extension.
 The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
 cannot collide with a vLLM `_C` in the same environment. If the extension

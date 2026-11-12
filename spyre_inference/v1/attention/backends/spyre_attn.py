@@ -982,7 +982,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
-        self._slot_mapping.publish(slot_mapping)
+        self.publish_slot_mapping(slot_mapping)
 
         num_decode_seqs, _, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
@@ -1215,6 +1215,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 BatchedDecodeGroup(len(members), torch.tensor(members, dtype=torch.int32), *fields)
             )
         return out
+
+    def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
+        """Set the KV-write slots this builder's layers read on their next forward."""
+        self._slot_mapping.publish(slot_mapping)
 
     def build_for_variant(
         self, bucket: SpyreAttnBucket, causal: bool = True

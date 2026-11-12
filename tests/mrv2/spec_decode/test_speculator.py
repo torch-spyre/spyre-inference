@@ -87,7 +87,8 @@ def speculator(monkeypatch):
     s._context = None
     s.holder = _Holder()
     group = SimpleNamespace(
-        kv_cache_group_id=0, get_metadata_builder=lambda: SimpleNamespace(_slot_mapping=s.holder)
+        kv_cache_group_id=0,
+        get_metadata_builder=lambda: SimpleNamespace(publish_slot_mapping=s.holder.publish),
     )
     s.attn_groups = [[group]]
     s.draft_kv_cache_group_id = 0

@@ -142,6 +142,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         self._context = self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
 
     def _precompute_context_kv(self, start: int, end: int, dummy_run: bool = False) -> None:
+        # Upstream passes start > 0 only from _prepare_graph_replay (FULL CUDA graphs).
         assert start == 0 and self._context is not None
         rows = self._context.shape[0]
         # Rows past the batch write the null page (upstream's PAD_SLOT_ID, clamped).
@@ -180,7 +181,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
             for group in (g for groups in self.attn_groups for g in groups):
                 slots = self.block_tables.slot_mappings[group.kv_cache_group_id]
                 builder = cast(SpyreAttentionMetadataBuilder, group.get_metadata_builder())
-                builder._slot_mapping.publish(
+                builder.publish_slot_mapping(
                     F.pad(slots[:num_tokens], (0, num_tokens_padded - num_tokens), value=0)
                 )
         hidden = self._run_model(num_tokens_padded, *args, **kwargs)

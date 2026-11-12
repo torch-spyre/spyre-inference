@@ -335,6 +335,7 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` |
 | `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
@@ -641,11 +642,18 @@ The weight transposes happen before that, in each layer's
 call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
-- **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling). A pooling
-  model whose pooler runs on Spyre keeps its hidden states there instead, and the pooler
-  copies back only the pooled vectors
-- **`compute_logits`**: moves the CPU-sliced `hidden_states[logits_indices]` back onto
-  Spyre for the `SpyreParallelLMHead` matmul, which returns logits on Spyre
+- **Output**: a generative model's hidden states stay on Spyre. Upstream's
+  `hidden_states[logits_indices]` is routed through `select_rows`, which gathers the
+  sampled rows on Spyre onto a warmed row bucket (the padded sampled-row counts the lm_head
+  compiles for, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets));
+  a decode step whose indices are the
+  identity reuses the padded body output with no gather. A pooling model whose pooler
+  runs on Spyre keeps its hidden states there too, and the pooler copies back only the
+  pooled vectors. Every other output, including the eager decoder's, which has no shape
+  bucketer, is converted to CPU
+- **`compute_logits`**: projects a gathered row bucket on Spyre directly. Any other
+  input, such as a prompt-logprob slice, is padded onto a row bucket on the host and moved
+  onto Spyre for the `SpyreParallelLMHead` matmul. Only the logits cross back to the host
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward`. The weight moves to Spyre with the rest of the model, and the

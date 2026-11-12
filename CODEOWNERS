@@ -25,6 +25,25 @@ spyre_inference/v1/pool/ @torch-spyre/spyre-inference-default-codeowners @gkumbh
 spyre_inference/v1/attention/backends/spyre_encoder_attn.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
 spyre_inference/v1/worker/spyre_model_runner.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
 
+# FP8
+spyre_inference/custom_ops/fp8_linear_kernel.py @torch-spyre/spyre-inference-default-codeowners @yannicks1 @dilipgb @R3hankhan123
+tests/test_fp8_linear.py @torch-spyre/spyre-inference-default-codeowners @R3hankhan123
+tests/custom_ops/test_fp8.py @torch-spyre/spyre-inference-default-codeowners @R3hankhan123
+tests/e2e/test_fp8_*.py @torch-spyre/spyre-inference-default-codeowners @R3hankhan123
+
+# Multi-modal
+spyre_inference/multimodal/ @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/_vision_encoder.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/blip2.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/clip.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/gemma4_mm.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/granite4_vision.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/pixtral.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+spyre_inference/models/siglip.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+tests/multimodal/ @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+tests/e2e/test_multimodal.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+tests/e2e/test_granite_vision.py @torch-spyre/spyre-inference-default-codeowners @nikheal2 @ktuvw
+
 # CICD
 .github @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana
 Makefile @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana

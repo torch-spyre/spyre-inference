@@ -28,6 +28,10 @@ from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 
 MAX_MODEL_LEN = 128
 MAX_NUM_SEQS = 2
+NUM_LOGPROBS = 5
+# Max logprob gap (nats) per token while TP=1 and TP=2 share a prefix; the 6-layer nano runs wider.
+LOGPROB_TOLERANCE = {"joerunde/gemma-4-moe-nano": 0.7}
+DEFAULT_LOGPROB_TOLERANCE = 0.1
 
 
 def _generate(
@@ -37,7 +41,7 @@ def _generate(
     compilation_config: dict | None = None,
     hf_overrides=None,
     kv_cache_dtype: str = "auto",
-) -> list[list[int]]:
+) -> tuple[list[list[int]], list[list[dict[int, float]]]]:
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -54,9 +58,13 @@ def _generate(
     try:
         outs = llm.generate(
             ["Hello, world!", "Count to ten: one, two, three"],
-            SamplingParams(max_tokens=8, temperature=0.0),
+            SamplingParams(max_tokens=8, temperature=0.0, logprobs=NUM_LOGPROBS, ignore_eos=True),
         )
-        result = [list(o.outputs[0].token_ids) for o in outs]
+        tokens = [list(o.outputs[0].token_ids) for o in outs]
+        logprobs = [
+            [{tid: lp.logprob for tid, lp in step.items()} for step in o.outputs[0].logprobs]
+            for o in outs
+        ]
     finally:
         llm.llm_engine.engine_core.shutdown(timeout=60)
         del llm
@@ -64,7 +72,7 @@ def _generate(
         freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
     # Outside the finally, where a generate failure would mask this check's own.
     assert freed, "Spyre devices were not released after LLM shutdown"
-    return result
+    return tokens, logprobs
 
 
 def _assert_matches_tp1(
@@ -81,12 +89,67 @@ def _assert_matches_tp1(
                 return i
         return min(len(a), len(b))
 
+    assert len(tp1) == len(tp2), f"prompt count: {names[0]} {len(tp1)} vs {names[1]} {len(tp2)}"
     for i, (a, b) in enumerate(zip(tp1, tp2)):
         n = prefix_len(a, b)
         assert n >= 2, (
             f"prompt {i}: {names[0]} and {names[1]} diverged at token {n} "
             f"(expected >=2 matching tokens). {names[0]}={a} {names[1]}={b}"
         )
+
+
+def _assert_top_logprobs_close(
+    where: str, ref: dict[int, float], lp: dict[int, float], tolerance: float
+) -> None:
+    """Every token in either top-k agrees within the tolerance.
+
+    A token outside one run's top-k sits at or below that run's k-th logprob, so it
+    fails only when its other logprob clears that bound by more than the tolerance.
+    """
+    for a, b, names in ((ref, lp, ("tp1", "tp2")), (lp, ref, ("tp2", "tp1"))):
+        floor = min(b.values())
+        for tid, value in a.items():
+            gap = abs(value - b[tid]) if tid in b else value - floor
+            assert gap <= tolerance, (
+                f"{where}: token {tid} logprob {names[0]} {value:.3f} vs {names[1]} "
+                f"{b.get(tid, f'<= {floor:.3f}')} (gap {gap:.3f} > {tolerance})"
+            )
+
+
+def _assert_logprobs_match_tp1(
+    model: str,
+    tp1: tuple[list[list[int]], list[list[dict[int, float]]]],
+    tp2: tuple[list[list[int]], list[list[dict[int, float]]]],
+) -> None:
+    """Up to the first divergence, both runs' top tokens agree within the tolerance.
+
+    A divergence must be a near tie: each run's winner is in the other's top tokens and
+    beats it by no more than the tolerance in both runs.
+    """
+    tolerance = LOGPROB_TOLERANCE.get(model, DEFAULT_LOGPROB_TOLERANCE)
+    for name, (tokens, logprobs) in (("tp1", tp1), ("tp2", tp2)):
+        for i, (seq, steps) in enumerate(zip(tokens, logprobs, strict=True)):
+            assert len(seq) == len(steps), (
+                f"prompt {i}: {name} has {len(seq)} tokens but {len(steps)} logprob rows"
+            )
+    for i, (ref_tokens, tokens, ref_steps, steps) in enumerate(
+        zip(tp1[0], tp2[0], tp1[1], tp2[1], strict=True)
+    ):
+        for step, (ref_pick, pick, ref_lp, lp) in enumerate(
+            zip(ref_tokens, tokens, ref_steps, steps)
+        ):
+            where = f"prompt {i} step {step}"
+            assert ref_pick in lp, f"{where}: tp1 token {ref_pick} not in tp2 top {lp}"
+            assert pick in ref_lp, f"{where}: tp2 token {pick} not in tp1 top {ref_lp}"
+            _assert_top_logprobs_close(where, ref_lp, lp, tolerance)
+            if pick != ref_pick:
+                margins = (ref_lp[ref_pick] - ref_lp[pick], lp[pick] - lp[ref_pick])
+                assert max(margins) <= tolerance, (
+                    f"{where}: tp1 picked {ref_pick}, tp2 picked {pick}; not a near tie "
+                    f"(margins tp1 {margins[0]:.3f}, tp2 {margins[1]:.3f} > {tolerance})"
+                )
+                # Past a flip the two runs condition on different tokens.
+                break
 
 
 @pytest.mark.e2e_smoke
@@ -97,7 +160,7 @@ def _assert_matches_tp1(
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 def test_tp2_llm_generate_matches_tp1(record_property) -> None:
-    """TP=1 vs TP=2 greedy-decode prefix match, eager."""
+    """TP=1 vs TP=2 greedy-decode prefix and logprob match, eager."""
     model = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
     record_serving_capability(
         record_property,
@@ -109,7 +172,8 @@ def test_tp2_llm_generate_matches_tp1(record_property) -> None:
         task="generate",
         enforce_eager=True,
     )
-    _assert_matches_tp1(
+    _assert_logprobs_match_tp1(
+        model,
         _generate(model, tp=1, enforce_eager=True),
         _generate(model, tp=2, enforce_eager=True),
     )
@@ -136,13 +200,15 @@ def test_tp2_llm_generate_matches_tp1(record_property) -> None:
     ids=["micro-g3.3", "gemma-4-moe-nano-text"],
 )
 def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_property) -> None:
-    """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.
+    """TP=1 vs TP=2 greedy-decode prefix and logprob match, compiled: the in-graph reduction.
 
     compile_sizes is pinned to the reachable token counts: 1 (one sequence
-    decoding alone), 2 (both decoding), and 16 as the prefill/scheduler cap.
+    decoding alone), 2 (both decoding), and 64 as the prefill/scheduler cap.
+    64 is one fp16 stick, so the prefill pads onto a stick-aligned bucket and
+    the MoE is traced into the block graph with its all-reduce.
     Its served TP=2 verdict also requires TP=1 to run and match.
     """
-    _cc = {"compile_sizes": [1, 2, 16]}
+    _cc = {"compile_sizes": [1, 2, 64]}
     record_serving_capability(
         record_property,
         model,
@@ -154,7 +220,8 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
         enforce_eager=False,
         text_only=hf_overrides is not None,
     )
-    _assert_matches_tp1(
+    _assert_logprobs_match_tp1(
+        model,
         _generate(
             model, tp=1, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
         ),
@@ -254,8 +321,8 @@ def test_tp2_fp8_kv_cache_matches_fp16_cache() -> None:
     """
     model = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
     _cc = {"compile_sizes": [1, 2, 16]}
-    _assert_matches_tp1(
-        _generate(model, tp=2, enforce_eager=False, compilation_config=_cc),
-        _generate(model, tp=2, enforce_eager=False, compilation_config=_cc, kv_cache_dtype="fp8"),
-        names=("fp16 cache", "fp8 cache"),
+    fp16, _ = _generate(model, tp=2, enforce_eager=False, compilation_config=_cc)
+    fp8, _ = _generate(
+        model, tp=2, enforce_eager=False, compilation_config=_cc, kv_cache_dtype="fp8"
     )
+    _assert_matches_tp1(fp16, fp8, names=("fp16 cache", "fp8 cache"))

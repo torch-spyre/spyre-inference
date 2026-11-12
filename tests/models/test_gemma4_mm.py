@@ -528,8 +528,8 @@ def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
 
     ple_ids = torch.tensor([5, 0, 0, 11]) if has_image else input_ids
     assert torch.equal(looked_up[0], ple_ids)
-    assert torch.equal(embedded[0], input_ids)
-    assert torch.equal(text, input_ids[:, None].half())
+    assert torch.equal(embedded[0], ple_ids)
+    assert torch.equal(text, ple_ids[:, None].half())
     assert torch.equal(model.per_layer_embeddings[:4, 0, 0], ple_ids.half())
     assert (model.per_layer_embeddings[4:] == -1).all()
 

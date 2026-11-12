@@ -1691,7 +1691,9 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
         pytest.param(1025, 32, id="kv1025_to_32"),
     ],
 )
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len, expected):
+    # A declared page range keeps each sequence's own count instead.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
     assert expected in buckets
@@ -1737,14 +1739,17 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config)
         )
 
 
-def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
+@pytest.mark.parametrize("for_each_tile", [False, True], ids=["bucketed", "declared"])
+def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config, monkeypatch, for_each_tile):
     """Zero real blocks must not be padded: a fully-masked tile would divide by zero."""
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
 
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_stacks[0].shape[0] == 0
-    assert metadata.padded_num_blocks[1] == 2
+    if not for_each_tile:
+        assert metadata.padded_num_blocks[1] == 2
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):

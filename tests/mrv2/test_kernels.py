@@ -61,17 +61,47 @@ def test_bind_then_unbind_restores_upstream() -> None:
 
 def test_unbind_restores_top_k_top_p_and_triton_placeholder() -> None:
     from vllm.triton_utils import triton
-    from vllm.triton_utils.importing import TritonPlaceholder
     from vllm.v1.worker.gpu.sample import sampler, states
 
+    sites = (sampler, states)
+    originals = [site.apply_top_k_top_p for site in sites]
+    helper = getattr(triton, "next_power_of_2", None)
+    assert kernels.spyre_apply_top_k_top_p not in originals  # not leaked by an earlier test
     try:
         kernels.bind(force_host=True)
+        assert all(site.apply_top_k_top_p is kernels.spyre_apply_top_k_top_p for site in sites)
+        assert callable(triton.next_power_of_2)
     finally:
         kernels.unbind()
-    assert sampler.apply_top_k_top_p is not kernels.spyre_apply_top_k_top_p
-    assert states.apply_top_k_top_p is not kernels.spyre_apply_top_k_top_p
-    if isinstance(triton, TritonPlaceholder):
-        assert not hasattr(triton, "next_power_of_2")
+    assert all(site.apply_top_k_top_p is o for site, o in zip(sites, originals, strict=True))
+    assert getattr(triton, "next_power_of_2", None) is helper
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("nan_at", [53, 517, 1023])
+def test_host_greedy_sampling_skips_nan_logits(dtype: torch.dtype, nan_at: int) -> None:
+    """Host policy, not Triton parity: triton-cpu's NaN pick depends on the placement
+    (5, 0 and 1023 for these three), so the host skips NaNs and an all-NaN row takes 0."""
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    logits = torch.zeros(2, 1024)
+    logits[0, 5] = 60.0
+    logits[0, nan_at] = float("nan")
+    logits[1] = float("nan")
+    try:
+        kernels.bind(force_host=True)
+        sampled = gumbel_sample(
+            logits=logits.to(dtype),
+            expanded_idx_mapping=torch.arange(2, dtype=torch.int32),
+            temperature=torch.zeros(2),
+            seed=torch.zeros(2, dtype=torch.int64),
+            pos=torch.zeros(2, dtype=torch.int64),
+            apply_temperature=True,
+            is_drafting=False,
+        )
+    finally:
+        kernels.unbind()
+    assert sampled.tolist() == [5, 0]
 
 
 def test_placeholder_next_power_of_2() -> None:

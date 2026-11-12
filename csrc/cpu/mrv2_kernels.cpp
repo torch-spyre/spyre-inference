@@ -609,7 +609,7 @@ std::pair<int64_t, acc_t> gumbel_row(const scalar_t* row, int64_t begin, int64_t
       }
     } else {
       // Greedy: a running max, then one scan for its first index. max_ps returns its
-      // second operand on NaN, so vmax goes second to skip NaN logits as Triton does.
+      // second operand on NaN, so vmax goes second to skip NaN logits.
       __m512 vmax = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
       int64_t w = v;
       for (; w + 16 <= end; w += 16) vmax = _mm512_max_ps(_mm512_loadu_ps(row + w), vmax);

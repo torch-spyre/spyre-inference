@@ -319,18 +319,13 @@ def _with_nans(g, logits: torch.Tensor, rows: list[int], argmax_row: int) -> tor
     return logits
 
 
-def _gumbel(
-    g, use_fp64: bool, apply_temperature: bool, is_drafting: bool, dtype=torch.float32, nan=False
-):
+def _gumbel(g, use_fp64: bool, apply_temperature: bool, is_drafting: bool, dtype=torch.float32):
     gb = _m("sample.gumbel")
     num_tokens, vocab = 9, 5000
     logits = _logits(g, num_tokens, vocab)
     logits[3] = float("-inf")
     logits[4, 100] = 50.0
     logits[5, 10:20] = 30.0
-    if nan:
-        # Only the greedy row: under noise, triton-cpu's NaN handling has no single answer.
-        logits = _with_nans(g, logits, rows=[0], argmax_row=0)
     logits = logits.to(dtype)
     state = dict(
         logits=logits,
@@ -358,11 +353,6 @@ def gumbel_sample_temperature_drafting(g):
 @case("gpu.sample.gumbel._gumbel_sample_kernel")
 def gumbel_sample_fp64(g):
     return _gumbel(g, use_fp64=True, apply_temperature=True, is_drafting=False)
-
-
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
-def gumbel_sample_nan_logits(g):
-    return _gumbel(g, use_fp64=False, apply_temperature=True, is_drafting=False, nan=True)
 
 
 @case("gpu.sample.gumbel._gumbel_sample_kernel")

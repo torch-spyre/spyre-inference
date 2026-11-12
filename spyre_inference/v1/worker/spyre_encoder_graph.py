@@ -50,7 +50,23 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         dtype: torch.dtype,
         model: SpyreVisionEncoderMixin,
     ) -> None:
-        super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
+        cap = model.vision_max_items_per_call
+        by_tokens = model.vision_items_limited_by_tokens
+        if by_tokens and cap is None:
+            raise ValueError(
+                f"{type(model).__name__} sets vision_items_limited_by_tokens, which needs "
+                "vision_max_items_per_call (e.g. SEGMENT_ITEMS for segment_buffer())."
+            )
+        # Upstream bounds items per call by the smallest budget for its per-item capture split,
+        # which Spyre never does: an opted-in model hides the user's limit and applies it below.
+        comp_config = vllm_config.compilation_config
+        user_max_items = comp_config.encoder_cudagraph_max_vision_items_per_batch
+        if by_tokens:
+            comp_config.encoder_cudagraph_max_vision_items_per_batch = 0
+        try:
+            super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
+        finally:
+            comp_config.encoder_cudagraph_max_vision_items_per_batch = user_max_items
         # One graph set per budget: upstream's extra capture axes are not supported.
         if self._capture_axes:
             raise NotImplementedError("encoder capture_axes are not supported on Spyre.")
@@ -77,10 +93,17 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 f"item ({largest_item} tokens), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
-        # Respect a layout limit on items per encoder call when packing. Upstream derived the
-        # frame limit from the wider item count, so it shrinks with it.
-        cap = model.vision_max_items_per_call
-        if cap is not None and cap < self.max_batch_size:
+        if by_tokens:
+            assert cap is not None
+            self.max_batch_size = min(cap, user_max_items) if user_max_items > 0 else cap
+            if (
+                self.max_frames_per_batch
+                and comp_config.encoder_cudagraph_max_frames_per_batch is None
+            ):
+                self.max_frames_per_batch = self.max_batch_size * self.config.max_frames_per_video
+        # Otherwise respect a layout limit on items per encoder call when packing. Upstream
+        # derived the frame limit from the wider item count, so it shrinks with it.
+        elif cap is not None and cap < self.max_batch_size:
             self.max_batch_size = cap
             self.max_frames_per_batch = min(
                 self.max_frames_per_batch, cap * self.config.max_frames_per_video

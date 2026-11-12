@@ -70,6 +70,10 @@ inputs:
     description: The benchmark step's verdict (passed | failed) for artifact_results.
     required: false
     default: passed
+  leg-key:
+    description: Names this leg when several perf legs share one run, so each lands its own v2 rows.
+    required: false
+    default: ''
   clickhouse-host:
     description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
     required: false
@@ -179,4 +183,5 @@ runs:
           --rpm-lock "${{ inputs.rpm-lock }}" \
           --installed "${{ inputs.installed }}" \
           --state "${{ inputs.state }}" \
+          --leg-key "${{ inputs.leg-key }}" \
           --repository "${{ github.repository }}"

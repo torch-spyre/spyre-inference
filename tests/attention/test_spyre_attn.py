@@ -2378,9 +2378,9 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
     # The fixture's max_model_len 2048 at block 128 declares pages 2..16. Compiled at 16, as
     # warmup records it, then reused at 1 (walked as 2), 3 and 8.
     kernel_code = getattr(spyre_attn, kernel_name).__code__
-    # The default reservation floor of 8 rows would put short sequences on 8 pages. Not
-    # monkeypatch: its undo deletes a config-module entry, hiding it for later tests.
-    with ts_config.patch(min_reserved_dim_size=2):
+    # Restores the reservation floor the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8):
         for kv_len in (2048, query_len + 10, 300, 1000):
             _run_spyre_attn_test(
                 seq_lens=[(query_len, kv_len)],

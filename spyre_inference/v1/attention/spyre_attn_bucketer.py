@@ -35,6 +35,7 @@ consecutive buckets is the *bucket step*.
 from __future__ import annotations
 
 import bisect
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -53,10 +54,6 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
-
-# A one-page walk is its own Dynamo specialization (torch-spyre#6018), so a declared
-# page range starts at two and a one-page sequence walks a masked repeat of its page.
-_MIN_DECLARED_PAGES = 2
 
 
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
@@ -227,8 +224,14 @@ def _declared_page_range(max_pages: int) -> dict[int, dict[str, int]] | None:
             "for_each_tile trip counts (torch-spyre#6066)."
         )
         return None
-    # torch-spyre refuses a declared minimum below its reservation floor.
-    min_pages = max(_MIN_DECLARED_PAGES, ts_config.min_reserved_dim_size)
+    # The page axis is the only declared dim, so its range sets these torch-spyre limits
+    # unless they are exported. Two pages, not one: a one-page walk is its own Dynamo
+    # specialization (torch-spyre#6018), so a one-page sequence walks a masked repeat.
+    if "MIN_RESERVED_DIM_SIZE" not in os.environ:
+        ts_config.min_reserved_dim_size = 2
+    if "MAX_BUCKETS" not in os.environ:
+        ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
+    min_pages = ts_config.min_reserved_dim_size
     # A range with min == max would specialize to a constant and fail to trace.
     if not min_pages < max_pages <= ts_config.max_buckets:
         logger.info_once(

@@ -175,15 +175,14 @@ def test_padding_does_not_leak_into_images(tp_group):
 
 def test_offset_major_merge_matches_upstream_merger(tp_group):
     """Offset-major patches times the per-offset weight equal ``unfold`` plus the original."""
-    from spyre_inference.models._vision_encoder import offset_major
-    from spyre_inference.models.pixtral import offset_major_merge_weight
+    from spyre_inference.models._vision_encoder import offset_major, split_weight_by_group
 
     torch.manual_seed(2)
     hp, wp, d = 6, 4, 16
     x = torch.randn(hp * wp, d)
     merger = pixtral.PatchMerger(d, MERGE, use_mlp_bias=False)
     merger.merging_layer.weight.data.normal_()
-    weight = offset_major_merge_weight(merger.merging_layer.weight.data, MERGE)
+    weight = split_weight_by_group(merger.merging_layer.weight.data, MERGE**2, group_major=False)
     _finish_weight_loading(merger)
     expected = merger(x, image_sizes=[(hp, wp)])
 

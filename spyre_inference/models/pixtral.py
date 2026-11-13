@@ -45,10 +45,12 @@ from spyre_inference.models._vision_encoder import (
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
+    fold_conv_patch_embedding,
     offset_major,
     one_hot_segments,
     segment_buffer,
     segment_mask,
+    split_weight_by_group,
     unbind_items,
 )
 from spyre_inference.multimodal.utils import (
@@ -142,13 +144,6 @@ def pixtral_rope_tables(
     return cos.reshape(-1, head_dim), sin.reshape(-1, head_dim)
 
 
-def offset_major_merge_weight(weight: torch.Tensor, merge: int) -> torch.Tensor:
-    """The merging layer's ``[D_out, D * merge**2]`` weight (columns in ``unfold``'s
-    ``(c, ki, kj)`` order) as ``[merge**2, D, D_out]``, one slice per offset group."""
-    out_dim, in_dim = weight.shape
-    return weight.reshape(out_dim, in_dim // merge**2, merge**2).permute(2, 1, 0).contiguous()
-
-
 def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
     """The ``[C, H, W]`` images in ``mm_kwargs``, whether batched in one tensor or a list."""
     images = mm_kwargs.get("images")
@@ -206,15 +201,13 @@ class SpyrePixtralForConditionalGeneration(
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         tower = self.vision_encoder
-        weight = tower.patch_conv.weight.detach().flatten(1)
-        weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
-        # A plain holder, not the conv layer: nothing runs the conv, so the runner must not
-        # place a tiled conv copy of the weight on the card as well.
-        tower.patch_conv = nn.Module()
-        tower.patch_conv.weight = nn.Parameter(weight_t, requires_grad=False)
+        tower.patch_conv = fold_conv_patch_embedding(tower.patch_conv, self._patch_width)
         if self.patch_merger is not None:
             layer = self.patch_merger.merging_layer
-            merge_weight = offset_major_merge_weight(linear_weight(layer), self._merge)
+            # The columns follow ``unfold``'s (c, ki, kj) order: the group is the fast axis.
+            merge_weight = split_weight_by_group(
+                linear_weight(layer), self.patches_per_token, group_major=False
+            )
             layer.weight = nn.Parameter(merge_weight, requires_grad=False)
 
     # --- protocol methods upstream Pixtral does not provide ---

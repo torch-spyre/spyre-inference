@@ -51,6 +51,7 @@ from spyre_inference.multimodal.utils import (
     rope_perm_matrix,
     rope_rotate_matmul,
 )
+from spyre_inference.v1.worker import compile_guard
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -606,3 +607,26 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         """The pool only: the tail runs in ``postprocess_encoder_output``."""
         x = x.squeeze(0)
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).sum(dim=0)
+
+    def vision_embed_text(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
+    ) -> torch.Tensor:
+        # Upstream masks the image ids for the PLE lookup with an eager bool `where`, which
+        # does not lower on Spyre; mask them here in one graph and hand upstream text only.
+        # The merge overwrites the image rows, so their token-0 text embedding never shows.
+        if (
+            self.per_layer_embeddings is not None
+            and is_multimodal is not None
+            and is_multimodal.any()
+        ):
+            mask = convert(is_multimodal, device=input_ids.device, dtype=input_ids.dtype)
+            input_ids = _ids_outside_mask(input_ids, mask)
+        return super().vision_embed_text(input_ids, None)
+
+
+@torch.compile(backend="inductor", fullgraph=True, dynamic=False)
+def _ids_outside_mask(input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return torch.where(mask != 0, torch.zeros_like(input_ids), input_ids)
+
+
+compile_guard.watch(_ids_outside_mask, "Gemma 4 PLE image-token mask")

@@ -657,21 +657,24 @@ _UNSUPPORTED_ARCH_MODELS: dict[str, tuple[str, ...]] = {
 }
 
 
+def unsupported_on_current_arch(name: str) -> bool:
+    """True if `name` matches a model family excluded on the host architecture."""
+    patterns = _UNSUPPORTED_ARCH_MODELS.get(platform.machine())
+    return bool(patterns) and any(pat in name.lower() for pat in patterns)
+
+
 def _is_unsupported_on_current_platform(item: pytest.Item) -> bool:
     """Return True if the test item matches unsupported model families for the host architecture."""
-    arch = platform.machine()
-    patterns = _UNSUPPORTED_ARCH_MODELS.get(arch)
-    if not patterns:
+    if not _UNSUPPORTED_ARCH_MODELS.get(platform.machine()):
         return False
-    path_str = str(item.fspath).lower()
-    if any(pat in path_str for pat in patterns):
+    if unsupported_on_current_arch(str(item.fspath)):
         return True
     params = getattr(getattr(item, "callspec", None), "params", {})
     # Deliberately sweep all param values, not just a "model" key. The GSM8K gate
     # (test_gsm8k_correctness.py) has no "qwen" in its file path; the match comes
     # from its config_filename param ("qwen2.5-0.5b-instruct.yaml"). Narrowing this
     # to params["model"] would silently re-enable that gate on ppc64le.
-    return any(any(pat in str(v).lower() for pat in patterns) for v in params.values())
+    return any(unsupported_on_current_arch(str(v)) for v in params.values())
 
 
 def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:

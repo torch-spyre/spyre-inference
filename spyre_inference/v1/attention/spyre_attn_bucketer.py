@@ -51,18 +51,20 @@ logger = init_logger(__name__)
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 
-# Cores available to split a gather's entry axis across.
-_SPYRE_CORE_COUNT = 32
+# Gathered pages per batched-decode trip, two per core. Each trip has a fixed cost, so a
+# long context pays for its trip count; 64 entries measured faster than 32 at long context
+# and no slower at short.
+_BATCHED_DECODE_ENTRIES = 64
 
 
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
-    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
-    them, more than one stick's worth hits a backend axis-merge limit. The block
-    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+    ``entries = b_seqs * blocks_per_chunk`` targets ``_BATCHED_DECODE_ENTRIES``: fewer
+    takes more trips. The block axis pads up to a whole chunk, so
+    ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
-    blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    blocks_per_chunk = max(1, min(_BATCHED_DECODE_ENTRIES // b_seqs, b_blocks))
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
     return blocks_per_chunk, num_chunks
 

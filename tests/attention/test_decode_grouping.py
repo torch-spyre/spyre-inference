@@ -124,7 +124,7 @@ def test_each_group_matches_its_own_batch(decode_config, monkeypatch, kv_lens):
 
 @pytest.mark.parametrize(("group_cost", "split"), [(2, True), (8, False)])
 def test_groups_merge_within_the_dispatch_cost(decode_config, monkeypatch, group_cost, split):
-    """256 + 2 blocks: 8 + 1 chunks apart, 16 as one batch, so a dispatch worth 8
+    """256 + 2 blocks: 4 + 1 chunks apart, 8 as one batch, so a dispatch worth 8
     chunks merges them and one worth 2 does not."""
     from spyre_inference.v1.attention.backends import spyre_attn
 

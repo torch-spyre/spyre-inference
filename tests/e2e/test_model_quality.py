@@ -41,6 +41,12 @@ DECODER_MODELS = [
     "google/gemma-4-E2B",
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
+# The shipped decoders the regression tier checks on every PR; trunk runs all of them.
+REGRESSION_EXTRA_MODELS = {
+    "ibm-granite/granite-4.1-8b",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "ibm-granite/granite-4.1-8b-fp8",
+}
 
 # Every gemma-4 checkpoint carries a vision tower this decoder test does not need. Every
 # modality at 0 keeps the default Gemma4ForConditionalGeneration load and stage-skips the
@@ -89,11 +95,18 @@ COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
 # The guard counts with a bare `tokenizer()`; vLLM can add a special token or two.
 PROMPT_TOKEN_MARGIN = 8
 
+
+def _regression_extra(model: str):
+    if model in REGRESSION_EXTRA_MODELS:
+        return pytest.param(model, marks=pytest.mark.regression_extra)
+    return model
+
+
 _REF_PATH = Path(__file__).parent.parent / "data" / "decoder_output_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
 
 
-@pytest.mark.parametrize("model", DECODER_MODELS)
+@pytest.mark.parametrize("model", [_regression_extra(m) for m in DECODER_MODELS])
 def test_decoder_model_output(
     model: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -155,7 +168,7 @@ def test_decoder_model_output(
     _report_reference_coverage(model, matched, max_tokens, record_property)
 
 
-@pytest.mark.parametrize("model", FP8_DECODER_MODELS)
+@pytest.mark.parametrize("model", [_regression_extra(m) for m in FP8_DECODER_MODELS])
 def test_fp8_decoder_model_smoke(
     model: str,
     monkeypatch: pytest.MonkeyPatch,

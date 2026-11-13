@@ -99,7 +99,7 @@ on:
       test_type:
         description: >-
           Suite subset to run: unit | integration (default, the smoke suite)
-          | regression (every config) | trunk | perf. Literal, first-class
+          | regression (integration + regression_extra) | trunk (every config) | perf. Literal, first-class
           values -- no alias-resolution layer. Selects which matrix configs
           run (see _test_matrix.yaml); same knob and vocabulary as the
           sibling repos. GitHub validates `choice` options against the REST
@@ -182,7 +182,7 @@ jobs:
   # Run the test matrix via the reusable workflow shared with
   # test_each_commit.yaml, defaulting to the integration tier (the smoke
   # suite) -- same default as the sibling repos' integration-tests.yaml.
-  # Callers can still request test_type: regression for complete coverage.
+  # Callers can request test_type: trunk for complete coverage.
   # ---------------------------------------------------------------------------
   run-tests:
     needs: provenance

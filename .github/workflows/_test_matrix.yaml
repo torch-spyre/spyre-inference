@@ -96,8 +96,10 @@ on:
                           e2e_smoke and attention_smoke subsets (1- and
                           2-card jobs); the upstream-dependency dispatch's
                           default
-            regression  — every config (default)
-            trunk       — push-to-main CI; same coverage as regression
+            regression  — integration plus the opt-in regression_extra
+                          set (default; cross-repo dispatches)
+            trunk       — every config; what this repo's own PRs, merge
+                          queue and pushes run (test_each_commit.yaml)
           Same knob and vocabulary as the sibling repos (torch-spyre,
           hf-adapters); the mapping to configs is repo-internal. Validated
           and defaulted (empty -> regression) once in the "Decide whether to
@@ -476,7 +478,7 @@ jobs:
           # SMOKE_SHARDS (Makefile default). Marker expression owned by the
           # Makefile (test-<name> target); see that target's comment.
           - cfg: Non-distributed spyre tests (shard 1/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -484,7 +486,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-0
           - cfg: Non-distributed spyre tests (shard 2/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -492,7 +494,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-1
           - cfg: Non-distributed spyre tests (shard 3/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -500,7 +502,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-2
           - cfg: Non-distributed spyre tests (shard 4/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -508,7 +510,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-3
           - cfg: Non-distributed spyre tests (shard 5/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -516,7 +518,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-4
           - cfg: Non-distributed spyre tests (shard 6/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -524,7 +526,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-5
           - cfg: Non-distributed spyre tests (shard 7/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -532,7 +534,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-6
           - cfg: Non-distributed spyre tests (shard 8/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -540,7 +542,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-7
           - cfg: Non-distributed spyre tests (shard 9/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -548,7 +550,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-8
           - cfg: Non-distributed spyre tests (shard 10/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -556,17 +558,17 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-shard-9
           - cfg: Non-distributed spyre tests (shard 11/11)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-smoke-shard-10
-          # Integration tier: tests/e2e enters only via the opt-in e2e_smoke marker
-          # (docs/contributing/integration-tier.md); other tiers run the full shards.
+          # Integration tier, also run by regression: tests/e2e enters only via the opt-in
+          # e2e_smoke marker (docs/contributing/integration-tier.md); trunk runs the full shards.
           - cfg: Unit-level spyre tests (shard 1/3)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -574,7 +576,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-unit-shard-0
           - cfg: Unit-level spyre tests (shard 2/3)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -582,7 +584,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-unit-shard-1
           - cfg: Unit-level spyre tests (shard 3/3)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -590,7 +592,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-smoke-unit-shard-2
           - cfg: Spyre e2e smoke (shard 1/3)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -598,7 +600,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-e2e-smoke-shard-0
           - cfg: Spyre e2e smoke (shard 2/3)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -606,7 +608,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-e2e-smoke-shard-1
           - cfg: Spyre e2e smoke (shard 3/3)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -614,7 +616,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-e2e-smoke-shard-2
           - cfg: Spyre e2e smoke TP=2 (shard 1/2)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -622,13 +624,39 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-e2e-smoke-dist-shard-0
           - cfg: Spyre e2e smoke TP=2 (shard 2/2)
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x2
               - linux
             image_label: image_torch_spyre
             test_target: test-e2e-smoke-dist-shard-1
+          # What regression adds on top of integration: the opt-in regression_extra set.
+          # REGRESSION_EXTRA_SHARDS (Makefile) is the count.
+          - cfg: Spyre regression extra (shard 1/3)
+            test_types: regression
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-regression-extra-shard-0
+          - cfg: Spyre regression extra (shard 2/3)
+            test_types: regression
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-regression-extra-shard-1
+          - cfg: Spyre regression extra (shard 3/3)
+            test_types: regression
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-regression-extra-shard-2
           # Model-output quality gate: the product-model output checks (model_quality)
           # plus the GSM8K accuracy evals (gsm8k). Its own jobs and not in `integration`,
           # since every case compiles a product model or starts a vLLM server. Sharded
@@ -638,7 +666,7 @@ jobs:
           # default. (The gsm8k evals need the upstream vLLM checkout; the combo's marker
           # expression pulls it in automatically, no --upstream flag.)
           - cfg: Spyre quality gate (shard 1/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -646,7 +674,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-0
           - cfg: Spyre quality gate (shard 2/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -654,7 +682,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-1
           - cfg: Spyre quality gate (shard 3/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -662,7 +690,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-2
           - cfg: Spyre quality gate (shard 4/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -670,7 +698,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-3
           - cfg: Spyre quality gate (shard 5/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -678,7 +706,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-4
           - cfg: Spyre quality gate (shard 6/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -686,7 +714,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-5
           - cfg: Spyre quality gate (shard 7/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -694,7 +722,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-quality-shard-6
           - cfg: Spyre quality gate (shard 8/8)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -710,7 +738,7 @@ jobs:
           # Adding/removing a shard = add/remove an entry here and bump that
           # default. The encoder split runs below.
           - cfg: Spyre attention tests (shard 1/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -718,7 +746,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-0
           - cfg: Spyre attention tests (shard 2/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -726,7 +754,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-1
           - cfg: Spyre attention tests (shard 3/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -734,7 +762,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-2
           - cfg: Spyre attention tests (shard 4/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -742,7 +770,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-3
           - cfg: Spyre attention tests (shard 5/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -750,7 +778,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-4
           - cfg: Spyre attention tests (shard 6/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -758,7 +786,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-5
           - cfg: Spyre attention tests (shard 7/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -766,7 +794,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-6
           - cfg: Spyre attention tests (shard 8/8)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -774,7 +802,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-shard-7
           - cfg: Encoder attention tests
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -783,9 +811,9 @@ jobs:
             test_target: test-encoder-attention
           # Small decoder-attention subset carrying attention coverage into the integration
           # tier, which the full test-attention-shard-* suite above is excluded from. Hence
-          # integration-only: regression/trunk/unit already run the full shards.
+          # integration/regression only: trunk/unit already run the full shards.
           - cfg: Spyre attention smoke
-            test_types: integration
+            test_types: integration regression
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -795,10 +823,11 @@ jobs:
           # Distributed (TP=2) suite, sharded across parallel 2-card jobs. Each
           # case spawns a TP=2 subprocess pair, so the model-run cases dominate;
           # the plugin's weighted partition balances by recorded runtime.
-          # Not `integration` (it uses the e2e_smoke TP=2 shards). Probes are excluded (dedicated probe job below). Adding/
-          # removing a shard = add/remove an entry here and bump DIST_SHARDS.
+          # Not `integration` (it uses the e2e_smoke TP=2 shards). Probes are excluded
+          # (dedicated probe job below). Adding/removing a shard = add/remove an entry
+          # here and bump DIST_SHARDS.
           - cfg: Distributed spyre tests (shard 1/3)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -806,7 +835,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-distributed-shard-0
           - cfg: Distributed spyre tests (shard 2/3)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -814,7 +843,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-distributed-shard-1
           - cfg: Distributed spyre tests (shard 3/3)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -825,7 +854,7 @@ jobs:
           # A distinct marker (distributed_tp4) keeps these out of the 2-card
           # distributed job, which would silently skip them.
           - cfg: Distributed TP4 spyre tests
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x4
@@ -839,7 +868,7 @@ jobs:
           # native-collective probes). Adding/removing a shard = add/remove an entry here
           # and bump PROBE_SHARDS (Makefile default).
           - cfg: Spyre probe tests (shard 1/2)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -847,7 +876,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-probes-shard-0
           - cfg: Spyre probe tests (shard 2/2)
-            test_types: unit regression trunk
+            test_types: unit trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -861,7 +890,7 @@ jobs:
           # Excluded from integration/unit (heavy). Adding/removing a shard =
           # add/remove an entry here and bump UPSTREAM_SHARDS (Makefile default).
           - cfg: Upstream vLLM tests (shard 1/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -869,7 +898,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-0
           - cfg: Upstream vLLM tests (shard 2/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -877,7 +906,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-1
           - cfg: Upstream vLLM tests (shard 3/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -885,7 +914,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-2
           - cfg: Upstream vLLM tests (shard 4/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -893,7 +922,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-3
           - cfg: Upstream vLLM tests (shard 5/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -901,7 +930,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-4
           - cfg: Upstream vLLM tests (shard 6/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -909,7 +938,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-5
           - cfg: Upstream vLLM tests (shard 7/7)
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
@@ -917,7 +946,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-shard-6
           - cfg: Upstream distributed vLLM tests
-            test_types: regression trunk
+            test_types: trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
@@ -957,7 +986,7 @@ jobs:
       #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
       #      flow passes only when source files changed;
       #   2. this config's test_types set contains the requested test_type
-      #      (so test_type selects a subset of the matrix; regression = every
+      #      (so test_type selects a subset of the matrix; trunk = every
       #      config).
       - name: Decide whether to run
         id: gate

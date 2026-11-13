@@ -3,7 +3,7 @@
 The `integration` tier is the check a torch-spyre (or Spyre RPM) PR pays for on every push.
 It answers one question: does this change break a Spyre-specific path in spyre-inference?
 It is not where correctness, accuracy or model coverage is proven; `trunk` and the quality
-gate do that, and they keep running every e2e test.
+gate do that, and `trunk` keeps running every e2e test.
 
 ## What runs
 
@@ -92,9 +92,35 @@ Review the whole set quarterly. Re-check that each entry's path is still distinc
 at which entries actually caught a torch-spyre regression. A path that has never failed is
 not removed for that alone; it is still the cheap guard on its path.
 
+## The regression tier
+
+`regression` is the broader tier other repos' tooling can request. It is the integration
+tier plus one more opt-in marker, `regression_extra`: the product-model quality cases and the
+one heavy compiled vision path that integration leaves out. This repo's own PRs, merge queue
+and pushes always run `trunk`, which is every test, so a case outside both sets keeps its
+coverage there.
+
+```bash
+pytest -m regression_extra --collect-only -q   # what regression adds on top of integration
+make tests TEST_TYPE=regression                # the whole tier, unsharded
+```
+
+Admission to `regression_extra` follows the policy above with relaxed numbers:
+
+- The case names a shipped model family, a serving config, or a distinct path that
+  integration doesn't cover.
+- It takes about 20 minutes or less cold.
+- The `regression_extra` total stays around 60 minutes, with the same swap rule.
+- It is stable, and the PR that adds the marker is the admission. There is no CI guard.
+
+The compiled `test_single_image_prompt_produces_output` case is over the per-case limit. It
+is admitted as the named exception for compiled vision, and it is the first entry to drop
+once a cheaper compiled vision case exists.
+
 ## Shard counts
 
-`SMOKE_UNIT_SHARDS`, `E2E_SMOKE_SHARDS` and `E2E_SMOKE_DIST_SHARDS` in the `Makefile` set
+`SMOKE_UNIT_SHARDS`, `E2E_SMOKE_SHARDS`, `E2E_SMOKE_DIST_SHARDS` and
+`REGRESSION_EXTRA_SHARDS` in the `Makefile` set
 the counts, and `.github/workflows/_test_matrix.yaml` declares one job per shard. Resize
 them with the `rebalance-test-shards` skill; `tests/test_sharding.py` checks that the two
 files agree.

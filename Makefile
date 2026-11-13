@@ -9,8 +9,9 @@ SHELL := /bin/bash
 #   integration — the unit-level smoke tests (tests/e2e excluded) plus the
 #                 opt-in e2e_smoke and attention_smoke subsets (TEST_TYPE=smoke
 #                 by itself is rejected below)
-#   regression  — everything
-#   trunk       — same coverage as regression; push-to-main CI label
+#   regression  — integration plus the opt-in regression_extra set
+#                 (cross-repo dispatches)
+#   trunk       — everything; this repo's own PR, merge-queue and push CI
 #   perf        — vLLM benchmark suite (perf-tests target), not a pytest
 #                 marker subset
 # Empty / unset defaults to "regression". This Makefile is the single source
@@ -94,8 +95,8 @@ endif
 ifneq ($(MARK_OVERRIDE),)
 MARK_EXPR := -m "$(MARK_OVERRIDE)"
 else ifeq ($(TEST_TYPE),regression)
-MARK_EXPR :=
-UPSTREAM_ARG := --upstream
+# Only the regression_extra part; `make tests` adds the integration combos (tests-regression).
+MARK_EXPR := -m "regression_extra and not (distributed or upstream)"
 else ifeq ($(TEST_TYPE),trunk)
 MARK_EXPR :=
 UPSTREAM_ARG := --upstream
@@ -106,7 +107,7 @@ else ifeq ($(TEST_TYPE),integration)
 MARK_EXPR := -m "not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)"
 E2E_IGNORE_ARG := --ignore=tests/e2e
 else ifeq ($(TEST_TYPE),unit)
-# model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
+# model_quality is scheduled trunk only (_test_matrix.yaml), so it stays
 # out of the unit tier as well. distributed_tp4 has its own 4-card job.
 MARK_EXPR := -m "not (upstream or model_quality or distributed_tp4)"
 else
@@ -123,6 +124,7 @@ RESULTS_DIR ?= .
 .PHONY: help test tests run-one aiu-setup perf-tests perf-legs coverage print-test-type \
         test-smoke test-smoke-shard test-smoke-unit-shard test-quality test-quality-shard \
         test-e2e-smoke test-e2e-smoke-shard test-e2e-smoke-dist-shard tests-integration \
+        test-regression-extra test-regression-extra-shard tests-regression \
         test-probes test-probes-shard \
         test-attention test-attention-shard test-attention-smoke \
         test-distributed test-distributed-shard test-distributed-tp4 \
@@ -239,6 +241,21 @@ test-e2e-smoke-dist-shard: ## Run one 2-card e2e_smoke shard (E2E_SMOKE_DIST_SHA
 
 test-e2e-smoke-dist-shard-%:
 	$(MAKE) test-e2e-smoke-dist-shard E2E_SMOKE_DIST_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# What the regression tier adds on top of integration (admission:
+# docs/contributing/integration-tier.md). Trunk runs these cases in the full suites.
+test-regression-extra: ## Run the regression_extra subset in one process. Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='regression_extra and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+REGRESSION_EXTRA_SHARDS ?= 3
+REGRESSION_EXTRA_SHARD_ID ?= 0
+test-regression-extra-shard: ## Run one regression_extra shard (REGRESSION_EXTRA_SHARDS=N REGRESSION_EXTRA_SHARD_ID=i). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='regression_extra and not (distributed or upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --regression-extra-shards=$(REGRESSION_EXTRA_SHARDS) --regression-extra-shard-id=$(REGRESSION_EXTRA_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+test-regression-extra-shard-%:
+	$(MAKE) test-regression-extra-shard REGRESSION_EXTRA_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # The model-output quality gate. Two kinds of heavy case share it: the product-model output
 # checks (`model_quality`; local, every case compiles a product model, up to the 31B decoders)
@@ -394,6 +411,12 @@ tests-integration: ## Run the integration tier: unit-level smoke, e2e_smoke, att
 	mkdir -p "$(RESULTS_DIR)/junit-test-attention-smoke" && $(MAKE) test-attention-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-smoke/junit-test-attention-smoke.xml" || rc=1; \
 	exit $$rc
 
+tests-regression: ## Run the regression tier: the integration tier plus regression_extra.
+	rc=0; \
+	$(MAKE) tests-integration RESULTS_DIR="$(RESULTS_DIR)" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-regression-extra" && $(MAKE) test-regression-extra JUNIT_XML="$(RESULTS_DIR)/junit-test-regression-extra/junit-test-regression-extra.xml" || rc=1; \
+	exit $$rc
+
 tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstream-distributed/probes/tp4). Needs 2 cards minimum; TP=4 tests skip gracefully on hosts with fewer than 4 cards.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
@@ -407,17 +430,18 @@ tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstre
 	mkdir -p "$(RESULTS_DIR)/junit-test-distributed-tp4" && $(MAKE) test-distributed-tp4 JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed-tp4/junit-test-distributed-tp4.xml" || rc=1; \
 	exit $$rc
 
-# When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same
-# coverage), GHA's _test_matrix.yaml runs this as 6 separate marker-combo
+# When MARK_OVERRIDE is unset and TEST_TYPE=trunk, GHA's _test_matrix.yaml runs this as 6 separate marker-combo
 # jobs, not one unfiltered run -- mirror that here so
-# `make test TEST_TYPE=regression` is GHA-parity, one flat JUnit file per
+# `make test TEST_TYPE=trunk` is GHA-parity, one flat JUnit file per
 # combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
 tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default regression) or set MARK_OVERRIDE directly.
 	if [ "$(TEST_TYPE)" = "perf" ]; then \
 	  $(MAKE) perf-tests RESULTS_DIR="$(RESULTS_DIR)"; \
 	elif [ -z "$(MARK_OVERRIDE)" ] && [ "$(TEST_TYPE)" = "integration" ]; then \
 	  $(MAKE) tests-integration RESULTS_DIR="$(RESULTS_DIR)"; \
-	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "regression" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
+	elif [ -z "$(MARK_OVERRIDE)" ] && [ "$(TEST_TYPE)" = "regression" ]; then \
+	  $(MAKE) tests-regression RESULTS_DIR="$(RESULTS_DIR)"; \
+	elif [ -n "$(MARK_OVERRIDE)" ] || [ "$(TEST_TYPE)" != "trunk" ]; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \

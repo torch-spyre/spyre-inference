@@ -63,7 +63,9 @@ def _synthetic_image(size: int = 224, seed: int = 0):
 def _hf_text_embeddings(prompts: list[str]) -> list[torch.Tensor]:
     from transformers import CLIPModel, CLIPTokenizer
 
-    model = CLIPModel.from_pretrained(MODEL, revision=REVISION).eval()
+    # Explicit dtype: with the default "auto", transformers probes the .bin checkpoint on the
+    # meta device, and on big-endian s390x torch's byteswap of a meta storage segfaults.
+    model = CLIPModel.from_pretrained(MODEL, revision=REVISION, dtype=torch.float32).eval()
     tokenizer = CLIPTokenizer.from_pretrained(MODEL, revision=REVISION)
     out = []
     with torch.inference_mode():
@@ -77,7 +79,7 @@ def _hf_text_embeddings(prompts: list[str]) -> list[torch.Tensor]:
 def _hf_image_embeddings(images: list) -> list[torch.Tensor]:
     from transformers import CLIPImageProcessor, CLIPModel
 
-    model = CLIPModel.from_pretrained(MODEL, revision=REVISION).eval()
+    model = CLIPModel.from_pretrained(MODEL, revision=REVISION, dtype=torch.float32).eval()
     processor = CLIPImageProcessor.from_pretrained(MODEL, revision=REVISION)
     with torch.inference_mode():
         pixel_values = processor(images=images, return_tensors="pt")["pixel_values"]

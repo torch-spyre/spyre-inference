@@ -148,7 +148,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MOE_CHUNKS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
     ),
-    # Experts per trip of the compiled all-expert loop (stick-aligned batches of 256 to 1,024
+    # Experts per trip of the compiled all-expert loop (stick-aligned batches of 256 to 512
     # tokens, in practice prefill chunks), for every model on the Spyre MoE backend. G > 1 puts
     # the G experts of a trip on G groups of SENCORES / G cores, each core taking a block of
     # tokens through one whole expert. Unset keeps the model recipe's value (1 = one expert

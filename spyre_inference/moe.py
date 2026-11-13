@@ -116,10 +116,10 @@ def _derive_moe_chunks(
     return best_chunks
 
 
-# Traced batches of 256 to 1,024 tokens run grouped. Below, a core of a four-group map takes
-# under 32 token rows; at 2,048 tokens the grouped loop is slower than one expert per trip.
+# Traced batches of 256 to 512 tokens run grouped. Below, a core of a four-group map takes
+# under 32 token rows; at 1,024 tokens it is slower than one expert per trip at TP 4.
 _MIN_GROUPED_TOKENS = 256
-_MAX_GROUPED_TOKENS = 1024
+_MAX_GROUPED_TOKENS = 512
 
 
 @dataclass(frozen=True)

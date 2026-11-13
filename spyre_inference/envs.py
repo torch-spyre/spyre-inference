@@ -153,7 +153,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device at the same time during load. "0" (default) uses min(8, torch threads), this
     # worker's share of the CPU budget, at most 16; "1" prepares one layer after another.
     "SPYRE_MOE_PREP_THREADS": lambda: int(os.getenv("SPYRE_MOE_PREP_THREADS", "0")),
-    # Experts per trip of the compiled all-expert loop (stick-aligned batches of 256 to 1,024
+    # Experts per trip of the compiled all-expert loop (stick-aligned batches of 256 to 512
     # tokens, in practice prefill chunks), for every model on the Spyre MoE backend. G > 1 puts
     # the G experts of a trip on G groups of SENCORES / G cores, each core taking a block of
     # tokens through one whole expert. Unset keeps the model recipe's value (1 = one expert

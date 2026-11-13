@@ -246,7 +246,10 @@ def _run_artifactory_datasets():
 
     base_url = _require_env("ARTIFACTORY_BASE_URL").rstrip("/")
     token = _require_env("ARTIFACTORY_TOKEN")
-    root = _require_env("ARTIFACTORY_DATA_PATH").strip("/")
+    # Datasets root with fallback to the artifacts root; see fetch_bench_datasets.py.
+    root = (os.getenv("ARTIFACTORY_DATASETS_PATH") or _require_env("ARTIFACTORY_DATA_PATH")).strip(
+        "/"
+    )
 
     force = os.getenv("FORCE_DOWNLOAD") == "true"
 

@@ -76,6 +76,7 @@ jobs:
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+          ARTIFACTORY_DATASETS_PATH: ${{ secrets.ARTIFACTORY_DATASETS_PATH }}
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh

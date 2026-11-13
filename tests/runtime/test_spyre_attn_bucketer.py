@@ -22,6 +22,7 @@ import pytest
 
 from spyre_inference import envs
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    _BATCHED_DECODE_ENTRIES,
     SpyreAttnBucketer,
     _parse_buckets,
     _powers_of_two_up_to,
@@ -614,8 +615,8 @@ class TestBatchedDecodeVariants:
     def test_chunking_pads_when_the_ladder_is_not_a_power_of_two(self):
         """With power-of-two buckets the padding vanishes, so a drifting copy of the
         chunking rule would look correct."""
-        assert batched_decode_chunking(8, 8) == (4, 2)  # 4*2 == 8, no padding
-        assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
+        assert batched_decode_chunking(8, 16) == (8, 2)  # 8*2 == 16, no padding
+        assert batched_decode_chunking(6, 16) == (10, 2)  # 10*2 == 20, padded
 
     def test_count_stays_tractable_at_long_context(self, monkeypatch):
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
@@ -825,10 +826,10 @@ class TestDynamicChunks:
             yield
 
     def test_one_variant_past_one_chunk_covers_every_longer_context(self):
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
-        max_pages = 8192 // BLOCK_SIZE
+        b = SpyreAttnBucketer(make_config(max_model_len=16384), declare_pages=True)
+        max_pages = 16384 // BLOCK_SIZE
         for num_seqs in b.num_seqs_buckets:
-            width = 32 // num_seqs
+            width = _BATCHED_DECODE_ENTRIES // num_seqs
             variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
             (dynamic,) = [v for v in variants if v.dynamic_chunks]
             assert (dynamic.blocks_per_chunk, dynamic.num_chunks) == (width, max_pages // width)
@@ -844,9 +845,9 @@ class TestDynamicChunks:
             assert (plan.chunk_range, plan.num_chunks) == (None, 1)
 
     def test_one_chunk_kernel_serves_every_call_within_one_chunk(self):
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        b = SpyreAttnBucketer(make_config(max_model_len=16384), declare_pages=True)
         for num_seqs in b.num_seqs_buckets:
-            width = 32 // num_seqs
+            width = _BATCHED_DECODE_ENTRIES // num_seqs
             variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
             assert [
                 (v.blocks_per_chunk, v.num_chunks) for v in variants if not v.dynamic_chunks
@@ -855,8 +856,8 @@ class TestDynamicChunks:
                 assert b.batched_decode_plan(num_seqs, nb) == (width, width, 1, None)
 
     def test_a_batch_size_whose_context_fits_two_chunks_keeps_the_buckets(self):
-        # 32 pages: one chunk at one sequence, two at two sequences.
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        # 64 pages: one chunk at one sequence, two at two sequences.
+        b = SpyreAttnBucketer(make_config(max_model_len=4096), declare_pages=True)
         for num_seqs in (1, 2):
             variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
             assert not any(v.dynamic_chunks for v in variants)

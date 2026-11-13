@@ -35,7 +35,7 @@ Vocabulary:
 - A *page* (also *block*) is one KV cache block: ``block_size`` tokens of one sequence.
 - A *chunk* is what the batched decode kernel reads in one loop step: the next
   ``blocks_per_chunk`` pages of every sequence in the batch. ``_chunk_width`` picks
-  ``blocks_per_chunk`` so that a chunk holds about 32 pages, one per core, and at least
+  ``blocks_per_chunk`` so that a chunk holds about 64 pages, two per core, and at least
   one page of each sequence. A batch runs as many chunks as its longest sequence needs;
   shorter sequences are masked past their end. The per-sequence prefill kernel's
   counterpart is its *page group*, ``page_group`` pages of one sequence per loop step.
@@ -66,8 +66,10 @@ logger = init_logger(__name__)
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 
-# Cores available to split a gather's entry axis across.
-_SPYRE_CORE_COUNT = 32
+# Gathered pages per batched-decode trip, two per core. Each trip has a fixed cost, so a
+# long context pays for its trip count; 64 entries measured faster than 32 at long context
+# and no slower at short.
+_BATCHED_DECODE_ENTRIES = 64
 
 
 class DynamicRange(TypedDict):
@@ -81,17 +83,17 @@ class DynamicRange(TypedDict):
 
 
 def _chunk_width(b_seqs: int) -> int:
-    """The pages per sequence in one chunk: ``32 // b_seqs``, so that a chunk gives each
-    of the 32 cores one page, but at least 1."""
-    return max(1, _SPYRE_CORE_COUNT // b_seqs)
+    """The pages per sequence in one chunk: ``_BATCHED_DECODE_ENTRIES // b_seqs``, but at
+    least 1."""
+    return max(1, _BATCHED_DECODE_ENTRIES // b_seqs)
 
 
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
-    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
-    them, more than one stick's worth hits a backend axis-merge limit. The block
-    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+    ``entries = b_seqs * blocks_per_chunk`` targets ``_BATCHED_DECODE_ENTRIES``: fewer
+    takes more trips. The block axis pads up to a whole chunk, so
+    ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
     blocks_per_chunk = min(_chunk_width(b_seqs), b_blocks)
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
@@ -612,7 +614,7 @@ class SpyreAttnBucketer:
 
         That kernel reads ``_chunk_width`` pages per sequence, so the smallest KV bucket
         must be no larger. With one KV head the smallest KV bucket is 2 pages, because the
-        decode kernel does not compile on a single page. At 32 sequences a chunk is 1
+        decode kernel does not compile on a single page. At 64 sequences a chunk is 1
         page, so there is no one-chunk kernel and every call runs the dynamic kernel.
         """
         if num_seqs_bucket not in self._chunk_ranges:

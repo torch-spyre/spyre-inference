@@ -1,0 +1,8 @@
+# Cadence hints for the planner. The bench/v1alpha1 schemas have no schedule block yet and the engine reads *.yaml only,
+# so this file is .yml and not validated. est_hours are placeholders to fill from recorded durations.
+default: {preferred: nightly, fallback: weekly, priority: 50}
+selections:
+  perf-sanity: {preferred: nightly, est_hours: null}
+  perf-core: {preferred: nightly, fallback: weekly, est_hours: null}
+  quality-sanity: {preferred: nightly, est_hours: null}
+  quality-core: {preferred: nightly, fallback: weekly, est_hours: null}

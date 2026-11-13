@@ -1,0 +1,24 @@
+# Digests and paths mirror .github/cache_config/artifactory_datasets.yaml.
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: aiops-trace-files}
+spec:
+  type: fileset
+  format: jsonl
+  visibility: internal
+  source: {store: bench-data, path: spyre-inference/vllm-bench-data/converted_traces/2025.11.03_e2ee1b0_reordered}
+  integrity:
+    files:
+      - {path: aiops_results_2025.11.03_e2ee1b0_correct_order.jsonl, sha256: 468cf059f2ec3b14108efc09baffabf5c5a440172a25660673d5a8fa029d0637}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: cics-trace-files}
+spec:
+  type: fileset
+  format: jsonl
+  visibility: internal
+  source: {store: bench-data, path: spyre-inference/vllm-bench-data/converted_traces/2025.11.03_e2ee1b0_reordered}
+  integrity:
+    files:
+      - {path: cics_results_2025.11.03_e2ee1b0_correct_order.jsonl, sha256: e0efa895b4a22b601748c7dda9e8a2db146773fb8735fc45ee2920c042b40fb7}

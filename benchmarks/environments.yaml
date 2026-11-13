@@ -1,0 +1,24 @@
+# What a case needs: a number of cards. Architecture, queue and node pools are chosen by the launcher, not named here.
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-1card, description: "one card"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 1}]
+  labels: {device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-2card, description: "two cards, tensor parallel 2"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 2}]
+  labels: {device.count: 2}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-4card, description: "four cards, tensor parallel 4"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 4}]
+  labels: {device.count: 4}

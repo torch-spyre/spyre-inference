@@ -1,0 +1,9 @@
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: aiops-trace, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: aiops-trace-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: cics-trace, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: cics-trace-files, role: trace}

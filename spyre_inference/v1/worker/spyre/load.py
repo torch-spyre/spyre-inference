@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.prompt_logprob import CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE
 
 from spyre_inference.models import check_spyre_model
+from spyre_inference.moe import wait_for_moe_layers
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.pool import configure_pooling_for_spyre
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre
@@ -81,6 +82,7 @@ class _SpyreModelLoaderWrapper:
         runner = self._runner
         install_pad_loaders(self._loader, model_config)
         model = self._loader.load_model(vllm_config=vllm_config, model_config=model_config)
+        wait_for_moe_layers()
         check_spyre_model(model, get_model_architecture(model_config)[1])
         fix_padded_model(model, model_config)
         # Before any trace: resolved lazily inside the block graph, the scales become a

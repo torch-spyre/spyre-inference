@@ -193,6 +193,11 @@ per-core working set. For Gemma 4 with `top_k=8` and 32 cores this selects `C=4`
 whole-stick chunks. Alias entry `e·C + c` is chunk `c` of expert `e`. TP narrows only `M`, so
 the slicing is unchanged at every TP degree.
 
+The relayout and copy of one layer's stacks are independent of every other layer's, so loading
+prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
+worker's share of the CPU budget; `1` prepares them in order). The loader waits for all of them
+before anything reads the model.
+
 Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
 expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input
 is one broadcast, the gate/up chunk sum reduces a contiguous axis and the down parts reshape

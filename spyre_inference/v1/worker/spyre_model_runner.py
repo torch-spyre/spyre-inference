@@ -70,6 +70,7 @@ from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
+from spyre_inference.moe import wait_for_moe_layers
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -722,6 +723,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        wait_for_moe_layers()
         check_spyre_model(self.model, get_model_architecture(self.model_config)[1])
         self.model_memory_usage = 0  # No GPU memory profiling for Spyre
 

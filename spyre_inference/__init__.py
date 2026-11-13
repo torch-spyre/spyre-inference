@@ -44,8 +44,10 @@ def register():
     pin_model_runner(envs.SPYRE_MODEL_RUNNER)
     # flex and torch-spyre read these once, when the device runtime starts on the first
     # device op in each worker, which is after this runs; an explicit value still wins.
-    for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
-        os.environ.setdefault(name, "1")
+    # Preferred on a PF device only, not on a VF.
+    if os.environ.get("FLEX_DEVICE") == "PF":
+        for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
+            os.environ.setdefault(name, "1")
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 

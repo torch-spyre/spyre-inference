@@ -158,8 +158,8 @@ Bucketing trades warmup time for per-request padding. A request is padded up to 
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
 compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
-that fit its smallest real query length. Batched decode uses KV-length/num-sequences
-pairs; both recording paths also enforce the allocated page-capacity limit. Extra
+that fit its smallest real query length. Batched decode records one variant per trip
+count (see below); both recording paths also enforce the allocated page-capacity limit. Extra
 buckets can still multiply the recorded variants, so keep those lists short.
 
 **Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
@@ -242,9 +242,9 @@ exception: there the step rounds down to a whole block and adds a few buckets (1
 
 As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
 saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
-it buys little for its warmup. Once the block count exceeds one chunk of `64 // num_seqs` blocks,
-the batched-decode kernel also pads it up to whole chunks, which takes back part of a denser
-preset's saving below 64 sequences. `8_5` is the recommended compromise, `9_8` the fastest when
+it buys little for its warmup. A packed decode batch (below) does not round onto these buckets
+at all, so a preset only reaches decode through the per-sequence path and the grid fallback.
+`8_5` is the recommended compromise, `9_8` the fastest when
 warmup time does not matter, and `pow2` the default because it has the shortest warmup.
 
 If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every preset: put the
@@ -252,6 +252,9 @@ buckets where the lengths actually are. A workload that sits on one power of two
 from any preset.
 
 #### A denser ladder for large batches only
+
+This applies to the grid fallback only: batches wider than one packed trip, and models with a
+sliding window.
 
 A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
 concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
@@ -266,10 +269,15 @@ num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
 `SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
 less warmup.
 
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), warmup
-records eligible KV-length × num-sequences combinations.
-`SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
-extra lever there, and the same keep-it-short advice applies.
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), a decode batch
+of up to 64 sequences is packed onto one trip's 64 page lanes, which it splits by page count:
+a long sequence takes more lanes and a short one fewer, so no sequence pads up to the longest
+in the batch or to a num-sequences bucket. The kernel then varies only in its trip count, so
+warmup records one variant per entry of a trip-count ladder with four steps per doubling, up
+to the longest batch `--max-model-len` and `--max-num-seqs` allow. Wider batches, and models
+with a sliding window, use the grid instead, which records KV-length × num-sequences
+combinations; `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to
+`--max-num-seqs`) is the extra lever there, and the same keep-it-short advice applies.
 
 ## KV cache size
 

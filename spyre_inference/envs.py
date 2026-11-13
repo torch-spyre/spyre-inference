@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
+    SPYRE_MOE_EXPERT_GROUP: int | None = None
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -146,6 +147,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives it from top_k, stick alignment and the core count.
     "SPYRE_MOE_CHUNKS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
+    ),
+    # Experts per trip of the compiled all-expert loop (stick-aligned batches of 256 to 1,024
+    # tokens, in practice prefill chunks), for every model on the Spyre MoE backend. G > 1 puts
+    # the G experts of a trip on G groups of SENCORES / G cores, each core taking a block of
+    # tokens through one whole expert. Unset keeps the model recipe's value (1 = one expert
+    # per trip on all cores).
+    "SPYRE_MOE_EXPERT_GROUP": lambda: (
+        int(value) if (value := os.getenv("SPYRE_MOE_EXPERT_GROUP")) is not None else None
     ),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).

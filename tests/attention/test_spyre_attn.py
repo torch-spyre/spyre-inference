@@ -1691,7 +1691,9 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
         pytest.param(1025, 32, id="kv1025_to_32"),
     ],
 )
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len, expected):
+    # A declared page range keeps each sequence's own count instead.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
     assert expected in buckets
@@ -1737,14 +1739,17 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config)
         )
 
 
-def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
+@pytest.mark.parametrize("for_each_tile", [False, True], ids=["bucketed", "declared"])
+def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config, monkeypatch, for_each_tile):
     """Zero real blocks must not be padded: a fully-masked tile would divide by zero."""
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
 
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_stacks[0].shape[0] == 0
-    assert metadata.padded_num_blocks[1] == 2
+    if not for_each_tile:
+        assert metadata.padded_num_blocks[1] == 2
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):
@@ -2337,6 +2342,57 @@ def test_spyre_attn_dispatches_by_query_width(
     )
 
     assert sorted(called) == ["decode", "prefill"], called
+
+
+@pytest.mark.parametrize(
+    ("query_len", "kernel_name"),
+    [(1, "page_attn_decode"), (64, "page_attn_prefill")],
+    ids=["decode", "prefill"],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_kernel_serves_every_page_count(
+    default_vllm_config,
+    monkeypatch,
+    query_len,
+    kernel_name,
+    configure_compilation,
+    configure_device,
+):
+    """One compiled per-sequence kernel per query width serves every page count up to
+    max_model_len, a one-page sequence included, and matches the reference."""
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch_spyre._inductor import config as ts_config
+    from torch_spyre._inductor import pass_utils
+
+    if not hasattr(pass_utils, "declared_dims"):
+        pytest.skip("needs symbolic for_each_tile trip counts (torch-spyre#6066)")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    # The fixture's max_model_len 2048 at block 128 declares pages 2..16. Compiled at 16, as
+    # warmup records it, then reused at 1 (walked as 2), 3 and 8.
+    kernel_code = getattr(spyre_attn, kernel_name).__code__
+    # Restores the reservation floor the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8):
+        for kv_len in (2048, query_len + 10, 300, 1000):
+            _run_spyre_attn_test(
+                seq_lens=[(query_len, kv_len)],
+                block_size=128,
+                sliding_window=None,
+                configure_compilation=configure_compilation,
+                configure_device=configure_device,
+                # 8 x 128 query heads keep prefill page grouping eligible.
+                num_query_heads=8,
+                num_kv_heads=2,
+            )
+            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
 
 
 @pytest.mark.parametrize(

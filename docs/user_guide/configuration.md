@@ -271,6 +271,23 @@ records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+#### One per-sequence kernel for every page count
+
+The per-sequence kernels do not bucket the KV axis: they compile once per query bucket and
+walk each sequence's own page count, from two pages (a one-page sequence walks a masked repeat)
+up to `--max-model-len`. The page table and mask stack are moved with torch-spyre's
+`tensor.to("spyre", dynamic=...)`, so the plugin sets torch-spyre's `MIN_RESERVED_DIM_SIZE` to 2
+and raises its `MAX_BUCKETS` to `--max-model-len / block_size`; an exported value of either wins.
+The KV buckets above still apply, and warmup records every (KV, query) pair as before, when any
+of these holds:
+
+- torch-spyre has no symbolic `for_each_tile` trip counts (torch-spyre#6066);
+- an exported `MAX_BUCKETS` is below `--max-model-len / block_size`, or an exported
+  `MIN_RESERVED_DIM_SIZE` is not below it;
+- `SPYRE_ATTN_FOR_EACH_TILE=0`, or the layer uses a sliding window.
+
+Batched decode keeps its buckets.
+
 ## KV cache size
 
 The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the

@@ -160,6 +160,7 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
 def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
     from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -194,7 +195,10 @@ def test_mask_mirror_normalizes_singleton_strides_and_keeps_its_cached_copy(shap
         shape, tuple(1 if size == 1 else stride for size, stride in zip(shape, stack.stride()))
     )
     metadata = SimpleNamespace(
-        attention_mask_stacks=[stack], attention_mask_stacks_device=None, num_seqs=1
+        attention_mask_stacks=[stack],
+        attention_mask_stacks_device=None,
+        num_seqs=1,
+        page_range=None,
     )
     mirrored = _mirror_mask_stack(metadata, 0, torch.device("cpu"))
     torch.testing.assert_close(mirrored, stack, rtol=0, atol=0)
@@ -531,6 +535,7 @@ class TestRecordGraphs:
         """
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+        monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
         cfg = get_current_vllm_config()
         monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
 

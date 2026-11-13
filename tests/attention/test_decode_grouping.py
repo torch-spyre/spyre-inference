@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Card-free tests for splitting a batched decode into length groups."""
+"""Card-free tests for splitting a batched decode into length groups.
+
+Grouping belongs to the grid path, which a batch too wide for a packed trip and a sliding
+window still take; ``decode_config`` sends every batch here down it.
+"""
 
 import pytest
 import torch
@@ -26,7 +30,10 @@ KV_HEADS, HEAD = 2, 64
 def decode_config(default_vllm_config, monkeypatch):
     from vllm.config import get_current_vllm_config
 
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setattr(SpyreAttnBucketer, "packed_eligible", lambda self, num_seqs: False)
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 32768

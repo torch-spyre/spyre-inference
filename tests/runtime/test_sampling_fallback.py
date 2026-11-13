@@ -29,6 +29,10 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.v1.sample import sampler, topk_topp_sampler
 from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.sampling_kernels import (
+    isa_from_capabilities,
+    sampling_extension_name,
+)
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -37,6 +41,7 @@ from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 def _no_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sampler, "has_sampling_kernels", lambda: False)
     monkeypatch.setattr(topk_topp_sampler, "has_sampling_kernels", lambda: False)
+    monkeypatch.setattr(topk_topp_sampler, "has_topk_topp_kernels", lambda: False)
 
 
 def _meta(rows: int, k: int | None, p: float | None, greedy: bool = False) -> SamplingMetadata:
@@ -59,6 +64,26 @@ def _meta(rows: int, k: int | None, p: float | None, greedy: bool = False) -> Sa
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
+
+
+def test_avx2_without_fma_does_not_load_the_fma_build() -> None:
+    assert sampling_extension_name("x86_64", avx512=True, avx2_fma=True) == "_C"
+    assert sampling_extension_name("x86_64", avx512=False, avx2_fma=True) == "_C_AVX2"
+    with pytest.raises(ImportError):
+        sampling_extension_name("x86_64", avx512=False, avx2_fma=False)
+    assert sampling_extension_name("ppc64le", avx512=False, avx2_fma=False) == "_C"
+    assert sampling_extension_name("s390x", avx512=False, avx2_fma=False) == "_C"
+
+
+def test_avx512_build_needs_vl_bw_and_dq() -> None:
+    """AVX512F alone is not the _C build. Knights Landing has F and not VL/BW/DQ."""
+    full = {flag: True for flag in ("avx512_f", "avx512_vl", "avx512_bw", "avx512_dq")}
+    assert isa_from_capabilities({**full, "avx2": True, "fma3": True}) == (True, True)
+    knl = {**full, "avx512_vl": False, "avx512_bw": False, "avx512_dq": False}
+    avx512, avx2_fma = isa_from_capabilities({**knl, "avx2": True, "fma3": True})
+    assert (avx512, avx2_fma) == (False, True)
+    assert sampling_extension_name("x86_64", avx512=avx512, avx2_fma=avx2_fma) == "_C_AVX2"
+    assert isa_from_capabilities({"avx2": True, "fma3": False}) == (False, False)
 
 
 @pytest.mark.parametrize("rows", [1, 8])
@@ -106,6 +131,23 @@ def test_random_draw_matches_softmax_distribution() -> None:
     )[0]
     freq = torch.bincount(out, minlength=vocab).float() / draws
     assert (freq - logp.exp()).abs().max() < 0.01
+
+
+def test_stale_extension_filters_on_pytorch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An older _C still has the Gumbel op. The filter must stay on PyTorch."""
+    monkeypatch.setattr(topk_topp_sampler, "has_sampling_kernels", lambda: True)
+    monkeypatch.setattr(topk_topp_sampler, "has_topk_topp_kernels", lambda: False)
+
+    def unexpected_kernel(*_args, **_kwargs):
+        raise AssertionError("stale extension must not call the top-k kernel")
+
+    monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_kernels", unexpected_kernel)
+    logits = torch.randn(4, 128, dtype=torch.float32)
+    k = torch.full((4,), 5)
+    p = torch.full((4,), 0.9)
+    # fp64 noise skips fused_gumbel_argmax, which this stale build may lack.
+    out = SpyreTopKTopPSampler("raw_logprobs", True).forward_native(logits.clone(), {}, k, p)[0]
+    assert out.shape == (4,)
 
 
 def test_topk_draw_stays_in_kept_set() -> None:

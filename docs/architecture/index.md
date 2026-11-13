@@ -705,16 +705,27 @@ same way. That brings back the CPU kernels and drops the full-vocabulary sort:
   vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
   single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
   scan.
-- **Top-k + top-p** — `apply_top_k_top_p_sort_free` takes a `topk` window of `2 × max_k`
-  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
-  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
-  exact tie count when ties run past it. Top-p without top-k still sorts.
+- **Top-k / top-p** — with the filter ops loaded, `apply_top_k_top_p_kernels` masks in
+  place. Top-k keeps every tie with the k-th value and does not sort. Top-k together
+  with top-p sorts those survivors and cuts top-p exactly on them, so a k near the
+  vocabulary size is close to a full sort. Top-p alone, including a row whose k is disabled in a
+  mixed batch, uses vLLM's approximate CPU kernel: the kept set can differ from a full
+  sort by a few boundary tokens, and it does not drop below the requested probability
+  mass. Without those ops, top-k uses `topk`, top-k with top-p uses
+  `apply_top_k_top_p_sort_free`, and top-p alone sorts. Speculative decoding's
+  `apply_sampling_constraints` is separate from that sampler: it still calls vLLM's
+  `apply_top_k_top_p` and sorts. The shared `Sampler` only covers the token draw.
 
-The kernels live in `csrc/cpu/sampling_kernels.cpp` and are built with CMake from
+The kernels live in `csrc/cpu/sampling_kernels.cpp` and `csrc/cpu/topk_topp_sampler.cpp`,
+with the vector exp in `csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from
 `setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
 so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
-AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
-supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
+AVX2 fallback (`_C_AVX2`). `v1/sample/sampling_kernels.py` loads `_C` when
+`torch.cpu.get_capabilities()` reports `avx512_f`, `avx512_vl`, `avx512_bw` and
+`avx512_dq`, and `_C_AVX2` when it reports `avx2` and `fma3` but not that set.
+AVX512F alone is not enough: the build also uses VL, BW and DQ. The check ignores
+`ATEN_CPU_CAPABILITY`, so pinning ATen's dispatch level keeps the extension.
+The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
 cannot collide with a vLLM `_C` in the same environment. If the extension
 is missing or fails to import (a failed build, or a dev checkout that never built it), the

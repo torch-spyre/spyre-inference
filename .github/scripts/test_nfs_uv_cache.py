@@ -18,11 +18,13 @@ save, cross-scope isolation, and GC. The tar roundtrip runs on real files.
 
 from __future__ import annotations
 
+import io
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 
 import pytest
@@ -450,6 +452,64 @@ def test_save_skips_when_prune_empties_cache(tmp_path, lockfiles):
 
     assert nuc.main(_args("save", nfs, local, lockfiles, uv=uv, **_push_main())) == 0
     assert not (nfs / "main" / "x86_64").exists()
+
+
+def test_extract_roundtrips_a_benign_tar(tmp_path):
+    src = tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    _write(src / "pkg" / "wheel.txt", "payload")
+    tar = tmp_path / "ok.tar"
+    subprocess.run(["tar", "-cf", str(tar), "-C", str(src), "."], check=True)
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    nuc._extract(tar, dest)
+    assert (dest / "pkg" / "wheel.txt").read_text() == "payload"
+
+
+def test_extract_rejects_parent_traversal(tmp_path):
+    """A poisoned cache tar that walks out of dest with ``..`` must abort before unpack."""
+    outside = tmp_path / "outside.txt"
+    tar = tmp_path / "evil.tar"
+    with tarfile.open(tar, "w") as handle:
+        info = tarfile.TarInfo("../outside.txt")
+        data = b"pwned"
+        info.size = len(data)
+        handle.addfile(info, io.BytesIO(data))
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(nuc.UnsafeTarMember):
+        nuc._extract(tar, dest)
+    assert not outside.exists()
+
+
+def test_extract_rejects_absolute_member(tmp_path):
+    tar = tmp_path / "evil.tar"
+    with tarfile.open(tar, "w") as handle:
+        info = tarfile.TarInfo("/etc/evil")
+        info.size = 0
+        handle.addfile(info, io.BytesIO(b""))
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(nuc.UnsafeTarMember):
+        nuc._extract(tar, dest)
+
+
+def test_extract_rejects_escaping_symlink(tmp_path):
+    """A symlink whose target resolves outside dest must abort before unpack."""
+    tar = tmp_path / "evil.tar"
+    with tarfile.open(tar, "w") as handle:
+        info = tarfile.TarInfo("link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../../etc/passwd"
+        handle.addfile(info)
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(nuc.UnsafeTarMember):
+        nuc._extract(tar, dest)
 
 
 if __name__ == "__main__":

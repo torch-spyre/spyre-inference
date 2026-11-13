@@ -674,7 +674,7 @@ def test_traced_dispatch_inlines_the_persistent_form_without_compiled_regions(
 def test_the_expert_group_reaches_the_in_graph_loop_from_the_recipe_or_env(
     monkeypatch, env, recipe_group, expected
 ):
-    """``SPYRE_MOE_EXPERT_GROUP`` overrides the recipe; batches outside 256 to 1,024 run one."""
+    """``SPYRE_MOE_EXPERT_GROUP`` overrides the recipe; batches outside 256 to 512 run one."""
     from torch_spyre._inductor import config as spyre_config
 
     from spyre_inference import moe as moe_module
@@ -699,7 +699,7 @@ def test_the_expert_group_reaches_the_in_graph_loop_from_the_recipe_or_env(
     dispatch = _dispatch_layer("topk_softmax")
     # The configured layer's own recipe, so the loop sees exactly what configure stored.
     dispatch.spyre_moe_recipe = layer.spyre_moe_recipe
-    for tokens in (2048, 1024, 256, 64):
+    for tokens in (1024, 512, 256, 64):
         _apply(dispatch, tokens=tokens)
     assert seen == [1, expected, expected, 1]
 
@@ -736,10 +736,10 @@ def test_the_group_threshold_comes_from_the_recipe_or_env(monkeypatch, env, reci
     )
     dispatch = _dispatch_layer("topk_softmax")
     dispatch.spyre_moe_recipe = layer.spyre_moe_recipe
-    sizes = (64, 128, 256, 1024, 2048)
+    sizes = (64, 128, 256, 512, 1024)
     for tokens in sizes:
         _apply(dispatch, tokens=tokens)
-    assert seen == {tokens: 4 if expected <= tokens <= 1024 else 1 for tokens in sizes}
+    assert seen == {tokens: 4 if expected <= tokens <= 512 else 1 for tokens in sizes}
 
 
 @pytest.mark.parametrize("min_tokens", ["0", "-64"])

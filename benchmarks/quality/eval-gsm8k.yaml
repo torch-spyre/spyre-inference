@@ -1,0 +1,28 @@
+# The existing GSM8K gate (tests/plugin/spyre_testing_plugin/gsm8k_configs/) as recorded scores.
+# Thresholds and tolerances stay in those configs; nothing here judges the score.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: eval-gsm8k, description: 'GSM8K correctness of the existing x86 gate models; the score is recorded, no threshold', owner: spyre-inference}
+spec:
+  type: quality
+  level: service
+  tier: core
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/lm-eval}
+  run: {cache: warm, repeats: 1}
+  variants:
+    - name: eval_gsm8k_granite-4.1-3b_tp1_l64
+      tier: core
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: granite-4.1-3b, model: granite-4.1-3b, precision: fp16, tp: 1, flags: {max-model-len: 4096}}
+      workload: {type: llm/lm-eval, eval: {task: gsm8k, num_fewshot: 5, limit: 64}, flags: {max-concurrency: 4}}
+    - name: eval_gsm8k_mistral-7b-instruct-v0.3_tp1_l64
+      tier: core
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: mistral-7b-instruct-v0.3, model: mistral-7b-instruct-v0.3, precision: fp16, tp: 1, flags: {max-model-len: 4096}}
+      workload: {type: llm/lm-eval, eval: {task: gsm8k, num_fewshot: 5, limit: 64}, flags: {max-concurrency: 4}}
+    - name: eval_gsm8k_qwen2.5-0.5b-instruct_tp1_l64
+      tier: sanity
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: qwen2.5-0.5b-instruct, model: qwen2.5-0.5b-instruct, precision: fp16, tp: 1, flags: {max-model-len: 4096}}
+      workload: {type: llm/lm-eval, eval: {task: gsm8k, num_fewshot: 5, limit: 64}, flags: {max-concurrency: 4}}

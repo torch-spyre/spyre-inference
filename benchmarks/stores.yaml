@@ -1,0 +1,10 @@
+# Credentials by reference only. The same variables fetch_bench_datasets.py reads.
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: bench-data}
+spec:
+  type: core/artifactory
+  endpoint: {env: ARTIFACTORY_BASE_URL}
+  root: {env: ARTIFACTORY_DATA_PATH}
+  auth: {mode: token, refs: [{env: ARTIFACTORY_TOKEN}]}
+  visibility: internal

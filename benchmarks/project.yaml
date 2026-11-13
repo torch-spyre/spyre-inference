@@ -1,0 +1,65 @@
+# Benchmark definitions for the spyre-bench engine (bench/v1alpha1). Advisory only: nothing here gates a check.
+# The runner still reads vllm-benchmarks/; each variant name below is its test_name.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: spyre-inference, owner: spyre-inference}
+spec:
+  component: spyre-inference
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [decoder, encoder, multimodal, quality]
+  default_environment: spyre-1card
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core, extended]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.device.count]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: decoder}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: encoder}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: multimodal}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: quality}
+spec: {type: quality}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke, description: "one cheap latency case, for bench-smoke"}
+spec:
+  cases: [latency_granite8b_tp1_in64_out64]
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: perf-sanity}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: sanity}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: perf-core, description: "what the CI perf job runs today"}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: core}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: quality-sanity}
+spec:
+  selector: {types: [quality], groupings: {tier: {at_most: sanity}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: quality-core, description: "the GSM8K gate models; scores are recorded"}
+spec:
+  selector: {types: [quality], groupings: {tier: {at_most: core}}}

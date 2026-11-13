@@ -1,0 +1,23 @@
+# Variant names are the test_name values of vllm-benchmarks/benchmarks/spyre/latency-tests.yaml, lower-cased.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: latency-decoder, description: 'one batch end to end (vllm bench latency)', owner: spyre-inference}
+spec:
+  type: perf
+  level: model
+  tier: core
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/latency}
+  run: {cache: warm, repeats: 1}
+  variants:
+    - name: latency_granite8b_tp1_in64_out64
+      tier: sanity
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: micro-g3.3-8b-instruct-1b, model: micro-g3.3-8b-instruct-1b, precision: fp16, tp: 1, flags: {load-format: auto, max-model-len: 128}}
+      workload: {type: llm/latency, shape: {batch_size: 1, input_len: 64, output_len: 64}, load: {executor: iterations, iterations: 2, warmup_iterations: 1}}
+    - name: latency_granite33-8b_tp1_in64_out64
+      tier: core
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: granite-3.3-8b-instruct, model: granite-3.3-8b-instruct, precision: fp16, tp: 1, flags: {load-format: auto, max-model-len: 128}}
+      workload: {type: llm/latency, shape: {batch_size: 1, input_len: 64, output_len: 64}, load: {executor: iterations, iterations: 10, warmup_iterations: 2}}

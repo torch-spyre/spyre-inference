@@ -54,3 +54,10 @@ repos:
       # ubuntu-latest (which does not install vllm/torch-spyre) skips it; a
       # dedicated CI job on a Spyre runner runs `prek run ty --stage pre-commit`.
       stages: [pre-commit]
+    - id: bench-validate
+      name: bench definitions
+      # A no-op with a notice unless spyre-bench is installed.
+      entry: make -s bench-validate
+      language: system
+      files: ^(benchmarks|mk)/
+      pass_filenames: false

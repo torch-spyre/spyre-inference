@@ -681,6 +681,7 @@ def test_the_expert_group_reaches_the_in_graph_loop_from_the_recipe_or_env(
     from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
     monkeypatch.delenv("SPYRE_MOE_EXPERT_GROUP", raising=False)
+    monkeypatch.delenv("SPYRE_MOE_GROUP_MIN_TOKENS", raising=False)
     if env is not None:
         monkeypatch.setenv("SPYRE_MOE_EXPERT_GROUP", env)
     layer = _generic_layer()
@@ -701,6 +702,53 @@ def test_the_expert_group_reaches_the_in_graph_loop_from_the_recipe_or_env(
     for tokens in (2048, 1024, 256, 64):
         _apply(dispatch, tokens=tokens)
     assert seen == [1, expected, expected, 1]
+
+
+@pytest.mark.parametrize(
+    ("env", "recipe_min", "expected"),
+    [(None, 256, 256), (None, 128, 128), ("64", 256, 64), ("256", 64, 256)],
+)
+def test_the_group_threshold_comes_from_the_recipe_or_env(monkeypatch, env, recipe_min, expected):
+    """``SPYRE_MOE_GROUP_MIN_TOKENS`` overrides the recipe; batches outside the range run one."""
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    monkeypatch.delenv("SPYRE_MOE_GROUP_MIN_TOKENS", raising=False)
+    if env is not None:
+        monkeypatch.setenv("SPYRE_MOE_GROUP_MIN_TOKENS", env)
+    monkeypatch.setenv("SPYRE_MOE_EXPERT_GROUP", "4")
+    layer = _generic_layer()
+    recipe = SpyreMoERecipe(*_STANDARD, expert_group_min_tokens=recipe_min)
+    with spyre_config.patch({"sencores": 32}):
+        configure_spyre_moe_layer(layer, recipe)
+    assert layer.spyre_moe_recipe.expert_group_min_tokens == expected
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    seen = {}
+    monkeypatch.setattr(moe_module, "_topk_probs", lambda *args: None)
+    monkeypatch.setattr(moe_module, "_route_selected", lambda *args: None)
+    monkeypatch.setattr(
+        moe_module,
+        "_moe_persistent_in_graph",
+        lambda x, *args, group: seen.update({x.shape[0]: group}),
+    )
+    dispatch = _dispatch_layer("topk_softmax")
+    dispatch.spyre_moe_recipe = layer.spyre_moe_recipe
+    sizes = (64, 128, 256, 1024, 2048)
+    for tokens in sizes:
+        _apply(dispatch, tokens=tokens)
+    assert seen == {tokens: 4 if expected <= tokens <= 1024 else 1 for tokens in sizes}
+
+
+@pytest.mark.parametrize("min_tokens", ["0", "-64"])
+def test_a_bad_group_threshold_fails_at_configure_time(monkeypatch, min_tokens):
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    monkeypatch.setenv("SPYRE_MOE_GROUP_MIN_TOKENS", min_tokens)
+    with pytest.raises(ValueError, match="expert_group_min_tokens="):
+        configure_spyre_moe_layer(_generic_layer(), SpyreMoERecipe(*_STANDARD))
 
 
 @pytest.mark.parametrize(
@@ -1049,13 +1097,14 @@ def _record_expert_loops(monkeypatch):
     return loops
 
 
-@pytest.mark.parametrize(("sticks", "group"), [(1, 1), (8, 4)])
-def test_traced_persistent_dispatch_matches_dense_reference(monkeypatch, sticks, group):
+@pytest.mark.parametrize(("sticks", "group", "min_tokens"), [(1, 1, 256), (8, 4, 256), (2, 4, 128)])
+def test_traced_persistent_dispatch_matches_dense_reference(monkeypatch, sticks, group, min_tokens):
     """Traced into one graph, as a compiled block does for a stick-aligned token bucket.
 
     SpyreMoERunner only traces batches that span whole sticks of tokens; this is that path,
     end to end through ``apply_monolithic``, at gemma-4's expert count: one stick of tokens
-    with one expert per trip, and a 512-token chunk with four.
+    with one expert per trip, and four per trip for a 512-token chunk and, with the threshold
+    lowered to it, for 128 tokens.
     """
     from spyre_testing_plugin.pytest_plugin import spyre_available
     from torch_spyre._C import get_elem_in_stick
@@ -1082,7 +1131,9 @@ def test_traced_persistent_dispatch_matches_dense_reference(monkeypatch, sticks,
     device = {k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in host.items()}
     stick = get_elem_in_stick(torch.float16)
     layer = SimpleNamespace(
-        spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax", expert_group=group),
+        spyre_moe_recipe=SpyreMoERecipe(
+            "gelu_tanh", "full_softmax", expert_group=group, expert_group_min_tokens=min_tokens
+        ),
         spyre_moe_gate=device["gate"],
         spyre_moe_up=device["up"],
         spyre_moe_down=device["down"],

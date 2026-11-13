@@ -116,8 +116,9 @@ def _derive_moe_chunks(
     return best_chunks
 
 
-# Traced batches of 256 to 1,024 tokens run grouped. Below, a core of a four-group map takes
-# under 32 token rows; at 2,048 tokens the grouped loop is slower than one expert per trip.
+# Traced batches from 256 tokens (the recipe default) to 1,024 run grouped. Below, a core of a
+# four-group map takes under 32 token rows; at 2,048 tokens the grouped loop is slower than one
+# expert per trip.
 _MIN_GROUPED_TOKENS = 256
 _MAX_GROUPED_TOKENS = 1024
 
@@ -136,6 +137,9 @@ class SpyreMoERecipe:
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
     # Experts per trip of the traced all-expert loop; ``SPYRE_MOE_EXPERT_GROUP`` overrides it.
     expert_group: int = 1
+    # Smallest traced batch that runs ``expert_group`` experts per trip;
+    # ``SPYRE_MOE_GROUP_MIN_TOKENS`` overrides it.
+    expert_group_min_tokens: int = _MIN_GROUPED_TOKENS
 
 
 # vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
@@ -256,6 +260,13 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
             )
     if envs.SPYRE_MOE_EXPERT_GROUP is not None:
         recipe = replace(recipe, expert_group=envs.SPYRE_MOE_EXPERT_GROUP)
+    if envs.SPYRE_MOE_GROUP_MIN_TOKENS is not None:
+        recipe = replace(recipe, expert_group_min_tokens=envs.SPYRE_MOE_GROUP_MIN_TOKENS)
+    if recipe.expert_group_min_tokens < 1:
+        raise ValueError(
+            "SPYRE_MOE_GROUP_MIN_TOKENS / SpyreMoERecipe.expert_group_min_tokens="
+            f"{recipe.expert_group_min_tokens} must be positive."
+        )
     if recipe.expert_group != 1:
         if not _expert_group_fits(layer, recipe.expert_group):
             raise ValueError(
@@ -266,7 +277,7 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
             "Spyre MoE: %d experts per trip in the in-graph expert loop for stick-aligned "
             "batches of %d to %d tokens; other batches keep one expert per trip.",
             recipe.expert_group,
-            _MIN_GROUPED_TOKENS,
+            recipe.expert_group_min_tokens,
             _MAX_GROUPED_TOKENS,
         )
     layer = cast("RoutedExperts", layer)
@@ -989,7 +1000,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer.spyre_moe_biases,
                 group=(
                     recipe.expert_group
-                    if _MIN_GROUPED_TOKENS <= tokens <= _MAX_GROUPED_TOKENS
+                    if recipe.expert_group_min_tokens <= tokens <= _MAX_GROUPED_TOKENS
                     else 1
                 ),
             )

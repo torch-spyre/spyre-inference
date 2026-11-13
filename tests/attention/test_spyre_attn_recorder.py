@@ -704,10 +704,10 @@ class TestRecompileLimit:
 class TestRecordBatchedDecode:
     """Recording the batched decode kernel's variants."""
 
-    # entries = num_seqs * blocks_per_chunk tops out at the core count, so a cache
-    # this wide clears the recorder's page-budget skip for every variant. The
+    # entries = num_seqs * blocks_per_chunk tops out at _BATCHED_DECODE_ENTRIES (64), so a
+    # cache this wide clears the recorder's page-budget skip for every variant. The
     # per-seq recorder is still bounded by NUM_PAGES, hence the two page counts.
-    PAGES = 64
+    PAGES = 128
 
     @pytest.fixture(autouse=True)
     def _enabled(self, monkeypatch):

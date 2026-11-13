@@ -242,9 +242,9 @@ exception: there the step rounds down to a whole block and adds a few buckets (1
 
 As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
 saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
-it buys little for its warmup. Once the block count exceeds one chunk of `32 // num_seqs` blocks,
+it buys little for its warmup. Once the block count exceeds one chunk of `64 // num_seqs` blocks,
 the batched-decode kernel also pads it up to whole chunks, which takes back part of a denser
-preset's saving below 32 sequences. `8_5` is the recommended compromise, `9_8` the fastest when
+preset's saving below 64 sequences. `8_5` is the recommended compromise, `9_8` the fastest when
 warmup time does not matter, and `pow2` the default because it has the shortest warmup.
 
 If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every preset: put the

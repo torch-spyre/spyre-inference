@@ -2373,13 +2373,15 @@ def test_spyre_attn_decode_compiles_at_a_prime_page_count(
 @pytest.mark.parametrize(
     ("seq_lens", "use_sinks"),
     [
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], False, id="long_and_shorts"),
-        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], False, id="graded"),
+        # Long enough that splitting saves more chunks than a second dispatch costs at the
+        # batched-decode entry limit; shorter contexts merge into one dispatch.
+        pytest.param([(1, 28000), (1, 200), (1, 200), (1, 200)], False, id="long_and_shorts"),
+        pytest.param([(1, 24000), (1, 12000), (1, 4000), (1, 1200)], False, id="graded"),
         pytest.param(
-            [(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], False, id="with_prefill"
+            [(1, 28000), (1, 200), (1, 200), (1, 200), (64, 300)], False, id="with_prefill"
         ),
-        # Sinks barely move the 7000-token row, so the short group is what catches a miss.
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], True, id="long_and_shorts_sinks"),
+        # Sinks barely move the 28000-token row, so the short group is what catches a miss.
+        pytest.param([(1, 28000), (1, 200), (1, 200), (1, 200)], True, id="long_and_shorts_sinks"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2400,7 +2402,7 @@ def test_spyre_attn_grouped_decode_matches_reference(
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
-    cfg.model_config.max_model_len = 8192
+    cfg.model_config.max_model_len = 32768
 
     groups_run = []
     run_grouped = SpyreAttentionImpl._run_grouped_decode
@@ -2418,6 +2420,7 @@ def test_spyre_attn_grouped_decode_matches_reference(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         use_sinks=use_sinks,
+        num_blocks=512,
     )
 
     assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"

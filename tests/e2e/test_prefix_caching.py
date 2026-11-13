@@ -50,11 +50,13 @@ _QUESTIONS = [
 
 # On-device fp16 greedy decode: cache-served and freshly-recomputed attention
 # accumulate rounding errors in different orders, which can flip a near-tie at
-# the logit level.  Empirically the outputs agree on the first ~12 tokens and
-# diverge only in the tail of a 16-token sequence.  We therefore compare only
-# the first _STABLE_TOKENS tokens rather than demanding bit-exact equality
-# across the full sequence.
+# the logit level.  We therefore compare only the first _STABLE_TOKENS tokens,
+# and accept a divergence there only when it is such a tie: the token each
+# engine picked must be within _TIE_TOLERANCE (in logprob) of the other
+# engine's best candidate.  Measured APC-vs-plain logprob noise on this
+# hardware is up to ~0.06, with or without --load-format spyre.
 _STABLE_TOKENS = 12
+_TIE_TOLERANCE = 0.1
 
 
 def _build_prefix(tokenizer: AutoTokenizer) -> str:
@@ -99,6 +101,85 @@ def _make_llm(*, enable_prefix_caching: bool, enforce_eager: bool) -> LLM:
     )
 
 
+def _within_tie(logprobs: dict, token_id: int) -> bool:
+    """Whether ``token_id`` is within ``_TIE_TOLERANCE`` of the best candidate."""
+    if token_id not in logprobs:
+        return False
+    best = max(lp.logprob for lp in logprobs.values())
+    return best - logprobs[token_id].logprob <= _TIE_TOLERANCE
+
+
+def _assert_agrees_with_baseline(label: str, i: int, got, plain) -> None:
+    """``got`` must match ``plain`` over the first ``_STABLE_TOKENS`` tokens, except that
+    a divergence on a near-tie (both engines' picks within ``_TIE_TOLERANCE`` of each
+    other's best candidate) is accepted. Nothing after it is compared: the contexts differ."""
+    got_out, plain_out = got.outputs[0], plain.outputs[0]
+    got_ids = list(got_out.token_ids)[:_STABLE_TOKENS]
+    plain_ids = list(plain_out.token_ids)[:_STABLE_TOKENS]
+    if got_ids == plain_ids:
+        return
+    k = next((j for j, (g, p) in enumerate(zip(got_ids, plain_ids)) if g != p), None)
+    is_tie = k is not None and (
+        _within_tie(plain_out.logprobs[k], got_ids[k])
+        and _within_tie(got_out.logprobs[k], plain_ids[k])
+    )
+    assert is_tie, (
+        f"Prompt {i}: {label} output does not match non-APC baseline "
+        f"(first {_STABLE_TOKENS} tokens, first divergence at token {k}).\n"
+        f"  {label:<9}: {got_ids}\n"
+        f"  plain    : {plain_ids}"
+    )
+
+
+def _fake_request_output(ids, logprobs_per_position):
+    """A minimal RequestOutput stand-in: token ids plus {token_id: logprob} per position."""
+    from types import SimpleNamespace
+
+    out = SimpleNamespace(
+        token_ids=ids,
+        logprobs=[
+            {t: SimpleNamespace(logprob=v) for t, v in position.items()}
+            for position in logprobs_per_position
+        ],
+    )
+    return SimpleNamespace(outputs=[out])
+
+
+def test_baseline_check_accepts_identical_outputs() -> None:
+    lp = [{1: -0.1}, {2: -0.1}]
+    _assert_agrees_with_baseline(
+        "cold APC", 0, _fake_request_output([1, 2], lp), _fake_request_output([1, 2], lp)
+    )
+
+
+def test_baseline_check_accepts_a_divergence_on_a_near_tie() -> None:
+    """The logged case: APC top-2 equal (-1.807), plain's differ by 0.047."""
+    got = _fake_request_output([1, 3], [{1: -0.1}, {3: -1.807, 4: -1.807}])
+    plain = _fake_request_output([1, 4], [{1: -0.1}, {4: -1.782, 3: -1.829}])
+    _assert_agrees_with_baseline("cold APC", 0, got, plain)
+
+
+def test_baseline_check_rejects_a_divergence_with_a_clear_preference() -> None:
+    got = _fake_request_output([1, 3], [{1: -0.1}, {3: -0.2, 4: -3.0}])
+    plain = _fake_request_output([1, 4], [{1: -0.1}, {4: -0.2, 3: -3.0}])
+    with pytest.raises(AssertionError, match="first divergence at token 1"):
+        _assert_agrees_with_baseline("cold APC", 0, got, plain)
+
+
+def test_baseline_check_rejects_a_pick_outside_the_other_engines_candidates() -> None:
+    got = _fake_request_output([1, 3], [{1: -0.1}, {3: -1.0}])
+    plain = _fake_request_output([1, 4], [{1: -0.1}, {4: -1.0}])  # 3 not in plain's top-k
+    with pytest.raises(AssertionError):
+        _assert_agrees_with_baseline("cold APC", 0, got, plain)
+
+
+def test_baseline_check_rejects_a_length_mismatch() -> None:
+    got = _fake_request_output([1, 2], [{1: -0.1}, {2: -0.1}])
+    plain = _fake_request_output([1, 2, 3], [{1: -0.1}, {2: -0.1}, {3: -0.1}])
+    with pytest.raises(AssertionError):
+        _assert_agrees_with_baseline("cold APC", 0, got, plain)
+
+
 # Parametrize over enforce_eager so the compiled production path
 # (STOCK_TORCH_COMPILE, the default) is exercised alongside the eager path.
 # The compiled variant hits the attention bucketer / warmup machinery with the
@@ -122,12 +203,13 @@ def test_prefix_caching(enforce_eager: bool, shared_prefix: str) -> None:
     2. A non-APC baseline engine.
 
     Asserts that both cold and warm APC outputs agree with the non-APC baseline
-    for the first ``_STABLE_TOKENS`` tokens. Full-sequence bit-exact equality is
-    too strict on fp16 Spyre hardware, where cache-served vs recomputed
-    attention paths accumulate rounding differences in later tail tokens.
+    for the first ``_STABLE_TOKENS`` tokens, tolerating a divergence on an fp16
+    near-tie (see ``_assert_agrees_with_baseline``). Bit-exact equality is too
+    strict on fp16 Spyre hardware, where cache-served vs recomputed attention
+    paths accumulate rounding differences.
     """
     prompts = [shared_prefix + q for q in _QUESTIONS]
-    sp = SamplingParams(temperature=0.0, max_tokens=16)
+    sp = SamplingParams(temperature=0.0, max_tokens=16, logprobs=5)
 
     llm_apc = _make_llm(enable_prefix_caching=True, enforce_eager=enforce_eager)
     cold_outputs = llm_apc.generate(prompts, sp, use_tqdm=False)
@@ -146,18 +228,5 @@ def test_prefix_caching(enforce_eager: bool, shared_prefix: str) -> None:
 
     assert len(cold_outputs) == len(warm_outputs) == len(plain_outputs) == len(prompts)
     for i, (cold, warm, plain) in enumerate(zip(cold_outputs, warm_outputs, plain_outputs)):
-        cold_ids = list(cold.outputs[0].token_ids)[:_STABLE_TOKENS]
-        warm_ids = list(warm.outputs[0].token_ids)[:_STABLE_TOKENS]
-        plain_ids = list(plain.outputs[0].token_ids)[:_STABLE_TOKENS]
-        assert cold_ids == plain_ids, (
-            f"Prompt {i}: cold APC output does not match non-APC baseline "
-            f"(first {_STABLE_TOKENS} tokens).\n"
-            f"  cold APC : {cold_ids}\n"
-            f"  plain    : {plain_ids}"
-        )
-        assert warm_ids == plain_ids, (
-            f"Prompt {i}: warm APC output does not match non-APC baseline "
-            f"(first {_STABLE_TOKENS} tokens).\n"
-            f"  warm APC : {warm_ids}\n"
-            f"  plain    : {plain_ids}"
-        )
+        _assert_agrees_with_baseline("cold APC", i, cold, plain)
+        _assert_agrees_with_baseline("warm APC", i, warm, plain)

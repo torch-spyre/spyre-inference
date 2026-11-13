@@ -208,6 +208,47 @@ def test_inputs_must_be_fp16_with_one_patch_count():
         model.prepare_encoder_cudagraph_replay_buffers({"tokens": [1]}, 0, 0)
 
 
+class _WithWholeBuffer(_FakeVisionModel):
+    """Adds a ``[2, patches]`` buffer that is not per patch, like Pixtral's image canvas."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        whole = VisionBuffer(None, shape_at=lambda n: (2, n))
+        self.vision_buffers = {**self.vision_buffers, "whole": whole}
+
+    def vision_inputs(self, mm_kwargs):
+        values = super().vision_inputs(mm_kwargs)
+        patches = values["segments"].shape[0]
+        return {**values, "whole": torch.ones(2, patches, dtype=torch.float16)}
+
+
+def test_whole_buffers_are_copied_into_the_budget_corner():
+    model = _WithWholeBuffer()
+    bufs = model.prepare_encoder_cudagraph_capture_inputs(
+        16, 1, 1, torch.device("cpu"), torch.float16
+    ).values
+    assert bufs["whole"].shape == (2, 64)
+    copy = model.get_encoder_cudagraph_config().padding_logics["whole"]
+
+    short = model.prepare_encoder_cudagraph_replay_buffers({"tokens": [4]}, 0, 0).values
+    copy(bufs["whole"], short["whole"])
+    assert torch.equal(bufs["whole"][:, :16], short["whole"])
+    assert not bufs["whole"][:, 16:].any()
+    wide = model.prepare_encoder_cudagraph_replay_buffers({"tokens": [32]}, 0, 0).values
+    with pytest.raises(ValueError, match="the budget holds"):
+        copy(bufs["whole"], wide["whole"])
+    # The patch count comes from the per-patch buffers: the whole one's first dim is 2.
+    assert model.encoder_eager_forward({"tokens": [32]}).shape[0] == 32
+
+
+def test_whole_buffer_must_match_its_shape_at_the_patch_count():
+    model = _WithWholeBuffer()
+    inputs = model.vision_inputs
+    model.vision_inputs = lambda kw: {**inputs(kw), "whole": torch.ones(2, 3, dtype=torch.float16)}
+    with pytest.raises(ValueError, match="64 patches need"):
+        model.prepare_encoder_cudagraph_replay_buffers({"tokens": [16]}, 0, 0)
+
+
 def test_items_per_call_cap_splits_the_batch():
     model = _FakeVisionModel()
     type(model).vision_max_items_per_call = 1

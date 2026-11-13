@@ -35,7 +35,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 import torch
 import torch.nn as nn
@@ -59,15 +59,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class VisionBuffer:
-    """One encoder input, ``[P]`` or ``[P, width]`` over ``P`` patch slots.
+    """One encoder input: ``[P]`` or ``[P, width]`` over ``P`` patch slots, or with ``shape_at``
+    one whole tensor.
 
     ``pad`` is the value of the slots a budget adds: a scalar, or one ``[width]`` row.
     ``dtype`` is fp16 for activations; integer buffers carry indices (e.g. positions).
+    ``shape_at`` marks a buffer that is not per patch (e.g. an image canvas): its full shape at
+    a patch count. ``vision_inputs`` returns it at exactly ``shape_at(P)``; a budget copies it
+    into the leading corner of its own and pads the rest.
     """
 
     width: int | None
     pad: float | torch.Tensor = 0.0
     dtype: torch.dtype = torch.float16
+    shape_at: Callable[[int], tuple[int, ...]] | None = None
 
 
 class GatherTable(nn.Module):
@@ -143,7 +148,8 @@ class SpyreVisionEncoderMixin:
 
     # --- 1. What a model provides ---
 
-    # Host inputs by name, each ``[P]`` or ``[P, width]``: fp16 activations or integer indices.
+    # Host inputs by name, each ``[P]``, ``[P, width]`` or ``shape_at(P)``: fp16 activations or
+    # integer indices.
     vision_buffers: dict[str, VisionBuffer]
     # Patches per image token: the merge or pool factor (``M**2``), 1 if none.
     patches_per_token: int
@@ -154,14 +160,16 @@ class SpyreVisionEncoderMixin:
         """Image tokens each item in ``mm_kwargs`` produces, in item order.
 
         Computed on the host from the item shapes. ``sum(tokens) * patches_per_token`` must equal
-        the patch count ``vision_inputs`` returns for the same items.
+        the patch count ``vision_inputs`` returns for the same items, before any trailing padding
+        it adds up to a whole ``vision_patch_multiple``.
         """
         raise NotImplementedError
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Host-side preparation: one unpadded tensor per ``vision_buffers`` key, of its dtype.
 
-        All tensors share one patch count; the mixin pads them to a budget. When
+        The per-patch tensors share one patch count ``P``, and a ``shape_at`` tensor is
+        ``shape_at(P)``; the mixin pads them to a budget. When
         ``vision_project`` merges or pools, lay patches out offset-major (``offset_major``).
         Put everything that depends on values here (patching, position gathers, image ids), so
         the device graphs depend on shapes only.
@@ -280,7 +288,9 @@ class SpyreVisionEncoderMixin:
             buffer_keys=list(self.vision_buffers),
             out_hidden_size=self.out_hidden_size,
             padding_logics={
-                key: partial(_pad_groups, pad=buf.pad, groups=self.vision_pad_groups)
+                key: partial(_copy_corner, pad=buf.pad)
+                if buf.shape_at is not None
+                else partial(_pad_groups, pad=buf.pad, groups=self.vision_pad_groups)
                 for key, buf in self.vision_buffers.items()
             },
         )
@@ -331,7 +341,8 @@ class SpyreVisionEncoderMixin:
     ) -> EncoderCudaGraphReplayBuffers:
         """The validated ``vision_inputs`` of one packed batch. Replaces upstream's, whose
         buffers would not match ``vision_buffers``."""
-        return EncoderCudaGraphReplayBuffers(values=dict(self._checked_inputs(mm_kwargs)))
+        values, _ = self._checked_inputs(mm_kwargs)
+        return EncoderCudaGraphReplayBuffers(values=dict(values))
 
     def encoder_cudagraph_forward(
         self, inputs: dict[str, torch.Tensor], path: str = "default"
@@ -368,8 +379,7 @@ class SpyreVisionEncoderMixin:
         Serves ``enforce_eager`` and the profiling run before warmup. Unreached once compiled:
         the manager's startup check makes the largest budget cover every item.
         """
-        values = self._checked_inputs(mm_kwargs)
-        num_patches = next(iter(values.values())).shape[0]
+        values, num_patches = self._checked_inputs(mm_kwargs)
         padded = self._vision_empty(align_up(num_patches, self.vision_patch_multiple))
         padding = self.get_encoder_cudagraph_config().padding_logics
         for key, src in values.items():
@@ -460,27 +470,49 @@ class SpyreVisionEncoderMixin:
         """Host buffers of ``num_patches`` slots, filled with each buffer's padding value."""
         out = {}
         for key, buf in self.vision_buffers.items():
-            shape = (num_patches,) if buf.width is None else (num_patches, buf.width)
+            if buf.shape_at is not None:
+                shape = buf.shape_at(num_patches)
+            elif buf.width is None:
+                shape = (num_patches,)
+            else:
+                shape = (num_patches, buf.width)
             out[key] = torch.empty(shape, dtype=buf.dtype)
             out[key][:] = buf.pad
         return out
 
-    def _checked_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """``vision_inputs``, validated: every declared key, its declared dtype, one patch count."""
+    def _checked_inputs(self, mm_kwargs: dict[str, Any]) -> tuple[dict[str, torch.Tensor], int]:
+        """``vision_inputs``, validated (every declared key, its declared dtype, one patch count),
+        and that patch count."""
         values = self.vision_inputs(mm_kwargs)
         if set(values) != set(self.vision_buffers):
             raise ValueError(
                 f"{type(self).__name__}.vision_inputs returned {sorted(values)}, but "
                 f"vision_buffers declares {sorted(self.vision_buffers)}"
             )
-        counts = {v.shape[0] for v in values.values()}
+        counts = {v.shape[0] for k, v in values.items() if self.vision_buffers[k].shape_at is None}
         wrong = [k for k, v in values.items() if v.dtype != self.vision_buffers[k].dtype]
         if len(counts) != 1 or wrong:
             raise ValueError(
                 f"vision_inputs must return one patch count and the declared dtypes; got "
                 f"counts {sorted(counts)}, wrong dtype for {wrong}"
             )
-        return values
+        (count,) = counts
+        for key, value in values.items():
+            shape_at = self.vision_buffers[key].shape_at
+            if shape_at is not None and tuple(value.shape) != tuple(shape_at(count)):
+                raise ValueError(
+                    f"vision_inputs returned {key} of shape {tuple(value.shape)}, but "
+                    f"{count} patches need {tuple(shape_at(count))}"
+                )
+        return values, count
+
+
+def _copy_corner(dst: torch.Tensor, src: torch.Tensor, pad: float | torch.Tensor) -> None:
+    """Copy ``src`` into the leading corner of the larger ``dst``, padding the rest."""
+    if src.dim() != dst.dim() or any(s > d for s, d in zip(src.shape, dst.shape, strict=True)):
+        raise ValueError(f"buffer is {tuple(src.shape)}, but the budget holds {tuple(dst.shape)}")
+    dst[:] = pad
+    dst[tuple(slice(0, n) for n in src.shape)].copy_(src)
 
 
 def _pad_groups(

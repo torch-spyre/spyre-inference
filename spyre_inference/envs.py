@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
+    SPYRE_PARALLEL_ATTN_PRECOMPILE: int = 0
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
@@ -88,6 +89,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
     # compiling each variant lazily on first use.
     "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
+    # Number of forked processes that compile the attention variants side by side
+    # during warmup (torch-spyre's fork_inner_compiles). "0" (default) compiles them
+    # one after another. Capped at this rank's CPU share (torch threads). A restart
+    # with warm caches skips it.
+    "SPYRE_PARALLEL_ATTN_PRECOMPILE": lambda: int(os.getenv("SPYRE_PARALLEL_ATTN_PRECOMPILE", "0")),
     # When "1", paged attention walks KV pages and batched decode walks logical
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.

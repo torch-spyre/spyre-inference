@@ -426,6 +426,9 @@ buckets; combinations that reach or exceed the allocated page count are skipped 
 declined at dispatch. A single step can carry a mix of prefill and decode sequences; each
 sequence is padded to its own query bucket (decodes use the length-1 bucket) before
 dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+With `SPYRE_PARALLEL_ATTN_PRECOMPILE=N`, a first start traces every variant once and
+compiles them in N forked processes side by side (torch-spyre's `fork_inner_compiles`), so
+the recording finds them in the caches. A restart with warm caches skips this step.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows

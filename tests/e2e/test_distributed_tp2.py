@@ -232,6 +232,8 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
 
 
 MULTIMODAL_MODEL = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
+# Per-tensor FP8 sibling: quant_method "fp8", static activations.
+MULTIMODAL_FP8_MODEL = "mistralai/Ministral-3-14B-Instruct-2512"
 # Short enough to keep both warmups (TP=1, then TP=2) inside one test's budget: the 176x176
 # image and the prompt fit, and attention records only the buckets up to it.
 MULTIMODAL_MAX_MODEL_LEN = 256
@@ -263,11 +265,11 @@ def _image_conversation():
     ]
 
 
-def _generate_image(tp: int) -> list[list[int]]:
+def _generate_image(tp: int, model: str = MULTIMODAL_MODEL) -> list[list[int]]:
     from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model=MULTIMODAL_MODEL,
+        model=model,
         config_format="mistral",
         tensor_parallel_size=tp,
         dtype="float16",
@@ -304,6 +306,25 @@ def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     _assert_matches_tp1(_generate_image(tp=1), _generate_image(tp=2))
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.multimodal
+@pytest.mark.fp8
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+@pytest.mark.timeout(3600)
+def test_tp2_fp8_image_prompt_matches_bf16(monkeypatch) -> None:
+    """The FP8 checkpoint, loaded through ``SpyreFp8Config``, tracks its BF16 sibling at TP=2."""
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    _assert_matches_tp1(
+        _generate_image(tp=2),
+        _generate_image(tp=2, model=MULTIMODAL_FP8_MODEL),
+        names=("bf16", "fp8"),
+    )
 
 
 @pytest.mark.e2e_smoke

@@ -19,6 +19,7 @@ from functools import lru_cache
 from vllm.logger import init_logger
 
 from spyre_inference import moe  # noqa: F401
+from spyre_inference.quantization.fp8 import register_spyre_fp8_config
 
 from . import (
     conv,  # noqa: F401
@@ -44,5 +45,6 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
+    register_spyre_fp8_config()
     utils.register()
     multimodal_embeddings.register()

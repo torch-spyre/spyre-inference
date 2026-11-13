@@ -72,6 +72,7 @@ import tarfile
 from argparse import ArgumentParser
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -264,15 +265,30 @@ def download(rel_path: str, dest: Path, expected_sha: str) -> None:
     token = _require("ARTIFACTORY_TOKEN")
     url = f"{base}/artifactory/{root}/{rel_path.lstrip('/')}"
 
+    # Refuse to attach the bearer token to anything but https: a fat-fingered
+    # http:// base URL would otherwise send the token in the clear. curl's
+    # --proto/--proto-redir below is the second layer, covering a redirect the
+    # server returns at request time rather than the base URL set here.
+    if urlsplit(url).scheme != "https":
+        raise FetchUnavailable(
+            f"{rel_path}: ARTIFACTORY_BASE_URL must use https, refusing to send the token"
+        )
+
     # PID-suffixed so two processes can never write the same temp file.
     partial = dest.with_suffix(f"{dest.suffix}.{os.getpid()}.part")
     print(f"Fetching {rel_path} ...", file=sys.stderr)
     # The token goes in on stdin as a curl config file, never in argv: argv is
-    # world-readable through /proc/<pid>/cmdline on a shared runner.
+    # world-readable through /proc/<pid>/cmdline on a shared runner. --proto and
+    # --proto-redir pin the initial request and every redirect hop to https, so
+    # a redirect to http:// can never carry the Authorization header in cleartext.
     returncode = subprocess.run(
         [
             "curl",
             "-fSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
             "--no-progress-meter",
             "--retry",
             "3",

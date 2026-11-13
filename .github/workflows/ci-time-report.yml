@@ -1,0 +1,46 @@
+name: ci-time-report
+
+# workflow_run because a fork PR's pull_request token cannot comment. It runs with a
+# write token, so it must never check out or run PR code; PR artifacts are data only.
+on:
+  workflow_run:
+    workflows:
+      - test_each_commit
+    types: [completed]
+
+concurrency:
+  group: ci-time-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read          # the PR run's and the baseline runs' artifacts
+  pull-requests: write   # comment on the PR
+
+jobs:
+  report:
+    name: CI time report
+    # A failed run misses legs, which would read as removed tests.
+    if: >-
+      github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Report and update the PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          uv run --no-project --with pyyaml \
+            python3 .github/scripts/ci_time_report.py report --run-id "${RUN_ID}" --post

@@ -90,6 +90,7 @@ def _llm(
     revision: str | None = None,
     max_model_len: int = MAX_MODEL_LEN,
     encoder_budgets: tuple[int, ...] = (),
+    max_num_batched_tokens: int = 512,
 ):
     from vllm import LLM
 
@@ -102,9 +103,10 @@ def _llm(
         config_format=config_format,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
-        # One decoding sequence, and a prefill chunk of the whole prompt up to the platform's 512.
+        max_num_batched_tokens=max_num_batched_tokens,
+        # One decoding sequence, and a prefill chunk of the whole prompt up to the cap.
         compilation_config={
-            "compile_sizes": [1, min(max_model_len, 512)],
+            "compile_sizes": [1, min(max_model_len, max_num_batched_tokens)],
             "encoder_cudagraph_token_budgets": list(encoder_budgets),
         },
         dtype=dtype,
@@ -176,6 +178,56 @@ def test_two_image_prompt_produces_output():
 
 
 @pytest.mark.multimodal
+@pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
+def test_chunked_prefill_splits_an_image(monkeypatch):
+    """Prefill chunks smaller than the image token span; row handles still gather."""
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    uri = _synthetic_image_data_uri()
+    (text,) = _generate(
+        [_conversation(uri)],
+        enforce_eager=False,
+        max_num_batched_tokens=64,
+    )
+    assert text.strip(), "empty generation from a chunked-prefill image split"
+
+
+@pytest.mark.multimodal
+@pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
+def test_same_image_encoder_cache_hit(monkeypatch):
+    """The same image in two requests reuses the encoder cache; no second encode."""
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    from vllm import SamplingParams
+
+    def encoder_counts(worker):
+        manager = worker.model_runner.encoder_cudagraph_manager
+        return manager.graph_hits, manager.graph_misses
+
+    llm = _llm(False)
+    uri = _synthetic_image_data_uri()
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
+    conv = [_conversation(uri)]
+    ((hits0, misses0),) = llm.collective_rpc(encoder_counts)
+    first = llm.chat(conv, params)[0].outputs[0].text
+    ((hits1, misses1),) = llm.collective_rpc(encoder_counts)
+    second = llm.chat(conv, params)[0].outputs[0].text
+    ((hits2, misses2),) = llm.collective_rpc(encoder_counts)
+    assert first.strip() and second.strip()
+    assert (hits1, misses1) != (hits0, misses0)
+    assert (hits2, misses2) == (hits1, misses1)
+
+
+@pytest.mark.multimodal
 @pytest.mark.gemma4_vision
 @pytest.mark.uses_subprocess
 @pytest.mark.timeout(3600)
@@ -207,11 +259,15 @@ def test_gemma4_single_image_prompt_produces_output(monkeypatch):
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
 @pytest.mark.uses_subprocess
-# Cold cache: ~30min of decoder warmup, then six vision budgets compile at ~5min each.
+# Cold cache: decoder warmup, then one tower compile per encoder budget.
 @pytest.mark.timeout(7200)
 def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
-    """Every opted-in ``max_soft_tokens``, and a default and a 1120 image sharing one encoder
-    call, replay a budget compiled at warmup."""
+    """Every opted-in ``max_soft_tokens`` replays a budget compiled at warmup.
+
+    A default image and an 1120-token image cannot share one encoder call: the
+    encoder cache and compute budget are one 1152-token item, and the two images
+    together exceed that.
+    """
     _skip_without_gemma4()
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
@@ -273,8 +329,9 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     for output in llm.wait_for_completion():
         assert output.outputs[0].text.strip(), "empty generation from the mixed batch"
 
-    ((calls, pack, *counts),) = llm.collective_rpc(encoder_calls)
-    assert any(len(c) == 2 and min(c) <= pack < max(c) for c in calls), calls
+    ((calls, _, *counts),) = llm.collective_rpc(encoder_calls)
+    assert all(len(c) == 1 for c in calls), calls
+    assert len(calls) == len(larger) + 2
     assert counts == [hits + len(larger) + 2, misses]
 
 

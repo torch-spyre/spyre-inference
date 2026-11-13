@@ -150,7 +150,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
     ),
     # Experts per trip of the compiled all-expert loop (stick-aligned batches of
-    # SPYRE_MOE_GROUP_MIN_TOKENS to 1,024 tokens), for every model on the Spyre MoE backend.
+    # SPYRE_MOE_GROUP_MIN_TOKENS to 512 tokens), for every model on the Spyre MoE backend.
     # G > 1 puts the G experts of a trip on G groups of SENCORES / G cores, each core taking a
     # block of tokens through one whole expert. Unset keeps the model recipe's value: 4 for
     # gemma-4 MoE where that fits the experts and the cores, else 1 (one expert per trip on all

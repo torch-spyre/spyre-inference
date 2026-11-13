@@ -614,8 +614,8 @@ class TestBatchedDecodeVariants:
     def test_chunking_pads_when_the_ladder_is_not_a_power_of_two(self):
         """With power-of-two buckets the padding vanishes, so a drifting copy of the
         chunking rule would look correct."""
-        assert batched_decode_chunking(8, 8) == (4, 2)  # 4*2 == 8, no padding
-        assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
+        assert batched_decode_chunking(8, 16) == (8, 2)  # 8*2 == 16, no padding
+        assert batched_decode_chunking(6, 16) == (10, 2)  # 10*2 == 20, padded
 
     def test_count_stays_tractable_at_long_context(self, monkeypatch):
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")

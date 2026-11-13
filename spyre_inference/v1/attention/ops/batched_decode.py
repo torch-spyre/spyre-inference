@@ -32,6 +32,54 @@ from spyre_inference.v1.attention.ops.sinks import normalize
 from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
 
 
+def gather_query(
+    query, rep_row_ids, entries, num_kv_heads, num_queries_per_kv, head_size, verify_len
+):
+    """Each entry's query rows as [entries, KV, verify_len * qpk, D].
+
+    Speculative verification folds its verify_len tokens into the GQA axis, the matmul's
+    row axis, since lower_bmm allows only the (entries, KV) batch axes. The rows are
+    gathered token-major, so the tokens are moved inside the head axis first; merging
+    the permuted pair needs the copy.
+    """
+    q = query.index_select(0, rep_row_ids)
+    if verify_len == 1:
+        return q.reshape(entries, num_kv_heads, num_queries_per_kv, head_size)
+    return (
+        q.reshape(entries, verify_len, num_kv_heads, num_queries_per_kv, head_size)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(entries, num_kv_heads, verify_len * num_queries_per_kv, head_size)
+    )
+
+
+def fold_sinks(sinks, verify_len):
+    """Per-head sinks [KV, qpk, 1] tiled to ``gather_query``'s [KV, verify_len * qpk, 1]."""
+    if sinks is None or verify_len == 1:
+        return sinks
+    num_kv_heads, num_queries_per_kv, _ = sinks.shape
+    return (
+        sinks.unsqueeze(1)
+        .expand(num_kv_heads, verify_len, num_queries_per_kv, 1)
+        .reshape(num_kv_heads, verify_len * num_queries_per_kv, 1)
+    )
+
+
+def token_major_output(attn, num_seqs, num_kv_heads, num_queries_per_kv, verify_len):
+    """[num_seqs * verify_len, num_heads, D] from per-(seq, KV head) rows, undoing
+    ``gather_query``'s fold so row s * verify_len + t is sequence s's token t."""
+    head_size = attn.shape[-1]
+    num_heads = num_kv_heads * num_queries_per_kv
+    if verify_len == 1:
+        return attn.reshape(num_seqs, num_heads, head_size)
+    return (
+        attn.reshape(num_seqs, num_kv_heads, verify_len, num_queries_per_kv, head_size)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(num_seqs * verify_len, num_heads, head_size)
+    )
+
+
 def _entry_local_update(
     carry,
     sc,
@@ -112,6 +160,7 @@ def batched_decode_kernel(
     logits_soft_cap=0.0,
     out=None,
     v_scale=None,
+    verify_len=1,
     sinks=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
@@ -130,9 +179,18 @@ def batched_decode_kernel(
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``. sinks: [num_kv_heads,
     num_queries_per_kv, 1] per-head sink logits, or None.
+
+    Each sequence has verify_len query rows: 1 at decode, 1 + k when verifying k
+    speculative drafts. They fold with the query group into M = verify_len *
+    num_queries_per_kv, the matmul's row axis. The mask's group axis is then M, not 1:
+    the builder expands it, as torch-spyre cannot broadcast the group out of M.
+    rep_row_ids holds entries * verify_len rows, and the result is
+    [num_seqs * verify_len, num_heads, head_size], row s * verify_len + t holding
+    sequence s's token t.
     """
-    num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    m = verify_len * num_queries_per_kv
+    sinks = fold_sinks(sinks, verify_len)
     # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
     split_index = USE_FOR_EACH_TILE
     num_chunks = (
@@ -140,8 +198,8 @@ def batched_decode_kernel(
     )
     # With one chunk there is no repeated cross-slot merge to defer.
     use_entry_local = num_chunks > 1
-    q = query.index_select(0, rep_row_ids).reshape(
-        entries, num_kv_heads, num_queries_per_kv, head_size
+    q = gather_query(
+        query, rep_row_ids, entries, num_kv_heads, num_queries_per_kv, head_size, verify_len
     )
 
     def reduce_chunk(probs, v_page):
@@ -149,9 +207,9 @@ def batched_decode_kernel(
         chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
         chunk_out = torch.sum(
             torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                probs.reshape(entries, num_kv_heads, m, block_size),
                 v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, m, head_size),
             dim=0,
             keepdim=True,
         )
@@ -178,9 +236,7 @@ def batched_decode_kernel(
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # Leading-axis split only: torch-spyre rejects merging a permuted axis pair, and
         # the mask's advancing read window must stay unflattened.
-        sc = scores.reshape(
-            blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
-        )
+        sc = scores.reshape(blocks_per_chunk, num_seqs, num_kv_heads, m, block_size)
         sc = sc + mask_rows
         if use_entry_local:
             return (
@@ -192,7 +248,7 @@ def batched_decode_kernel(
                     blocks_per_chunk,
                     num_seqs,
                     num_kv_heads,
-                    num_queries_per_kv,
+                    m,
                     block_size,
                     head_size,
                 ),
@@ -220,9 +276,9 @@ def batched_decode_kernel(
         ), None
 
     slots = (
-        (blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv)
+        (blocks_per_chunk, num_seqs, num_kv_heads, m)
         if use_entry_local
-        else (1, num_seqs, num_kv_heads, num_queries_per_kv)
+        else (1, num_seqs, num_kv_heads, m)
     )
     state_shape = (*slots, 1)
     out_shape = (*slots, head_size)
@@ -246,19 +302,18 @@ def batched_decode_kernel(
             tile_output=tile_output,
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
-            num_queries_per_kv=num_queries_per_kv,
+            num_queries_per_kv=m,
             head_size=head_size,
             sinks=sinks,
         )
     else:
-        attn = normalize(tile_max, tile_sum, tile_output, sinks).reshape(
-            num_seqs, num_heads, head_size
-        )
+        attn = normalize(tile_max, tile_sum, tile_output, sinks)
+    attn = token_major_output(attn, num_seqs, num_kv_heads, num_queries_per_kv, verify_len)
     if v_scale is not None and v_scale != 1.0:
         attn = attn * v_scale
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
+        out[: num_seqs * verify_len].copy_(attn)
         return out
     return attn

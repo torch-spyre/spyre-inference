@@ -52,6 +52,8 @@ docs/examples
 # tmp files of agent harness
 .plans/
 .kilo/
+# hive's per-run scratch inside an agent workspace (kick prompt, transcript, PR text)
+.hive/
 
 
 # Micro-benchmark run artifacts (scripts/microbench default --output-dir)

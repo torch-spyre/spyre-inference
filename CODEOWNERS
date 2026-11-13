@@ -46,4 +46,7 @@ tests/e2e/test_granite_vision.py @torch-spyre/spyre-inference-default-codeowners
 
 # CICD
 .github @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana
+
+# Hive agent prompts and data, read live by the hive from main. Must stay below `.github`.
+.github/hive/ @torch-spyre/spyre-inference-default-codeowners @joerunde
 Makefile @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana

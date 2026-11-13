@@ -1257,6 +1257,18 @@ def test_batched_decode_chunking_covers_every_block(
         assert md.blocks_per_chunk is not None, (
             f"batched decode declined num_seqs={num_seqs}, which it should accept"
         )
+        if md.packed_out_seqs is not None:
+            # Packed: each sequence's lanes must gather every one of its pages.
+            assert md.lane_seq_ids_cpu is not None and md.chunk_page_ids_cpu is not None
+            for s in range(num_seqs):
+                lanes = (md.lane_seq_ids_cpu == s) & (md.lane_onehot_cpu[0, 0, s] == 1)
+                got = set(md.chunk_page_ids_cpu[:, lanes].flatten().tolist())
+                want = set(block_table[s].tolist())
+                assert want <= got, (
+                    f"max_num_seqs={max_num_seqs} max_model_len={max_model_len} "
+                    f"num_seqs={num_seqs}: sequence {s} misses pages {sorted(want - got)}"
+                )
+            continue
         bpc = md.blocks_per_chunk
         padded = md.padded_batch_blocks
         assert padded is not None
@@ -1390,8 +1402,16 @@ def _decode_reference_fp32(
     ],
 )
 def test_bucketed_block_ids_match_scalar_fill(
-    default_vllm_config, enable_batched_decode, kv_lens: list[int], sliding_window: int | None
+    default_vllm_config,
+    enable_batched_decode,
+    monkeypatch,
+    kv_lens: list[int],
+    sliding_window: int | None,
 ) -> None:
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
+    # The grid's [blocks, seqs] page ids; test_packed_decode covers the lanes'.
+    monkeypatch.setattr(SpyreAttnBucketer, "packed_eligible", lambda self, num_seqs: False)
     block_size = 64
     seq_lens = [(1, kv) for kv in kv_lens]
     metadata = _padded_mask_metadata(seq_lens, block_size=block_size, sliding_window=sliding_window)
@@ -2373,13 +2393,15 @@ def test_spyre_attn_decode_compiles_at_a_prime_page_count(
 @pytest.mark.parametrize(
     ("seq_lens", "use_sinks"),
     [
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], False, id="long_and_shorts"),
-        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], False, id="graded"),
+        # Long enough that splitting saves more chunks than a second dispatch costs at the
+        # batched-decode entry limit; shorter contexts merge into one dispatch.
+        pytest.param([(1, 28000), (1, 200), (1, 200), (1, 200)], False, id="long_and_shorts"),
+        pytest.param([(1, 24000), (1, 12000), (1, 4000), (1, 1200)], False, id="graded"),
         pytest.param(
-            [(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], False, id="with_prefill"
+            [(1, 28000), (1, 200), (1, 200), (1, 200), (64, 300)], False, id="with_prefill"
         ),
-        # Sinks barely move the 7000-token row, so the short group is what catches a miss.
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], True, id="long_and_shorts_sinks"),
+        # Sinks barely move the 28000-token row, so the short group is what catches a miss.
+        pytest.param([(1, 28000), (1, 200), (1, 200), (1, 200)], True, id="long_and_shorts_sinks"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2395,12 +2417,16 @@ def test_spyre_attn_grouped_decode_matches_reference(
 ):
     from vllm.config import get_current_vllm_config
 
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     envs.clear_env_cache()
+    # Grouping is the grid path's, which a packed batch never takes.
+    monkeypatch.setattr(SpyreAttnBucketer, "packed_eligible", lambda self, num_seqs: False)
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
-    cfg.model_config.max_model_len = 8192
+    cfg.model_config.max_model_len = 32768
 
     groups_run = []
     run_grouped = SpyreAttentionImpl._run_grouped_decode
@@ -2418,6 +2444,7 @@ def test_spyre_attn_grouped_decode_matches_reference(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         use_sinks=use_sinks,
+        num_blocks=512,
     )
 
     assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
@@ -2857,7 +2884,8 @@ def test_spyre_attn_batched_decode_uses_plain_page_ids(default_vllm_config, conf
         num_kv_heads=num_kv_heads,
     )
 
-    pages = torch.empty(1 + num_seqs * blocks_per_seq)
+    # Wider than a trip's gather, which may not select the whole cache (torch-spyre#4033).
+    pages = torch.empty(128)
     assert impl._batched_decode_supported(pages.device)
     assert impl._batched_decode_preconditions_met(attn_metadata, pages), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
@@ -2932,6 +2960,55 @@ def batched_decode_calls(monkeypatch):
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", counting)
     return calls
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "head_size"),
+    [
+        pytest.param(14, 2, 128, id="q7_per_kv"),
+        pytest.param(32, 8, 128, id="q4_per_kv"),
+    ],
+)
+@pytest.mark.parametrize("max_num_seqs", [8, 256])
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_packed_decode_head_layouts(
+    default_vllm_config,
+    batched_decode_calls,
+    num_query_heads,
+    num_kv_heads,
+    head_size,
+    max_num_seqs,
+    configure_compilation,
+    configure_device,
+):
+    """A packed decode merges its lanes per head, so the head split is part of the kernel.
+
+    Covers an odd query-per-KV count and the 64 output rows a wide --max-num-seqs gives,
+    with a prefill after the ragged decode prefix.
+    """
+    from vllm.config import get_current_vllm_config
+
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = max_num_seqs
+    cfg.model_config.max_model_len = 4096
+    _run_spyre_attn_test(
+        seq_lens=[(1, 3000), (1, 200), (1, 1100), (1, 64), (64, 300)],
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+    )
+    assert batched_decode_calls, "the batch fell back to the per-seq loop"
 
 
 @pytest.mark.parametrize(
@@ -3012,7 +3089,6 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     One bucket, not the whole enumeration: what matters is that the recorder reaches the
     folded gather through builder-produced metadata.
     """
-    import sys
     from unittest.mock import MagicMock
 
     from vllm.config import get_current_vllm_config
@@ -3020,14 +3096,10 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     from spyre_inference.v1.attention.backends.spyre_attn import (
         SpyreAttentionMetadataBuilder,
     )
-    from spyre_inference.v1.attention.spyre_attn_bucketer import (
-        SpyreAttnBatchedDecodeBucket,
-        batched_decode_chunking,
-    )
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
-    num_seqs, num_blocks, num_pages = 4, 4, 64
+    num_pages = 128
 
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
@@ -3052,17 +3124,12 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     assert impl._batched_decode_supported(device)
 
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
-    blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-    bucket = SpyreAttnBatchedDecodeBucket(
-        num_seqs=num_seqs,
-        num_blocks=num_blocks,
-        blocks_per_chunk=blocks_per_chunk,
-        num_chunks=num_chunks,
-    )
+    bucket = builder.batched_decode_variants()[-1]
+    assert bucket.packed
 
-    realized = impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
+    realized = impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), num_pages)
 
-    assert realized == (num_seqs, blocks_per_chunk, num_chunks)
+    assert realized == (bucket.num_seqs, bucket.blocks_per_chunk, bucket.num_chunks)
     assert batched_decode_calls, "the recorder traced the per-seq loop, not the batched kernel"
 
     del kv_cache

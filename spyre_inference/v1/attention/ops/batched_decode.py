@@ -94,6 +94,49 @@ def _merge_entry_local(
     )
 
 
+# Score offset that takes a lane out of a softmax: far below any real attention score, yet
+# finite in fp16 and bf16 even doubled. The merge's matmul sums every lane, so a single
+# non-finite one would turn every output row NaN (0 * inf); finfo limits leave no headroom.
+LANE_EXCLUDED_SCORE = 30000.0
+
+
+def _merge_lanes(
+    *,
+    tile_max,
+    tile_sum,
+    tile_output,
+    lane_seq_ids,
+    lane_onehot,
+    num_kv_heads,
+    num_queries_per_kv,
+    head_size,
+    sinks=None,
+):
+    """Merge each sequence's lanes into one output row, then normalize once.
+
+    ``lane_onehot`` [KV, Q, S, E] marks the lanes of each output row, repeated per head so
+    the merge is a batched matmul over (KV, Q), the two batch axes lower_bmm allows;
+    ``lane_seq_ids`` [E] is the row of each lane. The heads stay split until the final
+    reshape, as in _merge_entry_local: torch-spyre cannot put a merged (KV, Q) axis on the
+    stick. Clamp-free, as it has no layout for a clamp of these reductions either: a row
+    with no lanes holds a small weight on lane 0 instead (see the builder), which keeps it
+    finite, and every exclusion uses LANE_EXCLUDED_SCORE rather than a dtype limit.
+    """
+    num_out, entries = lane_onehot.shape[2:]
+    tm = tile_max.reshape(entries, num_kv_heads, num_queries_per_kv, 1)
+    bias = ((lane_onehot[0, 0] - 1.0) * LANE_EXCLUDED_SCORE).reshape(num_out, entries, 1, 1, 1)
+    seq_max = torch.amax(tm.unsqueeze(0) + bias, dim=1)
+    weight = torch.exp(tm - seq_max.index_select(0, lane_seq_ids))
+    lane_sum = weight * tile_sum.reshape(entries, num_kv_heads, num_queries_per_kv, 1)
+    lane_out = weight * tile_output.reshape(entries, num_kv_heads, num_queries_per_kv, head_size)
+    # [KV, Q, S, E] @ [KV, Q, E, x] -> [KV, Q, S, x] -> [S, KV, Q, x]
+    seq_sum = torch.matmul(lane_onehot, lane_sum.permute(1, 2, 0, 3)).permute(2, 0, 1, 3)
+    seq_out = torch.matmul(lane_onehot, lane_out.permute(1, 2, 0, 3)).permute(2, 0, 1, 3)
+    return normalize(seq_max, seq_sum, seq_out, sinks).reshape(
+        num_out, num_kv_heads * num_queries_per_kv, head_size
+    )
+
+
 def batched_decode_kernel(
     *,
     query,
@@ -113,6 +156,8 @@ def batched_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    lane_seq_ids=None,
+    lane_onehot=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -239,7 +284,19 @@ def batched_decode_kernel(
         ),
     )
     tile_max, tile_sum, tile_output = carry
-    if use_entry_local:
+    if lane_onehot is not None:
+        attn = _merge_lanes(
+            tile_max=tile_max,
+            tile_sum=tile_sum,
+            tile_output=tile_output,
+            lane_seq_ids=lane_seq_ids,
+            lane_onehot=lane_onehot,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            head_size=head_size,
+            sinks=sinks,
+        )
+    elif use_entry_local:
         attn = _merge_entry_local(
             tile_max=tile_max,
             tile_sum=tile_sum,
@@ -259,6 +316,6 @@ def batched_decode_kernel(
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
+        out[: attn.shape[0]].copy_(attn)
         return out
     return attn

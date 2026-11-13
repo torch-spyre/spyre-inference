@@ -246,6 +246,7 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
         rep_row_ids_cpu=rep,
         chunk_page_ids_cpu=page_ids,
         mask_by_chunk_cpu=mask,
+        lane_onehot_cpu=None,
     )
     layouts = []
     original_to = torch.Tensor.to

@@ -22,10 +22,13 @@ import pytest
 
 from spyre_inference import envs
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    BATCHED_DECODE_ENTRIES,
     SpyreAttnBucketer,
     _parse_buckets,
     _powers_of_two_up_to,
+    _quarter_octaves_up_to,
     batched_decode_chunking,
+    packed_lanes,
 )
 
 BLOCK_SIZE = 64
@@ -480,6 +483,73 @@ class TestEnvOverride:
         assert _parse_buckets(None) is None
 
 
+class TestPackedDecode:
+    """Lanes: a trip's entries split across the decode batch by page count."""
+
+    @pytest.mark.parametrize(
+        "blocks",
+        [[1], [512], [469, 15, 266, 1, 79], [512] * 32, [3] * 64, [1, 2], [100, 1, 1, 1, 1]],
+    )
+    def test_lanes_are_a_valid_split(self, blocks):
+        lanes = packed_lanes(blocks)
+        assert len(lanes) == len(blocks)
+        assert sum(lanes) <= BATCHED_DECODE_ENTRIES
+        assert all(1 <= n <= max(1, b) for n, b in zip(lanes, blocks))
+
+    @pytest.mark.parametrize(
+        "blocks", [[512], [469, 15, 266, 1, 79], [512, 512, 512], [512] * 32, [7] * 9]
+    )
+    def test_lanes_never_take_more_trips_than_an_even_share(self, blocks):
+        """The ladder's top assumes this bound."""
+        trips = max(-(-b // n) for b, n in zip(blocks, packed_lanes(blocks)))
+        share = BATCHED_DECODE_ENTRIES // len(blocks)
+        assert trips <= -(-max(blocks) // share)
+
+    def test_lanes_follow_page_counts_not_the_batch_size(self):
+        """A short sequence keeps its one lane; the long one takes the rest."""
+        assert packed_lanes([1000, 1, 1, 1, 1]) == [60, 1, 1, 1, 1]
+
+    def test_spare_lanes_stay_idle_once_every_page_has_one(self):
+        assert packed_lanes([2, 3]) == [2, 3]
+
+    def test_trip_ladder_has_four_steps_per_doubling(self):
+        assert _quarter_octaves_up_to(16) == [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16]
+        assert _quarter_octaves_up_to(20) == [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20]
+        assert _quarter_octaves_up_to(1) == [1]
+
+    @pytest.mark.parametrize(
+        ("max_num_seqs", "expected"), [(1, 1), (5, 5), (8, 8), (32, 32), (64, 64), (128, 64)]
+    )
+    def test_output_rows_are_the_bucket_holding_a_full_trip(self, max_num_seqs, expected):
+        assert SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs)).packed_out_seqs == expected
+
+    @pytest.mark.parametrize("max_num_seqs", [1, 4, 8, 32, 64])
+    def test_trip_ladder_reaches_the_longest_batch(self, max_num_seqs):
+        b = SpyreAttnBucketer(make_config(max_model_len=32768, max_num_seqs=max_num_seqs))
+        blocks = [b.num_blocks_buckets[-1]] * max_num_seqs
+        trips = max(-(-n // ln) for n, ln in zip(blocks, packed_lanes(blocks)))
+        assert b.find_packed_chunks(trips) is not None
+
+    def test_packed_variants_replace_the_grid_up_to_a_full_trip(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=32768, max_num_seqs=32))
+        variants = b.batched_decode_variants(packed=True)
+        assert all(v.packed for v in variants)
+        assert [v.num_chunks for v in variants] == list(reversed(b.packed_chunk_buckets))
+        assert {(v.num_seqs, v.blocks_per_chunk) for v in variants} == {(BATCHED_DECODE_ENTRIES, 1)}
+        # One axis instead of two: fewer variants than the grid it replaces.
+        assert len(variants) < len(b.batched_decode_variants())
+
+    def test_batches_wider_than_a_trip_keep_the_grid(self):
+        b = SpyreAttnBucketer(make_config(max_num_seqs=128))
+        grid = [v for v in b.batched_decode_variants(packed=True) if not v.packed]
+        assert grid and {v.num_seqs for v in grid} == {128}
+        assert not b.packed_eligible(65)
+        assert b.packed_eligible(64)
+
+    def test_unpacked_enumeration_is_the_grid(self, bucketer):
+        assert not any(v.packed for v in bucketer.batched_decode_variants())
+
+
 class TestRecorderBuilders:
     """The recorder records through the builder each layer dispatches against."""
 
@@ -614,8 +684,8 @@ class TestBatchedDecodeVariants:
     def test_chunking_pads_when_the_ladder_is_not_a_power_of_two(self):
         """With power-of-two buckets the padding vanishes, so a drifting copy of the
         chunking rule would look correct."""
-        assert batched_decode_chunking(8, 8) == (4, 2)  # 4*2 == 8, no padding
-        assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
+        assert batched_decode_chunking(8, 16) == (8, 2)  # 8*2 == 16, no padding
+        assert batched_decode_chunking(6, 16) == (10, 2)  # 10*2 == 20, padded
 
     def test_count_stays_tractable_at_long_context(self, monkeypatch):
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")

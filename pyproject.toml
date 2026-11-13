@@ -325,6 +325,14 @@ ignore-words-list = "dout, te, indicies, subtile, ElementE, arange"
 skip = "*.svg,./tests/hf_cache.json"
 #skip = "./tests/models/fixtures,./tests/prompts,./benchmarks/sonnet.txt,./tests/lora/data,./build"
 
+[tool.typos.default]
+# `"ture"` is a deliberate misspelling of "true" used as a test fixture in
+# test_ingest_vllm_identity.py: it stands in for an operator's typo'd
+# CLICKHOUSE_SECURE value, which _use_tls must still treat as "on" rather than
+# falling back to a cleartext password. Scope the ignore to that exact quoted
+# literal so a genuine `ture` -> `true` typo anywhere else is still caught.
+extend-ignore-re = ['"ture"']
+
 [tool.typos.default.extend-words]
 # Mirrors `tool.codespell.ignore-words-list` so the typos hook doesn't
 # "correct" the documented list of allowed misspellings.

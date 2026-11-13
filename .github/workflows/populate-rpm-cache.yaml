@@ -117,8 +117,10 @@ jobs:
             [[ -z "$relpath" ]] && continue
             fn="$(basename "$relpath")"
             echo "Downloading ${fn} ..."
-            curl -fSL -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
-              -o "${DEST}/${fn}" "${BASE}/${relpath}"
+            # Token on stdin, not argv: argv is world-readable via /proc on a shared runner.
+            curl -fSL -K - -o "${DEST}/${fn}" "${BASE}/${relpath}" <<CURL_CONFIG
+          header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+          CURL_CONFIG
           done < /tmp/rpm-relpaths.txt
 
       - name: Save RPM cache

@@ -188,6 +188,29 @@ def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
     assert is_multimodal_gemma4(hf_config) is expected
 
 
+@pytest.mark.parametrize(
+    ("hf_config", "expected"),
+    [
+        (SimpleNamespace(model_type="gemma4_text", enable_moe_block=True), True),
+        (SimpleNamespace(model_type="gemma4_text", use_second_mlp_block=True), True),
+        # A multimodal checkpoint carries the flags on its nested text config.
+        (
+            SimpleNamespace(
+                model_type="gemma4", text_config=SimpleNamespace(enable_moe_block=True)
+            ),
+            True,
+        ),
+        (SimpleNamespace(model_type="gemma4", text_config=SimpleNamespace()), False),
+        (SimpleNamespace(model_type="gemma4_text"), False),
+        (SimpleNamespace(model_type="llama", enable_moe_block=True), False),
+    ],
+)
+def test_is_gemma4_moe_reads_the_text_config_flags(hf_config, expected):
+    from spyre_inference.models.gemma4 import is_gemma4_moe
+
+    assert is_gemma4_moe(hf_config) is expected
+
+
 def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
     """Why ``SpyreGemma4ForConditionalGeneration`` adapts only the vision tower: upstream
     resolves its text half through ``ModelRegistry``, so it already lands on
@@ -244,6 +267,8 @@ def test_moe_recipe_reads_the_decoder_experts_and_router_scale(monkeypatch):
     assert routed == "routed"
     folded = recipe.prepare_down_weight(torch.ones(2, 1, 1))
     torch.testing.assert_close(folded.flatten(), scale)
+    assert recipe.expert_group == 4
+    assert recipe.expert_group_min_tokens == gemma4.GEMMA4_MOE_SHORT_BUCKET == 128
 
 
 @pytest.mark.parametrize(

@@ -260,6 +260,14 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
             )
     if envs.SPYRE_MOE_EXPERT_GROUP is not None:
         recipe = replace(recipe, expert_group=envs.SPYRE_MOE_EXPERT_GROUP)
+    elif recipe.expert_group != 1 and not _expert_group_fits(layer, recipe.expert_group):
+        # A recipe's group is a default: it yields where it does not fit the experts and cores.
+        logger.warning_once(
+            "Spyre MoE: the recipe's %d experts per trip do not fit this layer's experts and "
+            "the cores; running one expert per trip.",
+            recipe.expert_group,
+        )
+        recipe = replace(recipe, expert_group=1)
     if envs.SPYRE_MOE_GROUP_MIN_TOKENS is not None:
         recipe = replace(recipe, expert_group_min_tokens=envs.SPYRE_MOE_GROUP_MIN_TOKENS)
     if recipe.expert_group_min_tokens < 1:

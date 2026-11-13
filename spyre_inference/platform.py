@@ -389,6 +389,13 @@ class TorchSpyrePlatform(CpuPlatform):
                 # Short prefills keep a default-size bucket instead of padding up.
                 if max_capture_size > prefill:
                     sizes.add(prefill)
+                # A gemma-4 MoE step of up to 128 tokens runs its expert loop on 128 rows.
+                from spyre_inference.models.gemma4 import GEMMA4_MOE_SHORT_BUCKET, is_gemma4_moe
+
+                if max_capture_size > GEMMA4_MOE_SHORT_BUCKET and is_gemma4_moe(
+                    vllm_config.model_config.hf_config
+                ):
+                    sizes.add(GEMMA4_MOE_SHORT_BUCKET)
                 size = 1
                 while size < num_seqs:
                     sizes.add(size)

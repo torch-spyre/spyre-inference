@@ -117,6 +117,26 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
+# The short prefill bucket of a gemma-4 MoE checkpoint, and the smallest batch that its recipe
+# runs grouped: one value, so the bucket runs grouped by default.
+GEMMA4_MOE_SHORT_BUCKET = 128
+
+
+def _has_moe_block(text_config: Any) -> bool:
+    # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
+    return bool(
+        getattr(text_config, "enable_moe_block", False)
+        or getattr(text_config, "use_second_mlp_block", False)
+    )
+
+
+def is_gemma4_moe(hf_config: Any) -> bool:
+    """True for a gemma-4 config whose decoder has the MoE block."""
+    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return False
+    return _has_moe_block(getattr(hf_config, "text_config", hf_config))
+
+
 def force_text_backbone(engine_args: EngineArgs, hf_config: PretrainedConfig | None) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
@@ -171,6 +191,8 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
                     _fold_gemma4_expert_scale,
                     scale=cast(Gemma4Router, decoder.router).per_expert_scale,
                 ),
+                expert_group=4,
+                expert_group_min_tokens=GEMMA4_MOE_SHORT_BUCKET,
             ),
         )
         configured += 1
@@ -244,11 +266,7 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         if decoder.embed_tokens_per_layer is not None:
             retype(decoder, SpyreGemma4SelfDecoderLayers).arm_outer_compile()
         # Without the recipe the experts run upstream's path, which is wrong on Spyre.
-        # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
-        is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(
-            self.config, "use_second_mlp_block", False
-        )
-        if not configure_gemma4_moe_layers(self.model.layers) and is_moe_checkpoint:
+        if not configure_gemma4_moe_layers(self.model.layers) and _has_moe_block(self.config):
             raise RuntimeError(
                 "gemma-4 MoE checkpoint, but no decoder layer exposes `experts`: vLLM has "
                 "moved them; update configure_gemma4_moe_layers."

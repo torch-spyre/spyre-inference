@@ -152,14 +152,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experts per trip of the compiled all-expert loop (stick-aligned batches of
     # SPYRE_MOE_GROUP_MIN_TOKENS to 1,024 tokens), for every model on the Spyre MoE backend.
     # G > 1 puts the G experts of a trip on G groups of SENCORES / G cores, each core taking a
-    # block of tokens through one whole expert. Unset keeps the model recipe's value (1 = one
-    # expert per trip on all cores).
+    # block of tokens through one whole expert. Unset keeps the model recipe's value: 4 for
+    # gemma-4 MoE where that fits the experts and the cores, else 1 (one expert per trip on all
+    # cores).
     "SPYRE_MOE_EXPERT_GROUP": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_EXPERT_GROUP")) is not None else None
     ),
     # Smallest stick-aligned batch that runs SPYRE_MOE_EXPERT_GROUP experts per trip; shorter
     # batches run one. Unset keeps the model recipe's value (default 256, in practice prefill
-    # chunks), so a 128-token compile size needs 128 or less here to run grouped.
+    # chunks; 128 for gemma-4 MoE), so a 128-token compile size needs 128 or less here to run
+    # grouped.
     "SPYRE_MOE_GROUP_MIN_TOKENS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_GROUP_MIN_TOKENS")) is not None else None
     ),

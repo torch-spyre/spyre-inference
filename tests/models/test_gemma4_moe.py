@@ -768,6 +768,20 @@ def test_a_bad_expert_group_fails_at_configure_time(monkeypatch, group, cores):
         configure_spyre_moe_layer(_generic_layer(), SpyreMoERecipe(*_STANDARD))
 
 
+@pytest.mark.parametrize("cores", [2, 24])
+def test_a_recipe_group_that_does_not_fit_the_cores_runs_one_expert_per_trip(monkeypatch, cores):
+    """Only an explicit ``SPYRE_MOE_EXPERT_GROUP`` raises; a recipe's group is a default."""
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    monkeypatch.delenv("SPYRE_MOE_EXPERT_GROUP", raising=False)
+    layer = _generic_layer()
+    with spyre_config.patch({"sencores": cores}):
+        configure_spyre_moe_layer(layer, SpyreMoERecipe(*_STANDARD, expert_group=4))
+    assert layer.spyre_moe_recipe.expert_group == 1
+
+
 def test_the_expert_group_leaves_unsupported_layers_rejected(monkeypatch):
     """The switch changes no admission rule."""
     from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer

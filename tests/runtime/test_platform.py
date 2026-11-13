@@ -862,6 +862,66 @@ def test_compile_sizes_default_honors_a_user_budget(monkeypatch, budget, user_bu
     assert vllm_config.scheduler_config.max_num_batched_tokens == sizes[-1]
 
 
+_GEMMA4_MOE = SimpleNamespace(model_type="gemma4_text", enable_moe_block=True)
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "user_budget", "sizes"),
+    [
+        pytest.param(_GEMMA4_MOE, None, [1, 2, 4, 128, 512], id="text_moe"),
+        pytest.param(
+            SimpleNamespace(
+                model_type="gemma4", text_config=SimpleNamespace(use_second_mlp_block=True)
+            ),
+            None,
+            [1, 2, 4, 128, 512],
+            id="multimodal_moe",
+        ),
+        pytest.param(SimpleNamespace(model_type="gemma4_text"), None, [1, 2, 4, 512], id="dense"),
+        pytest.param(
+            SimpleNamespace(model_type="qwen3", enable_moe_block=True),
+            None,
+            [1, 2, 4, 512],
+            id="other_model_type",
+        ),
+        pytest.param(_GEMMA4_MOE, 1024, [1, 2, 4, 128, 512, 1024], id="user_budget_1024"),
+        pytest.param(_GEMMA4_MOE, 256, [1, 2, 4, 128, 256], id="user_budget_256"),
+        pytest.param(_GEMMA4_MOE, 128, [1, 2, 4, 128], id="user_budget_128"),
+        pytest.param(_GEMMA4_MOE, 64, [1, 2, 4, 64], id="user_budget_64"),
+    ],
+)
+def test_compile_sizes_default_adds_a_short_bucket_for_gemma4_moe(
+    monkeypatch, hf_config, user_budget, sizes
+):
+    """Only a gemma-4 MoE checkpoint gets the 128-token bucket, below its token budget."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", user_budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.model_config.hf_config = hf_config
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    if user_budget is not None:
+        vllm_config.scheduler_config.max_num_batched_tokens = user_budget
+
+    for _ in range(2):  # a second run of the hook keeps the stored list
+        TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+        assert vllm_config.compilation_config.compile_sizes == sizes
+        assert vllm_config.scheduler_config.max_num_batched_tokens == sizes[-1]
+
+
+def test_compile_sizes_user_list_is_kept_for_gemma4_moe():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.model_config.hf_config = _GEMMA4_MOE
+    vllm_config.compilation_config.compile_sizes = [1, 512]
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 512]
+
+
 @pytest.mark.parametrize(("budget", "expect_warn"), [(1024, False), (2048, True)])
 def test_compile_sizes_warns_above_twice_the_default(monkeypatch, caplog, budget, expect_warn):
     import logging

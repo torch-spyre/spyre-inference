@@ -35,8 +35,18 @@ from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 pytestmark = pytest.mark.uses_subprocess
 
 _POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
+_TRANSFORMERS_ENCODER_MODEL = "ibm-granite/granite-embedding-278m-multilingual"
 _POOLING_REFS = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _COSINE_MIN = 0.99
+# RoBERTa-family models (incl. XLM-R) read their position embedding at pos + 2. A second
+# +2 (the double offset) still scores 0.992-0.998 on these prompts, so the bar has to sit
+# above that.
+_TRANSFORMERS_COSINE_MIN = 0.999
+_TRANSFORMERS_NER_MODEL = "dslim/bert-base-NER"
+_TRANSFORMERS_NER_PROMPTS = [
+    "My name is Wolfgang and I live in Berlin",
+    "George Washington went to Washington",
+]
 
 
 @pytest.mark.parametrize(
@@ -213,6 +223,83 @@ def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> 
         monkeypatch,
         prompt_logprobs=1,
     )
+
+
+@pytest.mark.e2e_smoke
+def test_transformers_backend_encoder_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compiled ``model_impl="transformers"`` encoder embedding matches cached HF refs.
+
+    ``SpyreTransformersEmbeddingModel`` is compiled per transformer block (the
+    default ``SPYRE_COMPILE_GRANULARITY``). Verifies that the XLM-RoBERTa gather-free
+    embedding patch and the single RoBERTa position offset survive compilation.
+    """
+    from vllm import LLM
+
+    refs = json.loads(_POOLING_REFS.read_text())[_TRANSFORMERS_ENCODER_MODEL]
+    prompts = refs["prompts"]
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    engine = LLM(
+        model=_TRANSFORMERS_ENCODER_MODEL,
+        runner="pooling",
+        model_impl="transformers",
+        enforce_eager=False,
+        max_model_len=64,
+        max_num_seqs=2,
+    )
+    outputs = engine.embed(prompts)
+    assert len(outputs) == len(prompts)
+    for out, ref_emb in zip(outputs, refs["embeddings"]):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb)
+        assert all(math.isfinite(x) for x in emb)
+        sim = F.cosine_similarity(
+            torch.tensor(emb, dtype=torch.float32),
+            torch.tensor(ref_emb, dtype=torch.float32),
+            dim=0,
+        ).item()
+        assert sim >= _TRANSFORMERS_COSINE_MIN, f"cosine {sim:.5f} < {_TRANSFORMERS_COSINE_MIN}"
+
+
+def test_transformers_backend_token_classify_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compiled ``model_impl="transformers"`` BERT NER matches HF on every token's label.
+
+    Covers ``SpyreTransformersForSequenceClassification`` (BERT, no position offset) on the
+    ``token_classify`` task, where upstream's ``ClassifierWithReshape`` returns
+    ``[tokens, 1, labels]``.
+    """
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+    from vllm import LLM
+
+    tok = AutoTokenizer.from_pretrained(_TRANSFORMERS_NER_MODEL)
+    hf = AutoModelForTokenClassification.from_pretrained(
+        _TRANSFORMERS_NER_MODEL, dtype=torch.float32
+    ).eval()
+    with torch.inference_mode():
+        refs = [
+            hf(**tok(p, return_tensors="pt")).logits[0].softmax(-1)
+            for p in _TRANSFORMERS_NER_PROMPTS
+        ]
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    engine = LLM(
+        model=_TRANSFORMERS_NER_MODEL,
+        runner="pooling",
+        model_impl="transformers",
+        enforce_eager=False,
+        max_model_len=128,
+        max_num_seqs=1,
+    )
+    assert engine.llm_engine.model_config.using_transformers_backend()
+    outputs = engine.encode(_TRANSFORMERS_NER_PROMPTS, pooling_task="token_classify")
+    assert len(outputs) == len(_TRANSFORMERS_NER_PROMPTS)
+    for prompt, out, ref in zip(_TRANSFORMERS_NER_PROMPTS, outputs, refs):
+        got = torch.as_tensor(out.outputs.data).float().reshape(ref.shape)
+        assert torch.isfinite(got).all()
+        assert torch.equal(got.argmax(-1), ref.argmax(-1)), (
+            f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
+        )
+        assert (got - ref).abs().max().item() < 1e-2, f"{prompt!r}: scores drifted from HF"
 
 
 def _assert_compiled_output(

@@ -19,6 +19,7 @@ from functools import lru_cache
 from vllm.logger import init_logger
 
 from spyre_inference import moe  # noqa: F401
+from spyre_inference.quantization.fp8 import register_spyre_fp8_config
 
 from . import (
     conv,  # noqa: F401
@@ -36,7 +37,6 @@ from . import (
     vocab_parallel_embedding,  # noqa: F401
 )
 from .fp8_linear_kernel import register_spyre_fp8_linear_kernel
-from .fp8_linear_method import register_spyre_fp8_config
 
 logger = init_logger(__name__)
 

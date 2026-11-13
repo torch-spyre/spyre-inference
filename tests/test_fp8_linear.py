@@ -126,7 +126,7 @@ def _load_fp8_qkv(
     means dynamic activations."""
     from vllm.model_executor.layers.linear import QKVParallelLinear
 
-    from spyre_inference.custom_ops.fp8_linear_method import SpyreFp8Config
+    from spyre_inference.quantization.fp8 import SpyreFp8Config
 
     layer = QKVParallelLinear(
         hidden_size=128,
@@ -792,7 +792,7 @@ def test_process_weights_rejects_fp16():
 )
 def test_shard_scales_to_kernel_scale(scales, expected_shape):
     """Equal shard scales collapse to one; differing ones go per row."""
-    from spyre_inference.custom_ops.fp8_linear_method import shard_scales_to_kernel_scale
+    from spyre_inference.quantization.fp8 import shard_scales_to_kernel_scale
 
     scale = shard_scales_to_kernel_scale(torch.tensor(scales), [2, 2, 2])
     assert tuple(scale.shape) == expected_shape
@@ -806,7 +806,7 @@ def test_shard_scales_missing_scale_raises():
     """A shard the checkpoint gave no scale must not borrow another shard's."""
     from vllm.model_executor.layers.quantization.utils.fp8_utils import FP8_SCALE_SENTINEL
 
-    from spyre_inference.custom_ops.fp8_linear_method import shard_scales_to_kernel_scale
+    from spyre_inference.quantization.fp8 import shard_scales_to_kernel_scale
 
     sentinel = FP8_SCALE_SENTINEL
     with pytest.raises(ValueError, match=r"shard\(s\) \[1, 2\]"):
@@ -817,7 +817,7 @@ def test_fp8_quantization_resolves_to_spyre_config():
     from vllm.model_executor.layers.quantization import get_quantization_config
 
     from spyre_inference.custom_ops import register_all
-    from spyre_inference.custom_ops.fp8_linear_method import SpyreFp8Config
+    from spyre_inference.quantization.fp8 import SpyreFp8Config
 
     register_all()
     assert get_quantization_config("fp8") is SpyreFp8Config
@@ -835,7 +835,7 @@ def test_per_tensor_qkv_loads_without_requant(scales, fused, tp_group, monkeypat
         pytest.skip("vLLM FP8 kernel base unavailable")
     import vllm._custom_ops as ops
 
-    from spyre_inference.custom_ops.fp8_linear_method import SpyreFp8LinearMethod
+    from spyre_inference.quantization.fp8 import SpyreFp8LinearMethod
 
     def _no_requant(*args, **kwargs):
         raise AssertionError("scaled_fp8_quant needs _C, which the empty vLLM build lacks")

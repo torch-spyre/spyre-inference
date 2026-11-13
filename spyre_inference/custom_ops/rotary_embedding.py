@@ -29,8 +29,16 @@ A head whose half is not stick-aligned (head_size=64) uses ``_rotate_neox_split_
 instead: the 2x2 form views each head as two halves, which cannot restickify when a
 half is narrower than a stick.
 
-Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
+Only neox-style full rotary uses the on-device kernels. Other configs (partial rotary,
+where ``rotary_dim < head_size``, and gptj/interleaved) fall back to the native
+``RotaryEmbedding`` forward, run on the host inside the opaque op
+``torch.ops.vllm.spyre_partial_rotary``: the native half-split slices the head at a
+sub-stick offset (``rotary_dim // 2``) that cannot lower on-device, and keeping it opaque
+hides the host transfer from the compile graph (a traced ``spyre->cpu`` copy segfaults
+libsenlib during warmup). Partial rotary is used by some vision-language models (GLM-OCR).
 """
+
+from functools import lru_cache
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
@@ -48,6 +56,7 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .utils import place_row_gathered
 
@@ -55,6 +64,52 @@ from .utils import place_row_gathered
 _STICK = 64
 
 logger = init_logger(__name__)
+
+
+def _partial_rotary_op_func(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    # Rotate on the host: the sub-stick head slice (rotary_dim < head_size) cannot lower
+    # on Spyre, and hiding it in an opaque op keeps the transfer out of the compile graph.
+    out, _ = RotaryEmbedding.forward_static(
+        positions.cpu(),
+        x.cpu(),
+        None,
+        head_size,
+        rotary_dim,
+        cos_sin_cache.cpu().to(x.dtype),
+        is_neox_style,
+    )
+    return out.to(x.device)
+
+
+def _partial_rotary_op_fake(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@lru_cache(maxsize=1)
+def _register_partial_rotary_op():
+    # CompositeExplicitAutograd so the op dispatches regardless of input device
+    # (query/key arrive on Spyre, cos_sin_cache stays CPU-pinned).
+    direct_register_custom_op(
+        op_name="spyre_partial_rotary",
+        op_func=_partial_rotary_op_func,
+        fake_impl=_partial_rotary_op_fake,
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    logger.debug_once("Registered custom op: spyre_partial_rotary")
 
 
 def _rotate_neox_2x2(
@@ -106,29 +161,40 @@ def _rotate_neox_split_free(
 class _SpyreRotaryMixin:
     """Spyre RoPE wiring shared by the OOT rotary classes.
 
-    Runs the 2x2 (or, for a sub-stick half, split-free) rotation on Spyre for supported
-    configs; unsupported configs raise ``NotImplementedError`` at construction. The
-    rotation cache is derived lazily on CPU from the base ``cos_sin_cache`` (inheriting
-    all rope-scaling variants), and ``_apply`` places a copy on the device when the
-    module moves there.
+    Runs the 2x2 (or, for a sub-stick half, split-free) rotation on Spyre for neox-style
+    full rotary; any other config (partial rotary or gptj/interleaved) falls back to the
+    native ``RotaryEmbedding`` forward. The rotation cache is derived lazily on CPU from
+    the base ``cos_sin_cache`` (inheriting all rope-scaling variants), and ``_apply``
+    places a copy on the device when the module moves there.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Only neox full rotary has a Spyre kernel; gptj/interleaved and partial
-        # rotary are rejected here rather than run on CPU.
-        if not (self.is_neox_style and self.rotary_dim == self.head_size):
-            raise NotImplementedError(
-                "SpyreRoPE supports only neox-style full rotary (rotary_dim == "
-                f"head_size); got is_neox_style={self.is_neox_style}, "
-                f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
-            )
         # A model may request its cache at a wider dtype than it runs in.
-        # For example gpt-oss models ask for fp32.
+        # For example gpt-oss models ask for fp32. Done before the fallback branch
+        # below so the native forward sees the widened cache as well.
         vllm_config = get_current_vllm_config_or_none()
         model_config = vllm_config.model_config if vllm_config is not None else None
         if model_config is not None and self.cos_sin_cache.dtype != model_config.dtype:
             self.cos_sin_cache = self.cos_sin_cache.to(model_config.dtype)
+        # Only neox full rotary has a Spyre kernel; gptj/interleaved and partial
+        # rotary (rotary_dim < head_size) fall back to the native forward instead.
+        self._spyre_native_fallback = not (
+            self.is_neox_style and self.rotary_dim == self.head_size
+        )
+        if self._spyre_native_fallback:
+            logger.warning_once(
+                "SpyreRoPE: config unsupported by the on-device rotation kernels "
+                "(is_neox_style=%s, rotary_dim=%s, head_size=%s); falling back to the "
+                "native RotaryEmbedding forward.",
+                self.is_neox_style,
+                self.rotary_dim,
+                self.head_size,
+            )
+            # Register here, not in forward_oot: registration must not be traced (Dynamo
+            # graph-breaks trying to enter infer_schema inside a compiled forward).
+            _register_partial_rotary_op()
+            return
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
@@ -140,6 +206,10 @@ class _SpyreRotaryMixin:
         )
 
     def _apply(self, fn, recurse=True):
+        if self._spyre_native_fallback:
+            # Keep cos_sin_cache CPU-pinned: spyre_partial_rotary reads it on the host,
+            # so relocating it to Spyre would only add a round-trip per call.
+            return self
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
         # holds no other movable tensor, so there is nothing to relocate. We instead prime
         # the device rotation cache here (before torch.compile traces forward_oot).
@@ -190,6 +260,28 @@ class _SpyreRotaryMixin:
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._spyre_native_fallback:
+            out_query = torch.ops.vllm.spyre_partial_rotary(
+                query,
+                positions,
+                self.cos_sin_cache,
+                self.head_size,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+            out_key = (
+                torch.ops.vllm.spyre_partial_rotary(
+                    key,
+                    positions,
+                    self.cos_sin_cache,
+                    self.head_size,
+                    self.rotary_dim,
+                    self.is_neox_style,
+                )
+                if key is not None
+                else None
+            )
+            return out_query, out_key
         # Cache was primed in _apply before compile, so only the index_select is traced.
         cache = self._get_device_rotation_cache()
         rotate_half = self._rotate_half

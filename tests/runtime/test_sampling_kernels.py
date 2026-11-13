@@ -28,6 +28,7 @@ from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import (
     SpyreTopKTopPSampler,
     apply_top_k_top_p_kernels,
+    apply_top_k_top_p_sort_free,
 )
 
 # Skip, like vLLM's optional extensions, where the kernels are absent (a prebaked image
@@ -107,8 +108,12 @@ def test_topk_sampler_matches_pytorch_reference(k: int | None, p: float | None) 
     torch.manual_seed(1)
     out = sampler.forward_native(logits.clone(), {}, k_t, p_t)[0]
 
-    # The sampler's own filter, then its per-row seed draw.
-    filtered = apply_top_k_top_p_kernels(logits.clone(), k_t, p_t)
+    # PyTorch's filter, then the same per-row seed draw. The sampler uses the
+    # kernels, so this fails if the kernel keeps a different set.
+    if k_t is not None and p_t is not None:
+        filtered = apply_top_k_top_p_sort_free(logits.clone(), k_t, p_t)
+    else:
+        filtered = apply_top_k_top_p_pytorch(logits.clone(), k_t, p_t, allow_cpu_sync=True)
     torch.manual_seed(1)
     seeds = torch.randint(0, 2**62, (rows,), dtype=torch.long)
     assert torch.equal(out, _reference_gumbel_argmax(filtered, seeds))

@@ -15,11 +15,10 @@
 // Portions adapted from vLLM (https://github.com/vllm-project/vllm),
 // Copyright contributors to the vLLM project, Apache-2.0.
 
-// Vectorised expf over vec_op::FP32Vec16, adapted from the DEFINE_FAST_EXP
-// macro in vLLM csrc/cpu/cpu_arch_macros.h (AVX512 from vllm#62440, AVX2 from
-// vllm#43452). The s390x path is the same polynomial on VXE lanes. Defined
-// only on ISAs with a SIMD FP32Vec16; callers keep a scalar expf path for
-// the rest.
+// Vectorised expf over vec_op::FP32Vec16. The polynomial is DEFINE_FAST_EXP
+// from the unmerged vllm#62440 (AVX512) and vllm#43452 (AVX2); vLLM did not
+// merge it. The s390x path is the same polynomial on VXE lanes. Defined only
+// on ISAs with a SIMD FP32Vec16; callers keep a scalar expf path for the rest.
 #ifndef SPYRE_CPU_FAST_EXP_HPP
 #define SPYRE_CPU_FAST_EXP_HPP
 

@@ -813,6 +813,10 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.model_config is not None:
             cls._warn_if_not_in_registry(vllm_config)
 
+            from spyre_inference import _patch_granitemoehybrid_is_hybrid
+
+            _patch_granitemoehybrid_is_hybrid()
+
             # From here, not from `hf_overrides`, so a user-supplied override does not skip
             # it; no-op for every other model. Runs again for the nested text config a
             # multimodal model builds its decoder from.

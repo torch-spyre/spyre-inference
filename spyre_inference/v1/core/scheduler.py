@@ -49,15 +49,24 @@ class TorchSpyreScheduler(Scheduler):
         # The waiting loop re-reads this every iteration and appends one request per
         # admission, so a lowered cap stops it after `free_slots` of them while still
         # letting it skip candidates. Steps that preempt skip the loop entirely.
-        # Lower the admission cap, not max_num_running_reqs: since 0.31 the loop gates
-        # on max_num_active_reqs, and max_num_running_reqs is the runner slot count
-        # that `assert len(self.running) <= ...` checks after the loop.
-        max_num_active_reqs = self.max_num_active_reqs
-        self.max_num_active_reqs = min(
-            max_num_active_reqs,
-            len(self.running) + self.num_waiting_for_streaming_input + free_slots,
+        # Lower the admission cap: since 0.31 the loop gates on max_num_active_reqs;
+        # in earlier releases it was max_num_running_reqs.
+        cap_attr = (
+            "max_num_active_reqs"
+            if hasattr(self, "max_num_active_reqs")
+            else "max_num_running_reqs"
+        )
+        orig_cap = getattr(self, cap_attr)
+        streaming_waiting = getattr(self, "num_waiting_for_streaming_input", 0)
+        setattr(
+            self,
+            cap_attr,
+            min(
+                orig_cap,
+                len(self.running) + streaming_waiting + free_slots,
+            ),
         )
         try:
             return super().schedule(*args, **kwargs)
         finally:
-            self.max_num_active_reqs = max_num_active_reqs
+            setattr(self, cap_attr, orig_cap)

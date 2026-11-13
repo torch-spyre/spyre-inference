@@ -119,7 +119,10 @@ def allocate_spyre_kv_caches(
     # would let each layer's KV write clobber the others'.
     num_blocks = kv_cache_config.num_blocks
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        for layer_name in kv_cache_tensor.layers:
+        layers = getattr(kv_cache_tensor, "layers", None)
+        if layers is None:
+            layers = getattr(kv_cache_tensor, "shared_by", ())
+        for layer_name in layers:
             spec = spec_by_layer[layer_name]
             # The layout belongs to the backend; a layer without an impl (fixture
             # stubs) gets the default decoder layout.

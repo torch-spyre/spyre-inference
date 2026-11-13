@@ -181,6 +181,41 @@ def _compute_slot_mapping_impl(
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
 
+def _legacy_compute_slot_mapping_impl(
+    num_tokens: int,
+    max_num_tokens: int,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    block_table_stride: int,
+    block_size: int,
+    slot_mapping: torch.Tensor,
+    KV_CACHE_BLOCK_SIZE: int | None = None,
+    BLOCKS_PER_KV_BLOCK: int = 1,
+    TOTAL_CP_WORLD_SIZE: int = 1,
+    TOTAL_CP_RANK: int = 0,
+    CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
+    PAD_ID: int = _PAD_SLOT_ID,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    effective_block_size = KV_CACHE_BLOCK_SIZE if KV_CACHE_BLOCK_SIZE is not None else block_size
+    _compute_slot_mapping_impl(
+        num_tokens=num_tokens,
+        max_num_tokens=max_num_tokens,
+        query_start_loc=query_start_loc,
+        positions=positions,
+        block_table=block_table,
+        block_table_stride=block_table_stride,
+        slot_mapping=slot_mapping,
+        KV_CACHE_BLOCK_SIZE=effective_block_size,
+        TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
+        TOTAL_CP_RANK=TOTAL_CP_RANK,
+        CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
+        PAD_ID=PAD_ID,
+    )
+
+
 class _SlotMappingKernelShim:
     """Drop-in for vLLM's Triton ``ComputeSlotMappingKernel``, which Spyre cannot run:
     calls go to the pure-PyTorch impl and warmup registration is a no-op."""
@@ -214,15 +249,20 @@ class _SlotMappingKernelShim:
             CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
         )
 
-    def register_warmup(self, *args, **kwargs) -> None:
+    def __getitem__(self, grid: Any) -> Any:
+        """Support older vLLM releases that used grid launch syntax kernel[(grid,)](...)."""
+        return _legacy_compute_slot_mapping_impl
+
+    def register_warmup(self, *args: Any, **kwargs: Any) -> None:
         pass
 
 
 _compute_slot_mapping_kernel = _SlotMappingKernelShim()
 
-# The module attribute in vllm.v1.worker.block_table that both launches the
-# slot-mapping kernel and receives its warmup registration.
+# The module attributes in vllm.v1.worker.block_table that both launch the
+# slot-mapping kernel and receive its warmup registration across vLLM versions.
 _SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
+_LEGACY_SLOT_MAPPING_KERNEL_ATTR = "_compute_slot_mapping_kernel"
 
 
 def _patch_compute_slot_mapping() -> None:
@@ -234,16 +274,19 @@ def _patch_compute_slot_mapping() -> None:
     """
     from vllm.v1.worker import block_table
 
-    if not hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+    if hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+        setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
+    elif hasattr(block_table, _LEGACY_SLOT_MAPPING_KERNEL_ATTR):
+        setattr(block_table, _LEGACY_SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
+    else:
         raise RuntimeError(
-            f"Cannot find vLLM's slot-mapping kernel to patch: "
-            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} does not exist. vLLM has moved it; "
+            f"Cannot find vLLM's slot-mapping kernel to patch: neither "
+            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} nor "
+            f"block_table.{_LEGACY_SLOT_MAPPING_KERNEL_ATTR} exists. vLLM has moved it; "
             f"update _SlotMappingKernelShim and _patch_compute_slot_mapping for the "
             f"new launch site. Leaving the patch unapplied would defer the failure to "
             f"the first decode step."
         )
-
-    setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
@@ -1303,18 +1346,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return CUDAGraphMode.NONE, pad, False, None, None
         self._encoder_buffer_rows = num_tokens
 
-        return super()._determine_batch_execution_and_padding(
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
-            allow_microbatching=allow_microbatching,
-            force_eager=force_eager,
-            force_uniform_decode=force_uniform_decode,
-            force_has_lora=force_has_lora,
-            force_num_active_loras=force_num_active_loras,
-            num_encoder_reqs=num_encoder_reqs,
-        )
+        kwargs: dict[str, Any] = {
+            "num_tokens": num_tokens,
+            "num_reqs": num_reqs,
+            "num_scheduled_tokens_np": num_scheduled_tokens_np,
+            "max_num_scheduled_tokens": max_num_scheduled_tokens,
+            "allow_microbatching": allow_microbatching,
+            "force_eager": force_eager,
+            "force_uniform_decode": force_uniform_decode,
+            "force_has_lora": force_has_lora,
+            "force_num_active_loras": force_num_active_loras,
+            "num_encoder_reqs": num_encoder_reqs,
+        }
+        import inspect
+
+        sig = inspect.signature(super()._determine_batch_execution_and_padding)
+        if "use_cascade_attn" in sig.parameters:
+            kwargs["use_cascade_attn"] = use_cascade_attn
+        return super()._determine_batch_execution_and_padding(**kwargs)
 
     def _spyre_bucket_batch_descriptor(
         self,

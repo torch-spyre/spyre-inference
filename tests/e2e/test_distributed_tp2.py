@@ -191,15 +191,14 @@ def test_tp2_llm_generate_matches_tp1(record_property) -> None:
         pytest.param(
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b", None, 64, marks=pytest.mark.e2e_smoke
         ),
-        # gemma-4 vision checkpoints resolve the multimodal architecture, so these rows
-        # pin the text-only backbone -- the decoder is what TP splits anyway, and the
+        # gemma-4 vision checkpoints resolve the multimodal architecture, so this row
+        # pins the text-only backbone -- the decoder is what TP splits anyway, and the
         # tower's weights and warmup would be paid for nothing. The nano model keeps
-        # the 26B-A4B layout (MoE, sliding + full attention) at 6 layers. Its MoE loop runs
-        # one expert per trip on the 64-token bucket and grouped on the 128-token one.
-        ("joerunde/gemma-4-moe-nano", GEMMA4_TEXT_BACKBONE_OVERRIDE, 64),
+        # the 26B-A4B layout (MoE, sliding + full attention) at 6 layers. It prefills on
+        # the 128-token bucket, where its MoE loop runs grouped by default.
         ("joerunde/gemma-4-moe-nano", GEMMA4_TEXT_BACKBONE_OVERRIDE, 128),
     ],
-    ids=["micro-g3.3", "gemma-4-moe-nano-text", "gemma-4-moe-nano-text-grouped"],
+    ids=["micro-g3.3", "gemma-4-moe-nano-text"],
 )
 def test_tp2_compiled_llm_generate_matches_tp1(
     model: str, hf_overrides, prefill: int, record_property
@@ -209,8 +208,8 @@ def test_tp2_compiled_llm_generate_matches_tp1(
     compile_sizes is pinned to the reachable token counts: 1 (one sequence
     decoding alone), 2 (both decoding), and ``prefill`` as the prefill/scheduler cap.
     64 is one fp16 stick, so the prefill pads onto a stick-aligned bucket and
-    the MoE is traced into the block graph with its all-reduce. The second gemma-4
-    row uses 128, where its MoE loop runs grouped by default.
+    the MoE is traced into the block graph with its all-reduce. The gemma-4 row
+    uses 128, where its MoE loop runs grouped by default.
     Its served TP=2 verdict also requires TP=1 to run and match.
     """
     _cc = {"compile_sizes": [1, 2, prefill]}

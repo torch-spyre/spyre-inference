@@ -15,6 +15,8 @@
 """kernels.py's seam: HostKernel launches like a Triton kernel, bind_or_raise()
 enforces the full list, and unsupported features fail loudly."""
 
+import re
+
 import pytest
 import torch
 
@@ -34,18 +36,15 @@ def test_unsupported_kernel_names_the_feature() -> None:
         kernel[(1,)](0)
 
 
-def test_bind_or_raise_names_a_kernel_bind_left_unbound(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bind_or_raise_names_a_kernel_missing_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(kernels, "use_triton", lambda: False)
-    monkeypatch.setattr(kernels, "HOST_KERNELS", {"a": "op"})
-    monkeypatch.setattr(kernels, "UNSUPPORTED_KERNELS", {"b": "feature"})
-    monkeypatch.setattr(
-        kernels,
-        "bind",
-        lambda: {"a", *(f"{s}.apply_top_k_top_p" for s in kernels._TOP_K_TOP_P_SITES)},
-    )
-
-    with pytest.raises(RuntimeError, match=r"\['b'\]"):
-        kernels.bind_or_raise()
+    renamed = "gpu.input_batch._renamed_kernel"
+    monkeypatch.setitem(kernels.HOST_KERNELS, renamed, "mrv2_post_update")
+    try:
+        with pytest.raises(RuntimeError, match=re.escape(renamed)):
+            kernels.bind_or_raise()
+    finally:
+        kernels.unbind()
 
 
 def test_bind_then_unbind_restores_upstream() -> None:
@@ -60,14 +59,60 @@ def test_bind_then_unbind_restores_upstream() -> None:
     assert input_batch._post_update_kernel is original
 
 
+def test_unbind_restores_top_k_top_p_and_triton_placeholder() -> None:
+    from vllm.triton_utils import triton
+    from vllm.v1.worker.gpu.sample import sampler, states
+
+    sites = (sampler, states)
+    originals = [site.apply_top_k_top_p for site in sites]
+    helper = getattr(triton, "next_power_of_2", None)
+    assert kernels.spyre_apply_top_k_top_p not in originals  # not leaked by an earlier test
+    try:
+        kernels.bind(force_host=True)
+        assert all(site.apply_top_k_top_p is kernels.spyre_apply_top_k_top_p for site in sites)
+        assert callable(triton.next_power_of_2)
+    finally:
+        kernels.unbind()
+    assert all(site.apply_top_k_top_p is o for site, o in zip(sites, originals, strict=True))
+    assert getattr(triton, "next_power_of_2", None) is helper
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("nan_at", [53, 517, 1023])
+def test_host_greedy_sampling_skips_nan_logits(dtype: torch.dtype, nan_at: int) -> None:
+    """Host policy, not Triton parity: triton-cpu's NaN pick depends on the placement
+    (5, 0 and 1023 for these three), so the host skips NaNs and an all-NaN row takes 0."""
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    logits = torch.zeros(2, 1024)
+    logits[0, 5] = 60.0
+    logits[0, nan_at] = float("nan")
+    logits[1] = float("nan")
+    try:
+        kernels.bind(force_host=True)
+        sampled = gumbel_sample(
+            logits=logits.to(dtype),
+            expanded_idx_mapping=torch.arange(2, dtype=torch.int32),
+            temperature=torch.zeros(2),
+            seed=torch.zeros(2, dtype=torch.int64),
+            pos=torch.zeros(2, dtype=torch.int64),
+            apply_temperature=True,
+            is_drafting=False,
+        )
+    finally:
+        kernels.unbind()
+    assert sampled.tolist() == [5, 0]
+
+
 def test_placeholder_next_power_of_2() -> None:
     from vllm.triton_utils import triton
 
     try:
         kernels.bind(force_host=True)
+        powers = [triton.next_power_of_2(n) for n in (0, 1, 2, 3, 1000, 1024)]
     finally:
         kernels.unbind()
-    assert [triton.next_power_of_2(n) for n in (0, 1, 2, 3, 1000, 1024)] == [1, 1, 2, 4, 1024, 1024]
+    assert powers == [1, 1, 2, 4, 1024, 1024]
 
 
 @pytest.mark.parametrize("use_k", [True, False])

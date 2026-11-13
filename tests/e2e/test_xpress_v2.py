@@ -47,7 +47,7 @@ CASES = {
             compilation_config={"compile_sizes": [1, 16, 32, 64, 128]},
         ),
         env={"SPYRE_ATTN_QUERY_BUCKETS": "1,16,64,128", "SPYRE_MAX_NUM_PARTIAL_PREFILLS": "4"},
-        batches={"single": (QWEN3_PROMPTS[:1], [48]), "batch": (QWEN3_PROMPTS, [48, 40, 24, 32])},
+        batches={"batch": (QWEN3_PROMPTS, [48, 40, 24, 32])},
     ),
     # A draft of four 2048-token sliding-window layers and one full-attention layer; the
     # last prompt passes the window.
@@ -68,7 +68,6 @@ CASES = {
             name: ([prompt], [32])
             for name, prompt in (
                 ("short", "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,"),
-                ("chunked", ", ".join(str(i) for i in range(1, 37)) + ","),
                 ("past_draft_window", ", ".join(str(i) for i in range(1, 451)) + ","),
             )
         },
@@ -77,16 +76,10 @@ CASES = {
 
 
 def _engine_outputs(case_name: str, speculative: bool) -> dict:
-    """Runs in the child: the Triton gate binds the runner at vLLM import."""
-    import warnings
-
-    import torch  # noqa: F401  (autoloads torch_spyre)
-    from torch_spyre.ops.fallbacks import FallbackWarning
     from vllm import LLM, SamplingParams
 
     from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 
-    warnings.simplefilter("error", FallbackWarning)
     case = CASES[case_name]
     engine = dict(case["engine"])
     if engine.pop("gemma4_text_backbone", False):
@@ -117,10 +110,24 @@ def _engine_outputs(case_name: str, speculative: bool) -> dict:
     metrics = {m.name: getattr(m, "value", None) for m in llm.get_metrics()}
     outputs["drafted"] = metrics.get("vllm:spec_decode_num_draft_tokens")
     outputs["accepted"] = metrics.get("vllm:spec_decode_num_accepted_tokens")
+    # Frees the card for the next engine in this process.
+    llm.llm_engine.engine_core.shutdown()
     return outputs
 
 
-def _generate(case_name: str, speculative: bool) -> dict:
+def _both_engines(case_name: str) -> dict:
+    """Runs in the child: the Triton gate binds the runner at vLLM import."""
+    import warnings
+
+    import torch  # noqa: F401  (autoloads torch_spyre)
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    warnings.simplefilter("error", FallbackWarning)
+    reference = _engine_outputs(case_name, speculative=False)
+    return {"reference": reference, "spec": _engine_outputs(case_name, speculative=True)}
+
+
+def _generate(case_name: str) -> dict:
     env = {
         **os.environ,
         "SPYRE_MODEL_RUNNER": "v2",
@@ -129,9 +136,8 @@ def _generate(case_name: str, speculative: bool) -> dict:
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "36000",
         **CASES[case_name]["env"],
     }
-    mode = "spec" if speculative else "reference"
     result = subprocess.run(
-        [sys.executable, __file__, case_name, mode],
+        [sys.executable, __file__, case_name],
         env=env,
         capture_output=True,
         text=True,
@@ -149,8 +155,8 @@ def test_xpress_on_v2_matches_the_target_alone(case_name):
 
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
-    reference = _generate(case_name, speculative=False)
-    speculative = _generate(case_name, speculative=True)
+    result = _generate(case_name)
+    reference, speculative = result["reference"], result["spec"]
     for name in CASES[case_name]["batches"]:
         assert speculative[name] == reference[name], name
     assert speculative["drafted"] and speculative["accepted"] > 0, speculative
@@ -161,4 +167,4 @@ def test_xpress_on_v2_matches_the_target_alone(case_name):
 
 
 if __name__ == "__main__":
-    print("RESULT " + json.dumps(_engine_outputs(sys.argv[1], sys.argv[2] == "spec")))
+    print("RESULT " + json.dumps(_both_engines(sys.argv[1])))

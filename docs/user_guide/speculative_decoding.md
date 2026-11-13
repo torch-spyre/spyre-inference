@@ -30,8 +30,9 @@ Requests can use greedy (`temperature=0`) or stochastic target sampling,
 including temperature, top-k and top-p. The drafter remains greedy;
 vLLM treats its proposals as point-mass distributions during CPU rejection
 sampling. The same speculative configuration works with `vllm.LLM`.
-The end-to-end test and CI's public-model cache list pin the same model and
-checkpoint revisions as this example; update all three together. A full
+The end-to-end test (`tests/e2e/test_xpress_v2.py`) and CI's public-model cache
+list pin the same model and checkpoint revisions as this example; update all
+three together. A full
 verification round needs at least 31 budgeted tokens because vLLM reserves
 additional drafting slots; the adapter rejects a smaller budget.
 
@@ -123,11 +124,11 @@ for now ([#1238](https://github.com/torch-spyre/spyre-inference/issues/1238)).
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
 uv run --no-sync pytest tests/e2e/test_xpress_feedback.py -m 'not upstream' -s
-uv run --no-sync pytest tests/e2e/test_gemma4_xpress.py -m model_quality -s
 uv run --no-sync pytest tests/e2e/test_xpress_v2.py -m model_quality -s
-uv run --no-sync pytest \
-  tests/e2e/test_speculative_decoding.py tests/e2e/test_xpress_batch.py -m model_quality -s
 ```
+
+The end-to-end check runs on the V2 runner, which replaces V1. On V1, XPress is
+covered by the unit tests in `tests/spec_decode` until the V1 runner is removed.
 
 PR regression jobs prefetch both pinned models before running the quality gate.
 On Spyre, missing checkpoints fail the tests instead of skipping coverage.

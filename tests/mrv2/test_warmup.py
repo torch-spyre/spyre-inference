@@ -20,8 +20,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from vllm.config import CompilationMode
 
+from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 from spyre_inference.v1.worker.spyre import warmup
+from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
 from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 
 
@@ -42,6 +45,7 @@ def _runner(*, pooling=False, eager=False, buckets=(1, 2, 4, 64, 512), max_reqs=
         is_pooling_model=pooling,
         max_num_reqs=max_reqs,
         max_num_tokens=max_tokens,
+        speculator=None,
     )
 
 
@@ -255,3 +259,69 @@ def test_run_warms_every_logits_row_bucket_including_the_prompt_logprobs_chunk(
     assert dummies == [chunk, 1]
     assert sampled == [max_reqs, 1]
     assert projected == [chunk]
+
+
+def _builder() -> SpyreAttentionMetadataBuilder:
+    return SpyreAttentionMetadataBuilder.__new__(SpyreAttentionMetadataBuilder)
+
+
+def _group(names, builder) -> SimpleNamespace:
+    return SimpleNamespace(layer_names=list(names), metadata_builders=[builder])
+
+
+def test_draft_layers_record_with_the_drafts_builders_and_its_causality(monkeypatch) -> None:
+    """The target's group also lists the draft layers, which share its KV group; recording
+    them causal through the target's builder would trace a kernel serving never runs."""
+    target, draft = _builder(), _builder()
+    recorded = {}
+
+    def record(ctx, caches, builders, *, causal_by_layer):
+        recorded.update(builders=builders, causal=causal_by_layer)
+
+    monkeypatch.setattr(warmup, "record_attention_graphs", record)
+    model = SimpleNamespace(
+        get_draft_kv_cache_layer_names=lambda: ["draft.0", "draft.1"],
+        get_draft_attn_causal=lambda: [False, False],
+    )
+    runner = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.STOCK_TORCH_COMPILE, static_forward_context={}
+        ),
+        spyre_kv_caches={},
+        attn_groups=[[_group(["target.0", "draft.0", "draft.1"], target)]],
+        speculator=SimpleNamespace(
+            attn_groups=[[_group(["draft.0", "draft.1"], draft)]], model=model
+        ),
+    )
+
+    warmup._record_attention(runner)
+
+    assert recorded["builders"] == {"target.0": target, "draft.0": draft, "draft.1": draft}
+    assert recorded["causal"] == {"target.0": True, "draft.0": False, "draft.1": False}
+
+
+def test_run_warms_the_draft_batches_once(monkeypatch) -> None:
+    monkeypatch.setattr(warmup, "allocate_staging_buffers", lambda *args: None)
+    monkeypatch.setattr(
+        warmup, "_set_spyre_compilation_settings", lambda config: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        warmup, "_dummy_run", lambda runner, n, skip: (torch.zeros(n, 4), torch.zeros(1, 4))
+    )
+    warmed = []
+    speculator = SpyreDFlashSpeculator.__new__(SpyreDFlashSpeculator)
+    speculator.warm_draft_batches = lambda: warmed.append(True)
+    runner = _runner(buckets=(1,), max_reqs=1, max_tokens=1)
+    runner.speculator = speculator
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.pooling_runner = None
+    runner.supports_mm_inputs = False
+    runner.get_model = lambda: None
+    runner.spyre_kv_caches = {}
+    runner.spyre_device = torch.device("cpu")
+    runner.model = SimpleNamespace(_logits_row_buckets=[], compute_logits=lambda h: None)
+    runner._dummy_sampler_run = lambda hidden: None
+
+    warmup.run(runner)
+
+    assert warmed == [True]

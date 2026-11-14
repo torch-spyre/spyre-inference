@@ -20,7 +20,9 @@ host, applies the shared fix-ups, moves the model to Spyre, compiles per block a
 returns the _SpyreModelWrapper. Everything upstream builds from ``self.model``
 afterwards (model state, sampler, pooling runner) therefore holds the wrapper.
 init_model_state and PoolingRunner are swapped for their Spyre counterparts for the
-duration of the call, and upstream's own whole-model stock compile is skipped.
+duration of the call, and upstream's own whole-model stock compile is skipped. A
+speculator's draft loads through vLLM's own get_model; the speculator moves it to
+Spyre (spec_decode.py).
 """
 
 import contextlib
@@ -32,6 +34,7 @@ from vllm.config import CompilationMode, LoadConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
+from vllm.model_executor.models.interfaces import supports_eagle3
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.prompt_logprob import CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE
@@ -62,6 +65,26 @@ if TYPE_CHECKING:
     from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
 logger = init_logger(__name__)
+
+
+class _SpyreEagle3ModelWrapper(_SpyreModelWrapper):
+    """SupportsEagle3 is a runtime Protocol, so __getattr__ forwarding can't satisfy it."""
+
+    supports_eagle3 = True
+
+    @property
+    def has_own_lm_head(self) -> bool:
+        return self._model.has_own_lm_head
+
+    @property
+    def has_own_embed_tokens(self) -> bool:
+        return self._model.has_own_embed_tokens
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self._model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self._model.get_eagle3_default_aux_hidden_state_layers()
 
 
 class _SpyreModelLoaderWrapper:
@@ -103,18 +126,22 @@ class _SpyreModelLoaderWrapper:
         bucketer = SpyreShapeBucketer.for_config(vllm_config)
         row_buckets = []
         if bucketer is not None:
-            row_buckets = logits_row_buckets(bucketer.bucket_sizes, runner.max_num_reqs)
+            row_buckets = logits_row_buckets(
+                bucketer.bucket_sizes, runner.max_num_reqs, runner.num_speculative_steps
+            )
             if model_config.runner_type == "generate" and model_config.max_logprobs != 0:
                 # Prompt logprobs project the prompt rows in chunks of up to CHUNK_SIZE.
                 chunk = min(PROMPT_LOGPROBS_CHUNK_SIZE, runner.max_num_tokens)
                 row_buckets = sorted({*row_buckets, chunk})
-        return _SpyreModelWrapper(  # ty: ignore[invalid-return-type]
+        wrapper_cls = _SpyreEagle3ModelWrapper if supports_eagle3(model) else _SpyreModelWrapper
+        return wrapper_cls(  # ty: ignore[invalid-return-type]
             compiled,
             runner.spyre_device,
             keep_outputs_on_device=runner.pooling_on_spyre,
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
             model_dtype=model_dtype(model_config),
+            keep_aux_hidden_states_on_device=runner.use_aux_hidden_state_outputs,
         )
 
 
@@ -216,10 +243,6 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
     if runner.parallel_config.enable_batch_sharded_sampling:
         # Upstream calls model.compute_logits_local, past the wrapper's H2D and row buckets.
         raise NotImplementedError("Batch-sharded sampling is not supported on the Spyre V2 runner.")
-    if runner.speculator is not None:
-        # Upstream loads a draft model through its own loader, outside the swap.
-        raise NotImplementedError("Speculative decoding is not supported on the Spyre V2 runner.")
-
     with _patched(runner):
         GPUModelRunner.load_model(runner, *args, **kwargs)
     # The profiler measures host memory, which Spyre weights don't occupy.

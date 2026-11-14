@@ -16,6 +16,7 @@
 
 import copy
 import os
+from types import SimpleNamespace
 
 import pytest
 import vllm.logger
@@ -81,9 +82,9 @@ def test_runner_switch(
     ("feature", "configure"),
     [
         pytest.param(
-            "speculative decoding",
-            lambda c: setattr(c, "speculative_config", object()),
-            id="spec-decode",
+            "speculative decoding other than DFlash/XPress",
+            lambda c: setattr(c, "speculative_config", SimpleNamespace(use_dflash=lambda: False)),
+            id="spec-decode-non-dflash",
         ),
         pytest.param(
             "batch-sharded sampling",

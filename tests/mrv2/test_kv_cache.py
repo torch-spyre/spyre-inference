@@ -129,22 +129,6 @@ def test_init_raises_when_the_swap_did_not_apply(monkeypatch) -> None:
         kv_cache.init(_runner(torch.device("cpu")), config)
 
 
-def test_speculative_decoding_is_refused(monkeypatch) -> None:
-    """The speculator calls init_attn_backend through its own import, past the swap."""
-    called = []
-    monkeypatch.setattr(
-        upstream_model_runner.GPUModelRunner,
-        "initialize_kv_cache",
-        lambda self, c, **k: called.append(True),
-    )
-    runner = _runner(torch.device("cpu"))
-    runner.speculator = object()
-
-    with pytest.raises(NotImplementedError, match="Speculative decoding"):
-        kv_cache.init(runner, make_fake_kv_cache_config())
-    assert called == []
-
-
 @pytest.mark.parametrize("is_profiling", [False, True])
 def test_a_kv_connector_is_refused_outside_profiling(monkeypatch, is_profiling) -> None:
     """The connector would register the empty dict upstream gets back."""

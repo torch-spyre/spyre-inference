@@ -49,6 +49,19 @@ def init(
     attn_groups, attn_cg_support, kernel_block_sizes = upstream_init_attn_backend(
         kv_cache_config, vllm_config, device, *args, **kwargs
     )
+    if split_by_window(attn_groups, vllm_config, device, kernel_block_sizes):
+        # Upstream computed it over the pre-split groups.
+        attn_cg_support = get_attn_cg_support(attn_groups, vllm_config)
+    return attn_groups, attn_cg_support, kernel_block_sizes
+
+
+def split_by_window(
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    device: torch.device,
+    kernel_block_sizes: list[int | None],
+) -> bool:
+    """Split groups by sliding window in place; True when any group split."""
     split_attn_groups_by_window(attn_groups, get_layers_from_vllm_config(vllm_config, Attention))
     # Upstream builds builders before the split, so the groups it creates have none.
     split = False
@@ -67,7 +80,4 @@ def init(
                 ),
                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
             )
-    if split:
-        # Upstream computed it over the pre-split groups.
-        attn_cg_support = get_attn_cg_support(attn_groups, vllm_config)
-    return attn_groups, attn_cg_support, kernel_block_sizes
+    return split

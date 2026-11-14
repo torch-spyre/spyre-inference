@@ -25,25 +25,6 @@ from spyre_inference.v1.spec_decode.config import (
 from spyre_inference.v1.spec_decode.dflash import accepted_context_length
 
 
-def test_platform_rejects_v2_before_constructing_a_worker(monkeypatch):
-    from spyre_inference import threading_config
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    config = NS(
-        model_config=None,
-        parallel_config=NS(
-            data_parallel_size=1, pipeline_parallel_size=1, tensor_parallel_size=1, world_size=1
-        ),
-        cache_config=NS(kv_sharing_fast_prefill=False),
-        speculative_config=NS(use_dflash=lambda: True),
-    )
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
-    monkeypatch.setattr(TorchSpyrePlatform, "log_server_boot", lambda config: None)
-    monkeypatch.setattr(threading_config, "configure_threading", lambda world_size: None)
-    with pytest.raises(ValueError, match="requires SPYRE_MODEL_RUNNER=v1"):
-        TorchSpyrePlatform.check_and_update_config(config)
-
-
 @pytest.mark.parametrize(
     "scheduled,drafts,sampled,expected",
     [(64, 0, 0, 64), (5, 0, 1, 5), (16, 15, 1, 1), (16, 15, 4, 4), (16, 15, 16, 16)],
@@ -283,10 +264,10 @@ def test_shifted_anchor_layout_is_rejected(config, nested):
         validate_dflash_config(config)
 
 
-def test_v2_runner_is_rejected_before_model_loading(config, monkeypatch):
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
-    with pytest.raises(ValueError, match="SPYRE_MODEL_RUNNER=v1"):
-        validate_dflash_config(config)
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_both_runners_are_accepted(config, monkeypatch, runner):
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
+    validate_dflash_config(config)
 
 
 @pytest.mark.parametrize(

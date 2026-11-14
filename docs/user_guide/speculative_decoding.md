@@ -6,15 +6,15 @@ published XPress checkpoints directly for Qwen3-8B and Gemma 4 26B A4B;
 checkpoint conversion is not required.
 
 Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
-the V1 runner, up to four active requests, and prefix caching
-disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+either model runner (`SPYRE_MODEL_RUNNER=v1` or `v2`), up to four active
+requests, and prefix caching disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
 The four-request cap reflects the batches validated on Spyre so far. Larger
 batches require additional device validation before raising this limit.
 
 ## Run Qwen3-8B
 
 ```bash
-export SPYRE_MODEL_RUNNER=v1
+export SPYRE_MODEL_RUNNER=v2  # or v1
 export SPYRE_ATTN_QUERY_BUCKETS=1,16,64
 uv run --no-sync vllm serve Qwen/Qwen3-8B \
   --revision b968826d9c46dd6066d109eabc6255188de91218 \
@@ -30,8 +30,9 @@ Requests can use greedy (`temperature=0`) or stochastic target sampling,
 including temperature, top-k and top-p. The drafter remains greedy;
 vLLM treats its proposals as point-mass distributions during CPU rejection
 sampling. The same speculative configuration works with `vllm.LLM`.
-The end-to-end test and CI's public-model cache list pin the same model and
-checkpoint revisions as this example; update all three together. A full
+The end-to-end test (`tests/e2e/test_xpress_v2.py`) and CI's public-model cache
+list pin the same model and checkpoint revisions as this example; update all
+three together. A full
 verification round needs at least 31 budgeted tokens because vLLM reserves
 additional drafting slots; the adapter rejects a smaller budget.
 
@@ -61,7 +62,7 @@ these settings and captures the six target layers specified by the checkpoint.
 Use the text-backbone override to load the target's decoder:
 
 ```bash
-export SPYRE_MODEL_RUNNER=v1
+export SPYRE_MODEL_RUNNER=v2  # or v1
 export SPYRE_ATTN_QUERY_BUCKETS=1,16,64
 uv run --no-sync vllm serve google/gemma-4-26B-A4B-it \
   --revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
@@ -97,8 +98,9 @@ Replaying a seeded request with the same configuration is deterministic.
 Changing between ordinary decoding, DFlash and XPress changes RNG consumption;
 the same seed need not produce identical tokens across these modes.
 
-Upstream serves XPress only on the V2 runner, so Spyre subclasses its XPress model
-and drives refinement from the V1 DFlash proposer. Initial vocabulary top-k runs
+Spyre subclasses upstream's XPress model and drives refinement from its own
+`propose_block`, called by the V1 DFlash proposer and by the V2 runner's DFlash
+speculator. Initial vocabulary top-k runs
 on CPU. Refinement and per-pass selection stay on Spyre; each pass selects the
 next token embeddings directly from the shortlist. Only the final shortlist
 positions return to CPU to recover token IDs.
@@ -113,20 +115,20 @@ This avoids the device integer-layout conversions needed to feed token IDs back
 into an embedding lookup. Direct gathers with device-generated indices remain
 dependent on torch-spyre support.
 
-Spyre's V2 runner still lacks model loading, compilation and warmup. After that
-runner is operational, XPress needs its auxiliary-state, draft-context and
-CPU-sampling hooks ported to V2's speculator interface. See
-[the V2 migration issue](https://github.com/torch-spyre/spyre-inference/issues/906).
+On the V2 runner, upstream's DFlash speculator does the draft bookkeeping, and
+its Triton kernels run through triton-cpu, so V2 speculative decoding is x86-only
+for now ([#1238](https://github.com/torch-spyre/spyre-inference/issues/1238)).
 
 ## Validation
 
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
 uv run --no-sync pytest tests/e2e/test_xpress_feedback.py -m 'not upstream' -s
-uv run --no-sync pytest tests/e2e/test_gemma4_xpress.py -m model_quality -s
-uv run --no-sync pytest \
-  tests/e2e/test_speculative_decoding.py tests/e2e/test_xpress_batch.py -m model_quality -s
+uv run --no-sync pytest tests/e2e/test_xpress_v2.py -m model_quality -s
 ```
+
+The end-to-end check runs on the V2 runner, which replaces V1. On V1, XPress is
+covered by the unit tests in `tests/spec_decode` until the V1 runner is removed.
 
 PR regression jobs prefetch both pinned models before running the quality gate.
 On Spyre, missing checkpoints fail the tests instead of skipping coverage.

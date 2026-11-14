@@ -1,20 +1,37 @@
 name: Install locked Spyre RPMs
 description: >
-  Restores the GHA RPM cache for the current spyre-rpms.lock, extracts
-  RPMs into user-space via rpm2cpio, and wires LD_LIBRARY_PATH.
+  Finds the RPMs for the current spyre-rpms.lock on the shared NFS mount, or
+  in the GHA cache when the mount has none, extracts them into user-space via
+  rpm2cpio, and wires LD_LIBRARY_PATH.
 
 runs:
   using: composite
   steps:
+    # populate-rpm-cache publishes each lock's RPMs here. GHA cache downloads
+    # stall on some pods and abort at the Azure SDK's fixed 100s read timeout.
+    - name: Find RPMs on NFS
+      id: rpm-nfs
+      shell: bash
+      env:
+        NFS_RPMS: /storage-1/spyre-inference/.cache/spyre-rpms/x86_64/${{ hashFiles('spyre-rpms.lock') }}
+      run: |
+        if [[ -d "$NFS_RPMS" ]]; then
+          echo "Using RPMs from ${NFS_RPMS}"
+          echo "dir=${NFS_RPMS}" >> "$GITHUB_OUTPUT"
+        else
+          echo "No RPMs at ${NFS_RPMS}; falling back to the GHA cache"
+        fi
+
     - name: Restore RPM cache
       id: rpm-cache
+      if: steps.rpm-nfs.outputs.dir == ''
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: /tmp/spyre-rpms
         key: spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}
 
     - name: Fail on RPM cache miss
-      if: steps.rpm-cache.outputs.cache-hit != 'true'
+      if: steps.rpm-nfs.outputs.dir == '' && steps.rpm-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         echo "::error::RPM cache miss for spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}. Trigger the populate-rpm-cache workflow to populate it."
@@ -22,6 +39,8 @@ runs:
 
     - name: Extract RPMs
       shell: bash
+      env:
+        RPM_DIR: ${{ steps.rpm-nfs.outputs.dir || '/tmp/spyre-rpms' }}
       run: |
         set -euo pipefail
         SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
@@ -33,7 +52,7 @@ runs:
         while IFS= read -r name; do
           [[ -z "$name" ]] && continue
           shopt -s nullglob
-          matches=( /tmp/spyre-rpms/"${name}"-[0-9]*."${ARCH}".rpm )
+          matches=( "${RPM_DIR}/${name}"-[0-9]*."${ARCH}".rpm )
           shopt -u nullglob
           if [[ ${#matches[@]} -eq 0 ]]; then
             echo "::error::No cached RPM for package '${name}' (arch ${ARCH})."
@@ -57,7 +76,7 @@ runs:
         # No RPM owns components.txt, and the image bakes LIB_VERSION_FILE to its
         # own copy, so torch-spyre's kernel cache key would ignore spyre-rpms.lock.
         python3 .github/scripts/write_components_file.py \
-          --rpm-dir /tmp/spyre-rpms \
+          --rpm-dir "$RPM_DIR" \
           --arch "$ARCH" \
           --output "${SPYRE_LIBS}/opt/ibm/spyre/components.txt"
         echo "LIB_VERSION_FILE=${SPYRE_LIBS}/opt/ibm/spyre/components.txt" >> "$GITHUB_ENV"

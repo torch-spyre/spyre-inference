@@ -86,6 +86,8 @@ MAX_NUM_SEQS = 3
 # platform.py clamps max_num_batched_tokens to max(compile_sizes), so this is its top entry.
 MAX_NUM_BATCHED_TOKENS = 64
 COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
+# gemma-4 MoE groups its expert loop from 128 tokens, so this row prefills on that bucket.
+PREFILL_BUCKET = {"google/gemma-4-26B-A4B": 128}
 # The guard counts with a bare `tokenizer()`; vLLM can add a special token or two.
 PROMPT_TOKEN_MARGIN = 8
 
@@ -124,6 +126,7 @@ def test_decoder_model_output(
         task="generate",
         enforce_eager=False,
     )
+    prefill = PREFILL_BUCKET.get(model, MAX_NUM_BATCHED_TOKENS)
     engine = LLM(
         model=model,
         revision=revision,
@@ -131,8 +134,8 @@ def test_decoder_model_output(
         enforce_eager=False,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        compilation_config={"compile_sizes": COMPILE_SIZES},
+        max_num_batched_tokens=prefill,
+        compilation_config={"compile_sizes": [MAX_NUM_SEQS, prefill]},
         limit_mm_per_prompt=MM_LIMITS.get(model, {}),
     )
 

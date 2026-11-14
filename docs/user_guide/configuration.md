@@ -180,6 +180,10 @@ llm = LLM(
 `1` and `8` cover decode steps (one token per running sequence, up to 8); `512` is the
 prefill bucket.
 
+A gemma-4 MoE checkpoint gets one more default bucket, 128 tokens, so its expert loop
+serves a short prefill step on 128 rows. An explicit `compile_sizes` replaces the defaults,
+this bucket included; `SPYRE_MOE_EXPERT_GROUP=1` alone keeps it.
+
 The default prefill bucket is 512 tokens, but larger ones compile. For prompts of many
 thousands of tokens, a 1024-token prefill chunk shortens time to first token, on dense
 models such as granite-3.3-8b as well as on MoE models such as gemma-4, where each

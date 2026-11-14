@@ -144,6 +144,25 @@ Three adaptations worth knowing:
   all-expert form whatever its size, since each row's storage offset has to span whole sticks
   for the compiled loop to address it; a single token is handed to the gathered form whole, so
   it never needs that.
+  Traced into a compiled block, the all-expert form is one `for_each_tile` loop over the
+  experts, one expert per trip on all cores. `SpyreMoERecipe.expert_group` (default 1), or
+  `SPYRE_MOE_EXPERT_GROUP`, which overrides it, runs G experts per trip for stick-aligned
+  batches of `SpyreMoERecipe.expert_group_min_tokens` (default 256; `SPYRE_MOE_GROUP_MIN_TOKENS`
+  overrides it, for example 128 with a 128-token compile size) to 512 tokens, in practice
+  prefill chunks: the cores form G groups, each core takes a block of tokens through one whole
+  expert, each group adds into its own accumulator, and one sum over the G accumulators follows
+  the loop. Only fp16 rounding changes. G must divide the expert count and the core count, and
+  the cores must divide a stick of tokens; the layer checks this when it is configured: the
+  switch raises, and a recipe value that does not fit keeps one expert per trip. The
+  accumulators stay in LX only on a torch-spyre that gives the sum after the loop a relayout
+  copy of the loop's carry; without it the values are the same and the accumulators live in
+  HBM. Traced batches outside that range (at 1,024 tokens it is slower at TP 4),
+  batches that are not whole sticks of tokens (the usual decode sizes) and the eager forms are
+  unchanged. The gemma-4 recipe sets G = 4 from 128 tokens, and the platform adds a 128-token
+  compile size to the default list of a gemma-4 MoE checkpoint, so a prefill step of up to 128
+  tokens runs 128 rows, not 512. `SPYRE_MOE_EXPERT_GROUP=1` with an explicit `compile_sizes`
+  restores the earlier steps; the switch alone keeps the 128-token size. Device tests cover a
+  grouped loop at TP 1, and at TP 2 on the nano checkpoint.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` stacks those forms contract on (see
   [MoE expert weights](#moe-expert-weights)), freeing each source stack as it goes,

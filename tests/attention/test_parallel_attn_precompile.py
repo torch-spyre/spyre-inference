@@ -38,7 +38,8 @@ def _run(monkeypatch, cold):
     # need a torch-spyre that has it.
     parallel_precompile = SimpleNamespace(
         CompileOnlyAbort=CompileOnlyAbort,
-        fork_inner_compiles=lambda n: contextlib.nullcontext(),
+        SecondPassCheck=lambda expected: SimpleNamespace(expected=expected),
+        fork_inner_compiles=lambda n: contextlib.nullcontext(SimpleNamespace(ok=3)),
     )
     monkeypatch.setitem(
         sys.modules, "torch_spyre._inductor.parallel_precompile", parallel_precompile
@@ -79,22 +80,24 @@ def _run(monkeypatch, cold):
             batched_decode_variants=lambda: [SimpleNamespace(num_blocks=1)],
         )
     )
-    warmup._precompile_in_workers(
+    check = warmup._precompile_in_workers(
         static_ctx,
         {name: [torch.empty(4)] for name in static_ctx},
         dict.fromkeys(static_ctx, builder),
         dict.fromkeys(static_ctx, True),
     )
-    return calls, resets, compiled
+    return calls, resets, compiled, check
 
 
 def test_cold_start_traces_every_variant_once_for_shared_layers(monkeypatch):
-    calls, resets, compiled = _run(monkeypatch, cold=True)
+    calls, resets, compiled, check = _run(monkeypatch, cold=True)
     assert calls == [("one", 0, 1), ("one", 0, 2), ("batched", 0, 1)]
     assert compiled.__code__ in resets  # the stand-in graphs are forgotten
+    assert check.expected == 3  # the recording is checked against the workers' compiles
 
 
 def test_restart_with_warm_caches_skips_the_precompile(monkeypatch):
-    calls, resets, compiled = _run(monkeypatch, cold=False)
+    calls, resets, compiled, check = _run(monkeypatch, cold=False)
     assert calls == [("one", 0, 1)]
     assert compiled.__code__ in resets
+    assert check is None

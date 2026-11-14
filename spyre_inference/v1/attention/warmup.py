@@ -42,8 +42,9 @@ def record_attention_graphs(
     """Pre-compile every Spyre attention layer's kernels; returns the graph count."""
     # The kernels are module-level torch.compile objects: a layer matching an already
     # recorded one on builder, graph_key() and causality would only replay its graphs.
+    check = None
     if envs.SPYRE_PARALLEL_ATTN_PRECOMPILE > 0:
-        _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer)
+        check = _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer)
     t0 = time.time()
     total = 0
     num_skipped = 0
@@ -69,6 +70,8 @@ def record_attention_graphs(
         logger.info("Recording attention graphs for layer %s...", layer_name)
         total += impl.record_graphs(layer, kv_cache, builder, causal=causal)
         recorded.add(key)
+    if check is not None:
+        check.finish()  # warns when the recording missed what the workers compiled
     logger.info(
         "Attention graph recording complete: %d graphs in %.3fs; %d layers share "
         "an earlier layer's graphs.",
@@ -79,15 +82,19 @@ def record_attention_graphs(
     return total
 
 
-def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer) -> None:
+def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer):
     """Trace every attention variant once, with its Spyre inner compile in a forked
     process (SPYRE_PARALLEL_ATTN_PRECOMPILE of them at once), so the recording that
     follows finds every compile in this start's caches. A restart already has them:
     then the first variant runs without compiling, and this stops at once.
+
+    Returns a started ``SecondPassCheck`` for the recording when the workers compiled
+    something, else None.
     """
     try:
         from torch_spyre._inductor.parallel_precompile import (  # ty: ignore[unresolved-import]
             CompileOnlyAbort,
+            SecondPassCheck,
             fork_inner_compiles,
         )
     except ImportError:
@@ -95,7 +102,7 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer) -> 
             "SPYRE_PARALLEL_ATTN_PRECOMPILE needs a torch-spyre with fork_inner_compiles "
             "(torch-spyre/torch-spyre#6262); compiling the attention variants one by one."
         )
-        return
+        return None
 
     layers, seen = [], set()
     for name, kv_cache in kv_caches.items():
@@ -112,7 +119,7 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer) -> 
     # At TP > 1 every rank precompiles, so stay within this rank's CPU share, which
     # vLLM's threading setup gives torch.
     workers = max(1, min(envs.SPYRE_PARALLEL_ATTN_PRECOMPILE, torch.get_num_threads()))
-    with fork_inner_compiles(workers):
+    with fork_inner_compiles(workers) as pool:
         for layer, impl, kv_cache, builder, causal in layers:
             num_pages = kv_cache[0].shape[0]
             runs = [
@@ -150,6 +157,9 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer) -> 
         "skipped, the caches are warm" if warm else f"{traced} variants compiled in workers",
         time.time() - t0,
     )
+    if warm or not traced:
+        return None
+    return SecondPassCheck(expected=pool.ok)
 
 
 def _compiled_kernels(impls) -> list:

@@ -53,9 +53,15 @@ find_isa(${CPUINFO} "POWER10" POWER10_FOUND)
 find_isa(${CPUINFO} "S390" S390_FOUND)
 
 set(SPYRE_EXT_SRC
+  "csrc/cpu/mrv2_kernels.cpp"
+  "csrc/cpu/mrv2_spec_decode_kernels.cpp"
   "csrc/cpu/sampling_kernels.cpp"
   "csrc/cpu/spec_decode_utils.cpp"
   "csrc/cpu/torch_bindings.cpp")
+
+# The MRV2 RNG must round like the Triton kernels it replaces: no contracted FMAs.
+set_source_files_properties("csrc/cpu/mrv2_kernels.cpp" "csrc/cpu/mrv2_spec_decode_kernels.cpp"
+  PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
   if (NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND

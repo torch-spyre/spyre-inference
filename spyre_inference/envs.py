@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
     SPYRE_MODEL_RUNNER: str = "v1"
+    SPYRE_MRV2_KERNELS: str = "host"
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
@@ -62,9 +63,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
     # Which model runner the worker uses:
     #  - "v1": the V1 runner (default)
-    #  - "v2": the Model Runner V2 port (#906), in bring-up and not yet functional. On
-    #    x86 it runs MRV2's Triton kernels on triton-cpu.
+    #  - "v2": the Model Runner V2 port (#906), in bring-up
     "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v1",
+    # What runs MRV2's Triton kernels under SPYRE_MODEL_RUNNER=v2:
+    #  - "host": the csrc/ host ops kernels.bind() puts in their place; vLLM never
+    #    sees Triton (default, every arch)
+    #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference)
+    "SPYRE_MRV2_KERNELS": lambda: os.getenv("SPYRE_MRV2_KERNELS") or "host",
     # Granularity of the decoder's torch.compile graph:
     #  - "block": compile one transformer block at a time (default)
     #  - "model": compile the whole model as a single graph

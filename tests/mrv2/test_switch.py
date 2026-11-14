@@ -51,7 +51,7 @@ def _set_runner(monkeypatch: pytest.MonkeyPatch, runner: str | None) -> None:
     else:
         monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
     envs.clear_env_cache()
-    monkeypatch.setattr(triton_gate, "check", lambda runner: None)
+    monkeypatch.setattr(triton_gate, "check", lambda runner, mrv2_kernels: None)
 
 
 @pytest.mark.parametrize(
@@ -150,29 +150,45 @@ def test_unknown_runner_is_rejected(
 
 
 @pytest.mark.parametrize(
-    ("runner", "has_triton", "triton_cpu"),
+    ("runner", "kernels", "has_triton"),
     [
-        pytest.param("v2", False, True, id="v2_got_placeholders"),
+        pytest.param("v2", "triton", False, id="v2_triton_got_placeholders"),
+        pytest.param("v2", "host", True, id="v2_host_got_triton"),
         # The bug the gate fixes: V1 with Triton on.
-        pytest.param("v1", True, True, id="v1_got_triton"),
+        pytest.param("v1", "host", True, id="v1_got_triton"),
     ],
 )
 def test_gate_must_match_the_runner(
     monkeypatch: pytest.MonkeyPatch,
     vllm_config: VllmConfig,
     runner: str,
+    kernels: str,
     has_triton: bool,
-    triton_cpu: bool,
 ) -> None:
     """E.g. SPYRE_MODEL_RUNNER set after `import vllm`, or a gate error at plugin load."""
     monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
+    monkeypatch.setenv("SPYRE_MRV2_KERNELS", kernels)
     envs.clear_env_cache()
     monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", has_triton)
-    monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: triton_cpu)
+    monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: True)
 
     with pytest.raises(
-        ValueError, match=f"SPYRE_MODEL_RUNNER={runner} needs HAS_TRITON={not has_triton}"
+        ValueError,
+        match=f"SPYRE_MODEL_RUNNER={runner} SPYRE_MRV2_KERNELS={kernels} needs "
+        f"HAS_TRITON={not has_triton}",
     ):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_v2_on_triton_needs_triton_cpu(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
+    monkeypatch.setenv("SPYRE_MRV2_KERNELS", "triton")
+    envs.clear_env_cache()
+    monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: False)
+
+    with pytest.raises(ValueError, match="needs triton-cpu"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
@@ -202,8 +218,9 @@ def test_runner_changed_after_import_is_rejected(
     assert envs.SPYRE_MODEL_RUNNER == "v1"
     monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: True)
     monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
+    monkeypatch.setenv("SPYRE_MRV2_KERNELS", "triton")
 
-    with pytest.raises(ValueError, match="SPYRE_MODEL_RUNNER=v2 needs HAS_TRITON=True"):
+    with pytest.raises(ValueError, match="SPYRE_MRV2_KERNELS=triton needs HAS_TRITON=True"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 

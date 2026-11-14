@@ -115,6 +115,9 @@ class _SpyreModelLoaderWrapper:
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
             model_dtype=model_dtype(model_config),
+            # As V1: without a bucketer the body is unpadded, so every prompt length
+            # would compile a fresh gather.
+            sample_rows_on_device=model_config.runner_type == "generate" and bucketer is not None,
         )
 
 

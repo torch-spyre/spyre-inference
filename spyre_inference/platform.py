@@ -921,7 +921,10 @@ class TorchSpyrePlatform(CpuPlatform):
         from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
 
         allow_xpress_on_v1()
-        triton_gate.check(runner)
+        mrv2_kernels = envs.environment_variables["SPYRE_MRV2_KERNELS"]()
+        if mrv2_kernels not in ("host", "triton"):
+            raise ValueError(f"SPYRE_MRV2_KERNELS={mrv2_kernels!r} is not host or triton.")
+        triton_gate.check(runner, mrv2_kernels)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 

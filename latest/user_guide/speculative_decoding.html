@@ -2026,12 +2026,12 @@ the target model verify the proposals. The experimental Spyre integration loads
 published XPress checkpoints directly for Qwen3-8B and Gemma 4 26B A4B;
 checkpoint conversion is not required.</p>
 <p>Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1,
-the V1 runner, up to four active requests, and prefix caching
-disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
+either model runner (<code>SPYRE_MODEL_RUNNER=v1</code> or <code>v2</code>), up to four active
+requests, and prefix caching disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
 The four-request cap reflects the batches validated on Spyre so far. Larger
 batches require additional device validation before raising this limit.</p>
 <h2 id="run-qwen3-8b">Run Qwen3-8B<a class="headerlink" href="#run-qwen3-8b" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_MODEL_RUNNER</span><span class="o">=</span>v1
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_MODEL_RUNNER</span><span class="o">=</span>v2<span class="w">  </span><span class="c1"># or v1</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,16,64
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>vllm<span class="w"> </span>serve<span class="w"> </span>Qwen/Qwen3-8B<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>--revision<span class="w"> </span>b968826d9c46dd6066d109eabc6255188de91218<span class="w"> </span><span class="se">\</span>
@@ -2046,8 +2046,9 @@ batches require additional device validation before raising this limit.</p>
 including temperature, top-k and top-p. The drafter remains greedy;
 vLLM treats its proposals as point-mass distributions during CPU rejection
 sampling. The same speculative configuration works with <code>vllm.LLM</code>.
-The end-to-end test and CI's public-model cache list pin the same model and
-checkpoint revisions as this example; update all three together. A full
+The end-to-end test (<code>tests/e2e/test_xpress_v2.py</code>) and CI's public-model cache
+list pin the same model and checkpoint revisions as this example; update all
+three together. A full
 verification round needs at least 31 budgeted tokens because vLLM reserves
 additional drafting slots; the adapter rejects a smaller budget.</p>
 <p>For four concurrent requests, set <code>--max-num-seqs 4</code>,
@@ -2090,7 +2091,7 @@ attention buckets, compilation sizes and the default single partial prefill.</p>
 with four sliding causal layers and one full non-causal layer. Spyre preserves
 these settings and captures the six target layers specified by the checkpoint.
 Use the text-backbone override to load the target's decoder:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_MODEL_RUNNER</span><span class="o">=</span>v1
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_MODEL_RUNNER</span><span class="o">=</span>v2<span class="w">  </span><span class="c1"># or v1</span>
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,16,64
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>vllm<span class="w"> </span>serve<span class="w"> </span>google/gemma-4-26B-A4B-it<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>--revision<span class="w"> </span>4d7ae4984b7db7de8f8457170b3f1a419ee76d52<span class="w"> </span><span class="se">\</span>
@@ -2120,8 +2121,9 @@ six as the default.</p>
 <p>Replaying a seeded request with the same configuration is deterministic.
 Changing between ordinary decoding, DFlash and XPress changes RNG consumption;
 the same seed need not produce identical tokens across these modes.</p>
-<p>Upstream serves XPress only on the V2 runner, so Spyre subclasses its XPress model
-and drives refinement from the V1 DFlash proposer. Initial vocabulary top-k runs
+<p>Spyre subclasses upstream's XPress model and drives refinement from its own
+<code>propose_block</code>, called by the V1 DFlash proposer and by the V2 runner's DFlash
+speculator. Initial vocabulary top-k runs
 on CPU. Refinement and per-pass selection stay on Spyre; each pass selects the
 next token embeddings directly from the shortlist. Only the final shortlist
 positions return to CPU to recover token IDs.</p>
@@ -2133,17 +2135,16 @@ shortlist positions and the selection sentinel exactly.</p>
 This avoids the device integer-layout conversions needed to feed token IDs back
 into an embedding lookup. Direct gathers with device-generated indices remain
 dependent on torch-spyre support.</p>
-<p>Spyre's V2 runner still lacks model loading, compilation and warmup. After that
-runner is operational, XPress needs its auxiliary-state, draft-context and
-CPU-sampling hooks ported to V2's speculator interface. See
-<a href="https://github.com/torch-spyre/spyre-inference/issues/906">the V2 migration issue</a>.</p>
+<p>On the V2 runner, upstream's DFlash speculator does the draft bookkeeping, and
+its Triton kernels run through triton-cpu, so V2 speculative decoding is x86-only
+for now (<a href="https://github.com/torch-spyre/spyre-inference/issues/1238">#1238</a>).</p>
 <h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/spec_decode<span class="w"> </span>-m<span class="w"> </span><span class="s1">'not upstream'</span>
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/e2e/test_xpress_feedback.py<span class="w"> </span>-m<span class="w"> </span><span class="s1">'not upstream'</span><span class="w"> </span>-s
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/e2e/test_gemma4_xpress.py<span class="w"> </span>-m<span class="w"> </span>model_quality<span class="w"> </span>-s
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span>tests/e2e/test_speculative_decoding.py<span class="w"> </span>tests/e2e/test_xpress_batch.py<span class="w"> </span>-m<span class="w"> </span>model_quality<span class="w"> </span>-s
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/e2e/test_xpress_v2.py<span class="w"> </span>-m<span class="w"> </span>model_quality<span class="w"> </span>-s
 </span></code></pre></div>
+<p>The end-to-end check runs on the V2 runner, which replaces V1. On V1, XPress is
+covered by the unit tests in <code>tests/spec_decode</code> until the V1 runner is removed.</p>
 <p>PR regression jobs prefetch both pinned models before running the quality gate.
 On Spyre, missing checkpoints fail the tests instead of skipping coverage.</p>
 <p>Validation covers recurrence, sampling, lifecycle, scripted rejection, full

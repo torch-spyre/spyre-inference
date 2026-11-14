@@ -43,6 +43,7 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
+from spyre_inference.numa_pinning import pin_to_card_node
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
@@ -106,7 +107,8 @@ def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
 def _get_spyre_pcie_address(local_rank: int) -> str:
     requested_devices = envs.SPYRE_DEVICES
     if not requested_devices:
-        return "unknown"
+        # Without SPYRE_DEVICES the runtime opens the cards in AIU_WORLD_RANK order.
+        return os.environ.get(f"AIU_WORLD_RANK_{local_rank}", "unknown")
 
     requested_indices = [index.strip() for index in requested_devices.split(",") if index.strip()]
     if local_rank >= len(requested_indices):
@@ -157,6 +159,8 @@ class TorchSpyreWorker(Worker):
 
     def init_device(self) -> None:
         apply_in_process_threading(self.parallel_config)
+        # First, so the runtime's threads and the host copies of the weights start there.
+        pin_to_card_node(self.parallel_config, _get_spyre_pcie_address(self.local_rank))
 
         # The env vars spyreccl reads. `setdefault` leaves torchrun-supplied
         # values intact.

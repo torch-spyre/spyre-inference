@@ -16,8 +16,13 @@ permissions:
 
 jobs:
   pre-commit:
-    runs-on: ubuntu-latest
+    # Card-less self-hosted pool, for the shared NFS uv cache: on GitHub's cache
+    # every uv.lock change saved a full venv-sized copy only its own PR could restore.
+    # These pods are too small to build torch-spyre, so ty reads its source as stubs.
+    runs-on: [x86_64, spyre_pf_x0, linux, image_torch_spyre]
     timeout-minutes: 30
+    env:
+      STORAGE_1_DIR: /storage-1/spyre-inference
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -25,27 +30,34 @@ jobs:
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
         python-version: "3.12"
-        enable-cache: true
-        # merge_group runs save to an ephemeral gh-readonly-queue ref nothing
-        # can restore later, orphaning a ~700MB cache per cycle; restore only
-        # there (mirrors run-matrix-config's save-cache guard).
-        save-cache: ${{ github.event_name != 'merge_group' }}
-        # Key only on uv.lock; setup-uv's default glob also hashes
-        # pyproject.toml, so config-only edits would needlessly bust the cache.
-        cache-dependency-glob: uv.lock
+        enable-cache: false
+
+    # Own root, keyed on uv.lock alone: this sync skips torch-spyre, so saving into
+    # .cache/uv would publish a cache missing it under the test jobs' key.
+    - name: uv cache (NFS)
+      uses: ./.github/actions/uv-nfs-cache
+      with:
+        storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv-pre-commit
+        key-files: uv.lock
 
     - name: "Install dependencies"
       run: uv sync --frozen --no-install-package torch-spyre --no-dev -v
 
+    # The image exports VIRTUAL_ENV for its own baked venv, which ty would read instead.
+    - name: Activate the project venv
+      run: |
+        echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+        echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
     - name: "Clone torch-spyre source for type stubs"
       run: |
         TORCH_SPYRE_REV=$(grep -oP '^torch-spyre = .*rev = "\K[^"]+' pyproject.toml)
-        git clone --depth 1 https://github.com/torch-spyre/torch-spyre /tmp/torch-spyre
-        git -C /tmp/torch-spyre fetch --depth 1 origin "$TORCH_SPYRE_REV"
+        git clone --depth 1 https://github.com/torch-spyre/torch-spyre "$RUNNER_TEMP/torch-spyre"
+        git -C "$RUNNER_TEMP/torch-spyre" fetch --depth 1 origin "$TORCH_SPYRE_REV"
         # FETCH_HEAD, not the ref: a shallow fetch of a tag creates no local tag.
-        git -C /tmp/torch-spyre checkout FETCH_HEAD
-        mkdir /tmp/torch-spyre-stubs
-        cp -r /tmp/torch-spyre/torch_spyre /tmp/torch-spyre-stubs/
+        git -C "$RUNNER_TEMP/torch-spyre" checkout FETCH_HEAD
+        mkdir "$RUNNER_TEMP/torch-spyre-stubs"
+        cp -r "$RUNNER_TEMP/torch-spyre/torch_spyre" "$RUNNER_TEMP/torch-spyre-stubs/"
 
     - run: echo "::add-matcher::.github/workflows/matchers/ruff.json"
 
@@ -56,7 +68,7 @@ jobs:
 
     - name: "Run ty type check"
       env:
-        PYTHONPATH: /tmp/torch-spyre-stubs
+        PYTHONPATH: ${{ runner.temp }}/torch-spyre-stubs
       run: uvx prek@v0.4.4 run ty --all-files --stage pre-commit
 
   # The .github/scripts ingest tests are not in the repo's pytest testpaths and no other job
@@ -71,6 +83,7 @@ jobs:
     - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
         python-version: "3.12"
+        enable-cache: false
 
     - name: Run the ingest script tests
       run: |

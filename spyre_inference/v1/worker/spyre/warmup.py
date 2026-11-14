@@ -252,7 +252,9 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             if runner.pooling_runner is not None:
                 _warm_pooling(runner, hidden_states)
                 continue
-            warm_sample_row_gathers(cast(_SpyreModelWrapper, runner.model), hidden_states, row_widths)
+            warm_sample_row_gathers(
+                cast(_SpyreModelWrapper, runner.model), hidden_states, row_widths
+            )
             if widest is None:
                 widest = sample_hidden_states
         if runner.pooling_runner is not None and not runner.model_config.enforce_eager:

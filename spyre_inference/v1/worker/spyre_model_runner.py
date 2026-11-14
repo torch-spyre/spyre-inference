@@ -375,7 +375,7 @@ class _SpyreHiddenStates(torch.Tensor):
 
 
 def warm_sample_row_gathers(
-    model: "_SpyreModelWrapper", hidden_states: torch.Tensor, row_widths: list[int]
+    model: _SpyreModelWrapper, hidden_states: torch.Tensor, row_widths: list[int]
 ) -> None:
     """Compile the sampled-row gather and the lm_head on its output, per row bucket.
 

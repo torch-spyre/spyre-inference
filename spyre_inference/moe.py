@@ -22,7 +22,7 @@ adapters opt a layer in with a ``SpyreMoERecipe``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -116,6 +116,13 @@ def _derive_moe_chunks(
     return best_chunks
 
 
+# Traced batches from 256 tokens (the recipe default) to 512 run grouped. Below, a core of a
+# four-group map takes under 32 token rows; at 1,024 tokens it is slower than one expert per
+# trip at TP 4.
+_MIN_GROUPED_TOKENS = 256
+_MAX_GROUPED_TOKENS = 512
+
+
 @dataclass(frozen=True)
 class SpyreMoERecipe:
     """The upstream MoE semantics implemented by Spyre's current kernels.
@@ -128,6 +135,11 @@ class SpyreMoERecipe:
     activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # Experts per trip of the traced all-expert loop; ``SPYRE_MOE_EXPERT_GROUP`` overrides it.
+    expert_group: int = 1
+    # Smallest traced batch that runs ``expert_group`` experts per trip;
+    # ``SPYRE_MOE_GROUP_MIN_TOKENS`` overrides it.
+    expert_group_min_tokens: int = _MIN_GROUPED_TOKENS
 
 
 # vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
@@ -168,6 +180,20 @@ def _compiler_scopes() -> tuple[Any, Any]:
     return (
         spyre_config.patch(_MOE_COMPILER_CONFIG),
         spyre_config.patch(_PERSISTENT_COMPILER_CONFIG),
+    )
+
+
+def _expert_group_fits(layer: _RoutedExperts, group: int) -> bool:
+    # A traced batch is whole sticks of tokens, which the cores must split evenly.
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
+
+    cores = spyre_config.sencores
+    return (
+        1 <= group <= cores
+        and layer.local_num_experts % group == 0
+        and cores % group == 0
+        and get_elem_in_stick(layer.moe_config.in_dtype) % cores == 0
     )
 
 
@@ -232,6 +258,28 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
                 f"Spyre swigluoai uses limit={_SWIGLUOAI_LIMIT} and alpha={_SWIGLUOAI_ALPHA}; "
                 f"the layer asks for limit={limit}, alpha={alpha}."
             )
+    if envs.SPYRE_MOE_EXPERT_GROUP is not None:
+        recipe = replace(recipe, expert_group=envs.SPYRE_MOE_EXPERT_GROUP)
+    if envs.SPYRE_MOE_GROUP_MIN_TOKENS is not None:
+        recipe = replace(recipe, expert_group_min_tokens=envs.SPYRE_MOE_GROUP_MIN_TOKENS)
+    if recipe.expert_group_min_tokens < 1:
+        raise ValueError(
+            "SPYRE_MOE_GROUP_MIN_TOKENS / SpyreMoERecipe.expert_group_min_tokens="
+            f"{recipe.expert_group_min_tokens} must be positive."
+        )
+    if recipe.expert_group != 1:
+        if not _expert_group_fits(layer, recipe.expert_group):
+            raise ValueError(
+                f"SPYRE_MOE_EXPERT_GROUP / SpyreMoERecipe.expert_group={recipe.expert_group} "
+                "must divide the experts and the cores, and the cores a stick of tokens."
+            )
+        logger.info_once(
+            "Spyre MoE: %d experts per trip in the in-graph expert loop for stick-aligned "
+            "batches of %d to %d tokens; other batches keep one expert per trip.",
+            recipe.expert_group,
+            recipe.expert_group_min_tokens,
+            _MAX_GROUPED_TOKENS,
+        )
     layer = cast("RoutedExperts", layer)
     layer.spyre_moe_recipe = recipe
     layer.spyre_moe_regions = {}
@@ -486,6 +534,7 @@ def _moe_persistent_in_graph(
     down: torch.Tensor,
     activation: str,
     biases: _ExpertBiases | None = None,
+    group: int = 1,
 ) -> torch.Tensor:
     """``_moe_persistent`` inside a block graph, where nothing names x's token axis."""
     from torch_spyre._inductor.propagate_hints import spyre_hint
@@ -500,6 +549,24 @@ def _moe_persistent_in_graph(
         x, route_tile, gate_tile, up_tile, down_tile, *bias = tiles
         expert_out = _expert_tile(x, gate_tile, up_tile, down_tile, bias, activation)
         return acc + expert_out * route_tile, None
+
+    if group > 1:
+        from torch_spyre._inductor import config as spyre_config
+
+        cores = spyre_config.sencores
+        # A trip's tiles carry G experts on a leading axis, which the body's ops broadcast
+        # over. One core map {G, T} serves x's per-group copy, the trip and the accumulators.
+        with spyre_hint(named_dims=["G", "T", "C"], work_div={"G": group, "T": cores // group}):
+            x_groups = x.expand(group, *x.shape).contiguous()
+            result, _ = for_each_tile(
+                expert_body,
+                (x_groups, *operands[1:]),
+                dims=dims,
+                tile_size=group,
+                init=x.new_zeros(group, *x.shape),
+            )
+        with spyre_hint(named_dims=["T", "C"], work_div={"T": cores}):
+            return result.sum(0)
 
     # Loop-body ops only receive this scope's hints, so T is named here; every body op stays
     # at [1, T, C] (C is M or H) so one name list fits them all.
@@ -931,6 +998,11 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer.spyre_moe_down,
                 recipe.activation,
                 layer.spyre_moe_biases,
+                group=(
+                    recipe.expert_group
+                    if recipe.expert_group_min_tokens <= tokens <= _MAX_GROUPED_TOKENS
+                    else 1
+                ),
             )
         moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.

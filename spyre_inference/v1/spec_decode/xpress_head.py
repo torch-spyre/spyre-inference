@@ -20,11 +20,29 @@ from torch.nn import functional as F
 from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead as _UpstreamHead
 
 
+def select_feedback(scores, embeddings, order, previous):
+    batch, slots, count = scores.shape
+    valid = order >= 0
+    maxima = torch.where(valid, scores, -torch.inf).amax(dim=-1, keepdim=True)
+    choices = torch.where(scores == maxima, order, count)
+    # Spyre's notequal misses NaNs; negative priorities select the first NaN.
+    choices = torch.where(scores == scores, choices, order - count)
+    choices = torch.where(valid, choices, count)
+    first = choices.amin(dim=-1, keepdim=True)
+    first = torch.where(first < 0, first + count, first)
+    selected = (order == first).to(scores.dtype)
+    # TODO: replace BMM and the candidate cache once torch-spyre supports
+    # embedding gathers with device-generated INT32 indices.
+    winners = torch.bmm(
+        selected.view(batch * slots, 1, count), embeddings.view(batch * slots, count, -1)
+    ).view(batch, slots, -1)
+    return first.squeeze(-1), torch.cat((previous[:, :2], winners[:, :-1]), dim=1)
+
+
 class XPressRefinerHead(_UpstreamHead):
     """Upstream's head, construction and loading included, with Spyre step helpers."""
 
     _mix_kjc: torch.Tensor | None = None
-    _readout_t: torch.Tensor | None = None
     _hidden_proj_t: torch.Tensor | None = None
     _token_proj_t: torch.Tensor | None = None
 
@@ -51,9 +69,6 @@ class XPressRefinerHead(_UpstreamHead):
             convert(weight, device, device_layout=row_outermost_layout(weight.shape, weight.dtype)),
             requires_grad=False,
         )
-        # Match the target LM head's output tiling; trim only full sticks.
-        padded = F.pad(weight, (0, 0, 0, (-weight.shape[0]) % 2048))
-        self._readout_t = padded.t().contiguous().to(device)
 
     def _mix_and_mlp(self, x):
         # Keep rank as the contiguous dimension for Spyre's stick layout.
@@ -72,29 +87,16 @@ class XPressRefinerHead(_UpstreamHead):
             return cache @ self._hidden_proj_t
         return F.linear(cache, self.in_proj.weight[:, : 2 * self.rank])
 
-    def refine_latent(self, previous_ids, projected_cache):
-        embeddings = self.w1(previous_ids)
+    def prepare_feedback(self, candidates, previous_ids):
+        return self.w1(candidates), self.w1(previous_ids), F.embedding(candidates, self.w2.weight)
+
+    def refine_feedback(self, base, previous_embeddings, projected_cache, readout):
         token_projection = (
-            embeddings @ self._token_proj_t
+            previous_embeddings @ self._token_proj_t
             if self._token_proj_t is not None
-            else F.linear(embeddings, self.in_proj.weight[:, 2 * self.rank :])
+            else F.linear(previous_embeddings, self.in_proj.weight[:, 2 * self.rank :])
         )
-        return self._mix_and_mlp(projected_cache + token_projection)[:, 1:]
-
-    def gather_readout(self, candidates):
-        """Candidate IDs must be flat for Spyre's embedding kernel."""
-        return F.embedding(candidates, self.w2.weight)
-
-    def refine_full(self, base, previous_ids, projected_cache):
-        latent = self.refine_latent(previous_ids, projected_cache)
-        if self._readout_t is not None:
-            bias = (latent @ self._readout_t)[..., : self.w2.out_features]
-        else:
-            bias = self.w2(latent)
-        return base + bias
-
-    def refine_candidates(self, base, previous_ids, projected_cache, readout):
-        latent = self.refine_latent(previous_ids, projected_cache)
+        latent = self._mix_and_mlp(projected_cache + token_projection)[:, 1:]
         batch, slots, candidates = base.shape
         bias = torch.bmm(
             readout.reshape(batch * slots, candidates, self.rank),

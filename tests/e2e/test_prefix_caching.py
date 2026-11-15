@@ -104,7 +104,13 @@ def _make_llm(*, enable_prefix_caching: bool, enforce_eager: bool) -> LLM:
 # The compiled variant hits the attention bucketer / warmup machinery with the
 # partial-prefix query/KV lengths that APC generates.
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        pytest.param(False, id="compiled", marks=pytest.mark.e2e_smoke),
+    ],
+)
 def test_prefix_caching(enforce_eager: bool, shared_prefix: str) -> None:
     """Prefix-caching must report cache hits and match non-APC token generation.
 

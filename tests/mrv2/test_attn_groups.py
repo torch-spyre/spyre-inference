@@ -60,6 +60,7 @@ def windows(monkeypatch: pytest.MonkeyPatch):
             name: types.SimpleNamespace(sliding_window=w) for name, w in windows_by_layer.items()
         }
         monkeypatch.setattr(attn_groups, "get_layers_from_vllm_config", lambda *a, **k: layers)
+        monkeypatch.setattr(attn_groups, "get_shared_kv_cache_layers", lambda vllm_config: {})
 
     return install
 
@@ -117,3 +118,32 @@ def test_an_unsplit_group_keeps_upstreams_builders(windows) -> None:
     assert groups == [[group]]
     assert cg_support == "upstream cg-support"
     assert group.metadata_builders is upstream_builders
+
+
+def test_upstream_sees_each_kv_sharing_layer_under_its_targets_spec(windows, monkeypatch) -> None:
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, UniformTypeKVCacheSpecs
+
+    owner, sharing = "layers.0", "layers.1"
+    windows(dict.fromkeys([owner, sharing]))
+    spec = FullAttentionSpec(**_SPEC)
+    uniform = UniformTypeKVCacheSpecs.from_specs({owner: spec})
+    assert uniform is not None
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[owner], kv_cache_spec=uniform)],
+    )
+    monkeypatch.setattr(
+        attn_groups, "get_shared_kv_cache_layers", lambda vllm_config: {sharing: owner}
+    )
+    seen = []
+
+    def upstream(kv_cache_config, vllm_config, device, *args, **kwargs):
+        seen.append(kv_cache_config.kv_cache_groups[0].kv_cache_spec.kv_cache_specs)
+        return [[]], "upstream cg-support", [64]
+
+    attn_groups.init(upstream, config, _config(), torch.device("cpu"))
+
+    assert seen == [{owner: spec, sharing: spec}]
+    assert config.kv_cache_groups[0].kv_cache_spec is uniform
+    assert uniform.kv_cache_specs == {owner: spec}

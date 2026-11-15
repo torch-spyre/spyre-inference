@@ -253,10 +253,10 @@ If you forget, the symptom is a `TypeError` referencing a kwarg or attribute tha
 The full test suite takes ~18 minutes and is better left to CI (which parallelizes across runners). Instead, run a single quick test to verify the build is functional:
 
 ```bash
-uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py::test_basic_model_load -m "not upstream" -x --timeout=120 -q 2>&1 | tail -20
+uv run --no-sync pytest 'tests/e2e/test_compile.py::test_basic_llm_inference[micro-g3.3]' -m "not upstream" -x --timeout=600 -q 2>&1 | tail -20
 ```
 
-This confirms torch-spyre loads and a model can be instantiated on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
+This confirms torch-spyre loads and a model compiles and decodes its reference output on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
 
 **A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§7). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[tool.spyre-rpms]` `packages` entry, then regenerate the lock.
 
@@ -437,7 +437,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits
 - [x] `uv lock` resolves cleanly to `<new-sha>`
 - [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
-- [x] Smoke test (`test_basic_model_load`) passes locally
+- [x] Smoke test (`test_compile[micro-g3.3]`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
 - [x] `spyre-rpms.lock` updated — no downgrades (commit-count check passed)
 
@@ -479,7 +479,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 - [x] `uv lock` resolves cleanly to `<new-sha>`
 - [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
-- [x] Smoke test (`test_basic_model_load`) passes locally
+- [x] Smoke test (`test_compile[micro-g3.3]`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
 - [x] `spyre-rpms.lock` updated — no downgrades (commit-count check passed)
 

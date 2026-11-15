@@ -22,7 +22,7 @@ norm with the same math, which Spyre compiles wherever it runs: ``GemmaRMSNorm``
 ``1 + w`` sandwich norms, ``RMSNorm`` for the rest.
 
 The vision tower is not adapted, so a checkpoint carrying one serves text only; see
-``force_language_model_only``.
+``disable_vision``.
 """
 
 from __future__ import annotations
@@ -34,40 +34,33 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.models import muse_glimmer as mg
 
+from spyre_inference.models._prelaunch import disable_modalities
+
 if TYPE_CHECKING:
     from torch import nn
+    from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
 
 
-def force_language_model_only(engine_args: EngineArgs) -> None:
-    """Default a Muse Glimmer checkpoint to ``language_model_only``.
+def disable_vision(engine_args: EngineArgs, hf_config: PretrainedConfig | None) -> None:
+    """Serve a Muse Glimmer checkpoint with a vision tower text only, refusing image or
+    video input asked for in ``limit_mm_per_prompt``.
 
-    Upstream then builds the vision tower as a placeholder, so its weights are neither
-    loaded nor moved to the card, and the frontend refuses image and video input per
-    request. Images are not supported on Spyre yet: the tower would run op by op, and its
-    host-built position tables have no device layout.
+    ``language_model_only`` makes upstream build the tower as a placeholder, so its weights
+    are neither loaded nor moved to the card, and the frontend refuses image and video input
+    per request. Images are not supported on Spyre yet: the tower would run op by op, and
+    its host-built position tables have no device layout.
     """
-    if engine_args.language_model_only or engine_args.limit_mm_per_prompt:
-        return
-    from vllm.transformers_utils.config import get_config
-
-    # On any load failure, defer to ModelConfig, which raises the real error.
-    try:
-        hf_config = get_config(
-            engine_args.hf_config_path or engine_args.model,
-            engine_args.trust_remote_code,
-            engine_args.revision,
-            engine_args.code_revision,
-            engine_args.config_format,
-            token=engine_args.hf_token,
-        )
-    except Exception:
+    if engine_args.language_model_only:
         return
     if getattr(hf_config, "model_type", None) != "muse_glimmer":
         return
+    if not mg._muse_glimmer_has_vision(hf_config):
+        return
+    disable_modalities(engine_args, ("image", "video"), "Muse Glimmer")
     engine_args.language_model_only = True
     logger.info("Muse Glimmer: serving text only (language_model_only=True).")
 

@@ -24,16 +24,32 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4Router
+from vllm.model_executor.models.gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4Router,
+    Gemma4SelfDecoderLayers,
+)
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+    replace_as,
+)
 
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.models._prelaunch import disable_modalities
+from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from torch import nn
+    from transformers import PretrainedConfig
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
@@ -101,25 +117,7 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
-def _disable_unsupported_modalities(engine_args: EngineArgs, has_audio: bool) -> None:
-    # A limit of 0 makes the frontend refuse the input per request; past it, the worker
-    # raises mid-step and takes the engine down with every in-flight request.
-    limits = dict(engine_args.limit_mm_per_prompt or {})
-    for modality in ("video", "audio") if has_audio else ("video",):
-        value = limits.get(modality)
-        # A dict without "count" takes vLLM's default, which enables the modality.
-        if isinstance(value, dict):
-            value = value.get("count", BaseDummyOptions().count)
-        if value:
-            raise NotImplementedError(
-                f"gemma-4 {modality} input is not supported on Spyre; remove it from "
-                "limit_mm_per_prompt."
-            )
-        limits[modality] = 0
-    engine_args.limit_mm_per_prompt = limits
-
-
-def force_text_backbone(engine_args: EngineArgs) -> None:
+def force_text_backbone(engine_args: EngineArgs, hf_config: PretrainedConfig | None) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
     Only a default: it is the same ``hf_overrides`` value ``GEMMA4_TEXT_BACKBONE_OVERRIDE``
@@ -131,28 +129,14 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     """
     if engine_args.hf_overrides:
         return
-    from vllm.transformers_utils.config import get_config
-
     # Detect gemma-4 by config model_type, not the checkpoint name: derivatives such as
-    # medgemma / translategemma carry a gemma4 config under an unrelated name. On any load
-    # failure, defer to ModelConfig, which loads the same config and raises the real error.
-    try:
-        hf_config = get_config(
-            engine_args.hf_config_path or engine_args.model,
-            engine_args.trust_remote_code,
-            engine_args.revision,
-            engine_args.code_revision,
-            engine_args.config_format,
-            token=engine_args.hf_token,
-        )
-    except Exception:
-        return
+    # medgemma / translategemma carry a gemma4 config under an unrelated name.
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return
     has_audio = getattr(hf_config, "audio_config", None) is not None
     # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
     if is_multimodal_gemma4(hf_config):
-        _disable_unsupported_modalities(engine_args, has_audio)
+        disable_modalities(engine_args, ("video", "audio") if has_audio else ("video",), "gemma-4")
         return
     if has_audio:
         # Falling through would force the text-only backbone and silently drop the
@@ -195,11 +179,70 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
     return configured
 
 
+class _PerLayerRows(torch.Tensor):
+    """PLE tensor whose ``[:, layer_idx, :]`` returns a row with its own storage, so all
+    layers share one compiled block (a view's storage_offset is guarded per layer)."""
+
+    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
+
+    spyre_rows: tuple[torch.Tensor, ...]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if (
+            isinstance(index, tuple)
+            and len(index) == 3
+            and index[0] == index[2] == slice(None)
+            and isinstance(index[1], int)
+        ):
+            return self.spyre_rows[index[1]]
+        return torch.Tensor.__getitem__(self, index)
+
+
+class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
+    @maybe_compile(force=True)
+    def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        # The upstream mask needs a compiled region even outside decoder blocks.
+        return super().get_per_layer_inputs(input_ids)
+
+    @maybe_compile
+    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # One graph: L eager clones would cost L host launches per step.
+        return tuple(ple[:, i, :].clone() for i in range(self.config.num_hidden_layers))
+
+    def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs):
+        ple = cast(torch.Tensor, super().project_per_layer_inputs(inputs_embeds, per_layer_inputs))
+        rows = ple.as_subclass(_PerLayerRows)
+        rows.spyre_rows = self.split_per_layer_inputs(ple)
+        return rows
+
+
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
 
+    @classmethod
+    def get_kv_cache_groups(
+        cls, vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+    ) -> list[KVCacheGroupSpec]:
+        speculative = vllm_config.speculative_config
+        if speculative is None or not speculative.use_dflash():
+            return get_kv_cache_groups(vllm_config, kv_cache_spec)
+        # Full allocation shares a block table without merging target/draft windows.
+        specs = {
+            name: replace_as(spec, FullAttentionSpec, drop=("extra_retained_tokens",))
+            if isinstance(spec, SlidingWindowSpec)
+            else spec
+            for name, spec in kv_cache_spec.items()
+        }
+        uniform = UniformTypeKVCacheSpecs.from_specs(specs)
+        if uniform is None:
+            raise ValueError("Gemma 4 DFlash requires one full-allocation KV cache group")
+        return [KVCacheGroupSpec(list(specs), uniform)]
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        decoder = self.model.self_decoder
+        if decoder.embed_tokens_per_layer is not None:
+            retype(decoder, SpyreGemma4SelfDecoderLayers).arm_outer_compile()
         # Without the recipe the experts run upstream's path, which is wrong on Spyre.
         # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
         is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(

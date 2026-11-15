@@ -7,8 +7,9 @@
 #   source ~/spyre-libs/env.sh
 #
 # Needs no root and leaves /opt/ibm/spyre alone: payloads are unpacked with
-# rpm2cpio and reached by pointing SENTIENT_BASE_INSTALL_DIR at them, so a shell
-# that has not sourced env.sh still sees the system libraries.
+# rpm2cpio, their hardcoded /opt/ibm/spyre paths are relocated to a /tmp alias,
+# and SENTIENT_BASE_INSTALL_DIR points at them, so a shell that has not sourced
+# env.sh still sees the system libraries.
 set -euo pipefail
 
 usage() {
@@ -141,25 +142,11 @@ else
     mv "${RESOLVED_DIR}/components.txt" "$COMPONENTS"
 fi
 
-# DT_RPATH is searched before LD_LIBRARY_PATH, so /opt/ibm/spyre entries would bind
-# the system libraries. Rewritten entries no longer match, so this runs every time
-# to also fix trees unpacked before the rewrite existed. readelf does the detection,
-# so a run with nothing left to rewrite does not need patchelf.
-PATCHELF=""
-while IFS= read -r -d '' f; do
-    [[ "$(head -c4 "$f")" == $'\x7fELF' ]] || continue
-    rpath="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*Library r\(un\)\?path: \[\(.*\)\]$/\2/p')"
-    [[ ":$rpath" == *:/opt/ibm/spyre* ]] || continue
-    if [[ -z "$PATCHELF" ]]; then
-        PATCHELF="$(command -v patchelf || uvx --from patchelf bash -c 'command -v patchelf')" || {
-            echo "patchelf not found and could not be fetched with uvx" >&2
-            exit 1
-        }
-    fi
-    new_rpath=":${rpath}"
-    new_rpath="${new_rpath//:\/opt\/ibm\/spyre/:"${BASE_INSTALL_DIR}"}"
-    "$PATCHELF" --force-rpath --set-rpath "${new_rpath#:}" "$f"
-done < <(find "$PREFIX" -type f -print0)
+# Idempotent, so it runs every time to also fix trees unpacked before it existed.
+RELOCATE="${REPO_ROOT}/.github/scripts/relocate_spyre_libs.py"
+ALIAS="$(python3 -I "$RELOCATE" "$PREFIX")"
+ALIAS_LINK="$(dirname "$ALIAS")"
+ALIAS_TARGET="$(readlink "$ALIAS_LINK")"
 
 # senlib ships its Python package in /usr/lib64, where aiu-assign-ranks.py does not
 # look in a prefix install.
@@ -175,6 +162,8 @@ done
 # rather than keeping /opt/ibm/spyre. It reads AIU_SETUP_MULTI_AIU bare, so
 # nounset has to come off around it or it aborts any `set -u` caller.
 cat > "${PREFIX}/env.sh" <<EOF
+# The relocated binaries reach this tree only through the alias, which /tmp may lose.
+[[ -e "${ALIAS_LINK}" ]] || ln -s "${ALIAS_TARGET}" "${ALIAS_LINK}"
 export SENTIENT_BASE_INSTALL_DIR="${BASE_INSTALL_DIR}"
 export _IBM_AIU_SETUP=
 export LIB_VERSION_FILE="${COMPONENTS}"

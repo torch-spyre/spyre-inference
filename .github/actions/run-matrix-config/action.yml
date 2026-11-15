@@ -51,6 +51,10 @@ inputs:
   use_prebaked_image:
     description: When 'true', skip the RPM install + spyre-inference build and use the runner image's stack as-is
     required: true
+  image_rpms:
+    description: When 'true', skip the baseline RPM install and use the runner image's Spyre RPMs; spyre-inference and torch-spyre are still built from source
+    required: false
+    default: 'false'
   storage_root:
     description: Repo-scoped uv-cache root on the shared mount, forwarded to the uv-nfs-cache action (e.g. $STORAGE_1_DIR/.cache/uv)
     required: true
@@ -92,7 +96,7 @@ runs:
   steps:
     # Install the baseline RPMs from spyre-rpms.lock; skipped when use_prebaked_image is true, so the run uses the image's Spyre stack as-is (see issue #543).
     - name: Install Spyre RPMs
-      if: ${{ inputs.use_prebaked_image != 'true' }}
+      if: ${{ inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' }}
       uses: ./.github/actions/spyre-rpm-install
 
     # Install the uv binary only. The cache itself is shipped from the shared
@@ -201,7 +205,7 @@ runs:
     # RPMs are overridden, since the lockfiles then no longer describe the stack.
     - name: Restore compile cache (NFS)
       id: compile-cache
-      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
+      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
       continue-on-error: true
       shell: bash
       env:

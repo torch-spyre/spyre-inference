@@ -42,6 +42,26 @@ perspectives:
       that loosen rtol/atol, swap the CPU reference, add skip/xfail, or force
       enforce_eager to make a numerics test pass. Name the op or file:line. A tolerance
       change the PR body does not justify is changes_requested
+  - name: spyre-performance
+    focus: >-
+      regressions in warmup time, host or Spyre memory, or step latency, judged from the
+      diff and, when this review runs on a card, by comparing the touched path against main.
+      Warmup: compile_or_warm_up_model records every attention variant
+      (SpyreAttnBucketer.variants() pairs block and query buckets, batched_decode_variants()
+      pairs sequence and block buckets), so a new bucket axis, denser buckets, a graph per
+      new shape, or a graph split into more pieces (graph breaks, more
+      compiled blocks, a new encoder rectangle) multiplies warmup, and lazy compiles in the
+      serving path move that cost into requests. Memory: tensors that persist per layer or
+      per request, extra KV copies or layouts, wider padding, buffers sized to
+      max_model_len or max_num_batched_tokens instead of the live batch, host copies of
+      weights or caches, caches that never evict, and anything that lowers what
+      determine_available_memory measures, which shrinks the KV cache. Runtime: Python
+      loops per sequence, token or layer on the hot path (batched decode exists to remove
+      the per-sequence loop), host syncs in forward (.item(), .cpu(), .tolist()), new
+      host-device copies, ops torch-spyre runs on CPU, recompiles from shapes that miss a
+      bucket, and kernels that materialise what a view or fused op avoids. Name the
+      file:line and what the cost scales with. An unjustified regression on a default path
+      is changes_requested; a cost the PR body states and justifies is a finding only
   - name: spyre-hardware-validation
     focus: >-
       whether the change works on the Spyre card this review runs on, and whether its tests

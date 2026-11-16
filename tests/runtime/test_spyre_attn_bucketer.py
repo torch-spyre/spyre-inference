@@ -737,12 +737,9 @@ class TestDeclaredPages:
     """The per-sequence page axis is declared, not bucketed, where it fits."""
 
     @pytest.fixture(autouse=True)
-    def _needs_declared_dims(self):
+    def _restore_ts_limits(self):
         from torch_spyre._inductor import config as ts_config
-        from torch_spyre._inductor import pass_utils
 
-        if not hasattr(pass_utils, "declared_dims"):
-            pytest.skip("needs symbolic for_each_tile trip counts (torch-spyre#6066)")
         # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
         # config-module entry, hiding it for later tests.
         with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):

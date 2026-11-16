@@ -219,11 +219,10 @@ def _declared_page_range(max_pages: int) -> dict[int, dict[str, int]] | None:
     from torch_spyre._inductor import pass_utils
 
     if not hasattr(pass_utils, "declared_dims"):
-        logger.info_once(
-            "Head-major attention keeps its KV buckets: this torch-spyre has no symbolic "
-            "for_each_tile trip counts (torch-spyre#6066)."
+        raise RuntimeError(
+            "This torch-spyre has no symbolic for_each_tile trip counts (torch-spyre#6066), "
+            "which the per-sequence attention kernels need. Upgrade torch-spyre."
         )
-        return None
     # The page axis is the only declared dim, so its range sets these torch-spyre limits
     # unless they are exported. Two pages, not one: a one-page walk is its own Dynamo
     # specialization (torch-spyre#6018), so a one-page sequence walks a masked repeat.
@@ -234,9 +233,9 @@ def _declared_page_range(max_pages: int) -> dict[int, dict[str, int]] | None:
     min_pages = ts_config.min_reserved_dim_size
     # A range with min == max would specialize to a constant and fail to trace.
     if not min_pages < max_pages <= ts_config.max_buckets:
-        logger.info_once(
-            "Head-major attention keeps its KV buckets: %d pages per sequence is outside the "
-            "declarable range (%d, MAX_BUCKETS=%d].",
+        logger.warning_once(
+            "%d pages per sequence is outside the declarable range (%d, MAX_BUCKETS=%d], so "
+            "the per-sequence attention kernels compile one variant per KV bucket.",
             max_pages,
             min_pages,
             ts_config.max_buckets,

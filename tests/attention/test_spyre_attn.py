@@ -2369,10 +2369,7 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
     max_model_len, a one-page sequence included, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
-    from torch_spyre._inductor import pass_utils
 
-    if not hasattr(pass_utils, "declared_dims"):
-        pytest.skip("needs symbolic for_each_tile trip counts (torch-spyre#6066)")
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
     envs.clear_env_cache()
     # The fixture's max_model_len 2048 at block 128 declares pages 2..16. Compiled at 16, as

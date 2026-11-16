@@ -534,10 +534,10 @@ def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
     assert (model.per_layer_embeddings[4:] == -1).all()
 
 
-@pytest.mark.parametrize("num_tokens", [33, 64])
+@pytest.mark.parametrize("num_tokens", [33, 64, 2048])
 def test_ids_outside_mask_on_spyre(num_tokens):
-    """The PLE image-token mask on the card, as ``vision_embed_text`` calls it: a stick-
-    aligned and an unaligned length, and a second mask replayed through the same graph."""
+    """The PLE image-token mask on the card, as ``vision_embed_text`` calls it: an unaligned,
+    a stick-aligned and a serving-bucket length, and a second mask through the same kernels."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import convert

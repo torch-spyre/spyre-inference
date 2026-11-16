@@ -40,7 +40,7 @@ from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.spyre import device_shims, kernels
+from spyre_inference.v1.worker.spyre import device_shims, kernels, triton_gate
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 from spyre_inference.v1.worker.spyre_worker import (  # shared with V1; moves at the flip
     TorchSpyreWorker,
@@ -51,6 +51,10 @@ from spyre_inference.v1.worker.spyre_worker import (  # shared with V1; moves at
 
 class SpyreWorkerV2(TorchSpyreWorker):
     """MRV2: vllm/v1/worker/gpu_worker.py:Worker, via TorchSpyreWorker."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        with triton_gate.v2_worker_init():
+            super().__init__(*args, **kwargs)
 
     def init_device(self) -> None:
         apply_in_process_threading(self.parallel_config)
@@ -123,7 +127,7 @@ class SpyreWorkerV2(TorchSpyreWorker):
         logger.debug("worker init memory snapshot: %r", self.init_snapshot)
 
         device_shims.install()  # MRV2-only: torch.cuda Stream/Event placeholders
-        kernels.bind_or_raise()  # MRV2-only: the kernel seam (DEFAULT_PATH_KERNELS)
+        kernels.bind_or_raise()  # MRV2-only: host ops in place of MRV2's Triton kernels
 
         # Construct the model runner directly — no monkey-patching needed.
         self.model_runner = SpyreModelRunnerV2(  # ty: ignore[invalid-assignment]

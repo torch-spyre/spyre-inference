@@ -91,8 +91,8 @@ required-environments = [
 ]
 
 override-dependencies = [
-    # triton-cpu on x86 only, for MRV2's Triton kernels until upstream's non-Triton ones
-    # exist (#906). Power/Z stay Triton-free; triton_gate hides it from V1.
+    # Any triton request resolves to triton-cpu, never PyPI's CUDA build. Only the dev group
+    # asks for it: the reference the MRV2 host kernels' parity tests run against.
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version == '3.11'",
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version >= '3.12'",
 
@@ -223,6 +223,21 @@ provides-extras = ["optree", "opt-einsum", "pyyaml"]
 
 # Vendored static metadata for the source-built (ppc64le/s390x) torchvision, copied
 # from torchvision 0.29.1 on PyPI.
+# xgrammar 0.2.8's own metadata, without `triton; platform_machine == "x86_64"`: it
+# imports Triton lazily for an optional bitmask kernel, and Triton stays dev-only (#1238).
+[[tool.uv.dependency-metadata]]
+name = "xgrammar"
+version = "0.2.8"
+requires-python = ">=3.8,<4"
+requires-dist = [
+    "apache-tvm-ffi>=0.1.11",
+    "pydantic",
+    "torch>=1.10.0",
+    "transformers>=4.38.0",
+    "numpy",
+    "typing-extensions>=4.9.0",
+]
+
 [[tool.uv.dependency-metadata]]
 name = "torchvision"
 version = "0.29.1"
@@ -415,6 +430,8 @@ plugins.md007.indent = 4
 dev = [
     "spyre-testing-plugin",
     "coverage",
+    # SPYRE_MRV2_KERNELS=triton, the parity reference for the MRV2 host kernels (x86 only)
+    "triton; platform_machine == 'x86_64'",
     # pandas 3.1.0 fails to build from source on s390x (pandas-dev/pandas#71548)
     "pandas!=3.1.0; platform_machine == 's390x'",
 ]

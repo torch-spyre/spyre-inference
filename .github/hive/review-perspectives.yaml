@@ -1,0 +1,18 @@
+# Review perspectives for the hive's review swarm, read live from main via review.perspectives_source.
+# Built-ins (correctness, security, intent-alignment, style, docs-currency) may omit focus; custom names need it.
+kind: ReviewPerspectives
+perspectives:
+  - name: correctness
+  - name: security
+  - name: intent-alignment
+  - name: style
+  - name: docs-currency
+  - name: spyre-constraints
+    focus: >-
+      Changes that break a Spyre hardware or platform limit: head size not a multiple of 64
+      (128-byte stick / fp16), a dtype other than float16 reaching the device, DP>1 or
+      bfloat16 with TP>1 slipping past check_and_update_config.
+  - name: spyre-numerics
+    focus: >-
+      Silent CPU fallbacks (ops that would raise torch-spyre's FallbackWarning) and changes
+      to fp16 accumulation order that move results against the CPU reference.

@@ -1410,7 +1410,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_sample_row_gathers(self, hidden_states: torch.Tensor, row_widths: list[int]) -> None:
-        warm_sample_row_gathers(cast(_SpyreModelWrapper, self.model), hidden_states, row_widths)
+        # Before reading self.model: host-path hidden states have no gather to warm.
+        if isinstance(hidden_states, _SpyreHiddenStates):
+            warm_sample_row_gathers(cast(_SpyreModelWrapper, self.model), hidden_states, row_widths)
 
     @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:

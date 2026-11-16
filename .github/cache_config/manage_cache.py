@@ -20,12 +20,8 @@
 # limitations under the License.
 
 import argparse
-import hashlib
 import os
-import shutil
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import yaml
@@ -187,54 +183,21 @@ def _run_gated(config, config_file):
     print("\n🎉 All models successfully processed and cached!")
 
 
-# Per socket operation, so it bounds a stall rather than the whole transfer.
-DOWNLOAD_TIMEOUT_S = 120
-
-# urllib leaves `HTTPError.reason` empty on some Artifactory responses, so carry a
-# short hint per code. Text only, no URL or token.
-HTTP_HINTS = {
-    401: "Unauthorized: check ARTIFACTORY_TOKEN",
-    403: "Forbidden: token lacks read access to ARTIFACTORY_DATA_PATH",
-    404: "Not Found: check ARTIFACTORY_DATA_PATH and the subdir",
-}
-
-
-def _sha256_of(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _require_env(name):
-    value = os.getenv(name)
-    if not value:
-        print(f"❌ Error: {name} is not available or empty.")
-        sys.exit(1)
-    return value
-
-
 def _run_artifactory_datasets():
-    """Cache artifactory_datasets entries into the shared runner volume.
+    """Cache the benchmark datasets into the shared runner volume.
 
-    These files live in Artifactory, not on HuggingFace, so they need a token.
-    The benchmark job that reads them runs on pull_request from forks, where
-    GitHub withholds every secret, so it can only ever read the cache. This
-    dispatch is the writer.
+    The datasets are the Asset definitions under benchmarks/, resolved by
+    .github/scripts/fetch_bench_datasets.py.
+    They need a token, and the benchmark job that reads them runs on pull_request from forks, where
+    GitHub withholds
+    every secret, so it can only read the cache. This dispatch is the writer.
     """
-    config_file = os.getenv(
-        "ARTIFACTORY_CONFIG_FILE_PATH", ".github/cache_config/artifactory_datasets.yaml"
-    )
-    if not os.path.exists(config_file):
-        print(f"❌ Error: Configuration file '{config_file}' not found.")
-        sys.exit(1)
-    with open(config_file, encoding="utf-8") as f:
-        spec = yaml.safe_load(f) or {}
-    groups = spec.get("artifactory_datasets") or []
-    if not groups:
-        print(f"⚠️ Warning: No artifactory_datasets defined in {config_file}.")
-        return
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "fetch_bench_datasets.py"
+    spec = importlib.util.spec_from_file_location("fetch_bench_datasets", script)
+    fetcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetcher)
 
     dest_dir = os.getenv("SPYRE_BENCH_DATA_DIR")
     if not dest_dir:
@@ -244,72 +207,20 @@ def _run_artifactory_datasets():
             sys.exit(1)
         dest_dir = os.path.join(storage, ".cache", "artifacts")
 
-    base_url = _require_env("ARTIFACTORY_BASE_URL").rstrip("/")
-    token = _require_env("ARTIFACTORY_TOKEN")
-    root = _require_env("ARTIFACTORY_DATA_PATH").strip("/")
-
     force = os.getenv("FORCE_DOWNLOAD") == "true"
-
-    files = [(group, entry) for group in groups for entry in group.get("files", [])]
-    print(f"📋 Found {len(files)} dataset(s) to cache under {Path(dest_dir)}")
+    datasets = {**fetcher.ARTIFACTS, **fetcher.ARCHIVES}
+    print(f"📋 Found {len(datasets)} dataset(s) to cache under {Path(dest_dir)}")
     failed = []
-    for group, entry in files:
-        name = entry["name"]
-        # Mirror the Artifactory layout under the cache root so the path a
-        # benchmark computes from the same path resolves without a mapping.
-        target_dir = Path(dest_dir) / group["path"].strip("/")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        # str(): YAML reads an all-digit digest as an int, which would never
-        # equal the hexdigest and would re-download forever.
-        expected = str(entry["sha256"])
-        target = target_dir / name
-        print(f"\n🚀 Processing: {name}...")
-
-        if target.is_file() and not force:
-            actual = _sha256_of(target)
-            if actual == expected:
-                print(f"✅ {name}: already cached")
-                continue
-            print(f"♻️ {name}: sha256 {actual} != {expected}, re-downloading")
-
-        url = f"{base_url}/artifactory/{root}/{group['path'].strip('/')}/{name}"
-        # A partial file under the real name would look like a valid cache entry
-        # to the benchmark, so download beside it and rename only after the
-        # digest matches. The pid keeps two concurrent writers off one temp file.
-        partial = target.with_name(f"{name}.{os.getpid()}.part")
+    for var, entry in datasets.items():
+        print(f"\n🚀 Processing: {var}...")
         try:
-            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-            # Per socket operation, not for the whole transfer, so the 98MB
-            # largest file is fine; without it a stalled connection would hang
-            # until the job timeout hours later.
-            with (
-                urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_S) as response,
-                open(partial, "wb") as handle,
-            ):
-                shutil.copyfileobj(response, handle)
-            actual = _sha256_of(partial)
-            if actual != expected:
-                partial.unlink(missing_ok=True)
-                raise ValueError(f"sha256 {actual}, expected {expected}")
-            os.replace(partial, target)
-            size_mb = target.stat().st_size / (1024 * 1024)
-            print(f"✅ {name}: downloaded and verified ({size_mb:.1f}MB)")
-        except (OSError, ValueError, urllib.error.URLError) as exc:
-            partial.unlink(missing_ok=True)
-            # Never echo the exception text: the URL carries the internal host and
-            # a TLS or proxy error quotes it back ("hostname '<host>' doesn't
-            # match ..."). Report the HTTP code where there is one, since
-            # Artifactory answers a bad token with a 401 whose `reason` is empty,
-            # and otherwise just the exception type plus errno.
-            if isinstance(exc, urllib.error.HTTPError):
-                reason = f"HTTP {exc.code} {exc.reason or HTTP_HINTS.get(exc.code, '')}".strip()
-            else:
-                errno = getattr(exc, "errno", None) or getattr(
-                    getattr(exc, "reason", None), "errno", None
-                )
-                reason = type(exc).__name__ + (f" (errno {errno})" if errno else "")
-            print(f"❌ Failed to download {name}: {reason}")
-            failed.append(name)
+            outcome = fetcher.ensure_cached(entry, Path(dest_dir), force)
+            print(f"✅ {var}: {outcome} and verified")
+        except (fetcher.FetchUnavailable, OSError) as exc:
+            # FetchUnavailable messages carry the dataset path and an HTTP code, never the store
+            # URL.
+            print(f"❌ Failed to cache {var}: {exc}")
+            failed.append(var)
 
     if failed:
         print(f"\n❌ Pipeline completed with errors. Failed datasets: {failed}")

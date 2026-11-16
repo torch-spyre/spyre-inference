@@ -1,0 +1,31 @@
+# test_name of vllm-benchmarks/benchmarks/spyre/serve-tests.yaml, lower-cased.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-granite-embedding-125m-english-tp1-in64, description: 'embedding and rerank serving on random inputs (vllm bench serve)', owner: spyre-inference}
+spec:
+  type: perf
+  level: service
+  tier: sanity
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/serve}
+  metrics: {required: [llm.request_throughput], headline: [llm.request_throughput]}
+  run:
+    cache: warm
+    repeats: 1
+    command: [python3, .github/scripts/bench_perf_vllm.py, run, --case, '{case}', --repeat-dir, '{repeat_dir}', --raw-dir, '{raw_dir}', '--', uv, run, --active, --no-sync, python3, .github/scripts/run_vllm_benchmarks.py, --configs-dir, vllm-benchmarks/benchmarks/spyre, --bench-types, serve, --tests, '{case}', --results-dir, '{raw_dir}']
+  identity:
+    mode: ingest
+    profile: vllm
+    name: serve_granite-embedding-125m-english_tp1_in64
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: serve}
+      - {key: tensor_parallel, value: 1}
+      - {key: input_len, value: 64}
+      - {key: output_len, value: ''}
+  variants:
+    - name: serve_granite-embedding-125m-english_tp1_in64
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: granite-embedding-125m-english, model: granite-embedding-125m-english, precision: fp16, tp: 1, flags: {load-format: auto, max-num-seqs: 4, max-num-batched-tokens: 512, enable-prefix-caching: true, runner: pooling, max-model-len: 512}}
+      workload: {type: llm/serve, endpoint: /v1/embeddings, load: {executor: closed, concurrency: 64, requests: 200, warmup_requests: 8}, input_len: 512, sampling: {ignore_eos: true}, flags: {dataset-name: random, custom-output-len: -1, disable-shuffle: true, percentile-metrics: 'ttft,tpot,itl,e2el', metric-percentiles: '99,100', backend: openai-embeddings, random-range-ratio: 0.5, random-batch-size: 1}}

@@ -1,0 +1,11 @@
+# The datasets namespace of the artifact store. Credentials by reference only: the variable names are the ones the CI
+# secrets and the Jenkins credential bindings export.
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: datasets}
+spec:
+  type: core/artifactory
+  endpoint: {env: ARTIFACTORY_BASE_URL}
+  root: {env: ARTIFACTORY_DATASETS_PATH}
+  auth: {mode: token, refs: [{env: ARTIFACTORY_TOKEN}]}
+  visibility: internal

@@ -1,0 +1,95 @@
+# Nightly bench route (BENCH_SUITE=nightly): the CI latency entries, their first-token companions (output-len 1, the second
+# point of the decode-per-token derive) and a 4-card pair. Entries that share a name with latency-tests.yaml must keep
+# its parameters (.github/scripts/test_bench_nightly.py). The ids come from benchmarks/decoder/.
+- test_name: latency_granite8B_tp1_in64_out64
+  environment_variables:
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+  parameters:
+    model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 64
+    batch-size: 1
+    num-iters-warmup: 1
+    num-iters: 2
+    max-model-len: 128
+- test_name: latency_granite8B_tp1_in64_out1
+  environment_variables:
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+  parameters:
+    model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 1
+    batch-size: 1
+    num-iters-warmup: 1
+    num-iters: 2
+    max-model-len: 128
+- test_name: latency_granite33-8b_tp1_in64_out64
+  environment_variables:
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 64
+    batch-size: 1
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_granite33-8b_tp1_in64_out1
+  environment_variables:
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 1
+    batch-size: 1
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_granite33-8b_tp4_in64_out64
+  environment_variables:
+    DTLOG_LEVEL: error
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 4
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 64
+    batch-size: 1
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_granite33-8b_tp4_in64_out1
+  environment_variables:
+    DTLOG_LEVEL: error
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 4
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 1
+    batch-size: 1
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128

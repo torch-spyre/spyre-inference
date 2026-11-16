@@ -283,6 +283,28 @@ def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path
     assert runner._select_configs([config], set(), {4}) == []
 
 
+def test_unknown_test_names_are_reported(tmp_path):
+    config = tmp_path / "latency-tests-demo.yaml"
+    config.write_text(
+        "- test_name: latency_Demo_tp1\n  parameters: {model: m, tensor_parallel_size: 1}\n"
+    )
+    files = [("latency", config), ("throughput", tmp_path / "absent.yaml")]
+    assert runner._unknown_tests(files, {"latency_demo_tp1"}) == set()
+    assert runner._unknown_tests(files, {"latency_demo_tp1", "typo"}) == {"typo"}
+    assert runner._unknown_tests(files, set()) == set()
+
+
+def test_tests_filter_matches_names_case_insensitively():
+    configs = [
+        {"test_name": "latency_Demo_tp1", "parameters": {"model": "m", "tensor_parallel_size": 1}},
+        {"test_name": "latency_other_tp1", "parameters": {"model": "m", "tensor_parallel_size": 1}},
+    ]
+    picked = runner._select_configs(configs, set(), set(), {"latency_demo_tp1"})
+    assert [c["test_name"] for c in picked] == ["latency_Demo_tp1"]
+    assert len(runner._select_configs(configs, set(), set(), None)) == 2
+    assert len(runner._select_configs(configs, set(), set(), set())) == 2
+
+
 # ── vision dataset: server_parameters expansion and archive defaults ──
 
 

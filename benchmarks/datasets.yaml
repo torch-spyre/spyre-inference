@@ -1,0 +1,74 @@
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-01, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-01-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-02, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-02-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-03, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-03-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-04, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-04-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-05, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-05-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-06, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-06-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-07, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-07-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-08, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-08-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-09, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-09-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-10, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-10-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-11, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-11-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-13, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-13-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-17, description: "recorded agentic trace, replayed in recorded order"}
+spec: {asset: slot-17-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-15, description: "prompts with images, replayed through the chat endpoint"}
+spec: {asset: slot-15-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-12, description: "eval questions; the gate scores the first N in file order"}
+spec: {asset: slot-12-files, role: eval, subsets: {first-64: {limit: 64, order: sequential}}}

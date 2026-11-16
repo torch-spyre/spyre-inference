@@ -1,0 +1,11 @@
+# Per-architecture knobs of the quality cases, as data: no Makefile target or workflow branches on the architecture name.
+# `.yml`: the engine reads *.yaml only; bench_quality_gate.py reads these.
+arch: x86_64
+enabled: true
+max_cards: 4
+on_capacity: skip
+cases:
+  - {case: eval_slot-12_granite-4.1-3b_tp1_l64, model: ibm-granite/granite-4.1-3b}
+  - {case: eval_slot-12_mistral-7b-instruct-v0.3_tp1_l64, model: mistralai/Mistral-7B-Instruct-v0.3}
+  - {case: eval_slot-12_qwen2.5-0.5b-instruct_tp1_l64, model: Qwen/Qwen2.5-0.5B-Instruct}
+skip_models: []

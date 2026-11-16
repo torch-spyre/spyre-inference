@@ -1,0 +1,22 @@
+# Per-token decode cost = (batch latency at 64 output tokens - at 1) / 63, per repeat pair, compared across CPU pinning
+# policies. The out1 case is also the first-token latency (prefill plus one token). A pair of cases from different
+# environments or subjects is refused.
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: decode-per-token, owner: spyre-inference}
+spec:
+  select: {benchmarks: [latency-granite33-8b-tp4-in64-out64, latency-granite33-8b-tp4-in64-out1]}
+  metric: llm.batch_latency.mean
+  hold: ["case.*", "system.*", "subject.id"]
+  vary: [run.exec.cpu_pinning]
+  derive:
+    name: llm.decode_per_token
+    op: slope
+    cases: {first: latency_granite33-8b_tp4_in64_out64, second: latency_granite33-8b_tp4_in64_out1}
+    x: {first: 64, second: 1}
+  compare:
+    by: run.exec.cpu_pinning
+    across: [env.label.device.count]
+    metric: llm.decode_per_token
+    baseline: none
+  output: {noise: series_floor}

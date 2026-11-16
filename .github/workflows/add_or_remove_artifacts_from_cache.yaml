@@ -9,7 +9,7 @@ on:
         type: string
         default: '.github/cache_config/hf_models_and_datasets.yaml'
       include_datasets:
-        description: 'Also fetch artifactory_datasets (needs the ARTIFACTORY_* secrets)?'
+        description: 'Also fetch the benchmark datasets (needs the ARTIFACTORY_* secrets)?'
         required: true
         type: boolean
         default: true
@@ -75,7 +75,7 @@ jobs:
         env:
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
-          ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+          ARTIFACTORY_DATASETS_PATH: ${{ secrets.ARTIFACTORY_DATASETS_PATH }}
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh

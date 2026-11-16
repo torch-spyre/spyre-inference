@@ -3,7 +3,7 @@
 #
 # gated_models: Cached via manual add_or_remove_artifacts_from_cache dispatch on main.
 # public_models: Auto-cached by test_each_commit.yaml.
-# artifactory_datasets: Pre-populated via the same manual dispatch so fork PR
+# benchmark datasets: Pre-populated via the same manual dispatch so fork PR
 #   benchmarks can use cached traces without Artifactory credentials. Other
 #   runs can fetch missing or corrupt traces when credentials are available.
 

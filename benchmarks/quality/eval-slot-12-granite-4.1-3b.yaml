@@ -1,0 +1,52 @@
+# The accuracy gate's granite-4.1-3b case (the gate config is passed as --config below), recorded as a score.
+# Nothing here judges it: the gate keeps its threshold, and Bench verdicts are advisory. Greedy, so no seed in identity.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: eval-slot-12-granite-4.1-3b, description: 'slot-12 accuracy of granite-4.1-3b, recorded from the gate run', owner: spyre-inference}
+spec:
+  type: quality
+  level: service
+  tier: core
+  system: {type: llm/vllm, backend: spyre}
+  workload:
+    type: llm/lm-eval
+    inputs: [{name: tasks, dataset: slot-12, subset: first-64, expect: {records: 64, selection_digest: "sha256:136119d82ee01bfc771615e7b057ddab785aa51bf733fdb407d08068a3c1244c"}}]
+    eval: {task: slot-12, num_fewshot: 5, limit: 64, temperature: 0}
+  metrics:
+    required: [llm.eval.exact_match, llm.eval.exact_match_stderr, llm.eval.n_samples, llm.eval.invalid_frac]
+    headline: [llm.eval.exact_match]
+  run:
+    cache: warm
+    repeats: 1
+    timeout: 60m
+    command:
+      - python3
+      - .github/scripts/bench_quality_gate.py
+      - record
+      - --case
+      - "{case}"
+      - --config
+      - tests/plugin/spyre_testing_plugin/gsm8k_configs/granite-4.1-3b.yaml
+      - --repeat-dir
+      - "{repeat_dir}"
+      - --raw-dir
+      - "{raw_dir}"
+  est_hours: 0.3
+  identity:
+    mode: ingest
+    profile: generic
+    name: eval_slot-12_granite-4.1-3b_tp1_l64
+    discriminators:
+      - {key: dataset, value: slot-12}
+      - {key: harness, value: accuracy-gate}
+      - {key: model, value: ibm-granite/granite-4.1-3b}
+      - {key: num_fewshot, value: 5}
+      - {key: num_questions, value: 64}
+      - {key: precision, value: fp16}
+      - {key: record_type, value: quality}
+      - {key: task, value: slot-12}
+      - {key: tp, value: 1}
+  variants:
+    - name: eval_slot-12_granite-4.1-3b_tp1_l64
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: granite-4.1-3b, model: granite-4.1-3b, precision: fp16, tp: 1, flags: {max-model-len: 4096}}

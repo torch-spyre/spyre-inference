@@ -1,0 +1,14 @@
+# The question file the accuracy gate downloads into the temp dir and scores in file order (see upstream_tests.yaml).
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: slot-12-files}
+spec:
+  type: fileset
+  format: jsonl
+  version: "1"
+  license: MIT
+  visibility: internal
+  source: {store: datasets, slug: slot-12}
+  integrity:
+    files:
+      - {path: test.jsonl, sha256: 3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14}

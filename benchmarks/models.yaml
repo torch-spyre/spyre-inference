@@ -1,0 +1,101 @@
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: all-roberta-large-v1}
+spec:
+  assets: [{role: weights, asset: all-roberta-large-v1-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: bge-reranker-large}
+spec:
+  assets: [{role: weights, asset: bge-reranker-large-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: bge-reranker-v2-m3}
+spec:
+  assets: [{role: weights, asset: bge-reranker-v2-m3-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: gemma-4-26b-a4b}
+spec:
+  assets: [{role: weights, asset: gemma-4-26b-a4b-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: gemma-4-26b-a4b-it}
+spec:
+  assets: [{role: weights, asset: gemma-4-26b-a4b-it-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-3.3-8b-instruct}
+spec:
+  assets: [{role: weights, asset: granite-3.3-8b-instruct-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-3.3-8b-instruct-fp8}
+spec:
+  assets: [{role: weights, asset: granite-3.3-8b-instruct-fp8-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-4.1-3b}
+spec:
+  assets: [{role: weights, asset: granite-4.1-3b-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-4.1-8b}
+spec:
+  assets: [{role: weights, asset: granite-4.1-8b-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-4.1-8b-fp8}
+spec:
+  assets: [{role: weights, asset: granite-4.1-8b-fp8-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-embedding-125m-english}
+spec:
+  assets: [{role: weights, asset: granite-embedding-125m-english-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: granite-embedding-278m-multilingual}
+spec:
+  assets: [{role: weights, asset: granite-embedding-278m-multilingual-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: micro-g3.3-8b-instruct-1b}
+spec:
+  assets: [{role: weights, asset: micro-g3.3-8b-instruct-1b-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: ministral-3-14b-instruct-2512-bf16}
+spec:
+  assets: [{role: weights, asset: ministral-3-14b-instruct-2512-bf16-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: mistral-7b-instruct-v0.3}
+spec:
+  assets: [{role: weights, asset: mistral-7b-instruct-v0.3-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: multilingual-e5-large}
+spec:
+  assets: [{role: weights, asset: multilingual-e5-large-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: qwen2.5-0.5b-instruct}
+spec:
+  assets: [{role: weights, asset: qwen2.5-0.5b-instruct-weights}]

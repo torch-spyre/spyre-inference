@@ -8,6 +8,26 @@ perspectives:
   - name: intent-alignment
   - name: style
   - name: docs-currency
+  - name: upstream-alignment
+    focus: >-
+      whether the PR plugs into upstream vLLM through the smallest possible Spyre-specific
+      override instead of copying or re-implementing upstream code. For every new or changed
+      class or function, open its upstream counterpart at the vLLM tag pinned in
+      pyproject.toml (in .venv site-packages, or the vllm-project/vllm repo at that tag) and
+      flag: bodies copied from vLLM with small edits; re-implementations of something vLLM
+      already provides (utilities, config handling, distributed helpers, model layers); and
+      overrides that replace a whole method or class when only a few lines are
+      Spyre-specific. Suggest the narrower plug point this repo already uses: register_oot
+      on a CustomOp or PluggableLayer (spyre_inference/custom_ops/), a model subclass
+      registered in spyre_inference/models/__init__.py, a mixin that overrides one hook
+      (SpyreBertEmbeddingMixin replaces only _build_model to swap the embedding class;
+      _SpyreRotaryMixin extends __init__ through super()), or a platform
+      hook in platform.py. When upstream exposes no hook for the change, recommend making
+      one (a small extracted method we override, or an upstream PR adding it) over forking
+      the code. Verbatim vendoring is allowed only under _vendored/ or csrc/, with the
+      upstream source SHA in the header and the reason the pinned vLLM lacks it; new copies
+      elsewhere, or vendored files edited away from upstream, are changes_requested. Quote
+      the duplicated lines and the upstream file:line they come from
   - name: spyre-numerics
     focus: >-
       numerical drift on the Spyre path that a green CI run can hide: ops that newly

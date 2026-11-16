@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Card-free tests for splitting a batched decode into length groups.
-
-Not named "batched_decode": tests/conftest.py skips those under the tiled walk.
-"""
+"""Card-free tests for splitting a batched decode into length groups."""
 
 import pytest
 import torch

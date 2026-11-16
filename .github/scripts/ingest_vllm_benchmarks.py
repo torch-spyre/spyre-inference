@@ -141,6 +141,12 @@ def parse_args() -> Any:
         help="The GHA event that built the leg's artifact; tagged as the library's ci_tags spells.",
     )
     parser.add_argument(
+        "--leg-key",
+        type=str,
+        default="",
+        help="Names this leg when several legs share one run_id, so each lands its own v2 rows.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print rows instead of inserting into ClickHouse",
@@ -271,6 +277,8 @@ def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> No
             # Suite wall clock: each throughput run's own elapsed_time.
             duration_s=duration_s(rows),
             props={"run_url": run_url, "source": "gha"},
+            # The first verdict otherwise sticks, so a failed leg must override a passed one.
+            supersede=bool(getattr(leg, "leg_key", "")) and leg.state == "failed",
         )
         if wrote:
             log.info("Linked artifact %s (base %s) to run_id=%s", aid, base, run_id_value)
@@ -334,10 +342,16 @@ IDENTITY_GOLDENS = (
 )
 
 
-def _write_v2_benchmarks(client, db: str, rows, run_id_value: str) -> None:
+def _write_v2_benchmarks(client, db: str, rows, run_id_value: str, leg_key: str = "") -> None:
     """benchmarks + benchmark_runs for this leg; a failure must not cost the flat rows."""
     try:
-        write_benchmarks(client, db, rows, run_id_value)
+        if leg_key:
+            # Dedup per leg, not per run: legs share the run_id, and only the first would land.
+            write_benchmarks(
+                client, db, rows, run_id_value, row_props={"upload_id": leg_key}, append=True
+            )
+        else:
+            write_benchmarks(client, db, rows, run_id_value)
     except Exception as exc:  # noqa: BLE001
         log.warning("v2 perf write failed, %s unaffected: %r", RESULTS_TABLE, exc)
 
@@ -346,6 +360,7 @@ def insert_to_clickhouse(
     rows: list[dict[str, Any]],
     v2_run_id_value: str = "",
     leg: Any = None,
+    leg_key: str = "",
 ) -> None:
     """Insert rows into ClickHouse using environment-configured connection."""
     clickhouse_env_vars = {
@@ -409,7 +424,7 @@ def insert_to_clickhouse(
     if v2_run_id_value and v2db:
         if leg is not None:
             _write_artifact_results(client, v2db, rows, v2_run_id_value, leg)
-        _write_v2_benchmarks(client, v2db, rows, v2_run_id_value)
+        _write_v2_benchmarks(client, v2db, rows, v2_run_id_value, leg_key)
     elif v2_run_id_value:
         # Cause-agnostic: a drift has already said its piece as an ::error:: above, and this
         # is the only report when the database is simply not configured.
@@ -488,7 +503,9 @@ def main() -> None:
             print(f"... and {len(rows) - 5} more")
         return
 
-    insert_to_clickhouse(rows, resolve_v2_run_id(args), args if links_artifact(args) else None)
+    insert_to_clickhouse(
+        rows, resolve_v2_run_id(args), args if links_artifact(args) else None, args.leg_key
+    )
 
 
 if __name__ == "__main__":

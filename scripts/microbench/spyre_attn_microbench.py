@@ -25,14 +25,37 @@ import gc
 import itertools
 import json
 import os
+import subprocess
 import sys
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
 
-# _ATTN_PROFILING is read at import time in spyre_attn, so set it before import.
-os.environ["SPYRE_ATTN_PROFILING"] = "1"
+# _ATTN_PROFILING is read at import time in spyre_attn, so the timing mode has to be
+# resolved from argv before any spyre_inference import, not in main().
+TIMING = "profiler"
+for _i, _a in enumerate(sys.argv[1:]):
+    if _a == "--timing" and _i + 2 <= len(sys.argv) - 1:
+        TIMING = sys.argv[_i + 2]
+    elif _a.startswith("--timing="):
+        TIMING = _a.split("=", 1)[1]
+if TIMING not in ("wall", "profiler"):
+    raise SystemExit(f"--timing must be wall or profiler, got {TIMING!r}")
+
+_THREADS = "1" if TIMING == "profiler" else "8"
+for _i, _a in enumerate(sys.argv[1:]):
+    if _a == "--threads" and _i + 2 <= len(sys.argv) - 1:
+        _THREADS = sys.argv[_i + 2]
+    elif _a.startswith("--threads="):
+        _THREADS = _a.split("=", 1)[1]
+
+os.environ["SPYRE_ATTN_PROFILING"] = "1" if TIMING == "profiler" else "0"
 os.environ.setdefault("VLLM_PLUGINS", "spyre_inference")
+# Assigned, not setdefault: an inherited SPYRE_NUM_CPUS or OMP_NUM_THREADS from the shell
+# would otherwise decide the thread count and the report would record a value that did
+# not apply.
+os.environ["SPYRE_NUM_CPUS"] = _THREADS
 for _k, _v in (
     ("RANK", "0"),
     ("LOCAL_RANK", "0"),
@@ -40,11 +63,16 @@ for _k, _v in (
     ("LOCAL_WORLD_SIZE", "1"),
     ("MASTER_ADDR", "127.0.0.1"),
     ("MASTER_PORT", "29500"),
-    ("OMP_NUM_THREADS", "1"),
-    ("OPENBLAS_NUM_THREADS", "1"),
-    ("MKL_NUM_THREADS", "1"),
 ):
     os.environ.setdefault(_k, _v)
+for _k in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ[_k] = _THREADS
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -266,15 +294,12 @@ def build_inputs_from_requests(
     num_blocks,
     device,
     seed=0,
-    kv_layout="slot_major_devfill",
-    attn_kv_layout="token_major",
     sliding_window=None,
 ):
     """Varlen multi-sequence inputs from explicit per-request lengths."""
     from vllm.utils.torch_utils import set_random_seed
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
     assert len(query_lens) == len(seq_lens)
     for ql, sl in zip(query_lens, seq_lens):
@@ -348,45 +373,12 @@ def build_inputs_from_requests(
 
     cache_device = torch.device(device)
 
-    def to_device(cache):
-        # plain: host-populated cache, plain transfer. Matches
-        # tests/attention/test_spyre_attn.py, correct at these shapes.
-        # _reshape_and_cache views pages as [-1, H, D] and requires the
-        # slot-outermost device layout, which host conversion cannot reproduce.
-        # slot_major is therefore wrong; slot_major_devfill uses production's
-        # device-side history write.
-        if cache_device.type != "spyre" or kv_layout == "plain":
-            return cache.to(cache_device)
-        nb, bsz, h, d = cache.shape
-        if kv_layout == "page_major":
-            from torch_spyre._C import SpyreTensorLayout
-
-            # device axes: [page, kv_head, D-stick, token, D-element]
-            return cache.to(
-                cache_device,
-                device_layout=SpyreTensorLayout(
-                    [nb, bsz, h, d],
-                    [bsz * h * d, h * d, d, 1],
-                    cache.dtype,
-                    [1, 0, 2, 3],
-                ),
-            )
-        layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
-        if kv_layout == "slot_major":
-            return cache.to(cache_device, device_layout=layout)
-        return torch.zeros_like(cache).to(cache_device, device_layout=layout)
-
-    if attn_kv_layout == "head_major":
-        # kv_layout is a token-major device-layout knob and does not apply here.
-        k_pages, v_pages = _head_major_pages(k_pages_cpu, v_pages_cpu, cache_device)
-    else:
-        k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
+    k_pages, v_pages = _head_major_pages(k_pages_cpu, v_pages_cpu, cache_device)
 
     # Eager index_copy_ takes an int64 index, which falls back to CPU and lands the rows in
     # the wrong place, so make_forward writes the history through the impl's compiled store.
-    devfill = cache_device.type == "spyre" and bool(hist_slots)
     hist_seed = None
-    if devfill and (attn_kv_layout == "head_major" or kv_layout == "slot_major_devfill"):
+    if cache_device.type == "spyre" and hist_slots:
         hist_seed = {
             "key": convert(torch.cat(hist_k), cache_device),
             "value": convert(torch.cat(hist_v), cache_device),
@@ -448,6 +440,28 @@ def grid_to_requests(
     query_lens = [max(1, q) for q in query_lens]
     seq_lens = [max(seq_lens[i], query_lens[i]) for i in range(batch_size)]
     return query_lens, seq_lens
+
+
+def assert_extension_matches_timing(timing):
+    """Each timing mode needs the opposite torch-spyre build; fail early, not at report time.
+
+    Profiler mode reads device time from AIUPTI spans, so the extension must carry it.
+    Wall mode times a synchronized interval that the same instrumentation would inflate.
+    """
+    import torch_spyre
+
+    linked = "libaiupti" in subprocess.check_output(["ldd", torch_spyre._C.__file__], text=True)
+    if timing == "wall" and linked:
+        raise SystemExit(
+            "--timing wall needs a torch-spyre built with USE_SPYRE_PROFILER=0: the "
+            "AIUPTI instrumentation lands inside the measured interval and inflates it."
+        )
+    if timing == "profiler" and not linked:
+        raise SystemExit(
+            "--timing profiler needs a torch-spyre built with USE_SPYRE_PROFILER=1 "
+            "(see docs/user_guide/kineto_profiling.md sec 1.3); without libaiupti there "
+            "are no device spans to attribute."
+        )
 
 
 def assert_device_profiler_active(prof):
@@ -536,7 +550,6 @@ def make_forward(
     num_kv_heads,
     head_size,
     kv_write=False,
-    attn_kv_layout="token_major",
 ):
     """One emulated attention layer, in the order ``attn_layer`` runs it.
 
@@ -551,15 +564,7 @@ def make_forward(
         SpyrePagedKVCache,
     )
 
-    impl_cls = SpyreAttentionImpl
-    if attn_kv_layout == "head_major":
-        from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
-            SpyreHeadMajorAttentionImpl,
-        )
-
-        impl_cls = SpyreHeadMajorAttentionImpl
-
-    impl = impl_cls(
+    impl = SpyreAttentionImpl(
         num_heads=num_query_heads,
         head_size=head_size,
         scale=inputs["scale"],
@@ -611,6 +616,29 @@ def make_forward(
         return output
 
     return run, output, impl
+
+
+def measure_wall(run, iterations):
+    """Synchronized wall latency per forward, in microseconds.
+
+    No profiler: the fences bound exactly one forward, so dispatch and host work are
+    inside the number. Instrumentation would land in the same interval, which is why
+    this mode refuses a libaiupti build.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        samples = []
+        for _ in range(iterations):
+            torch.spyre.synchronize()
+            before = time.perf_counter_ns()
+            run()
+            torch.spyre.synchronize()
+            samples.append((time.perf_counter_ns() - before) / 1e3)
+    finally:
+        gc.enable()
+    zeros = [0.0] * len(samples)
+    return samples, zeros, list(samples), zeros, {}
 
 
 def measure(run, iterations, span=SPANS["layer"]):
@@ -687,7 +715,7 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
         print(f"    -> {row['error']}", flush=True)
 
 
-def record_attn_path(row, impl, attn_metadata, batched_variant, num_pages):
+def record_attn_path(row, impl, attn_metadata, batched_variant, k_pages):
     """Record which read path the impl took, and flag a declined batched gate."""
     row["num_decode_seqs"] = attn_metadata.num_decode_seqs
     row["padded_num_seqs"] = (
@@ -697,7 +725,7 @@ def record_attn_path(row, impl, attn_metadata, batched_variant, num_pages):
     row["blocks_per_chunk"] = (
         -1 if attn_metadata.blocks_per_chunk is None else attn_metadata.blocks_per_chunk
     )
-    batched = impl._batched_decode_preconditions_met(attn_metadata, num_pages)
+    batched = impl._batched_decode_preconditions_met(attn_metadata, k_pages)
     if not batched:
         row["attn_path"] = "per_seq"
         if batched_variant:
@@ -713,16 +741,15 @@ def expected_kernels(row, span):
 
     The loop runs one kernel per sequence; the batched path collapses the decode
     prefix's into one. Staging copies count as memory ops, so they are excluded.
-    Head-major's decode kernel emits its store as a second kernel per call, where
-    token-major and head-major's batched-GQA prefill kernel both fuse it into the
-    attention one.
+    The decode kernel emits its store as a second kernel per call, where the
+    batched-GQA prefill kernel fuses it into the attention one.
     """
     num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
     if row["attn_path"].startswith("batched"):
         attn = 1 + (num_seqs - num_decode)
     else:
         attn = num_seqs
-    if row.get("attn_kv_layout") == "head_major" and row["padded_query_len"] == 1:
+    if row["padded_query_len"] == 1:
         attn *= 2
     write = 1 if row["kv_write"] else 0
     if span == SPANS["reshape_and_cache"]:
@@ -744,7 +771,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
     max_kv = max(seq_lens)
     num_blocks = max(cfg["num_blocks"], (max_kv + block_size - 1) // block_size)
 
-    attn_kv_layout = cfg.get("attn_kv_layout", "token_major")
     span = SPANS[cfg.get("span", "layer")]
     print(
         f"  {variant:26} bs={block_size:<4} {name:24} nreqs={len(query_lens)} "
@@ -765,14 +791,13 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "head_size": head_size,
         "block_size": block_size,
         "num_blocks": num_blocks,
-        "kv_layout": cfg.get("kv_layout", "slot_major_devfill"),
-        "attn_kv_layout": attn_kv_layout,
         "num_kv_blocks_iterated": -1,
         "padded_query_len": -1,
         "dtype": str(DTYPE),
         "implementation": meta["impl_label"],
         "variant": variant,
-        "benchmark_mode": "BenchmarkMode.SPYRE_PROFILER",
+        "benchmark_mode": TIMING,
+        "threads": _THREADS,
         "span": span,
         "model": cfg.get("model", ""),
         "ms": float("nan"),
@@ -818,8 +843,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             num_blocks,
             cfg.get("device", "spyre"),
             seed=cfg.get("seed", 0),
-            kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
-            attn_kv_layout=attn_kv_layout,
             sliding_window=cfg.get("sliding_window"),
         )
         if inputs is None:
@@ -847,7 +870,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             num_kv,
             head_size,
             kv_write=row["kv_write"],
-            attn_kv_layout=attn_kv_layout,
         )
 
         with warnings.catch_warnings(record=True) as caught:
@@ -855,20 +877,17 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             run()  # first call: compile + populate metadata device mirrors
             row["fallback_clean"] = not any("fallback" in str(w.message).lower() for w in caught)
 
-        record_attn_path(
-            row, impl, inputs["attn_metadata"], meta["batched"], inputs["k_pages"].shape[0]
-        )
+        record_attn_path(row, impl, inputs["attn_metadata"], meta["batched"], inputs["k_pages"])
 
         # Correctness gate before timing, same semantics as
         # tests/attention/test_spyre_attn.py. The reference reads KV pages back
-        # off the device, not the host copy: under slot-major the on-device
-        # contents are what the kernel actually read.
+        # off the device, not the host copy: the on-device contents are what the
+        # kernel actually read.
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
-        k_ref, v_ref = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
-        if attn_kv_layout == "head_major":
-            k_ref, v_ref = k_ref.permute(0, 2, 1, 3), v_ref.permute(0, 2, 1, 3)
+        k_ref = inputs["k_pages"].to("cpu").permute(0, 2, 1, 3)
+        v_ref = inputs["v_pages"].to("cpu").permute(0, 2, 1, 3)
         ref = ref_attn(
             inputs["query_cpu"],
             k_ref,
@@ -906,13 +925,18 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         from torch._dynamo.utils import counters
 
         graphs_before = counters["stats"]["unique_graphs"]
-        dev_us, mem_us, cpu_us, n_kernels, by_op = measure(run, cfg.get("iterations", 10), span)
+        if TIMING == "wall":
+            dev_us, mem_us, cpu_us, n_kernels, by_op = measure_wall(run, cfg.get("iterations", 10))
+        else:
+            dev_us, mem_us, cpu_us, n_kernels, by_op = measure(run, cfg.get("iterations", 10), span)
         row["late_compile"] = counters["stats"]["unique_graphs"] != graphs_before
         if row["late_compile"]:
             print("    -> WARNING: a kernel compiled inside a measured window", flush=True)
         row["kernels_attributed"] = int(np.median(n_kernels))
         row["kernels_expected"] = expected_kernels(row, span)
-        if row["kernels_attributed"] != row["kernels_expected"]:
+        # Kernel attribution is a profiler-span property; wall mode has no spans, so the
+        # count is always 0 and comparing it would mark every row failed.
+        if TIMING == "profiler" and row["kernels_attributed"] != row["kernels_expected"]:
             row["error"] = (
                 f"attributed {row['kernels_attributed']} compute kernels, expected "
                 f"{row['kernels_expected']}; the span under-counts (use --span layer)"
@@ -948,7 +972,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
                         [
                             {
                                 "capture_name": name,
-                                "attn_kv_layout": attn_kv_layout,
                                 "max_seq_len": max_kv,
                                 "op": op_name,
                                 "device_us": op_us,
@@ -957,7 +980,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
                             for op_name, (op_us, op_n) in ops
                         ]
                     ).to_csv(
-                        Path(csv_path).with_name(f"ops_{attn_kv_layout}_{name}_{max_kv}.tsv"),
+                        Path(csv_path).with_name(f"ops_{name}_{max_kv}.tsv"),
                         sep="\t",
                         index=False,
                     )
@@ -1084,8 +1107,6 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         block_size,
         num_blocks,
         cfg["device"],
-        kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
-        attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
         sliding_window=cfg.get("sliding_window"),
     )
     probe_run, _, _ = make_forward(
@@ -1094,16 +1115,19 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         cfg["num_kv_heads"],
         cfg["head_size"],
         kv_write=bool(cfg.get("kv_write", False)),
-        attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
     )
     probe_run()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
-        probe_run()
-    assert_span_present(prof, span)
-    if not args.allow_empty_device_profile:
-        assert_device_profiler_active(prof)
-    total, _, _, _ = span_device_times(prof, span)
-    print(f"  [guard] profiler active; '{span}' device time = {total:.1f}us\n", flush=True)
+    if TIMING == "profiler":
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
+            probe_run()
+        assert_span_present(prof, span)
+        if not args.allow_empty_device_profile:
+            assert_device_profiler_active(prof)
+        total, _, _, _ = span_device_times(prof, span)
+        print(f"  [guard] profiler active; '{span}' device time = {total:.1f}us\n", flush=True)
+    else:
+        torch.spyre.synchronize()
+        print("  [guard] wall timing; profiler span checks skipped\n", flush=True)
     del probe_inputs, probe_run
     gc.collect()
 
@@ -1111,30 +1135,26 @@ def run_startup_guard(cfg, entries, block_size, span, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
+    ap.add_argument(
+        "--timing",
+        choices=["wall", "profiler"],
+        default="profiler",
+        help="wall: synchronized perf_counter around one forward, needs a profiler-free "
+        "torch-spyre. profiler: device time from a record_function span, needs "
+        "USE_SPYRE_PROFILER=1. Parsed before imports; see the module header.",
+    )
+    ap.add_argument(
+        "--threads",
+        default=None,
+        help="CPU thread count. Defaults to 1 under --timing profiler (device time is "
+        "thread-insensitive, so fewer threads means less host jitter) and 8 under wall, "
+        "where host work is inside the measured interval.",
+    )
     ap.add_argument("--output-dir", default="./microbench_results")
     ap.add_argument("--variants", nargs="+", default=None)
     ap.add_argument("--iterations", type=int, default=None)
     ap.add_argument("--warmup", type=int, default=None)
     ap.add_argument("--device", default=None)
-    ap.add_argument(
-        "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill", "page_major"],
-        default=None,
-        help="KV page device layout. 'slot_major_devfill' (default) matches the "
-        "worker: zeroed slot-major alloc, history written on device. 'plain' is "
-        "correct for a host-populated cache. 'slot_major' pins the worker layout "
-        "on a host-populated cache and is numerically wrong. 'page_major' is an "
-        "index_select layout/SDSC probe.",
-    )
-    ap.add_argument(
-        "--attn-kv-layout",
-        choices=["token_major", "head_major"],
-        default=None,
-        help="KV cache decomposition the backend reads (SPYRE_ATTN_KV_LAYOUT). "
-        "'head_major' (default) stores a page as [KV, block_size, head_size] and selects "
-        "the head-major backend, the only one whose batched decode kernel runs under the "
-        "default tiled walk.",
-    )
     ap.add_argument(
         "--span",
         choices=sorted(SPANS),
@@ -1166,6 +1186,8 @@ def main():
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
     args = ap.parse_args()
+    # Mode already took effect at import (module header); this only verifies the wheel.
+    assert_extension_matches_timing(TIMING)
 
     with open(args.config) as f:
         cfg = json.load(f)
@@ -1174,8 +1196,6 @@ def main():
         ("warmup", args.warmup),
         ("device", args.device),
         ("span", args.span),
-        ("kv_layout", args.kv_layout),
-        ("attn_kv_layout", args.attn_kv_layout),
         ("kv_write", args.kv_write or None),
     ):
         if val is not None:
@@ -1226,20 +1246,6 @@ def main():
             "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
         )
     os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
-    # Selects the backend via the platform, and is cached on first envs read like the rest.
-    attn_kv_layout = cfg.setdefault("attn_kv_layout", "head_major")
-    os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
-    from spyre_inference import envs
-
-    if (
-        attn_kv_layout == "token_major"
-        and next(iter(batched_modes))
-        and envs.SPYRE_ATTN_FOR_EACH_TILE
-    ):
-        raise SystemExit(
-            "token-major batched decode is declined under the tiled walk; run the batched "
-            "variant on head_major, or set SPYRE_ATTN_FOR_EACH_TILE=0."
-        )
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries, cfg["max_num_batched_tokens"])
@@ -1262,7 +1268,6 @@ def main():
         f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}"
     )
     print(f"  span       : {sel_span}")
-    print(f"  kv layout  : {attn_kv_layout}")
     print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
@@ -1288,7 +1293,7 @@ def main():
 
             from spyre_inference.v1.attention.backends import spyre_attn as sa
 
-            if not sa._ATTN_PROFILING:
+            if TIMING == "profiler" and not sa._ATTN_PROFILING:
                 raise SystemExit("SPYRE_ATTN_PROFILING was not honoured; span will be absent.")
             print(
                 f"  limits     : max_model_len={vllm_config.model_config.max_model_len} "

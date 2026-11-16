@@ -183,22 +183,10 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
-    _head_major_backend_path = (
-        "spyre_inference.v1.attention.backends.spyre_head_major_attn.SpyreHeadMajorAttentionBackend"
-    )
-    _KV_LAYOUTS = ("token_major", "head_major")
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     # Largest item a request may carry per vision modality, in tokens.
     _vision_token_limits: ClassVar[dict[str, int]] = {}
-
-    @classmethod
-    def _decoder_backend_path(cls) -> str:
-        """The decoder attention backend for the requested KV cache layout."""
-        layout = envs.SPYRE_ATTN_KV_LAYOUT
-        if layout not in cls._KV_LAYOUTS:
-            raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
-        return cls._head_major_backend_path if layout == "head_major" else cls._backend_path
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -518,7 +506,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 "SpyreEncoderAttentionBackend"
             )
         else:
-            backend_path = cls._decoder_backend_path()
+            backend_path = cls._backend_path
 
         # Register the selected Spyre attention implementation as CUSTOM.
         register_backend(AttentionBackendEnum.CUSTOM, backend_path)
@@ -707,8 +695,10 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            # MRV2 builds self.speculator, which load.py refuses only once the model loads.
-            "speculative decoding": vllm_config.speculative_config is not None,
+            "speculative decoding other than DFlash/XPress": (
+                vllm_config.speculative_config is not None
+                and not vllm_config.speculative_config.use_dflash()
+            ),
             # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
             "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),
             # A CUDA-graph encoder manager; Spyre compiles towers per budget at warmup.
@@ -884,6 +874,11 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
 
+        # YOCO fast prefill swaps in its own attention backend and metadata, which the
+        # Spyre backend does not provide.
+        if vllm_config.cache_config.kv_sharing_fast_prefill:
+            raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
+
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
         # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
@@ -919,12 +914,6 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        if (
-            runner == "v2"
-            and vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_dflash()
-        ):
-            raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
         # Every process, ahead of the V1 validation that follows this hook in __post_init__.
         from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
 

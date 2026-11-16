@@ -71,3 +71,34 @@ def test_injection_in_name_is_rejected(name):
 def test_injection_in_version_is_rejected(version):
     with pytest.raises(SystemExit):
         rr.resolve_specs(_data(version=version), "x86_64")
+
+
+@pytest.mark.parametrize("url", ["http://artifactory.example/artifactory/api", "ftp://host/x"])
+def test_artifactory_open_rejects_non_https(url):
+    # The bearer token must never be sent over a non-TLS scheme.
+    with pytest.raises(SystemExit):
+        rr.artifactory_open(url, "secret-token")
+
+
+def test_cross_host_redirect_strips_authorization():
+    handler = rr._StripAuthOnCrossHostRedirect()
+    req = rr.urllib.request.Request(
+        "https://artifactory.example/artifactory/api/search/aql",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    new = handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/collect")
+    assert new is not None
+    assert not new.has_header("Authorization")
+
+
+def test_same_host_redirect_keeps_authorization():
+    handler = rr._StripAuthOnCrossHostRedirect()
+    req = rr.urllib.request.Request(
+        "https://artifactory.example/artifactory/api/search/aql",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    new = handler.redirect_request(
+        req, None, 302, "Found", {}, "https://artifactory.example/elsewhere"
+    )
+    assert new is not None
+    assert new.has_header("Authorization")

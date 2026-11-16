@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
-    SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
@@ -112,21 +111,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
-    # Which KV cache layout the decoder attention backend uses, within a page:
-    #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which
-    #    drops the per-page permute the kernels do before the matmuls and is the only
-    #    layout with a batched decode kernel under the default tiled walk. It always
-    #    compiles attention, even under --enforce-eager.
-    #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size], the fallback
-    #    for a fully eager attention run.
-    "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "head_major",
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1" (default), enables the batched multi-sequence decode kernel.
-    # Under the default tiled walk it applies only to the
-    # head-major cache, which uses a split page index, so a token-major run keeps
-    # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.

@@ -216,6 +216,16 @@ def escape_mrkdwn(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def escape_code_span(text: str) -> str:
+    """Escape a value rendered inside a Slack mrkdwn inline-code span.
+
+    Beyond escape_mrkdwn's link/entity characters, a backtick in the value
+    would close the inline-code span and re-enable mrkdwn in what follows, so
+    it is dropped here (Slack offers no in-code escape for it).
+    """
+    return escape_mrkdwn(text).replace("`", "")
+
+
 def build_mention(value: str) -> str:
     """Render SLACK_MENTION_GROUP_ID as a Slack mention entity, or "" for none.
 
@@ -252,7 +262,9 @@ def render_message(top: list[dict], total: int, now: datetime) -> str:
                 title=escape_mrkdwn(title),
                 author=(pr.get("user") or {}).get("login", "unknown"),
                 idle_days=(now - parse_timestamp(pr["updated_at"])).total_seconds() / 86400,
-                labels=" · " + ", ".join(f"`{n}`" for n in names) if names else "",
+                labels=" · " + ", ".join(f"`{escape_code_span(n)}`" for n in names)
+                if names
+                else "",
             )
         )
     lines.append(FOOTER_TEMPLATE.format(shown=len(top), total=total))

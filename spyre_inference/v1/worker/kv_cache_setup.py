@@ -15,12 +15,18 @@
 """Attention-group window split and per-layer KV page allocation, shared by both
 model runners."""
 
+from copy import copy
 from dataclasses import replace
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
@@ -30,6 +36,27 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 
 logger = init_logger(__name__)
+
+
+def with_kv_sharing_layer_specs(
+    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str]
+) -> KVCacheConfig:
+    """Copy mapping each KV-sharing layer to its target's spec, for attention only."""
+    if not shared_layers:
+        return kv_cache_config
+    groups = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = dict(spec.kv_cache_specs)
+            for layer, target in shared_layers.items():
+                if target in specs:
+                    specs[layer] = specs[target]
+            group = replace(group, kv_cache_spec=replace(spec, kv_cache_specs=specs))
+        groups.append(group)
+    kv_cache_config = copy(kv_cache_config)
+    kv_cache_config.kv_cache_groups = groups
+    return kv_cache_config
 
 
 def split_attn_groups_by_window(
@@ -118,7 +145,7 @@ def allocate_spyre_kv_caches(
                 kv_caches[layer_name] = _allocate_mamba_states(num_blocks, spec, device)
                 continue
             # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the token-major default.
+            # stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
             kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)

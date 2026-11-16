@@ -591,7 +591,7 @@ class TestSpyreFp8LinearKernel:
         x = torch.randn(5, in_features, dtype=torch.float16, device="spyre")
 
         eager = self._run_spyre_apply(kernel, layer, x, in_block=False)
-        assert kernel.spyre_compiled_kernel is not None
+        assert kernel.spyre_compiled_kernels
         in_block = self._run_spyre_apply(kernel, layer, x)
         torch.testing.assert_close(eager, in_block, atol=0.0, rtol=0.0)
 

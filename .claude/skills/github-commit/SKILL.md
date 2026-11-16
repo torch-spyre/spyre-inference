@@ -1,6 +1,6 @@
 ---
 name: github-commit
-description: Configure git with your GitHub identity, create a feature branch from origin/main, commit changes with DCO sign-off, and push to your fork. Use whenever the user wants help committing and pushing changes from a remote dev pod or any environment where git user.name/user.email is unset. Stops before PR creation.
+description: Configure git with your GitHub identity and commit signing key, create a feature branch from origin/main, commit changes with DCO sign-off and a GPG/SSH signature, and push to your fork. Use whenever the user wants help committing and pushing changes from a remote dev pod or any environment where git user.name/user.email or the signing key is unset. Stops before PR creation.
 ---
 
 # GitHub Commit and Push
@@ -51,6 +51,22 @@ EMAIL=$(gh api user --jq '.email // empty')
 git config user.email "$EMAIL"
 ```
 
+## 1b. Make sure commits get signed
+
+`main` requires signed commits, so every commit needs a GPG or SSH signature (`-S`) as well as the DCO sign-off (`-s`). An unsigned commit blocks the PR from merging. Check that a signing key is configured and usable:
+
+```bash
+git config --get user.signingkey
+git commit-tree -S -m probe HEAD^{tree} >/dev/null && echo "signing works"
+```
+
+If no key is configured, ask the user which one to use rather than generating one: a new key is not registered on their GitHub account, so its signatures will not verify. Then point git at it:
+
+```bash
+git config user.signingkey <key-id-or-pubkey-path>
+git config gpg.format openpgp   # or ssh
+```
+
 ## 2. Create a feature branch
 
 Always branch from the latest `origin/main`:
@@ -76,11 +92,11 @@ Run the formatter before committing:
 bash format.sh
 ```
 
-Stage your changes and commit with DCO sign-off:
+Stage your changes and commit with DCO sign-off and a signature:
 
 ```bash
 git add <files>
-git commit -s -m "type: description of change"
+git commit -s -S -m "type: description of change"
 ```
 
 Stage files by name, not `git add -A` / `git add .`. Do not stage `uv.lock`,
@@ -88,10 +104,23 @@ Stage files by name, not `git add -A` / `git add .`. Do not stage `uv.lock`,
 environment — a plain `uv lock` / `uv sync` rewrites the lockfile as a side effect.
 Revert accidental edits with `git checkout origin/main -- <file>`.
 
-To amend the last commit with a sign-off:
+To amend the last commit with a sign-off and signature:
 
 ```bash
-git commit --amend -s --no-edit
+git commit --amend -s -S --no-edit
+```
+
+Before pushing, confirm every commit on the branch is signed and signed off:
+
+```bash
+git log --format='%h %G? %s' origin/main..
+git log --format='%h %(trailers:key=Signed-off-by,valueonly)' origin/main..
+```
+
+`%G?` verifies against the local keyring, so only `N` (unsigned) is a definite failure. `U` or `E` can be a valid signature git cannot check locally, such as an SSH key with no `gpg.ssh.allowedSignersFile`, or an untrusted or missing GPG key. After pushing, GitHub is authoritative:
+
+```bash
+gh api repos/torch-spyre/spyre-inference/commits/<sha> --jq .commit.verification.verified
 ```
 
 ## 4. Push to your fork
@@ -122,6 +151,6 @@ Add new commits on top and push normally:
 ```bash
 bash format.sh
 git add <files>
-git commit -m "type: description of follow-up change" -s
+git commit -s -S -m "type: description of follow-up change"
 git push fork <branch-name>
 ```

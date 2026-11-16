@@ -85,10 +85,15 @@ for rpm_name in $RPM_NAMES; do
     filename="${rpm_name}.${RPM_ARCH}.rpm"
     url="${ARTIFACTORY_LOCATION}/${RPM_SUBDIR}${RPM_ARCH}/${filename}"
     echo "  ${url}"
+    # The token goes to curl on stdin as a config file (-K -), never in argv:
+    # argv is world-readable through /proc/<pid>/cmdline on a shared runner.
+    # This matches .github/scripts/fetch_bench_datasets.py.
     curl -fSL \
-        -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
         -o "${RPMS_DOWNLOAD_DIR}/${filename}" \
-        "${url}" || exit 1
+        -K - \
+        "${url}" <<CURL_CONFIG || exit 1
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 done
 
 echo 'done'

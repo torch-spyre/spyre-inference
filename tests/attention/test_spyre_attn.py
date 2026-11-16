@@ -1706,11 +1706,13 @@ def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, k
     assert [t.shape[0] for t in metadata.page_index_tables_cpu] == [expected]
 
 
-def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config):
+def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config, monkeypatch):
     """Padded blocks are exactly finfo.min; the real prefix is bit-identical
     regardless of how much headroom the block table has beyond the bucket
     build() actually pads to -- build() always pads to a bucket (no unpadded
     fallback), so both tables here must have at least that much headroom."""
+    # A declared page range keeps each sequence's own count, so nothing is padded.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     torch.set_default_device("cpu")
     block_size = 64
     kv_len, query_len = 300, 32

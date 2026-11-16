@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLIP on Spyre: ``SpyreCLIPEmbeddingModel``, and the EngineArgs override that must
+"""CLIP on Spyre: ``SpyreCLIPEmbeddingModel``, the vision-tower layer that takes the
+same-image mask (``SpyreCLIPEncoderLayer``), and the EngineArgs override that must
 land before ModelConfig is built.
 
 The LayerNorm boundary-norm swap lives in ``multimodal/clip.py`` instead
@@ -29,13 +30,16 @@ import vllm.model_executor.models.clip as vllm_clip
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.clip import (
+    CLIPAttention,
     CLIPEmbeddingModel,
+    CLIPEncoderLayer,
     _get_vision_feature_select_strategy,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, subclass_attention_backend
 from vllm.v1.attention.selector import get_attn_backend
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.multimodal.utils import padded_sdpa
 from spyre_inference.v1.pool.spyre_pooler import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
 
@@ -105,6 +109,53 @@ def select_class_rows(feats: torch.Tensor) -> torch.Tensor:
     b, s, h = feats.shape
     rows = torch.arange(b, dtype=torch.int64) * s
     return select_rows(feats.reshape(b * s, h), rows).reshape(b, 1, h)
+
+
+class SpyreCLIPAttention(CLIPAttention):
+    """Upstream's vision attention with the stick-aligned SDPA under an additive mask.
+
+    Upstream's ``attn`` takes packed sequence lengths and builds its mask on the host; this
+    one takes the same-image mask built once per encoder call in ``vision_embed``.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Upstream's host-masked attention: unused by forward, and weightless.
+        del self.attn
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        batch, patches, _ = x.shape
+        qkv, _ = self.qkv_proj(x)
+        q, k, v = (
+            t.reshape(batch, patches, self.num_heads_per_partition, self.head_dim).transpose(1, 2)
+            for t in qkv.chunk(3, dim=-1)
+        )
+        out = padded_sdpa(q, k, v, mask, scale=self.scale)
+        out = out.transpose(1, 2).reshape(batch, patches, -1)
+        out, _ = self.out_proj(out)
+        return out
+
+
+class SpyreCLIPEncoderLayer(CLIPEncoderLayer):
+    """Upstream's pre-norm block with ``SpyreCLIPAttention``, called as ``(x, mask)``.
+
+    For the vision tower only: the text tower shares ``CLIPEncoderLayer``, so this is swapped
+    into ``vision_model.encoder.layers`` rather than patched in globally.
+    """
+
+    def __init__(self, config, quant_config=None, *, prefix: str = "", attn_cls) -> None:
+        super().__init__(config, quant_config, prefix=prefix, attn_cls=attn_cls)
+        self.self_attn = SpyreCLIPAttention(
+            config, quant_config, prefix=f"{prefix}.self_attn", attn_cls=attn_cls
+        )
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        h = x + self.self_attn(self.layer_norm1(x), mask)
+        return h + self.mlp(self.layer_norm2(h))
 
 
 @lru_cache

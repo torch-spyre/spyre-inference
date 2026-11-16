@@ -74,10 +74,6 @@ def validate_dflash_config(config) -> None:
         # The platform's default length cap must not stop drafts inside the target context.
         spec.draft_model_config.max_model_len = config.model_config.max_model_len
     parallel = config.parallel_config
-    from spyre_inference import envs
-
-    if envs.SPYRE_MODEL_RUNNER != "v1":
-        raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
     if config.model_config.dtype != torch.float16 or spec.draft_model_config.dtype != torch.float16:
         raise ValueError("Spyre DFlash/XPress currently requires float16 serving weights")
     if config.model_config.enforce_eager:

@@ -45,6 +45,13 @@ on:
         required: false
         type: boolean
         default: false
+      image_rpms:
+        description: >-
+          When true, skip the baseline RPM install and use the runner image's Spyre RPMs, while still building
+          spyre-inference and torch-spyre (torch_spyre_ref) from source. Not combinable with rpm_names.
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -276,13 +283,18 @@ jobs:
         id: delta
         env:
           PREBAKED: ${{ inputs.use_prebaked_image }}
+          IMAGE_RPMS: ${{ inputs.image_rpms }}
           RPM_NAMES: ${{ inputs.rpm_names }}
           TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
         run: |
           SHA="$(git rev-parse HEAD)"
           TOKENS="spyre-inference@${SHA:0:12}"
           if [[ "${PREBAKED}" != "true" ]]; then
-            TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            if [[ "${IMAGE_RPMS}" == "true" ]]; then
+              TOKENS="${TOKENS} image-rpms"
+            else
+              TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            fi
             if [[ -n "${TORCH_SPYRE_REF}" ]]; then
               TOKENS="${TOKENS} torch-spyre@${TORCH_SPYRE_REF}"
             fi
@@ -1020,6 +1032,7 @@ jobs:
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
@@ -1111,6 +1124,7 @@ jobs:
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
@@ -1391,7 +1405,7 @@ jobs:
       # use_prebaked_image is true, so the run uses the image's Spyre stack
       # as-is. See issue #543.
       - name: Install Spyre RPMs
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/spyre-rpm-install
 
       # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
@@ -1403,10 +1417,16 @@ jobs:
 
       # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
       - name: uv cache (NFS)
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/uv-nfs-cache
         with:
           storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+
+      - name: Reject image_rpms with override RPMs
+        if: ${{ inputs.image_rpms && inputs.rpm_names != '' }}
+        run: |
+          echo "::error::image_rpms cannot be combined with rpm_names: override RPMs layer onto the baseline install, which image_rpms skips."
+          exit 1
 
       - name: Install override Spyre RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -1432,9 +1452,14 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+          IMAGE_RPMS: "${{ inputs.image_rpms }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+          # uv keys a git-built wheel on the rev alone, so a wheel built against other RPMs would be reused; force a rebuild against the image's.
+          if [[ "$IMAGE_RPMS" == "true" ]]; then
+            uv cache clean torch-spyre
+          fi
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
             # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
             # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
@@ -1541,8 +1566,9 @@ jobs:
           v2-run-id: ${{ inputs.run_id }}
           state: ${{ steps.bench.outcome == 'success' && 'passed' || 'failed' }}
           leg-key: ${{ matrix.leg.key }}
-          rpm-lock: ${{ !inputs.use_prebaked_image && 'spyre-rpms.lock' || '' }}
+          rpm-lock: ${{ !inputs.use_prebaked_image && !inputs.image_rpms && 'spyre-rpms.lock' || '' }}
           installed: >-
+            ${{ inputs.image_rpms && 'image-rpms' || '' }}
             ${{ inputs.rpm_names }}
             ${{ inputs.torch_spyre_ref && format('torch-spyre@{0}', inputs.torch_spyre_ref) || '' }}
           job-id: '0'

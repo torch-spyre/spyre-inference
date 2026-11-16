@@ -218,6 +218,14 @@ Using `-s` with `git commit` will automatically add this header.
 
 `main` requires signed commits, so every commit must also carry a GPG or SSH signature from a key registered on your GitHub account. Sign with `git commit -s -S`, or set `git config commit.gpgsign true` once. See [GitHub's guide to signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
 
+### CI time report
+
+After each green CI run on a PR, the `ci-time-report` workflow compares the run's per-test durations with recent runs on the base branch. New tests and new matrix legs count as added time; tests the PR removes count against it. When the net addition is 3% or more of main's test time (measured on its trunk-tier push runs), a bot comment lists what was added and asks you to confirm it is intended. Expensive e2e tests should earn their place: prefer a smaller model, fewer parametrizations, or folding the check into a test that already loads the same model. The comment never blocks the merge. PRs against `release-*` branches are skipped, since those branches have no push runs to compare with. To see the numbers for any PR (needs an authenticated [GitHub CLI](https://cli.github.com/)):
+
+```bash
+uv run --no-project --with pyyaml python3 .github/scripts/ci_time_report.py report --pr <number>
+```
+
 ## Additional Resources
 
 - [vLLM Documentation](https://docs.vllm.ai/)

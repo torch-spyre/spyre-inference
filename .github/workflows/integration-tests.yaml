@@ -96,6 +96,14 @@ on:
         required: false
         type: boolean
         default: false
+      image_rpms:
+        description: >-
+          When true, use the runner image's Spyre RPMs instead of installing the spyre-rpms.lock baseline,
+          but still build spyre-inference from the checked-out ref and torch-spyre from torch_spyre_ref.
+          Not combinable with rpm_names. Unlike use_prebaked_image, nothing is assumed to be baked in.
+        required: false
+        type: boolean
+        default: false
       test_type:
         description: >-
           Suite subset to run: unit | integration (default, the smoke suite)
@@ -205,6 +213,7 @@ jobs:
       # A dispatch on a prebaked image (for example Jenkins with a per-PR
       # runner_label) passes true to skip that install. See issue #543.
       use_prebaked_image: ${{ inputs.use_prebaked_image }}
+      image_rpms: ${{ inputs.image_rpms }}
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       torch_spyre_ref: ${{ inputs.torch_spyre_ref || '' }}

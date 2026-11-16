@@ -512,3 +512,4 @@ perf-legs: ## Print the CI perf legs (one per selected model and TP, with the ca
 # spyre-bench wrappers (advisory). `bench-run` gets the same AIU setup as run-one.
 BENCH_PREFIX = $(AIU_SETUP_CMD);
 include mk/bench.mk
+include mk/bench-nightly.mk

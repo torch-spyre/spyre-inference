@@ -147,6 +147,12 @@ def parse_args() -> Any:
         help="Names this leg when several legs share one run_id, so each lands its own v2 rows.",
     )
     parser.add_argument(
+        "--purpose",
+        choices=["", "nightly", "weekly", "on-demand"],
+        default="",
+        help="Recorded as the run.purpose tag of the benchmark rows (empty records nothing).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print rows instead of inserting into ClickHouse",
@@ -342,16 +348,26 @@ IDENTITY_GOLDENS = (
 )
 
 
-def _write_v2_benchmarks(client, db: str, rows, run_id_value: str, leg_key: str = "") -> None:
+def _write_v2_benchmarks(
+    client, db: str, rows, run_id_value: str, leg_key: str = "", purpose: str = ""
+) -> None:
     """benchmarks + benchmark_runs for this leg; a failure must not cost the flat rows."""
+    tags = {"run.purpose": purpose} if purpose else {}
     try:
         if leg_key:
             # Dedup per leg, not per run: legs share the run_id, and only the first would land.
             write_benchmarks(
-                client, db, rows, run_id_value, row_props={"upload_id": leg_key}, append=True
+                client,
+                db,
+                rows,
+                run_id_value,
+                row_props={"upload_id": leg_key, **tags},
+                append=True,
             )
         else:
-            write_benchmarks(client, db, rows, run_id_value)
+            write_benchmarks(
+                client, db, rows, run_id_value, **({"row_props": tags} if tags else {})
+            )
     except Exception as exc:  # noqa: BLE001
         log.warning("v2 perf write failed, %s unaffected: %r", RESULTS_TABLE, exc)
 
@@ -361,6 +377,7 @@ def insert_to_clickhouse(
     v2_run_id_value: str = "",
     leg: Any = None,
     leg_key: str = "",
+    purpose: str = "",
 ) -> None:
     """Insert rows into ClickHouse using environment-configured connection."""
     clickhouse_env_vars = {
@@ -424,7 +441,7 @@ def insert_to_clickhouse(
     if v2_run_id_value and v2db:
         if leg is not None:
             _write_artifact_results(client, v2db, rows, v2_run_id_value, leg)
-        _write_v2_benchmarks(client, v2db, rows, v2_run_id_value, leg_key)
+        _write_v2_benchmarks(client, v2db, rows, v2_run_id_value, leg_key, purpose)
     elif v2_run_id_value:
         # Cause-agnostic: a drift has already said its piece as an ::error:: above, and this
         # is the only report when the database is simply not configured.
@@ -504,7 +521,11 @@ def main() -> None:
         return
 
     insert_to_clickhouse(
-        rows, resolve_v2_run_id(args), args if links_artifact(args) else None, args.leg_key
+        rows,
+        resolve_v2_run_id(args),
+        args if links_artifact(args) else None,
+        args.leg_key,
+        args.purpose,
     )
 
 

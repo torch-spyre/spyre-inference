@@ -70,6 +70,12 @@ inputs:
     description: The benchmark step's verdict (passed | failed) for artifact_results.
     required: false
     default: passed
+  purpose:
+    description: >-
+      The run purpose (nightly, weekly, on-demand), recorded as the run.purpose tag of the rows so
+      baseline eligibility can tell scheduled runs from ad-hoc ones. Empty records nothing.
+    required: false
+    default: ''
   leg-key:
     description: Names this leg when several perf legs share one run, so each lands its own v2 rows.
     required: false
@@ -184,4 +190,5 @@ runs:
           --installed "${{ inputs.installed }}" \
           --state "${{ inputs.state }}" \
           --leg-key "${{ inputs.leg-key }}" \
+          --purpose "${{ inputs.purpose }}" \
           --repository "${{ github.repository }}"

@@ -22,9 +22,10 @@ perspectives:
       registered in spyre_inference/models/__init__.py, a mixin that overrides one hook
       (SpyreBertEmbeddingMixin replaces only _build_model to swap the embedding class;
       _SpyreRotaryMixin extends __init__ through super()), or a platform
-      hook in platform.py. When upstream exposes no hook for the change, recommend making
-      one (a small extracted method we override, or an upstream PR adding it) over forking
-      the code. Verbatim vendoring is allowed only under _vendored/ or csrc/, with the
+      hook in platform.py. Every suggested fix must work in this PR against the pinned vLLM:
+      when upstream has no hook, override the smallest upstream method that contains the
+      change and defer the rest to super(), or vendor it as below. An upstream PR adding a
+      hook may be noted as a follow-up, never as the requested change. Verbatim vendoring is allowed only under _vendored/ or csrc/, with the
       upstream source SHA in the header and the reason the pinned vLLM lacks it; new copies
       elsewhere, or vendored files edited away from upstream, are changes_requested. Quote
       the duplicated lines and the upstream file:line they come from

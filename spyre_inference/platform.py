@@ -694,8 +694,10 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            # MRV2 builds self.speculator, which load.py refuses only once the model loads.
-            "speculative decoding": vllm_config.speculative_config is not None,
+            "speculative decoding other than DFlash/XPress": (
+                vllm_config.speculative_config is not None
+                and not vllm_config.speculative_config.use_dflash()
+            ),
             # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
             "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),
             # A CUDA-graph encoder manager; Spyre compiles towers per budget at warmup.
@@ -911,12 +913,6 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        if (
-            runner == "v2"
-            and vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_dflash()
-        ):
-            raise ValueError("Spyre DFlash/XPress currently requires SPYRE_MODEL_RUNNER=v1")
         # Every process, ahead of the V1 validation that follows this hook in __post_init__.
         from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
 

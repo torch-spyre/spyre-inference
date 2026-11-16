@@ -271,6 +271,22 @@ records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+`SPYRE_ATTN_DECODE_SHAPES` replaces that cross product with an exact list of
+num-sequences × KV-length shapes. Give it either `NxL` entries (`32x4096,32x3072,24x4096`) or
+the path to a JSON file holding a list of `[num_seqs, kv_len]` pairs. Warmup records exactly
+those shapes, clamped to `--max-num-seqs` and `--max-model-len`, and adds their batch sizes to
+the default `compile_sizes`. A decode batch runs on the shape with the smallest listed
+batch × KV-length that holds it, ties going to the shorter KV length; a shape clamped to the
+run's limits keeps its listed size for that choice, so at a 4k context the list behaves exactly
+as its entries up to 4096. Jagged decode groups sequences by the shortest shape length that
+holds them, as it does by KV bucket without shapes. A batch no shape holds, such as 32
+sequences with one at a length only shapes with fewer sequences reach, runs as those length
+groups alone, a group with more sequences than any shape allows at its length in pieces; this
+needs `SPYRE_JAGGED_DECODE=1` (the default). Otherwise, or when a sequence outruns every shape, the per-sequence loop
+serves the decode batch. It cannot be combined with
+`SPYRE_ATTN_NUM_SEQS_BUCKETS` or `SPYRE_ATTN_KV_LADDER_LARGE_BATCH`, and leaves the
+per-sequence (prefill) buckets alone.
+
 ## KV cache size
 
 The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the

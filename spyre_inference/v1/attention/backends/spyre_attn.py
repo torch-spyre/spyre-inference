@@ -1002,17 +1002,37 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
-            b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            b_blocks = (
-                self._attn_bucketer.find_batched_blocks_bucket(max(decode_blocks), b_seqs)
-                if b_seqs is not None
-                else None
-            )
+            bucketer = self._attn_bucketer
+            shapes = bucketer.decode_shapes is not None
+            if shapes:
+                b_seqs, b_blocks = bucketer.find_decode_shape(
+                    num_decode_seqs, max(decode_blocks)
+                ) or (None, None)
+            else:
+                b_seqs = bucketer.find_sequence_bucket(num_decode_seqs)
+                b_blocks = (
+                    bucketer.find_batched_blocks_bucket(max(decode_blocks), b_seqs)
+                    if b_seqs is not None
+                    else None
+                )
+            # Mean/max block count: how uniform the contexts are, independent of
+            # bucket round-up (which padding the denser ladder addresses instead).
+            uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
 
+            if shapes and b_seqs is None and envs.SPYRE_JAGGED_DECODE:
+                # The group scatter writes row m for decode sequence m.
+                assert query_start_loc[:num_decode_seqs].tolist() == list(range(num_decode_seqs))
+                decode_uniformity = uniformity
+                decode_groups = self._batched_decode_groups(
+                    decode_blocks,
+                    blocks_per_seq,
+                    block_table,
+                    query_start_loc,
+                    active_block_indices,
+                    attention_mask_stacks,
+                )
             if b_seqs is not None and b_blocks is not None:
-                # Mean/max block count: how uniform the contexts are, independent of
-                # bucket round-up (which padding the denser ladder addresses instead).
-                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
+                decode_uniformity = uniformity
                 prefix = list(range(num_decode_seqs))
                 (
                     padded_num_seqs,
@@ -1168,16 +1188,25 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         bucketer = self._attn_bucketer
 
         def chunks(members: list[int]) -> int | None:
-            b_seqs = bucketer.find_sequence_bucket(len(members))
-            b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[m] for m in members))
-            if b_seqs is None or b_blocks is None:
-                return None
-            return batched_decode_chunking(b_seqs, b_blocks)[1]
+            bucket = self._decode_group_bucket(members, decode_blocks)
+            return None if bucket is None else batched_decode_chunking(*bucket)[1]
 
+        shapes = bucketer.decode_shapes is not None
+        key = bucketer.find_shape_blocks if shapes else bucketer.find_blocks_bucket
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
-            by_bucket.setdefault(bucketer.find_blocks_bucket(nb) or 0, []).append(s)
+            k = key(nb)
+            if k is None and shapes:
+                return None
+            by_bucket.setdefault(k or 0, []).append(s)
         groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
+        if shapes:
+            capped = []
+            for members in groups:
+                cap = bucketer.decode_shape_cap(max(decode_blocks[m] for m in members))
+                longest_first = sorted(members, key=lambda m: -decode_blocks[m])
+                capped += [longest_first[i : i + cap] for i in range(0, len(members), cap)]
+            groups = capped
         merged = True
         while merged and len(groups) > 1:
             merged = False
@@ -1187,8 +1216,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     chunks(groups[i + 1]),
                     chunks(groups[i] + groups[i + 1]),
                 )
-                if ca is None or cb is None or cab is None:
+                if ca is None or cb is None:
                     return None
+                # Only a shape list leaves a union uncovered; the two groups stay apart.
+                if cab is None:
+                    continue
                 if cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
                     groups[i : i + 2] = [groups[i] + groups[i + 1]]
                     merged = True
@@ -1198,9 +1230,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         out = []
         for members in groups:
             members.sort()
-            b_seqs = bucketer.find_sequence_bucket(len(members))
-            b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[m] for m in members))
-            assert b_seqs is not None and b_blocks is not None
+            bucket = self._decode_group_bucket(members, decode_blocks)
+            assert bucket is not None
+            b_seqs, b_blocks = bucket
             fields = self._batched_decode_tensors(
                 members,
                 b_seqs,
@@ -1215,6 +1247,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 BatchedDecodeGroup(len(members), torch.tensor(members, dtype=torch.int32), *fields)
             )
         return out
+
+    def _decode_group_bucket(
+        self, members: list[int], decode_blocks: list[int]
+    ) -> tuple[int, int] | None:
+        bucketer = self._attn_bucketer
+        max_blocks = max(decode_blocks[m] for m in members)
+        if bucketer.decode_shapes is not None:
+            return bucketer.find_decode_shape(len(members), max_blocks)
+        b_seqs = bucketer.find_sequence_bucket(len(members))
+        b_blocks = bucketer.find_blocks_bucket(max_blocks)
+        return None if b_seqs is None or b_blocks is None else (b_seqs, b_blocks)
 
     def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
         """Set the KV-write slots this builder's layers read on their next forward."""

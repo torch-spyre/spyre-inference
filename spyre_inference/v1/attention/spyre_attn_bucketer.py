@@ -35,6 +35,8 @@ consecutive buckets is the *bucket step*.
 from __future__ import annotations
 
 import bisect
+import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -103,6 +105,47 @@ def _parse_buckets(raw: str | None) -> list[int] | None:
     if not values or values[0] < 1:
         raise ValueError(f"bucket entries must be >= 1, got {raw!r}")
     return values
+
+
+def parse_decode_shapes(raw: str | None) -> list[tuple[int, int]] | None:
+    if not raw:
+        return None
+    pairs: list[tuple[int, int]] = []
+    if raw.strip().endswith(".json") or os.path.isfile(raw):
+        with open(raw) as f:
+            for entry in json.load(f):
+                num_seqs, kv_len = entry
+                pairs.append((int(num_seqs), int(kv_len)))
+    else:
+        for part in raw.split(","):
+            if not part.strip():
+                continue
+            num_seqs, sep, kv_len = part.strip().lower().partition("x")
+            if not sep:
+                raise ValueError(f"SPYRE_ATTN_DECODE_SHAPES entry {part!r} is not NxL")
+            pairs.append((int(num_seqs), int(kv_len)))
+    if not pairs or any(b < 1 or t < 1 for b, t in pairs):
+        raise ValueError(f"SPYRE_ATTN_DECODE_SHAPES needs entries >= 1, got {raw!r}")
+    return sorted(set(pairs))
+
+
+def resolve_decode_shapes(
+    shapes: list[tuple[int, int]], max_num_seqs: int, max_kv_len: int
+) -> dict[tuple[int, int], tuple[int, int]]:
+    """Shapes clamped to the run's limits, ranked by listed size; never-chosen ones dropped."""
+    ranked: dict[tuple[int, int], tuple[int, int]] = {}
+    for batch, kv_len in shapes:
+        shape = (min(batch, max_num_seqs), min(kv_len, max_kv_len))
+        rank = (batch * kv_len, kv_len)
+        ranked[shape] = min(rank, ranked.get(shape, rank))
+    return {
+        p: rank
+        for p, rank in ranked.items()
+        if not any(
+            q != p and q[0] >= p[0] and q[1] >= p[1] and q_rank < rank
+            for q, q_rank in ranked.items()
+        )
+    }
 
 
 def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
@@ -182,6 +225,13 @@ def validate_kv_ladder_env() -> None:
     if min_seqs < 1:
         raise ValueError(f"SPYRE_ATTN_LARGE_BATCH_MIN_SEQS must be >= 1, got {min_seqs}")
     large = envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH
+    if parse_decode_shapes(envs.SPYRE_ATTN_DECODE_SHAPES):
+        for var in ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "SPYRE_ATTN_NUM_SEQS_BUCKETS"):
+            if getattr(envs, var):
+                raise ValueError(
+                    f"{var} cannot be combined with SPYRE_ATTN_DECODE_SHAPES, which "
+                    "replaces the batched decode buckets it sets. Unset one of them."
+                )
     if envs.SPYRE_ATTN_KV_BUCKETS:
         # The explicit buckets replace the base ladder, so its name is not read.
         if large:
@@ -359,6 +409,40 @@ class SpyreAttnBucketer:
                 len(self._num_blocks_buckets),
             )
 
+        # (num_seqs, num_blocks) -> listed (num_seqs * kv_len, kv_len) rank.
+        self._decode_shapes: dict[tuple[int, int], tuple[int, int]] | None = None
+        shapes = parse_decode_shapes(envs.SPYRE_ATTN_DECODE_SHAPES)
+        if shapes is not None:
+            max_blocks = self._num_blocks_buckets[-1]
+            floor = self._num_blocks_buckets[0]
+            self._decode_shapes = {}
+            for (s, kv_len), rank in resolve_decode_shapes(
+                shapes, max_num_seqs, max_model_len
+            ).items():
+                shape = (s, min(max_blocks, max(floor, (kv_len + block_size - 1) // block_size)))
+                self._decode_shapes[shape] = min(rank, self._decode_shapes.get(shape, rank))
+            logger.info(
+                "SpyreAttnBucketer: batched decode uses %d of %d shapes (num_seqs x kv_len): %s",
+                len(self._decode_shapes),
+                len(shapes),
+                ", ".join(f"{s}x{b * block_size}" for s, b in sorted(self._decode_shapes)),
+            )
+            longest = max(b for _, b in self._decode_shapes)
+            if longest < max_blocks:
+                logger.warning(
+                    "SPYRE_ATTN_DECODE_SHAPES reaches %d tokens, below max_model_len=%d: a "
+                    "decode batch holding a longer sequence runs the per-seq loop.",
+                    longest * block_size,
+                    max_model_len,
+                )
+            elif self.find_decode_shape(max_num_seqs, max_blocks) is None:
+                logger.info(
+                    "No decode shape holds %d seqs at %d tokens; such batches run as length "
+                    "groups (SPYRE_JAGGED_DECODE=1) or the per-seq loop.",
+                    max_num_seqs,
+                    max_blocks * block_size,
+                )
+
         logger.info(
             "SpyreAttnBucketer: %d kv buckets [%d..%d], %d query buckets [%d..%d], "
             "max num_blocks=%d",
@@ -412,6 +496,30 @@ class SpyreAttnBucketer:
     def find_batched_blocks_bucket(self, num_blocks: int, num_seqs_bucket: int) -> int | None:
         return self._round_up(num_blocks, self.batched_blocks_buckets(num_seqs_bucket))
 
+    @property
+    def decode_shapes(self) -> list[tuple[int, int]] | None:
+        """``(num_seqs, num_blocks)`` per shape."""
+        return None if self._decode_shapes is None else sorted(self._decode_shapes)
+
+    def find_decode_shape(self, num_seqs: int, num_blocks: int) -> tuple[int, int] | None:
+        """Least listed volume that holds the batch; ties go to the shorter listed kv_len."""
+        assert self._decode_shapes is not None
+        fits = [
+            (rank, p)
+            for p, rank in self._decode_shapes.items()
+            if p[0] >= num_seqs and p[1] >= num_blocks
+        ]
+        return min(fits)[1] if fits else None
+
+    def find_shape_blocks(self, num_blocks: int) -> int | None:
+        """In blocks."""
+        assert self._decode_shapes is not None
+        return min((b for _, b in self._decode_shapes if b >= num_blocks), default=None)
+
+    def decode_shape_cap(self, num_blocks: int) -> int:
+        assert self._decode_shapes is not None
+        return max((s for s, b in self._decode_shapes if b >= num_blocks), default=0)
+
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
         idx = bisect.bisect_left(self._query_buckets, padded_query_len)
@@ -457,7 +565,15 @@ class SpyreAttnBucketer:
             return []
         out: list[SpyreAttnBatchedDecodeBucket] = []
         pairs = sorted(
-            ((nb, ns) for ns in self._num_seqs_buckets for nb in self.batched_blocks_buckets(ns)),
+            (
+                ((nb, ns) for ns, nb in self._decode_shapes)
+                if self._decode_shapes is not None
+                else (
+                    (nb, ns)
+                    for ns in self._num_seqs_buckets
+                    for nb in self.batched_blocks_buckets(ns)
+                )
+            ),
             reverse=True,
         )
         for num_blocks, num_seqs in pairs:

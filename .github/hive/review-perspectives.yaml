@@ -21,3 +21,18 @@ perspectives:
       that loosen rtol/atol, swap the CPU reference, add skip/xfail, or force
       enforce_eager to make a numerics test pass. Name the op or file:line. A tolerance
       change the PR body does not justify is changes_requested
+  - name: spyre-hardware-validation
+    focus: >-
+      proof that the change was exercised on real Spyre cards, not only on CPU or by a test
+      that silently skipped. For each test the PR adds or changes that needs hardware,
+      check it lands in a CI job that can run it: TP=2 tests need the distributed marker
+      (2-card spyre_pf_x2 jobs) and TP=4 tests need distributed_tp4 (the one 4-card
+      spyre_pf_x4 job). A multi-card test without its marker lands on a 1-card runner and
+      skips itself through spyre_device_count() or spyre_available() guards, and a skip
+      guard or skipif that is true on every runner means the test never runs. Once the
+      PR's Test each commit run has finished, confirm from its Aggregate test report
+      summary (it lists every skipped case with its shard and reason) or the junit-*
+      artifacts that each new test was collected and passed rather than skipped or
+      deselected. A new hardware test that never ran, or a change to device-path code
+      that no Spyre-run test covers, is changes_requested. Cite the test node ID and the
+      job it landed in

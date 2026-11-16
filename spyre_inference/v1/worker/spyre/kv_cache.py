@@ -18,14 +18,13 @@
 Upstream's initialize_kv_cache runs as-is, so every attribute it sets stays
 upstream's. Its two module-level calls have no override hook, so they're swapped
 for the call: init_attn_backend gains the window split (attn_groups.py), and
-init_kv_cache allocates per-layer SpyrePagedKVCache pages on Spyre.
+init_kv_cache allocates per-layer SpyrePagedKVCache pages on Spyre, draft layers
+included. The draft's own groups get the split in SpyreDFlashSpeculator.set_attn.
 
 The pages go on runner.spyre_kv_caches; upstream gets an empty dict back, since it
 filters by ``cache.device``, which the page tuple lacks. Only the KV connector and
 prefix-cache block copies read it, and neither is supported: init() refuses a KV
-transfer config and the runner refuses the copies (model_runner.py). init() also
-refuses speculative decoding, whose speculator calls init_attn_backend through its
-own import, outside the swap.
+transfer config and the runner refuses the copies (model_runner.py).
 """
 
 import contextlib
@@ -90,11 +89,6 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
 
 def init(runner: "SpyreModelRunnerV2", kv_cache_config: KVCacheConfig, **kwargs: Any) -> None:
     """Upstream's initialize_kv_cache with the Spyre attention groups and pages."""
-    if runner.speculator is not None:
-        raise NotImplementedError(
-            "Speculative decoding is not supported on the Spyre V2 runner (#1240): the "
-            "draft model's attention groups would skip the sliding-window split."
-        )
     if not kwargs.get("is_profiling", False) and has_kv_transfer_group():
         raise NotImplementedError(
             "KV connectors are not supported on the Spyre V2 runner (#1240): the "

@@ -21,7 +21,7 @@ public_models:
   # matrix prefetches these offline before the HF_HUB_OFFLINE test steps. granite-4.1-3b
   # is listed below. (Unpinned, matching its gsm8k siblings.)
   - Qwen/Qwen2.5-0.5B-Instruct
-  # Pinned with tests/e2e/test_speculative_decoding.py.
+  # Pinned with tests/e2e/test_xpress_v2.py.
   - repo: Qwen/Qwen3-8B
     revision: b968826d9c46dd6066d109eabc6255188de91218
   - repo: UIUC-SSAIL/Qwen3-8B-XPress-b16

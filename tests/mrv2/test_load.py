@@ -26,8 +26,10 @@ import pytest
 import torch
 import torch.nn as nn
 from vllm.config import CompilationMode
+from vllm.model_executor.models.interfaces import SupportsEagle3, supports_eagle3
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import set_eagle3_aux_hidden_state_layers
 
 from spyre_inference.v1.worker.spyre import load
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
@@ -50,6 +52,8 @@ def _runner(**attrs) -> SimpleNamespace:
         "max_num_tokens": 2048,
         "lora_config": None,
         "speculator": None,
+        "num_speculative_steps": 0,
+        "use_aux_hidden_state_outputs": False,
         "parallel_config": SimpleNamespace(enable_batch_sharded_sampling=False),
         "is_pooling_model": False,
         "compilation_config": SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
@@ -172,6 +176,58 @@ def test_row_buckets_cover_the_prompt_logprobs_chunk(
     assert wrapper._logits_row_buckets == want
 
 
+def test_row_buckets_cover_every_verified_draft_row(steps, monkeypatch) -> None:
+    """A verify step projects num_reqs x (drafts + 1) rows, not one row per request."""
+    bucketer = SimpleNamespace(bucket_sizes=[16, 32, 64, 128])
+    monkeypatch.setattr(load.SpyreShapeBucketer, "for_config", staticmethod(lambda c: bucketer))
+    config = _vllm_config(max_logprobs=0)
+    runner = _runner(num_speculative_steps=15, use_aux_hidden_state_outputs=True)
+
+    wrapper = _wrap(_Loader(FakeModel()), runner).load_model(
+        vllm_config=config, model_config=config.model_config
+    )
+
+    assert wrapper._logits_row_buckets == [16, 32, 64]
+    assert wrapper._keep_aux_hidden_states_on_device is True
+
+
+class _Eagle3Model(FakeModel, SupportsEagle3):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aux_layers: tuple[int, ...] = ()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.aux_layers = layers
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return (1, 2)
+
+
+def test_upstreams_aux_layer_setup_accepts_an_eagle3_models_wrapper(steps) -> None:
+    """SupportsEagle3 is a runtime Protocol, which attribute forwarding alone doesn't
+    satisfy; upstream's set_eagle3_aux_hidden_state_layers raises on a plain wrapper."""
+    config = _vllm_config()
+    model = _Eagle3Model()
+    wrapper = _wrap(_Loader(model), _runner()).load_model(
+        vllm_config=config, model_config=config.model_config
+    )
+    spec = SimpleNamespace(draft_model_config=None)
+
+    set_eagle3_aux_hidden_state_layers(wrapper, spec)
+
+    assert isinstance(wrapper, _SpyreModelWrapper) and model.aux_layers == (1, 2)
+
+
+def test_a_model_without_the_interface_gets_the_plain_wrapper(steps) -> None:
+    config = _vllm_config()
+    wrapper = _wrap(_Loader(FakeModel()), _runner()).load_model(
+        vllm_config=config, model_config=config.model_config
+    )
+    assert not supports_eagle3(wrapper)
+    with pytest.raises(RuntimeError, match="EAGLE3 interface"):
+        set_eagle3_aux_hidden_state_layers(wrapper, SimpleNamespace(draft_model_config=None))
+
+
 def test_the_loader_forwards_everything_else() -> None:
     loader = _wrap(_Loader(FakeModel()), _runner())
     assert loader.load_config == "load-config"
@@ -220,7 +276,7 @@ def test_upstreams_stock_compile_is_a_no_op_inside(monkeypatch, stub_targets) ->
 
 @pytest.mark.parametrize(
     "bypassed",
-    ["get_model_loader", "init_model_state", "compile_model_with_stock_torch", "PoolingRunner"],
+    _ALL,
 )
 def test_a_swap_upstream_bypasses_fails_loudly(stub_targets, bypassed) -> None:
     """A vLLM bump that imports one of these locally would otherwise make the swap a
@@ -268,15 +324,13 @@ def test_a_failure_after_the_swaps_ran_adds_no_note(stub_targets) -> None:
     assert not getattr(info.value, "__notes__", None)
 
 
-def test_load_refuses_lora_spec_decode_and_caller_built_models() -> None:
+def test_load_refuses_lora_batch_sharding_and_caller_built_models() -> None:
     with pytest.raises(NotImplementedError, match="LoRA"):
         load.load_and_wrap(_runner(lora_config=object()))
     with pytest.raises(NotImplementedError, match="Batch-sharded sampling"):
         load.load_and_wrap(
             _runner(parallel_config=SimpleNamespace(enable_batch_sharded_sampling=True))
         )
-    with pytest.raises(NotImplementedError, match="Speculative decoding"):
-        load.load_and_wrap(_runner(speculator=object()))
     with pytest.raises(NotImplementedError, match="caller-built"):
         load.load_and_wrap(_runner(), model=FakeModel())
 

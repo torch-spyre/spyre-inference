@@ -13,8 +13,9 @@
 # limitations under the License.
 
 """The csrc/ host kernels match upstream's Triton kernels on triton-cpu, output
-for output and buffer for buffer. One subprocess for every case: the gate has to
-open real Triton before vLLM imports, which this process did with it closed."""
+for output and buffer for buffer. One subprocess per pytest process runs the cases it
+selected: the gate has to open real Triton before vLLM imports, which this process
+did with it closed."""
 
 import importlib.util
 import os
@@ -34,9 +35,17 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def parity_report() -> dict[str, list[str]]:
+def parity_report(request: pytest.FixtureRequest) -> dict[str, list[str]]:
+    # Only this shard's cases: every shard with one parity test otherwise reran them all.
+    selected = sorted(
+        {
+            item.callspec.params["name"]
+            for item in request.session.items
+            if item.module is request.module and hasattr(item, "callspec")
+        }
+    )
     result = subprocess.run(
-        [sys.executable, "-m", "mrv2.kernels.parity_cases"],
+        [sys.executable, "-m", "mrv2.kernels.parity_cases", *selected],
         capture_output=True,
         text=True,
         env={

@@ -1417,10 +1417,16 @@ jobs:
 
       # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
       - name: uv cache (NFS)
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/uv-nfs-cache
         with:
           storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+
+      - name: Reject image_rpms with override RPMs
+        if: ${{ inputs.image_rpms && inputs.rpm_names != '' }}
+        run: |
+          echo "::error::image_rpms cannot be combined with rpm_names: override RPMs layer onto the baseline install, which image_rpms skips."
+          exit 1
 
       - name: Install override Spyre RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -1446,9 +1452,14 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+          IMAGE_RPMS: "${{ inputs.image_rpms }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+          # uv keys a git-built wheel on the rev alone, so a wheel built against other RPMs would be reused; force a rebuild against the image's.
+          if [[ "$IMAGE_RPMS" == "true" ]]; then
+            uv cache clean torch-spyre
+          fi
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
             # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
             # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare

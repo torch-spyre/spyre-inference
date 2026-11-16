@@ -23,19 +23,22 @@ is the reference here instead.
 from __future__ import annotations
 
 import pytest
+from spyre_testing_plugin.greedy_checks import Trace, assert_greedy_runs_agree, logprob_trace
 
+# Wide top-1/top-2 margin at every step, so no near-tie decides the comparison.
 PROMPTS = [
-    "Hello, my name is",
-    "The capital of France is",
+    "Count to ten: one, two, three",
+    "1, 2, 3, 4, 5, 6,",
 ]
 
-# The two paths are not bit-identical: they run different module code (HF's vs vLLM's)
-# and round their rotation caches differently, so greedy sampling eventually tie-breaks
-# apart. The failure mode being guarded against diverges from the first token or two.
+# The paths run different module code and round differently, so a near-tie may flip; a real
+# break puts the other path's token outside the top-k at once.
 MAX_TOKENS = 8
+NUM_LOGPROBS = 5
+LOGPROB_TOLERANCE = 0.1
 
 
-def _generate_greedy(model: str, model_impl: str) -> list[list[int]]:
+def _generate_greedy(model: str, model_impl: str) -> Trace:
     from vllm import LLM, SamplingParams
     from vllm.distributed import cleanup_dist_env_and_memory
 
@@ -50,12 +53,14 @@ def _generate_greedy(model: str, model_impl: str) -> list[list[int]]:
     assert llm.llm_engine.model_config.using_transformers_backend() == (
         model_impl == "transformers"
     )
-    outputs = llm.generate(PROMPTS, SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0))
-    token_ids = [list(o.outputs[0].token_ids) for o in outputs]
+    outputs = llm.generate(
+        PROMPTS, SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, logprobs=NUM_LOGPROBS)
+    )
+    trace = logprob_trace(outputs)
 
     del llm
     cleanup_dist_env_and_memory()
-    return token_ids
+    return trace
 
 
 @pytest.mark.uses_subprocess
@@ -73,7 +78,8 @@ def test_transformers_matches_native(model: str) -> None:
     Content, not just non-empty output: a broken RoPE or a norm falling back to an
     unsupported fp32 promotion still yields fluent text, just unrelated to the prompt.
     """
-    transformers_ids = _generate_greedy(model, "transformers")
-    native_ids = _generate_greedy(model, "vllm")
-
-    assert transformers_ids == native_ids
+    transformers = _generate_greedy(model, "transformers")
+    native = _generate_greedy(model, "vllm")
+    assert_greedy_runs_agree(
+        native, transformers, LOGPROB_TOLERANCE, names=("native", "transformers")
+    )

@@ -420,8 +420,9 @@ rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup recor
 per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
 block counts that fit its smallest real query length; variants exceeding the allocated
 page count are skipped. When the page table is declared with `tensor.to(dynamic=...)`,
-each query bucket is one per-sequence variant at the largest block count. Failed
-recordings are logged and compile on first use instead.
+each query bucket records a single per-sequence variant, traced at the page count that
+covers `max_model_len`; that one kernel serves every page count in the declared range.
+Failed recordings are logged and compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and

@@ -72,21 +72,41 @@ def test_respects_an_explicit_user_choice():
     assert args.enable_chunked_prefill is True
 
 
-def test_text_tower_is_built_with_causal_encoder_attention(monkeypatch):
+def _build_with_stub_upstream(monkeypatch, seen: dict) -> SpyreCLIPEmbeddingModel:
+    def init(self, *, vllm_config, prefix=""):
+        torch.nn.Module.__init__(self)
+        seen["attention"] = vllm_clip.Attention
+        self.text_model = torch.nn.Module()
+        self.text_model.final_layer_norm = torch.nn.LayerNorm(64, eps=1e-5)
+
+    monkeypatch.setattr(CLIPEmbeddingModel, "__init__", init)
+    monkeypatch.setattr(SpyreCLIPEmbeddingModel, "_init_spyre_vision", lambda *a: None)
+    return SpyreCLIPEmbeddingModel(vllm_config=types.SimpleNamespace(quant_config=None))
+
+
+def test_text_tower_is_built_with_causal_encoder_attention(default_vllm_config, monkeypatch):
     """The text tower takes its layers from the clip module's ``Attention``, and the
     swap is undone once the model is built."""
     upstream = vllm_clip.Attention
     seen = {}
-
-    def init(self, *, vllm_config, prefix=""):
-        torch.nn.Module.__init__(self)
-        seen["attention"] = vllm_clip.Attention
-
-    monkeypatch.setattr(CLIPEmbeddingModel, "__init__", init)
-    SpyreCLIPEmbeddingModel(vllm_config=None)
+    _build_with_stub_upstream(monkeypatch, seen)
 
     assert seen["attention"] is CausalEncoderOnlyAttention
     assert vllm_clip.Attention is upstream
+
+
+def test_text_tower_final_norm_is_built_as_spyre_layer_norm(default_vllm_config, monkeypatch):
+    """Built before weights load, under its upstream name: the post-load patch path does not
+    run for a mixin model."""
+    from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+
+    model = _build_with_stub_upstream(monkeypatch, {})
+    norm = model.text_model.final_layer_norm
+    assert isinstance(norm, SpyreLayerNorm)
+    assert norm.normalized_shape == (64,) and norm.eps == 1e-5
+    assert {"text_model.final_layer_norm.weight", "text_model.final_layer_norm.bias"} <= set(
+        model.state_dict()
+    )
 
 
 @pytest.mark.parametrize("runner_causal", [True, False])

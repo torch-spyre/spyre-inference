@@ -264,11 +264,9 @@ load-time constant such as a rope permutation becomes a non-persistent buffer on
 layer, lifted as a graph input, and a per-image one such as the attention mask is built
 once in the encoder forward and passed to each layer as an argument. A multimodal patch
 that has done that marks the layers with `mark_blocks_compilable` (`multimodal/utils.py`),
-and they are discovered like any other block stack; every other tower stays eager. CLIP's
-tower is marked (`multimodal/clip.py`): its attention is vLLM's `MMEncoderAttention`,
-which Spyre replaces out of tree (`custom_ops/vit_attn.py`) with a `padded_sdpa` call that
-traces into the block rather than running behind upstream's opaque SDPA wrapper, and its
-only mask is the key-padding row, which `padded_sdpa` keeps a graph input. Marked tower
+and they are discovered like any other block stack; every other tower stays eager. No
+registered model marks its tower any more: CLIP's (`models/clip.py`) runs on the vision
+encoder mixin below, and `multimodal/clip.py` is left until its removal. Marked tower
 blocks compile beside the decoder blocks but never stand in for them, so a model with no
 decoder blocks still falls back to the whole-model graph. Warmup runs a marked tower at
 every image-batch width up to `mm_max_items_per_batch`, for pooling and generative models
@@ -340,21 +338,21 @@ upstream: an *image token* is one position of `vision_project`'s output, counted
 budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
 `patches_per_token` per image token.
 
-| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) |
-|---|---|---|---|---|
-| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, key-padding row, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
-| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | one image's offset-major patches, a zero key-padding row, RoPE positions | valid patches only, offset-major by position; segments; x and y |
-| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, `[1, 1, 1, P]` key-padding mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
-| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses |
-| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` |
-| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default |
-| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
-| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
-| `vision_max_items_per_call` | no | layout bound on items per encoder call | 1 (so the mask only hides padding) | 63 (one-hot width) |
-| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` |
-| `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
-| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
+| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) | CLIP (`models/clip.py`) |
+|---|---|---|---|---|---|
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, key-padding row, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size | patches (zero class row), one-hot segments, positions; the slot (`class`) or 1 (`full`); `projection_dim` |
+| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image | 1 (`class`) or `grid² + 1` (`full`) per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | one image's offset-major patches, a zero key-padding row, RoPE positions | valid patches only, offset-major by position; segments; x and y | per image: class row, raster patches, slot padding (`class` only); segments; positions |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, `[1, 1, 1, P]` key-padding mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask | patch linear plus class and position embeddings, gathered; `pre_layrnorm` with fp32 statistics; image mask |
+| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses | `SpyreCLIPEncoderLayer`s with `SpyreCLIPAttention` |
+| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` | each slot's class row by a one-hot weight (`class` only); `post_layernorm` with fp32 statistics; `visual_projection` |
+| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default | default |
+| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none | none |
+| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) | 1; the slot (`class`) or 64 (`full`) |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 1 (so the mask only hides padding) | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` | `True` |
+| `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image | default |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected | `("image",)` |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
 as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
@@ -363,7 +361,7 @@ host), and `get_encoder_cudagraph_budget_range` when the processor's largest ite
 in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
-upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. Gemma 4
+upstream Pixtral and CLIP do not, so their Spyre subclasses write them. Gemma 4
 overrides `postprocess_encoder_output` to run its tail on the host in fp32, as upstream does:
 the pooler's `sqrt(hidden_size)` scale can leave the fp16 range, so the scale, standardize and
 `embed_vision` never run on the card, and its graphs end at the pooled vision hidden size. The eager

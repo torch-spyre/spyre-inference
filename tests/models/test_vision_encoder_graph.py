@@ -522,7 +522,9 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     model.vision_merge = lambda text, image, mask: merged.append(text.shape[0]) or merge(
         text, image, mask
     )
-    runner.mm_budget = SimpleNamespace(mm_max_toks_per_item={"image": 300})
+    runner.mm_budget = SimpleNamespace(
+        mm_max_toks_per_item={"image": 300}, mm_max_items_per_batch={"image": 2}
+    )
     runner._spyre_device = torch.device("cpu")
     runner.encoder_cudagraph_manager = None
 

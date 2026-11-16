@@ -2545,6 +2545,11 @@ are missing.</p>
 <td>The <code>DFlashProposer</code> import, construction and <code>isinstance</code> checks in <code>vllm/v1/worker/gpu_model_runner.py</code></td>
 <td>Temporarily replaces the module's constructor during runner initialization. The replacement remains an upstream <code>DFlashProposer</code> subclass so later checks in <code>_prepare_inputs</code> and <code>sample_tokens</code> still pass after restoration.</td>
 </tr>
+<tr>
+<td><code>csrc/cpu/mrv2_kernels.cpp</code>, <code>csrc/cpu/mrv2_spec_decode_kernels.cpp</code>, <code>HOST_KERNELS</code> / <code>UNSUPPORTED_KERNELS</code> (<code>spyre_inference/v1/worker/spyre/kernels.py</code>)</td>
+<td>Every <code>@triton.jit</code> kernel MRV2 launches under <code>vllm/v1/worker/gpu/</code> (plus <code>utils.py</code> and <code>mamba_utils.py</code>)</td>
+<td>One host op per kernel, taking the kernel's own argument list; <code>kernels.bind()</code> assigns it over the module global. <code>tests/mrv2/test_kernel_coverage.py</code> fails on a new, renamed or re-signed kernel; port the change into the op and add a case to <code>tests/mrv2/kernels/</code>, whose parity suite must stay bit-exact against triton-cpu (<code>SPYRE_MRV2_KERNELS=triton</code>).</td>
+</tr>
 </tbody>
 </table>
 <p>Diff the upstream side between the current pin and the target:</p>

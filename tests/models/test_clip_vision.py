@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``SpyreCLIPEncoderLayer`` against upstream's ``CLIPEncoderLayer`` with the same weights:
-packed images under the same-image mask each match their own unpacked run. The on-card
-twin at the bottom skips without a device."""
+"""CLIP's vision tower on Spyre against upstream with the same weights.
+
+``SpyreCLIPEncoderLayer`` against ``CLIPEncoderLayer``: packed images under the same-image mask
+each match their own unpacked run. ``SpyreCLIPEmbeddingModel``'s encoder pipeline against
+upstream's ``get_image_features``, for every pooling type. The on-card twins skip without a
+device."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,14 +27,22 @@ import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from transformers import CLIPVisionConfig
 from vllm.model_executor.layers.attention import MMEncoderAttention
-from vllm.model_executor.models.clip import CLIPEncoderLayer
+from vllm.model_executor.models.clip import (
+    CLIPEmbeddingModel,
+    CLIPEncoderLayer,
+    CLIPVisionTransformer,
+)
 
 from spyre_inference.models._vision_encoder import (
     SEGMENT_ITEMS,
     one_hot_segments,
     segment_mask,
 )
-from spyre_inference.models.clip import SpyreCLIPAttention, SpyreCLIPEncoderLayer
+from spyre_inference.models.clip import (
+    SpyreCLIPAttention,
+    SpyreCLIPEmbeddingModel,
+    SpyreCLIPEncoderLayer,
+)
 
 # Rows per image: 50 is ViT-B/32@224's grid**2 + 1; packed with 30 they fill 80 of 128 rows.
 SIZES = (50, 30)
@@ -168,3 +181,270 @@ def test_packed_images_match_upstream_on_spyre(tp_group, compiled):
             # the mask zeroed.
             assert _cosine(out[start : start + img.shape[0]], want) > 0.9999
             start += img.shape[0]
+
+
+# --- SpyreCLIPEmbeddingModel's encoder pipeline ---
+
+# 56 / 7 = an 8x8 grid: 65 rows per image, so a "class" slot is 128 rows with 63 of padding.
+# 3*7*7 = 147 values per patch, padded to 192.
+IMAGE, PATCH, PROJECTION = 56, 7, 64
+POOLING_TYPES = ["LAST", "CLS", "MEAN", "ALL"]
+
+
+def _tower_config(num_layers: int = 2) -> CLIPVisionConfig:
+    return CLIPVisionConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=2,  # head_dim 64
+        num_hidden_layers=num_layers,
+        num_channels=3,
+        image_size=IMAGE,
+        patch_size=PATCH,
+        layer_norm_eps=1e-5,
+        hidden_act="quick_gelu",
+    )
+
+
+def _upstream_modules(config: CLIPVisionConfig) -> nn.ModuleDict:
+    torch.manual_seed(0)
+    mods = nn.ModuleDict(
+        {
+            "vision_model": CLIPVisionTransformer(config, prefix="vision_model"),
+            "visual_projection": nn.Linear(config.hidden_size, PROJECTION, bias=False),
+        }
+    )
+    for p in mods.parameters():
+        p.data.normal_(std=0.05)
+    for name, p in mods.named_parameters():
+        if ("norm" in name or "layrnorm" in name) and name.endswith("weight"):
+            p.data.add_(1.0)
+    # Unfinished on purpose: the Spyre linears transpose `weight` when loading finishes.
+    return mods
+
+
+def _reference(config, pooling_type: str, images: list[torch.Tensor]) -> torch.Tensor:
+    """Upstream ``CLIPEmbeddingModel.get_image_features``: ``[images, tokens, projection]``."""
+    mods = _upstream_modules(config)
+    _finish_weight_loading(mods)
+    model = SimpleNamespace(
+        vision_model=mods["vision_model"],
+        visual_projection=mods["visual_projection"],
+        pooler_config=SimpleNamespace(seq_pooling_type=pooling_type),
+    )
+    return CLIPEmbeddingModel.get_image_features(model, torch.stack(images))
+
+
+def _spyre_model(config, pooling_type: str, dtype=torch.float16) -> SpyreCLIPEmbeddingModel:
+    """A ``SpyreCLIPEmbeddingModel`` around the same (seeded) upstream modules as
+    ``_reference``, with the steps weight loading performs."""
+    model = SpyreCLIPEmbeddingModel.__new__(SpyreCLIPEmbeddingModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(vision_config=config)
+    model.pooler_config = SimpleNamespace(seq_pooling_type=pooling_type)
+    model.projection_dim = PROJECTION
+    for name, mod in _upstream_modules(config).items():
+        setattr(model, name, mod)
+    # The Spyre layers replace upstream's whole, so they get the same seeded weights back.
+    states = [layer.state_dict() for layer in model.vision_model.encoder.layers]
+    model._init_spyre_vision(prefix="")
+    for layer, state in zip(model.vision_model.encoder.layers, states, strict=True):
+        layer.load_state_dict(state)
+    # The loader's finish steps, in its order: per-layer first, then the model hook.
+    _finish_weight_loading(model)
+    model.process_weights_after_loading()
+    return model.to(dtype)
+
+
+def _pixels(num_images: int) -> list[torch.Tensor]:
+    torch.manual_seed(1)
+    return list(torch.randn(num_images, 3, IMAGE, IMAGE).unbind(0))
+
+
+@pytest.mark.parametrize("num_images", [1, 3])
+@pytest.mark.parametrize("pooling_type", POOLING_TYPES)
+def test_pipeline_matches_upstream(tp_group, pooling_type, num_images):
+    config = _tower_config()
+    images = _pixels(num_images)
+
+    with torch.inference_mode():
+        expected = _reference(config, pooling_type, images)
+        actual = _spyre_model(config, pooling_type).embed_multimodal(pixel_values=images)
+
+    assert [tuple(t.shape) for t in actual] == [tuple(t.shape) for t in expected.unbind(0)]
+    for got, want in zip(actual, expected.unbind(0), strict=True):
+        assert got.device.type == "cpu"
+        assert _cosine(got, want) > 0.999
+
+
+@pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
+def test_budget_padding_does_not_leak_into_images(tp_group, pooling_type):
+    """A larger budget only adds padding slots, which have their own segment."""
+    model = _spyre_model(_tower_config(num_layers=1), pooling_type)
+    images = _pixels(2)
+    values = model.prepare_encoder_cudagraph_replay_buffers({"pixel_values": images}, 0, 0).values
+    padding = model.get_encoder_cudagraph_config().padding_logics
+    patches = next(iter(values.values())).shape[0]
+
+    def run(num_patches):
+        bufs = model._vision_empty(num_patches)
+        for key, src in values.items():
+            padding[key](bufs[key], src)
+        return model.encoder_cudagraph_forward(bufs)
+
+    with torch.inference_mode():
+        tight, loose = run(patches), run(4 * model.vision_patch_multiple)
+    n = sum(model.vision_item_tokens({"pixel_values": images}))
+    torch.testing.assert_close(tight[:n], loose[:n], atol=1e-3, rtol=1e-3)
+
+
+def test_class_layout_gives_each_image_one_token_and_a_fixed_slot(tp_group):
+    model = _spyre_model(_tower_config(num_layers=1), "LAST")
+    images = _pixels(3)
+    values = model.vision_inputs({"pixel_values": images})
+
+    assert model.vision_item_tokens({"pixel_values": images}) == [1, 1, 1]
+    assert model.patches_per_token == model.vision_patch_multiple == 128
+    assert values["patches"].shape == (3 * 128, 192)
+    ids = values["segments"].argmax(-1).reshape(3, 128)
+    for i in range(3):
+        assert (ids[i, :65] == i).all() and (ids[i, 65:] == SEGMENT_ITEMS).all()
+    # The class row has no patch: its embedding comes from the position table alone.
+    assert not values["patches"].reshape(3, 128, -1)[:, 0].any()
+    assert values["positions"].reshape(3, 128)[0, :65].tolist() == list(range(65))
+
+
+@pytest.mark.parametrize(
+    ("pooling_type", "expected"), [("LAST", (1, 8)), ("MEAN", (64, 576))], ids=["class", "full"]
+)
+def test_budget_range_covers_a_whole_step(tp_group, pooling_type, expected):
+    """Eight images per step: eight 1-token images, or eight 65-token ones on 64-row sticks."""
+    model = _spyre_model(_tower_config(num_layers=1), pooling_type)
+    model.max_items_per_step = 8
+    assert model.get_encoder_cudagraph_budget_range(None) == expected
+    assert model.vision_items_limited_by_tokens
+    assert model.vision_max_items_per_call == SEGMENT_ITEMS
+
+
+def test_loaded_vision_weights_are_reshaped_in_place(tp_group):
+    """The patch conv becomes the graph's linear under its own name, so one copy reaches the
+    card, and the class embedding folds into the position table's row 0."""
+    from spyre_inference.custom_ops.conv import SpyreConv2d
+
+    config = _tower_config(num_layers=1)
+    model = _spyre_model(config, "LAST", dtype=torch.float32)
+    emb = model.vision_model.embeddings
+    assert not isinstance(emb.patch_embedding, SpyreConv2d), "the runner would tile a conv copy"
+    assert emb.patch_embedding.weight.shape == (192, config.hidden_size)
+    table = model.spyre_position_table.table
+    torch.testing.assert_close(table[1:], emb.position_embedding.weight[1:])
+    torch.testing.assert_close(table[0], emb.position_embedding.weight[0] + emb.class_embedding)
+
+
+def test_image_limit_zero_keeps_the_placeholder(tp_group):
+    from vllm.model_executor.models.utils import StageMissingLayer
+
+    model = SpyreCLIPEmbeddingModel.__new__(SpyreCLIPEmbeddingModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(vision_config=_tower_config(num_layers=1))
+    model.pooler_config = SimpleNamespace(seq_pooling_type="LAST")
+    model.projection_dim = PROJECTION
+    model.vision_model = StageMissingLayer("image_tower")
+    model._init_spyre_vision(prefix="")
+    model.process_weights_after_loading()
+    assert isinstance(model.vision_model, StageMissingLayer)
+    assert not hasattr(model, "spyre_position_table")
+
+
+def test_embed_input_ids_reaches_the_mixin_merge(monkeypatch):
+    """Image rows arrive on the host and land at their placeholders; the step's mask is kept
+    for ``forward``."""
+    text = torch.full((4, PROJECTION), -1.0)
+    monkeypatch.setattr(
+        CLIPEmbeddingModel, "embed_input_ids", lambda self, ids, mm=None, **kw: text.clone()
+    )
+    model = SpyreCLIPEmbeddingModel.__new__(SpyreCLIPEmbeddingModel)
+    nn.Module.__init__(model)
+    mask = torch.tensor([True, False, False, False])
+    rows = torch.ones(1, PROJECTION)
+
+    out = model.embed_input_ids(torch.zeros(4, dtype=torch.int64), [rows], is_multimodal=mask)
+
+    assert torch.equal(out[0], rows[0])
+    assert torch.equal(out[1:], text[1:])
+    assert torch.equal(model._spyre_mm_token_mask, mask)
+    assert model._spyre_has_text_tokens
+
+
+def test_registry_and_mro_reach_upstream_init_and_protocol():
+    """``super().__init__`` must land on upstream's: a ``Protocol`` base ahead of it in the
+    MRO would substitute its placeholder ``__init__`` and skip building the model."""
+    from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
+
+    from spyre_inference.models import spyre_models
+
+    assert spyre_models()["CLIPModel"] == "spyre_inference.models.clip:SpyreCLIPEmbeddingModel"
+    mro = SpyreCLIPEmbeddingModel.__mro__[1:]
+    assert next(cls for cls in mro if "__init__" in cls.__dict__) is CLIPEmbeddingModel
+    assert supports_encoder_cudagraph(SpyreCLIPEmbeddingModel)
+    assert SpyreCLIPEmbeddingModel._processor_factory is CLIPEmbeddingModel._processor_factory
+
+
+def _padded_device_inputs(model, images, token_budget):
+    from spyre_inference.custom_ops.utils import convert
+
+    values = model.prepare_encoder_cudagraph_replay_buffers({"pixel_values": images}, 0, 0).values
+    padding = model.get_encoder_cudagraph_config().padding_logics
+    bufs = model.prepare_encoder_cudagraph_capture_inputs(
+        token_budget, 1, 1, torch.device("cpu"), torch.float16
+    ).values
+    for key, src in values.items():
+        padding[key](bufs[key], src)
+    return {k: convert(v, device="spyre") for k, v in bufs.items()}
+
+
+@pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
+def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group, pooling_type):
+    """The same padded device buffers through the uncompiled and the compiled pipeline."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    images = _pixels(2)
+    model = _spyre_model(_tower_config(), pooling_type).to("spyre")
+    tokens = sum(model.vision_item_tokens({"pixel_values": images}))
+    step = model.vision_patch_multiple // model.patches_per_token
+    inputs = _padded_device_inputs(model, images, token_budget=-(-2 * tokens // step) * step)
+
+    with torch.inference_mode():
+        eager = model.encoder_cudagraph_forward(inputs)[:tokens]
+        model.compile_vision_graphs()
+        compiled = model.encoder_cudagraph_forward(inputs)[:tokens]
+
+    assert _cosine(compiled, eager) > 0.9999
+    torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
+def test_compiled_pipeline_matches_upstream_at_every_budget_on_spyre(tp_group, pooling_type):
+    """The compiled graphs at each budget of an eight-image step, fed the way the manager
+    feeds them."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+    from spyre_inference.custom_ops.utils import convert
+
+    config = _tower_config()
+    images = _pixels(3)
+    model = _spyre_model(config, pooling_type).to("spyre")
+    model.max_items_per_step = 8
+    model.compile_vision_graphs()
+    budgets = EncoderCudaGraphManager._generate_budgets(
+        *model.get_encoder_cudagraph_budget_range(None)
+    )
+    tokens = sum(model.vision_item_tokens({"pixel_values": images}))
+    expected = _reference(config, pooling_type, images).flatten(0, 1)
+    for budget in (b for b in budgets if b >= tokens):
+        with torch.inference_mode():
+            out = model.encoder_cudagraph_forward(_padded_device_inputs(model, images, budget))
+        assert _cosine(convert(out, device="cpu")[:tokens], expected) > 0.995, budget

@@ -2435,6 +2435,79 @@ def test_spyre_attn_grouped_decode_matches_reference(
     assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
 
 
+@pytest.mark.parametrize(
+    ("shapes", "max_model_len", "max_num_seqs", "seq_lens", "dispatched"),
+    [
+        # 24 blocks: the 3072-token extent a power-of-two ladder lacks.
+        pytest.param(
+            "32x3072,32x4096", 4096, 32, [(1, 2100 + 25 * i) for i in range(32)], [(32, 24)],
+            id="32x3072",
+        ),
+        # A batch bucket the default powers of two lack.
+        pytest.param(
+            "24x4096,32x4096", 4096, 32, [(1, 3000 + 30 * i) for i in range(24)], [(24, 32)],
+            id="24x4096",
+        ),
+        # 10 seqs, one at 7000 tokens: no shape holds all 10 that long, so the long one
+        # runs alone at 8x8192 and the nine short ones at the clamped 16x2048.
+        pytest.param(
+            "8x8192,32x2048", 8192, 16, [(1, 7000)] + [(1, 200 + 7 * i) for i in range(9)],
+            [(8, 64), (16, 16)],
+            id="split_8x8192+16x2048",
+        ),
+    ],
+)  # fmt: skip
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_decode_shapes_match_reference(
+    default_vllm_config,
+    monkeypatch,
+    shapes,
+    max_model_len,
+    max_num_seqs,
+    seq_lens,
+    dispatched,
+    configure_compilation,
+    configure_device,
+):
+    """SPYRE_ATTN_DECODE_SHAPES shapes on the batched kernel, against the CPU reference."""
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_ATTN_DECODE_SHAPES", shapes)
+    envs.clear_env_cache()
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = max_num_seqs
+    cfg.model_config.max_model_len = max_model_len
+
+    seen = []
+    run_dispatch = SpyreAttentionImpl._run_batched_decode_dispatch
+
+    def spy(self, query_dev, k_pages, v_pages, attn_metadata, output):
+        seen.append((attn_metadata.padded_num_seqs, attn_metadata.padded_batch_blocks))
+        return run_dispatch(self, query_dev, k_pages, v_pages, attn_metadata, output)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode_dispatch", spy)
+
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_blocks=1024,
+    )
+
+    assert sorted(seen) == sorted(dispatched)
+
+
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",

@@ -393,6 +393,18 @@ class TorchSpyrePlatform(CpuPlatform):
                 while size < num_seqs:
                     sizes.add(size)
                     size *= 2
+                # A decode step the shape list sizes at 24 should not pad the model to 32.
+                from spyre_inference.v1.attention.spyre_attn_bucketer import (
+                    parse_decode_shapes,
+                    resolve_decode_shapes,
+                )
+
+                shapes = parse_decode_shapes(envs.SPYRE_ATTN_DECODE_SHAPES)
+                if shapes:
+                    resolved = resolve_decode_shapes(
+                        shapes, num_seqs, vllm_config.model_config.max_model_len
+                    )
+                    sizes.update(s for s, _ in resolved)
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 

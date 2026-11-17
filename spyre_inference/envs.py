@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
+    SPYRE_ATTN_DECODE_SHAPES: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
@@ -116,6 +117,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
+    # Exact (num_seqs, kv_len) shapes for the batched decode kernel instead of the num_seqs x
+    # KV bucket product: "NxL" entries ("32x4096,32x3072") or a JSON list of pairs.
+    "SPYRE_ATTN_DECODE_SHAPES": lambda: os.getenv("SPYRE_ATTN_DECODE_SHAPES") or None,
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),

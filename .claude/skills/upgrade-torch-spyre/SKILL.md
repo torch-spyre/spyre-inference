@@ -47,9 +47,10 @@ If any vars are missing or the request returns a 401 (revoked/expired token), **
 
 ## Unattended mode (hive `deps` agent)
 
-The hive `deps` agent (`.github/hive/prompts/deps.md`) runs this skill in a sandbox with nobody to ask and no GitHub credentials. Where the steps below differ, these rules win:
+The hive `deps` agent (`.hive/agents/deps.md`) runs this skill in a sandbox with nobody to ask and no GitHub credentials. Where the steps below differ, these rules win:
 
 - **No user to talk to.** Anything the steps say to tell the user, or to state in chat, goes into the PR body (§9) instead.
+- **Ceiling.** When the prompt names a ceiling commit, list the §1 range only up to the commit before it (`<current-sha>..<ceiling>^`), so neither the tip attempt nor the bisect reaches it.
 - **Downgrades (§7 step 4).** Do not ship one. Keep `[tool.spyre-rpms]` on its current bundle, do a torch-spyre-only bump if it builds against that bundle, and note the downgrade in the PR body.
 - **Artifactory unavailable.** The run fails. Every later run would hit the same wall, so an operator has to fix the credentials. Do not fall back to a torch-spyre-only bump: a build against the image's RPMs with an unvalidated lock can pass here and fail to link in CI.
 - **First failing commit.** When the bisect stops short of the tip, keep the first failing commit (`commits[high]`) and the first `error:` line of its `/tmp/spyre-bisect/<sha>.log`. The prompt explains how to report it.

@@ -643,7 +643,8 @@ def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
 # host-bound (~0.5 GiB/s a thread: the device-format conversion), so chunking costs no
 # time, and a chunk's transpose stays in cache where a whole 0.5 GiB stack's thrashes:
 # measured on gemma-4-26B-A4B stacks, 8 threads, 30 MiB chunks move a stack 26% faster
-# than one staged copy of it, and a load's transient host memory is threads × this.
+# than one staged copy of it, and a load's transient host memory is threads × this, or
+# twice that for a recipe with a down transform, whose output is staged once more.
 _EXPERT_CHUNK_BYTES = 32 << 20
 
 
@@ -865,13 +866,15 @@ def _start_prep_thread(device_index: int) -> None:
 class _MoePrep:
     """The routed-expert layers of one load: the first on the caller, the rest on threads."""
 
-    def __init__(self, threads: int) -> None:
-        self._threads = threads
+    def __init__(self) -> None:
+        self._threads: int | None = None  # read on the first MoE layer, so dense loads never do
         self._pool: ThreadPoolExecutor | None = None
         self._futures: list[Future[None]] = []
         self._started = False
 
     def prepare(self, layer: RoutedExperts) -> None:
+        if self._threads is None:
+            self._threads = _prep_thread_count()
         if self._threads <= 1 or not self._started:
             # The first layer runs here, which also starts the runtime the threads share.
             _prepare_layer(layer)
@@ -927,7 +930,7 @@ def prepare_moe_layers_on_threads() -> Iterator[None]:
     dropped and the threads joined. Outside, the layers are prepared on the caller, in
     order.
     """
-    prep = _MoePrep(_prep_thread_count())
+    prep = _MoePrep()
     token = _active_prep.set(prep)
     try:
         yield
@@ -997,7 +1000,9 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     layer.spyre_moe_chunks = chunks
     layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
     layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
-    del layer.w13_weight, w13
+    # gate and up are views of w13: drop them too, or the stack stays alive through the
+    # down copy.
+    del layer.w13_weight, w13, gate, up
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     prepare = _chunked_down_transform(transform_down) if transform_down is not None else None

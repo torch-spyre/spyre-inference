@@ -206,7 +206,8 @@ one load: the loader waits for every layer before anything reads the model, and 
 fails joins its threads. A recipe's down-weight transform (Gemma folds its expert scale
 there) runs per chunk too, and a `swigluoai` stack's gate and up rows are read as strided
 views, so no recipe builds a whole stack either: a load's transient host memory is the
-threads times one chunk.
+threads times one chunk, or two chunks for a recipe with a down transform, whose output is
+staged once more before the copy.
 
 Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
 expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input

@@ -296,8 +296,12 @@ class SpyreVisionEncoderMixin:
 
         Overridable: a model whose processor does not count in image tokens out of the encoder
         (e.g. it adds newline tokens) returns its largest item's encoder tokens as the maximum.
+
+        Capped at ``max_model_len``: an item's encoder tokens are among its prompt's, so a
+        larger item is rejected before it reaches the encoder and its budgets are unreachable.
         """
-        return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
+        largest = min(self.max_tokens_per_item, vllm_config.model_config.max_model_len)
+        return self.vision_patch_multiple // self.patches_per_token, largest
 
     @property
     def vision_pack_tokens(self) -> int | None:

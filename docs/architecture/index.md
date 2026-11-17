@@ -65,7 +65,7 @@ sub-stick half) run directly in the compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice on Spyre, compiled as its own graph (`maybe_compile`, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)) unless compilation is off; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
-| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which `SpyreFp8LMHeadMethod` DMAs into `qfp8wt` as is, compiled even under `enforce_eager` |
+| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which `SpyreFp8LMHeadMethod` DMAs into `qfp8wt` as is, compiled even under `enforce_eager`. For `quantization="fp8"` checkpoints the plugin replaces vLLM's config with `SpyreFp8Config` (`quantization/fp8.py`): a fused module's per-tensor shard scales become one `[1]` scale when they match and an `[N, 1]` per-channel scale when they differ, so the FP8 weight is never requantized (upstream requantizes through `_C`, which the vLLM build here lacks). Compressed-tensors, Quark and ModelOpt per-tensor checkpoints still take upstream's requant |
 
 ### Transposed linear weights
 
@@ -305,7 +305,9 @@ class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. 
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
 `EncoderCudaGraphManager` picks power-of-two token budgets (or takes
 `encoder_cudagraph_token_budgets`), packs a step's images into them, pads the inputs and splits
-the output per image. `SpyreEncoderGraphManager`
+the output per image. The mixin caps the largest budget at `max_model_len`: an image's encoder
+tokens are among its prompt's, so a larger one never reaches the encoder (granite vision, whose
+padded tiles can outnumber its placeholders, keeps its own range). `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention

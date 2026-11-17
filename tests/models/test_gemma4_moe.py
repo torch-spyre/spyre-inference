@@ -430,7 +430,7 @@ def test_post_load_advertises_no_preprocessed_weight_support(monkeypatch):
 _STANDARD = ("silu", "topk_softmax")
 
 
-def _identity_down(weight):
+def _identity_down(weight, experts):
     return weight
 
 
@@ -1136,6 +1136,31 @@ def test_expert_stacks_stream_in_chunks_to_the_same_device_tensor(monkeypatch, i
     assert torch.equal(got.cpu(), want.cpu())
 
 
+def test_the_down_transform_runs_per_chunk_of_experts(monkeypatch):
+    """The recipe sees each chunk with its expert slice; the result equals the whole-stack fold."""
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import _to_spyre_expert_weight
+
+    torch.manual_seed(0)
+    weight = torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05
+    scale = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
+    monkeypatch.setattr(moe_module, "_EXPERT_CHUNK_BYTES", 6 * weight[0].numel() * 2)
+    seen = []
+
+    def prepare(part, experts):
+        seen.append((experts, tuple(part.shape)))
+        return part * scale[experts].view(-1, 1, 1)
+
+    got = _to_spyre_expert_weight(weight, (), prepare=prepare)
+    want = dma_moe_expert_weight_to_spyre(weight * scale.view(EXPERTS, 1, 1))
+    assert want is not None
+    assert [s for s, _ in seen] == [slice(0, 6), slice(6, 12), slice(12, 16)]
+    assert [shape[0] for _, shape in seen] == [6, 6, 4]
+    assert torch.equal(got.cpu(), want.cpu())
+
+
 def test_layers_prepared_on_threads_match_the_caller_path(monkeypatch):
     """Thread-prepared stacks, on their own streams, equal the synchronous ones bit for bit."""
     import threading
@@ -1232,7 +1257,7 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter, monkeyp
     layer.spyre_moe_recipe = SpyreMoERecipe(
         "gelu_tanh",
         "full_softmax",
-        prepare_down_weight=lambda weight: weight * scale.view(EXPERTS, 1, 1),
+        prepare_down_weight=lambda weight, experts: weight * scale[experts].view(-1, 1, 1),
     )
 
     _prepare_layer(layer)

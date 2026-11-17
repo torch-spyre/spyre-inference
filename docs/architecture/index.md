@@ -203,7 +203,10 @@ The relayout and copy of one layer's stacks are independent of every other layer
 prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
 worker's share of the CPU budget, at most 16; `1` prepares them in order). The pool lives for
 one load: the loader waits for every layer before anything reads the model, and a load that
-fails joins its threads. A load's transient host memory is the threads times one chunk.
+fails joins its threads. A recipe's down-weight transform (Gemma folds its expert scale
+there) runs per chunk too, and a `swigluoai` stack's gate and up rows are read as strided
+views, so no recipe builds a whole stack either: a load's transient host memory is the
+threads times one chunk.
 
 Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
 expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input

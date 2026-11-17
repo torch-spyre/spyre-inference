@@ -131,7 +131,11 @@ class SpyreMoERecipe:
 
     activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
-    prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # ``prepare_down_weight(stack, experts)`` transforms a chunk of the source ``[E, H, M]``
+    # down stack: ``stack`` is ``w2[experts]`` for a slice ``experts`` of the expert axis.
+    # It is called once per chunk while the stack streams to the card, so the whole
+    # transformed stack is never built on the host.
+    prepare_down_weight: Callable[[torch.Tensor, slice], torch.Tensor] | None = None
 
 
 # vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
@@ -661,13 +665,18 @@ def _gather_layout(weight: torch.Tensor) -> SpyreTensorLayout | None:
 
 
 def _to_spyre_expert_weight(
-    weight: torch.Tensor, pad: tuple[int, ...], *, kernel_order: bool = False
+    weight: torch.Tensor,
+    pad: tuple[int, ...],
+    *,
+    kernel_order: bool = False,
+    prepare: Callable[[torch.Tensor, slice], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device.
 
-    The stack goes in chunks of experts: each chunk is padded and made contiguous on the
-    host, ``_EXPERT_CHUNK_BYTES`` at a time, and copied into its slice of the device
-    tensor, so a stack never stages a whole host copy of itself.
+    The stack goes in chunks of experts: each chunk is transformed by ``prepare(chunk,
+    experts)`` when given, padded and made contiguous on the host, ``_EXPERT_CHUNK_BYTES``
+    at a time, and copied into its slice of the device tensor, so a stack never stages a
+    whole host copy of itself.
     """
     from torch_spyre._C import copy_tensor
     from torch_spyre.model_utils import spyre_empty_with_layout
@@ -687,9 +696,26 @@ def _to_spyre_expert_weight(
     chunk = max(1, min(experts, _EXPERT_CHUNK_BYTES // max(1, per_expert)))
     for start in range(0, experts, chunk):
         part = weight[start : start + chunk]
+        if prepare is not None:
+            part = prepare(part, slice(start, min(start + chunk, experts)))
         part = F.pad(part, pad) if any(pad) else part.contiguous()
         copy_tensor(part, dst[start : start + chunk], non_blocking=False)
     return dst
+
+
+def _chunked_down_transform(
+    transform: Callable[[torch.Tensor, slice], torch.Tensor],
+) -> Callable[[torch.Tensor, slice], torch.Tensor]:
+    """Run a recipe's down transform on chunks of the transposed stack.
+
+    The recipe sees its chunk in the source ``[E, H, M]`` orientation; the transposes are
+    views.
+    """
+
+    def prepare(part: torch.Tensor, experts: slice) -> torch.Tensor:
+        return transform(part.transpose(1, 2), experts).transpose(1, 2)
+
+    return prepare
 
 
 def _chunk_entry_constants(chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -726,17 +752,11 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     experts, contract, free = pool.shape
     if contract % chunks:
         raise ValueError(f"gate/up contract dim {contract} must divide into {chunks} chunks")
-    eps = SpyreTensorLayout([experts, contract, free], pool.dtype).elems_per_stick()
+    expected = _gather_layout(pool)
+    assert expected is not None, "a gather pool spans whole sticks"
+    _check_pool_layout(pool, expected)
+    eps = expected.elems_per_stick()
     device_dtype = get_device_dtype(pool.dtype)
-    _check_pool_layout(
-        pool,
-        SpyreTensorLayout(
-            [experts, contract, free // eps, eps],
-            [contract * free, free, eps, 1],
-            device_dtype,
-            {(0,): experts, (1,): contract, (2, 3): free},
-        ),
-    )
     c4 = contract // chunks
     layout = SpyreTensorLayout(
         [experts * chunks, c4, free // eps, eps],
@@ -967,21 +987,23 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # too, and its padded activation lanes still meet those zero rows.
     pad = -inter % stick
     if layer.spyre_moe_recipe.activation == "swigluoai":
-        w13 = deinterleave_gate_up(w13)
+        # gate on the even rows, up on the odd ones (deinterleave_gate_up), as views.
+        gate, up = w13[:, 0::2, :], w13[:, 1::2, :]
+    else:
+        gate, up = w13[:, :inter, :], w13[:, inter:, :]
     # Share gate/up allocations between persistent and gathered chunk views.
-    layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
-    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
+    layer.spyre_moe_gate = _to_spyre_expert_weight(gate.transpose(1, 2), (0, pad))
+    layer.spyre_moe_up = _to_spyre_expert_weight(up.transpose(1, 2), (0, pad))
     layer.spyre_moe_chunks = chunks
     layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
     layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
-    if transform_down is not None:
-        w2 = transform_down(w2)
+    prepare = _chunked_down_transform(transform_down) if transform_down is not None else None
     # Keep the complete stack for persistent compute and expose a view for gathered decode.
     layer.spyre_moe_down = _to_spyre_expert_weight(
-        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
+        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True, prepare=prepare
     )
     layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
     layer.spyre_moe_chunk_scale, layer.spyre_moe_chunk_offsets = _chunk_entry_constants(chunks)

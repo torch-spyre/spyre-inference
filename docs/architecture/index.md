@@ -193,10 +193,17 @@ per-core working set. For Gemma 4 with `top_k=8` and 32 cores this selects `C=4`
 whole-stick chunks. Alias entry `e·C + c` is chunk `c` of expert `e`. TP narrows only `M`, so
 the slicing is unchanged at every TP degree.
 
+Each stack goes to the card in chunks of experts, 32 MiB of host copies at a time: a chunk is
+padded and made contiguous on the host and copied into its slice of the device tensor. The copy
+is host-bound (the device-format conversion runs at ~0.5 GiB/s a thread), so the chunking costs
+no time, and a chunk's transpose stays in cache where a whole stack's does not: on
+gemma-4-26B-A4B stacks with 8 threads it moves a stack 26% faster than one staged copy.
+
 The relayout and copy of one layer's stacks are independent of every other layer's, so loading
 prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
-worker's share of the CPU budget; `1` prepares them in order). The loader waits for all of them
-before anything reads the model.
+worker's share of the CPU budget, at most 16; `1` prepares them in order). The pool lives for
+one load: the loader waits for every layer before anything reads the model, and a load that
+fails joins its threads. A load's transient host memory is the threads times one chunk.
 
 Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
 expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input

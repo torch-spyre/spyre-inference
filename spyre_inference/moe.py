@@ -21,9 +21,11 @@ adapters opt a layer in with a ``SpyreMoERecipe``.
 
 from __future__ import annotations
 
+import contextvars
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -633,25 +635,61 @@ def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
     return SpyreTensorLayout(list(weight.shape), list(weight.stride()), weight.dtype, [1, 0, 2])
 
 
+# Host bytes one chunk of an expert stack stages on its way to the card. The copy is
+# host-bound (~0.5 GiB/s a thread: the device-format conversion), so chunking costs no
+# time, and a chunk's transpose stays in cache where a whole 0.5 GiB stack's thrashes:
+# measured on gemma-4-26B-A4B stacks, 8 threads, 30 MiB chunks move a stack 26% faster
+# than one staged copy of it, and a load's transient host memory is threads × this.
+_EXPERT_CHUNK_BYTES = 32 << 20
+
+
+def _gather_layout(weight: torch.Tensor) -> SpyreTensorLayout | None:
+    """The ``[E, C, F]`` gather layout ``dma_moe_expert_weight_to_spyre`` builds, or None
+    when ``F`` does not span whole sticks."""
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    experts, contract, free = weight.shape
+    eps = SpyreTensorLayout(list(weight.shape), weight.dtype).elems_per_stick()
+    if free % eps:
+        return None
+    return SpyreTensorLayout(
+        [experts, contract, free // eps, eps],
+        [contract * free, free, eps, 1],
+        get_device_dtype(weight.dtype),
+        {(0,): experts, (1,): contract, (2, 3): free},
+    )
+
+
 def _to_spyre_expert_weight(
     weight: torch.Tensor, pad: tuple[int, ...], *, kernel_order: bool = False
 ) -> torch.Tensor:
-    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device."""
-    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device.
 
-    if any(pad):
-        weight = F.pad(weight, pad)
-    if not kernel_order:
-        moved = dma_moe_expert_weight_to_spyre(weight)
-        assert moved is not None
-        return moved
+    The stack goes in chunks of experts: each chunk is padded and made contiguous on the
+    host, ``_EXPERT_CHUNK_BYTES`` at a time, and copied into its slice of the device
+    tensor, so a stack never stages a whole host copy of itself.
+    """
+    from torch_spyre._C import copy_tensor
+    from torch_spyre.model_utils import spyre_empty_with_layout
+
     if not torch.spyre.is_initialized():
         torch.empty(0, dtype=weight.dtype, device="spyre")
-    weight = weight.contiguous()
-    layout = _expert_kernel_layout(weight)
-    assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
+    # The padded stack's shape and strides, without materialising it.
+    padded = torch.empty(weight.shape, dtype=weight.dtype, device="meta")
+    if any(pad):
+        padded = F.pad(padded, pad)
+    layout = _expert_kernel_layout(padded) if kernel_order else _gather_layout(padded)
+    assert layout is not None, "the free dim must span whole sticks"
     # Lands on the current Spyre device, as the ``dma_*`` helpers do.
-    return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
+    dst = spyre_empty_with_layout(padded.size(), padded.stride(), weight.dtype, layout, device=None)
+    experts = weight.shape[0]
+    per_expert = padded[0].numel() * weight.element_size()
+    chunk = max(1, min(experts, _EXPERT_CHUNK_BYTES // max(1, per_expert)))
+    for start in range(0, experts, chunk):
+        part = weight[start : start + chunk]
+        part = F.pad(part, pad) if any(pad) else part.contiguous()
+        copy_tensor(part, dst[start : start + chunk], non_blocking=False)
+    return dst
 
 
 def _chunk_entry_constants(chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -769,17 +807,33 @@ def _prepare_biases(
     return biases
 
 
-# Routed-expert layers whose preparation runs on a thread; see _prepare_layer_soon.
-_prep_pool: ThreadPoolExecutor | None = None
-_prep_futures: list[Future] = []
+# ── Routed-expert layers prepared on threads while a model loads ──────────────────────
+#
+# Each layer's host relayout and copy to the device are independent of every other
+# layer's. Inside ``prepare_moe_layers_on_threads`` the loader's calls to
+# ``process_weights_after_loading`` hand all but the first layer to a pool of threads;
+# outside it every layer is prepared on the caller, as before. The pool belongs to that
+# context: leaving it waits for the layers, re-raises the first failure and joins the
+# threads, also when the load itself raises, so nothing of one load outlives it.
+
+_DEFAULT_PREP_THREADS = 8
+_MAX_PREP_THREADS = 16
+
 _prep_thread = threading.local()
 
 
 def _prep_thread_count() -> int:
-    if envs.SPYRE_MOE_PREP_THREADS > 0:
-        return envs.SPYRE_MOE_PREP_THREADS
-    # torch's thread count is this worker's share of the CPU budget (threading_config).
-    return min(8, torch.get_num_threads())
+    """``SPYRE_MOE_PREP_THREADS``, else min(8, torch's threads); 1 to 16.
+
+    torch's thread count is this worker's share of the CPU budget (threading_config), so
+    at TP > 1 each rank sizes its pool from its own share.
+    """
+    threads = envs.SPYRE_MOE_PREP_THREADS
+    if threads < 0:
+        raise ValueError(f"SPYRE_MOE_PREP_THREADS must be 0 or more, got {threads}")
+    if threads == 0:
+        threads = min(_DEFAULT_PREP_THREADS, torch.get_num_threads())
+    return max(1, min(threads, _MAX_PREP_THREADS))
 
 
 def _start_prep_thread(device_index: int) -> None:
@@ -788,46 +842,88 @@ def _start_prep_thread(device_index: int) -> None:
     _prep_thread.stream = torch.spyre.Stream()
 
 
-def _prepare_on_thread(layer: RoutedExperts) -> None:
-    with torch.spyre.stream(_prep_thread.stream):
-        _prepare_layer(layer)
+class _MoePrep:
+    """The routed-expert layers of one load: the first on the caller, the rest on threads."""
 
+    def __init__(self, threads: int) -> None:
+        self._threads = threads
+        self._pool: ThreadPoolExecutor | None = None
+        self._futures: list[Future[None]] = []
+        self._started = False
 
-def _prepare_layer_soon(layer: RoutedExperts) -> None:
-    """Prepare one routed-expert layer now, or hand it to a thread.
-
-    Each layer's host relayout and copy to the device are independent of every other
-    layer's, so layers run on SPYRE_MOE_PREP_THREADS threads while loading goes on.
-    The first layer runs here, which also starts the runtime the threads share. The
-    model loader calls ``wait_for_moe_layers`` before anything reads the model.
-    """
-    global _prep_pool
-    threads = _prep_thread_count()
-    if threads <= 1 or _prep_pool is None:
-        _prepare_layer(layer)
-        if threads > 1:
-            _prep_pool = ThreadPoolExecutor(
-                max_workers=threads,
+    def prepare(self, layer: RoutedExperts) -> None:
+        if self._threads <= 1 or not self._started:
+            # The first layer runs here, which also starts the runtime the threads share.
+            _prepare_layer(layer)
+            self._started = True
+            return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._threads,
                 thread_name_prefix="spyre-moe-prep",
                 initializer=_start_prep_thread,
                 initargs=(torch.spyre.current_device(),),
             )
-        return
-    _prep_futures.append(_prep_pool.submit(_prepare_on_thread, layer))
+            logger.info(
+                "Spyre MoE: preparing routed-expert layers on %d threads, each staging "
+                "%d MiB of host copies at a time.",
+                self._threads,
+                _EXPERT_CHUNK_BYTES >> 20,
+            )
+        self._futures.append(self._pool.submit(self._prepare_on_thread, layer))
 
+    @staticmethod
+    def _prepare_on_thread(layer: RoutedExperts) -> None:
+        with torch.spyre.stream(_prep_thread.stream):
+            _prepare_layer(layer)
 
-def wait_for_moe_layers() -> None:
-    """Wait for the layers handed to threads; re-raise the first failure."""
-    global _prep_pool
-    futures = list(_prep_futures)
-    _prep_futures.clear()
-    try:
+    def wait(self) -> None:
+        """Wait for the layers handed to threads; re-raise the first failure."""
+        futures, self._futures = self._futures, []
         for future in futures:
             future.result()
+
+    def shutdown(self) -> None:
+        """Drop the layers not started and join the threads."""
+        self._futures.clear()
+        if self._pool is not None:
+            self._pool.shutdown(cancel_futures=True)
+            self._pool = None
+
+
+_active_prep: contextvars.ContextVar[_MoePrep | None] = contextvars.ContextVar(
+    "spyre_moe_prep", default=None
+)
+
+
+@contextmanager
+def prepare_moe_layers_on_threads() -> Iterator[None]:
+    """Prepare the routed-expert layers of the model loaded inside on threads.
+
+    Inside, ``process_weights_after_loading`` runs a model's first MoE layer on the
+    caller, which also starts the runtime, and hands the others to a pool of
+    ``SPYRE_MOE_PREP_THREADS`` threads. Leaving the context waits for every layer and
+    re-raises the first failure; when the body raises, the layers not started are
+    dropped and the threads joined. Outside, the layers are prepared on the caller, in
+    order.
+    """
+    prep = _MoePrep(_prep_thread_count())
+    token = _active_prep.set(prep)
+    try:
+        yield
+        prep.wait()
     finally:
-        if _prep_pool is not None:
-            _prep_pool.shutdown(cancel_futures=True)
-            _prep_pool = None
+        _active_prep.reset(token)
+        prep.shutdown()
+
+
+def _prepare_layer_soon(layer: RoutedExperts) -> None:
+    """Prepare one routed-expert layer: on the active load's threads, else here."""
+    prep = _active_prep.get()
+    if prep is None:
+        _prepare_layer(layer)
+    else:
+        prep.prepare(layer)
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:

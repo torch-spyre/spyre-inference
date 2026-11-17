@@ -155,7 +155,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Threads that relayout and copy the routed-expert stacks of different MoE layers to the
     # device at the same time during load. "0" (default) uses min(8, torch threads), this
-    # worker's share of the CPU budget; "1" prepares one layer after another.
+    # worker's share of the CPU budget, at most 16; "1" prepares one layer after another.
     "SPYRE_MOE_PREP_THREADS": lambda: int(os.getenv("SPYRE_MOE_PREP_THREADS", "0")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).

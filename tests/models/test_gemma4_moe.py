@@ -1102,6 +1102,92 @@ def test_prepare_layer_rejects_a_non_stick_aligned_hidden_before_relayout(hidden
     assert not hasattr(layer, "spyre_moe_gate")
 
 
+@pytest.mark.parametrize("kernel_order", [False, True], ids=["gather", "kernel"])
+@pytest.mark.parametrize("inter", [INTER, GEMMA4_EXPERT_INTER // 4 + 1], ids=["aligned", "padded"])
+def test_expert_stacks_stream_in_chunks_to_the_same_device_tensor(monkeypatch, inter, kernel_order):
+    """Chunked copies into slices equal torch-spyre's one-shot helpers bit for bit."""
+    from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import _expert_kernel_layout, _to_spyre_expert_weight
+
+    torch.manual_seed(0)
+    stick = get_elem_in_stick(torch.float16)
+    pad = -inter % stick
+    weight = torch.randn(EXPERTS, HIDDEN, inter, dtype=torch.float16) * 0.05
+    pad_spec = (0, 0, 0, pad) if kernel_order else (0, pad)
+    padded = F.pad(weight.transpose(1, 2), pad_spec) if kernel_order else F.pad(weight, pad_spec)
+    source = weight.transpose(1, 2) if kernel_order else weight
+    # Three chunks for sixteen experts, so the loop takes a partial chunk too.
+    monkeypatch.setattr(moe_module, "_EXPERT_CHUNK_BYTES", 6 * padded[0].numel() * 2)
+
+    got = _to_spyre_expert_weight(source, pad_spec, kernel_order=kernel_order)
+    if kernel_order:
+        want = padded.contiguous().to(device_layout=_expert_kernel_layout(padded.contiguous()))
+    else:
+        want = dma_moe_expert_weight_to_spyre(padded)
+        assert want is not None
+
+    assert got.shape == want.shape
+    assert get_spyre_tensor_layout(got) == get_spyre_tensor_layout(want)
+    # The reference is torch-spyre's one-shot copy: the fp16 round trip through the device
+    # format is not bit-exact against the host source, for either path.
+    assert torch.equal(got.cpu(), want.cpu())
+
+
+def test_layers_prepared_on_threads_match_the_caller_path(monkeypatch):
+    """Thread-prepared stacks, on their own streams, equal the synchronous ones bit for bit."""
+    import threading
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer, prepare_moe_layers_on_threads
+
+    monkeypatch.delenv("SPYRE_MOE_CHUNKS", raising=False)
+    monkeypatch.setenv("SPYRE_MOE_PREP_THREADS", "2")
+    torch.manual_seed(0)
+    stacks = [
+        (
+            torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16) * 0.05,
+            torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        )
+        for _ in range(3)
+    ]
+
+    def layers():
+        out = []
+        for w13, w2 in stacks:
+            layer = _RoutedExperts(w13.clone(), w2.clone())
+            layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
+            out.append(layer)
+        return out
+
+    expected = layers()
+    for layer in expected:
+        _prepare_layer(layer)
+
+    threaded = layers()
+    prepared_on = {}
+
+    def record(layer):
+        prepared_on[id(layer)] = threading.current_thread().name
+        _prepare_layer(layer)
+
+    monkeypatch.setattr(moe_module, "_prepare_layer", record)
+    with prepare_moe_layers_on_threads():
+        for layer in threaded:
+            moe_module._prepare_layer_soon(layer)
+
+    assert prepared_on[id(threaded[0])] == threading.current_thread().name
+    assert all(prepared_on[id(layer)].startswith("spyre-moe-prep") for layer in threaded[1:])
+    for want, got in zip(expected, threaded, strict=True):
+        for name in ("spyre_moe_gate", "spyre_moe_up", "spyre_moe_down"):
+            torch.testing.assert_close(
+                getattr(got, name).cpu(), getattr(want, name).cpu(), rtol=0, atol=0
+            )
+        assert got.spyre_moe_chunks == want.spyre_moe_chunks
+
+
 def test_prepare_layer_honors_chunk_override(monkeypatch):
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 

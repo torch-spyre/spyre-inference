@@ -106,7 +106,8 @@ jobs:
 
   test:
     needs: [detect-label, signed-commits]
-    if: needs.detect-label.outputs.labeled != 'true'
+    # Repo variable GHA_FULL_MERGE_QUEUE_TESTS=true: GHA runs the full matrix even for labeled PRs that Jenkins would otherwise own.
+    if: needs.detect-label.outputs.labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true'
     uses: ./.github/workflows/_test_matrix.yaml
     secrets: inherit
     with:
@@ -139,7 +140,7 @@ jobs:
             echo "One or more test suites failed."
             exit 1
           fi
-          if [ "${{ needs.detect-label.outputs.labeled }}" = "true" ]; then
+          if [ "${{ needs.detect-label.outputs.labeled }}" = "true" ] && ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS != 'true' }}; then
             echo "integration-test label set -- the Jenkins integration run owns this commit's"
             echo "testing and mirrors its verdict onto this check name. Passing so the merge"
             echo "queue is not blocked by a missing required check."

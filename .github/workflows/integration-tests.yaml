@@ -96,6 +96,14 @@ on:
         required: false
         type: boolean
         default: false
+      image_rpms:
+        description: >-
+          When true, use the runner image's Spyre RPMs instead of installing the spyre-rpms.lock baseline,
+          but still build spyre-inference from the checked-out ref and torch-spyre from torch_spyre_ref.
+          Not combinable with rpm_names. Unlike use_prebaked_image, nothing is assumed to be baked in.
+        required: false
+        type: boolean
+        default: false
       test_type:
         description: >-
           Suite subset to run: unit | integration (default, the smoke suite)
@@ -152,25 +160,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Show trigger info
+        env:
+          TRIGGERING_REPO: ${{ inputs.triggering_repo || '(not specified)' }}
+          TRIGGERING_SHA: ${{ inputs.triggering_sha || '(not specified)' }}
+          PR_URL_HASH: ${{ inputs.pr_url_hash || '(not specified)' }}
+          SPYRE_INFERENCE_REF: ${{ inputs.ref || github.sha }}
+          TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref || '(none)' }}
+          RPM_NAMES: ${{ inputs.rpm_names || '(none)' }}
+          TEST_TYPE: ${{ inputs.test_type || 'integration' }}
         run: |
           {
             echo "## Integration test triggered by upstream change"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Upstream repo       | ${{ inputs.triggering_repo || '(not specified)' }} |"
-            echo "| Upstream commit     | ${{ inputs.triggering_sha || '(not specified)' }} |"
-            echo "| PR URL hash         | ${{ inputs.pr_url_hash || '(not specified)' }} |"
-            echo "| spyre-inference ref | ${{ inputs.ref || github.sha }} |"
-            echo "| torch-spyre ref     | ${{ inputs.torch_spyre_ref || '(none)' }} |"
-            echo "| RPM names           | ${{ inputs.rpm_names || '(none)' }} |"
-            echo "| Test type           | ${{ inputs.test_type || 'integration' }} |"
+            echo "| Upstream repo       | ${TRIGGERING_REPO} |"
+            echo "| Upstream commit     | ${TRIGGERING_SHA} |"
+            echo "| PR URL hash         | ${PR_URL_HASH} |"
+            echo "| spyre-inference ref | ${SPYRE_INFERENCE_REF} |"
+            echo "| torch-spyre ref     | ${TORCH_SPYRE_REF} |"
+            echo "| RPM names           | ${RPM_NAMES} |"
+            echo "| Test type           | ${TEST_TYPE} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # The workflow_run ingests can't read this run's inputs, so the threaded run_id travels as
       # the same "run-id" artifact _test_matrix.yaml uploads (it gets no run_id here, so it doesn't).
       - name: Record threaded run_id for ingest
-        run: echo -n "${{ inputs.run_id || '' }}" > run-id.txt
+        env:
+          RUN_ID: ${{ inputs.run_id || '' }}
+        run: printf '%s' "${RUN_ID}" > run-id.txt
       - name: Upload threaded run_id
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -195,6 +213,7 @@ jobs:
       # A dispatch on a prebaked image (for example Jenkins with a per-PR
       # runner_label) passes true to skip that install. See issue #543.
       use_prebaked_image: ${{ inputs.use_prebaked_image }}
+      image_rpms: ${{ inputs.image_rpms }}
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       torch_spyre_ref: ${{ inputs.torch_spyre_ref || '' }}

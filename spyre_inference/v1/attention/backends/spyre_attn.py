@@ -2142,10 +2142,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             output[:num_decode_seqs].copy_(store[:num_decode_seqs].clone())
 
     def _group_store_rows(self, rows: list[int], padded_num_seqs: int) -> torch.Tensor:
-        # Padded to the seq bucket so the store compiles once per bucket; padding writes the
-        # top staging rows, which no batch reaches.
-        pad = [self.staging_rows - 1 - k for k in range(padded_num_seqs - len(rows))]
-        return torch.tensor(rows + pad, dtype=torch.int32)
+        # Padded to the seq bucket so the store compiles once per bucket. Padding writes the
+        # spare last row: any row below it may hold another group's output.
+        scratch = self.staging_rows - 1
+        assert all(r < scratch for r in rows), f"decode rows {rows} reach the scratch row {scratch}"
+        return torch.tensor(rows + [scratch] * (padded_num_seqs - len(rows)), dtype=torch.int32)
 
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device

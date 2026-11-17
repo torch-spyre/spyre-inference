@@ -75,7 +75,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
-    batched_decode_chunking,
+    batched_decode_entries,
 )
 from spyre_inference.v1.worker import compile_guard
 
@@ -490,7 +490,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.
-        self._attn_bucketer = SpyreAttnBucketer(vllm_config)
+        self._attn_bucketer = SpyreAttnBucketer(
+            vllm_config, batched_decode_entries(self.num_kv_heads, self.head_size)
+        )
 
         self._init_reorder_batch_threshold(
             reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
@@ -1091,7 +1093,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Padding columns gather page 0 under an all--inf mask and
         # contribute zero; chunk 0 still holds every real row's block 0,
         # so the running max stays finite.
-        blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
+        blocks_per_chunk, num_chunks = self._attn_bucketer.decode_chunking(b_seqs, b_blocks)
         padded_batch_blocks = num_chunks * blocks_per_chunk
         assert padded_batch_blocks >= b_blocks
         query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
@@ -1172,7 +1174,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[m] for m in members))
             if b_seqs is None or b_blocks is None:
                 return None
-            return batched_decode_chunking(b_seqs, b_blocks)[1]
+            return bucketer.decode_chunking(b_seqs, b_blocks)[1]
 
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):

@@ -3038,7 +3038,6 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     )
     from spyre_inference.v1.attention.spyre_attn_bucketer import (
         SpyreAttnBatchedDecodeBucket,
-        batched_decode_chunking,
     )
 
     torch.set_default_device("cpu")
@@ -3068,7 +3067,7 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     assert impl._batched_decode_supported(device)
 
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
-    blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+    blocks_per_chunk, num_chunks = builder.attn_bucketer.decode_chunking(num_seqs, num_blocks)
     bucket = SpyreAttnBatchedDecodeBucket(
         num_seqs=num_seqs,
         num_blocks=num_blocks,

@@ -1,0 +1,86 @@
+# Review perspectives for the hive's review swarm, read live from main via
+# review.perspectives_source. Built-ins (correctness, security, intent-alignment, style,
+# docs-currency) may omit focus; custom names need it. Focus is spliced into a sentence
+# ("Focus ONLY on <focus>.") and a bullet list: one paragraph, at most 2000 bytes.
+kind: ReviewPerspectives
+perspectives:
+  - name: correctness
+  - name: security
+  - name: intent-alignment
+  - name: style
+  - name: docs-currency
+
+  - name: upstream-alignment
+    focus: >-
+      whether the PR plugs into upstream vLLM through the smallest possible Spyre-specific
+      override instead of copying or re-implementing upstream code. For every new or changed
+      class or function, open its upstream counterpart at the vLLM tag pinned in
+      pyproject.toml (in .venv site-packages, or the vllm-project/vllm repo at that tag) and
+      flag: bodies copied from vLLM with small edits; re-implementations of something vLLM
+      already provides (utilities, config handling, distributed helpers, model layers); and
+      overrides that replace a whole method or class when only a few lines are
+      Spyre-specific. Suggest the narrower plug point this repo already uses: register_oot
+      on a CustomOp or PluggableLayer (spyre_inference/custom_ops/), a model subclass
+      registered in spyre_inference/models/__init__.py, a mixin that overrides one hook
+      (SpyreBertEmbeddingMixin replaces only _build_model to swap the embedding class;
+      _SpyreRotaryMixin extends __init__ through super()), or a platform hook in
+      platform.py. Every suggested fix must work in this PR against the pinned vLLM: when
+      upstream has no hook, override the smallest upstream method that contains the change
+      and defer the rest to super(), or vendor it as below. An upstream PR adding a hook may
+      be noted as a follow-up, never as the requested change. Verbatim vendoring is allowed
+      only under _vendored/ or csrc/, with the upstream source SHA in the header and the
+      reason the pinned vLLM lacks it; new copies elsewhere, or vendored files edited away
+      from upstream, are changes_requested. Quote the duplicated lines and the upstream
+      file:line they come from
+
+  - name: spyre-numerics
+    focus: >-
+      numerical drift on the Spyre path that a green CI run can hide: ops that newly reach
+      the device but are routed to CPU by torch-spyre (they raise FallbackWarning, defined
+      in torch_spyre/ops/warning_types.py; check the fallback list in
+      torch_spyre/ops/fallbacks.py rather than assuming an op is supported); new .cpu()
+      round trips or dtype casts (float32 upcasts, bfloat16) inside model, attention,
+      sampling or custom-op code; changes to fp16 accumulation order, such as reordered or
+      split reductions and matmuls, new chunking, or padding and bucketing that change which
+      values are summed together or let padded rows reach live output; and tests that loosen
+      rtol/atol, swap the CPU reference, add skip/xfail, or force enforce_eager to make a
+      numerics test pass. Name the op or file:line. A tolerance change the PR body does not
+      justify is changes_requested
+
+  - name: spyre-performance
+    focus: >-
+      regressions in warmup time, host or Spyre memory, or step latency, judged from the
+      diff and, when this review runs on a card, by comparing the touched path against main.
+      Warmup: compile_or_warm_up_model records every attention variant
+      (SpyreAttnBucketer.variants() pairs block and query buckets, batched_decode_variants()
+      pairs sequence and block buckets), so a new bucket axis, denser buckets, a graph per
+      new shape, or a graph split into more pieces (graph breaks, more compiled blocks, a
+      new encoder rectangle) multiplies warmup, and lazy compiles in the serving path move
+      that cost into requests. Memory: tensors that persist per layer or per request, extra
+      KV copies or layouts, wider padding, buffers sized to max_model_len or
+      max_num_batched_tokens instead of the live batch, host copies of weights or caches,
+      caches that never evict, and anything that lowers what determine_available_memory
+      measures, which shrinks the KV cache. Runtime: Python loops per sequence, token or
+      layer on the hot path (batched decode exists to remove the per-sequence loop), host
+      syncs in forward (.item(), .cpu(), .tolist()), new host-device copies, ops torch-spyre
+      runs on CPU, recompiles from shapes that miss a bucket, and kernels that materialise
+      what a view or fused op avoids. Name the file:line and what the cost scales with. An
+      unjustified regression on a default path is changes_requested; a cost the PR body
+      states and justifies is a finding only
+
+  - name: spyre-hardware-validation
+    focus: >-
+      whether the change works on the Spyre card this review runs on, and whether its tests
+      will actually run in CI. First run it: check out the PR head (git fetch origin
+      pull/<number>/head), uv sync --frozen, rm -rf /tmp/torchinductor_*, then run the tests
+      the diff adds or changes plus the nearest existing tests of the device code it
+      touches, as uv run --no-sync pytest '<node id>' -m "not upstream", one Spyre command
+      at a time and never the whole suite. Report each command with its pass, fail or skip
+      result. A test needing more cards than spyre_device_count() reports here is listed as
+      not run, not as passed. Then scan the tests: TP=2 tests need the distributed marker
+      (2-card spyre_pf_x2 jobs), TP=4 tests need distributed_tp4 (the one spyre_pf_x4 job);
+      without it a test lands on a 1-card runner and skips itself through
+      spyre_device_count() or spyre_available(). A skipif or guard that is true on every
+      runner, or a marker that no Makefile test target selects, means CI never runs the
+      test. A test that fails or skips here, a test CI would never run, or device code no
+      test exercises on the card, is changes_requested. Cite the node ID and the job

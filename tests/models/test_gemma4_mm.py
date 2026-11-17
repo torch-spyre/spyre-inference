@@ -255,6 +255,7 @@ def _manager(model, budgets=()):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
+            max_model_len=4096,
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: 0 if modality == "video" else 2,
                 mm_encoder_tp_mode="weights",

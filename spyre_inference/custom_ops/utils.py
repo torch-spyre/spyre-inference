@@ -160,7 +160,7 @@ def convert(tensor, device=None, dtype=None, device_layout=None):
         # both a host->device placement and a same-device relayout (copy_from_d2d),
         # so a layout-aware conversion must not insist on a device transfer: a
         # cache already moved to Spyre still needs its rows placed outermost.
-        if tensor.device.type == "cpu" and device is not None:
+        if tensor.device.type == "cpu" and device is not None and device.type == "spyre":
             return _to_layout_async(tensor, device, dtype, device_layout)
         return tensor.to(
             tensor.device if device is None else device,

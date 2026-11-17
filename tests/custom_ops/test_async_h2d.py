@@ -38,6 +38,26 @@ def test_async_source_copies_only_unstaged_caller_buffers(dtype, owned, copied):
     assert (_async_source(src, owned).data_ptr() != src.data_ptr()) == copied
 
 
+def test_layout_convert_to_cpu_target_stays_on_tensor_to(monkeypatch):
+    from spyre_inference.custom_ops import utils
+
+    def no_async(*args, **kwargs):
+        raise AssertionError("a CPU target must not take the Spyre upload path")
+
+    layouts = []
+    original_to = torch.Tensor.to
+
+    def cpu_to(tensor, *args, **kwargs):
+        layouts.append(kwargs.pop("device_layout", None))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(utils, "_to_layout_async", no_async)
+    monkeypatch.setattr(torch.Tensor, "to", cpu_to)
+    sentinel = object()
+    utils.convert(torch.zeros(4, dtype=torch.int32), device="cpu", device_layout=sentinel)
+    assert layouts == [sentinel]
+
+
 @pytest.mark.parametrize("layout", [False, True], ids=["convert", "layout"])
 def test_upload_ignores_source_rewrite_after_enqueue(layout):
     """A caller rewriting its int32 buffer while the upload is queued must not reach the card."""

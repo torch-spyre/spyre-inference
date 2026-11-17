@@ -82,11 +82,15 @@ def run(client, cfg=CFG):
 
 
 def test_lock_round_trips_through_ci_resolver():
-    versions = run(FakeArtifactory())
+    versions, sha1s = run(FakeArtifactory())
     assert versions == {"ibm-flex": FLEX_V, "ibm-flex-devel": FLEX_V, "ibm-senlib-core": SENLIB_V}
+    # Each x86_64 pin carries the actual_sha1 the bundle and RPM repo agreed on;
+    # ibm-flex-devel inherits its base build's file and its digest.
+    assert sha1s == {"ibm-flex": "a1", "ibm-flex-devel": "a3", "ibm-senlib-core": "b1"}
 
-    data = tomllib.loads(lock.render(CFG, versions))
+    data = tomllib.loads(lock.render(CFG, versions, sha1s))
     assert data["bundle"] == {"id": "nightly"}
+    assert {name: spec.get("sha1") for name, spec in data["packages"].items()} == sha1s
     assert resolve_specs(data, "x86_64") == [
         ("ibm-flex", FLEX_V, ""),
         ("ibm-flex-devel", FLEX_V, ""),
@@ -98,6 +102,8 @@ def test_lock_round_trips_through_ci_resolver():
             "2.0.0-0.main.1+700.e066296_*",
             "2.0.0-0.main.1+316.9b2385f_*",
         ]
+        # Override arches wildcard the build, so they pin no digest.
+        assert all("sha1" not in s for s in data["overrides"][arch].values())
 
 
 def test_sha1_mismatch_fails():
@@ -179,15 +185,15 @@ def stale_artifactory(z_has_bundled=False):
 
 
 def test_stale_pin_holds_back_every_package_at_its_commit():
-    versions = run(stale_artifactory(), STALE_CFG)
-    data = tomllib.loads(lock.render(STALE_CFG, versions))
+    versions, sha1s = run(stale_artifactory(), STALE_CFG)
+    data = tomllib.loads(lock.render(STALE_CFG, versions, sha1s))
     z = {name: v for name, v, _ in resolve_specs(data, "s390x")}
     for name in ("ibm-senlib-core", "ibm-senlib-dd2", "ibm-senlib-headers"):
         assert data["packages"][name]["version"] == SENLIB_V
         assert data["overrides"]["ppc64le"][name]["version"] == "2.0.0-0.main.1+316.9b2385f_*"
         assert z[name] == f"{SENLIB_OLD}_*"
     assert z["ibm-flex"] == "2.0.0-0.main.1+700.e066296_*"
-    text = lock.render(STALE_CFG, versions)
+    text = lock.render(STALE_CFG, versions, sha1s)
     assert text.count("# stale: bundle has 2.0.0-0.main.1+316.9b2385f") == 3
     lock.verify(STALE_CFG, text)
     with pytest.raises(lock.LockError, match="differs from what this tool renders"):
@@ -259,11 +265,30 @@ def test_torch_spyre_build_stamp_must_match_bundle(tmp_path, stamp):
 
 
 def _lock_text():
-    return lock.render(CFG, run(FakeArtifactory()))
+    versions, sha1s = run(FakeArtifactory())
+    return lock.render(CFG, versions, sha1s)
 
 
 def test_verify_accepts_rendered_lock():
     lock.verify(CFG, _lock_text())
+
+
+def test_verify_accepts_pre_digest_lock():
+    # A lock generated before digests were pinned carries no `sha1`; the
+    # installer warns and proceeds rather than failing. `render()` must emit the
+    # pre-digest header for it so the committed lock round-trips through
+    # `--verify` until a maintainer regenerates it with Artifactory access.
+    versions, _ = run(FakeArtifactory())
+    text = lock.render(CFG, versions)
+    assert "each with its Artifactory" not in text
+    assert all("sha1" not in spec for spec in tomllib.loads(text)["packages"].values())
+    lock.verify(CFG, text)
+
+
+def test_render_header_describes_digests_only_when_pinned():
+    versions, sha1s = run(FakeArtifactory())
+    assert "each with its Artifactory" in lock.render(CFG, versions, sha1s)
+    assert "each with its Artifactory" not in lock.render(CFG, versions)
 
 
 @pytest.mark.parametrize(
@@ -274,7 +299,7 @@ def test_verify_accepts_rendered_lock():
         (CFG, ("700.e066296_*", "700.e066296_607"), "differs from what this tool renders"),
         (
             CFG,
-            ('_608" }\nibm-senlib', '_607" }\nibm-senlib'),
+            ('_608", sha1 = "a3" }\nibm-senlib', '_607", sha1 = "a3" }\nibm-senlib'),
             "ibm-flex-devel .* differs from its base",
         ),
         (CFG, ("+316.9b2385f_451", "+316.9b2385f"), "ibm-senlib-core .* no `.<commit>_<build>`"),

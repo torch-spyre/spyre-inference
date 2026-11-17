@@ -273,20 +273,25 @@ extra lever there, and the same keep-it-short advice applies.
 
 #### One per-sequence kernel for every page count
 
-The per-sequence kernels do not bucket the KV axis: they compile once per query bucket and
-walk each sequence's own page count, from two pages (a one-page sequence walks a masked repeat)
-up to `--max-model-len`. The page table and mask stack are moved with torch-spyre's
-`tensor.to("spyre", dynamic=...)`, so the plugin sets torch-spyre's `MIN_RESERVED_DIM_SIZE` to 2
-and raises its `MAX_BUCKETS` to `--max-model-len / block_size`; an exported value of either wins.
-The KV buckets above still apply, and warmup records every (KV, query) pair as before, when any
-of these holds:
+The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
+use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.
 
-- torch-spyre has no symbolic `for_each_tile` trip counts (torch-spyre#6066);
-- an exported `MAX_BUCKETS` is below `--max-model-len / block_size`, or an exported
-  `MIN_RESERVED_DIM_SIZE` is not below it;
-- `SPYRE_ATTN_FOR_EACH_TILE=0`, or the layer uses a sliding window.
+The page tables and mask stacks are copied to the device with torch-spyre's
+`tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+`--max-model-len / block_size`.
 
-Batched decode keeps its buckets.
+The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
+bucket pair, when any of these holds:
+
+- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
+  `MAX_BUCKETS`; startup logs a warning;
+- `SPYRE_ATTN_FOR_EACH_TILE=0` is set;
+- the layer uses sliding-window attention.
+
+The batched decode kernel always uses the KV buckets.
 
 ## KV cache size
 

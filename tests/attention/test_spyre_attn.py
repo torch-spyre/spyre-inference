@@ -1692,7 +1692,7 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
     ],
 )
 def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len, expected):
-    # A declared page range keeps each sequence's own count instead.
+    # A page range keeps each sequence's own page count, so test the bucketed path.
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
@@ -1711,7 +1711,7 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config,
     regardless of how much headroom the block table has beyond the bucket
     build() actually pads to -- build() always pads to a bucket (no unpadded
     fallback), so both tables here must have at least that much headroom."""
-    # A declared page range keeps each sequence's own count, so nothing is padded.
+    # A page range pads nothing, so test the bucketed path.
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     torch.set_default_device("cpu")
     block_size = 64
@@ -2374,10 +2374,10 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
     envs.clear_env_cache()
-    # The fixture's max_model_len 2048 at block 128 declares pages 2..16. Compiled at 16, as
-    # warmup records it, then reused at 1 (walked as 2), 3 and 8.
+    # The fixture's max_model_len 2048 at block size 128 gives a range of 2 to 16 pages. The
+    # kernel compiles at 16, as in warmup, and is reused at 1 page (run as 2), 3 and 8.
     kernel_code = getattr(spyre_attn, kernel_name).__code__
-    # Restores the reservation floor the bucketer sets. Not monkeypatch: its undo deletes a
+    # Restores the MIN_RESERVED_DIM_SIZE the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8):
         for kv_len in (2048, query_len + 10, 300, 1000):

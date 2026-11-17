@@ -734,7 +734,7 @@ class TestLargeBatchLadder:
 
 
 class TestDeclaredPages:
-    """The per-sequence page axis is declared, not bucketed, where it fits."""
+    """The per-sequence kernels take a page range instead of the KV buckets when it fits."""
 
     @pytest.fixture(autouse=True)
     def _restore_ts_limits(self):
@@ -753,17 +753,17 @@ class TestDeclaredPages:
 
     def test_page_range_spans_two_pages_to_max_model_len(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
-        assert b.page_range == {0: {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}}
+        assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
         assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [2, 2, 7, 32]
 
-    def test_an_exported_reservation_floor_raises_the_walked_minimum(self, monkeypatch):
+    def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
         assert b.page_range is not None
-        assert b.page_range[0]["min"] == 8
+        assert b.page_range["min"] == 8
         assert b.find_declared_pages(3) == 8
 
-    def test_a_context_at_the_exported_reservation_floor_keeps_the_buckets(self, monkeypatch):
+    def test_a_context_at_an_exported_min_reserved_dim_size_keeps_the_buckets(self, monkeypatch):
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
         b = SpyreAttnBucketer(make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True)
         assert b.page_range is None
@@ -773,7 +773,7 @@ class TestDeclaredPages:
         from torch_spyre._inductor import config as ts_config
 
         b = SpyreAttnBucketer(make_config(max_model_len=32768), declare_pages=True)
-        assert b.page_range == {0: {"min": 2, "max": 32768 // BLOCK_SIZE, "granularity": 1}}
+        assert b.page_range == {"min": 2, "max": 32768 // BLOCK_SIZE, "granularity": 1}
         assert ts_config.max_buckets == 32768 // BLOCK_SIZE
 
     def test_a_context_above_the_exported_max_buckets_keeps_the_buckets(self, monkeypatch):
@@ -782,6 +782,6 @@ class TestDeclaredPages:
         assert b.page_range is None
         assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
 
-    def test_not_declaring_keeps_the_buckets(self):
+    def test_without_declare_pages_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048))
         assert b.page_range is None

@@ -30,7 +30,7 @@ import time
 from collections.abc import Callable
 from contextvars import copy_context
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
 from torch_spyre._C import get_reserved_dims
@@ -163,21 +163,22 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
-def declare_pages(
-    host: torch.Tensor, page_range: dict[int, dict[str, int]], device: torch.device
+def _to_device_with_page_range(
+    host: torch.Tensor, page_range: dict[str, int], device: torch.device
 ) -> torch.Tensor:
-    """Move a per-sequence page-axis tensor into a buffer reserved at the declared maximum.
+    """Copy ``host``, one row per page, to ``device`` with a dynamic page count.
 
-    The reservation keeps one device layout for every page count, so the layout guard
-    passes. The host tensor is padded to the maximum and moved whole, then resized:
-    a partial copy into a reservation is several times slower (torch-spyre#6026).
+    The device buffer is allocated for ``page_range["max"]`` pages, so every page count
+    gets the same device layout and reuses one compiled kernel. The full buffer is
+    copied and then shrunk to ``host``'s length, since copying only part of it is several
+    times slower (torch-spyre#6026).
     """
+    # The device_cpu tests run this path too, and only a copy to Spyre takes `dynamic=`.
     if device.type != "spyre":
         return convert(host, device=device)
-    max_pages = page_range[0]["max"]
-    padded = host.new_zeros((max_pages, *host.shape[1:]))
+    padded = host.new_zeros((page_range["max"], *host.shape[1:]))
     padded[: host.shape[0]] = host
-    dev = padded.to(device, dynamic=page_range)  # ty: ignore[no-matching-overload]
+    dev = padded.to(device, dynamic={0: page_range})  # ty: ignore[no-matching-overload]
     return dev.resize_(host.shape)
 
 
@@ -203,7 +204,7 @@ def _mirror_mask_stack(
             stack_cpu.shape, (query_rows * block_size, block_size, 1)
         )
         if attn_metadata.page_range is not None:
-            stack_device = declare_pages(stack_cpu, attn_metadata.page_range, device)
+            stack_device = _to_device_with_page_range(stack_cpu, attn_metadata.page_range, device)
         else:
             # `convert` copies, so even a nonzero-offset host view arrives contiguous at
             # offset 0, ready for an in-graph dim-0 slice.
@@ -234,21 +235,33 @@ def _build_query_row_tables(
     return tables
 
 
-def _walked_pages(page_index_table, mask_stack, page_range) -> int:
-    """The page count to walk: the table's own length, or a bucket's when it is not declared.
+def _walked_pages(
+    page_index_table: torch.Tensor,
+    mask_stack: torch.Tensor,
+    page_range: dict[str, int] | None,
+) -> int:
+    """Return the number of pages the kernel loops over, ``page_index_table``'s length.
 
-    A declared table's length is symbolic, so the trace restates its range and ties the
-    mask stack to it; one compile then serves every page count in the range.
+    With a ``page_range`` that length is symbolic during tracing. The checks give the
+    compiler its bounds and tell it that ``mask_stack`` has the same length, so one
+    compiled kernel runs every page count in the range.
     """
     num_blocks = page_index_table.shape[0]
     if page_range is not None:
-        torch._check(num_blocks >= page_range[0]["min"])
-        torch._check(num_blocks <= page_range[0]["max"])
+        torch._check(num_blocks >= page_range["min"])
+        torch._check(num_blocks <= page_range["max"])
         torch._check(mask_stack.shape[0] == num_blocks)
     return num_blocks
 
 
-def page_attn_prefill(*, page_index_table, mask_stack, page_range, **kwargs):
+def page_attn_prefill(
+    *,
+    page_index_table: torch.Tensor,
+    mask_stack: torch.Tensor,
+    page_range: dict[str, int] | None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """Run ``page_attn_prefill_kernel`` over every page in ``page_index_table``."""
     return page_attn_prefill_kernel(
         page_index_table=page_index_table,
         mask_stack=mask_stack,
@@ -257,7 +270,14 @@ def page_attn_prefill(*, page_index_table, mask_stack, page_range, **kwargs):
     )
 
 
-def page_attn_decode(*, page_index_table, mask_stack, page_range, **kwargs):
+def page_attn_decode(
+    *,
+    page_index_table: torch.Tensor,
+    mask_stack: torch.Tensor,
+    page_range: dict[str, int] | None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """Run ``page_attn_decode_kernel`` over every page in ``page_index_table``."""
     return page_attn_decode_kernel(
         page_index_table=page_index_table,
         mask_stack=mask_stack,
@@ -442,9 +462,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # layer whose per-sequence kernel reads it. None entries have not been mirrored yet.
     attention_mask_stacks_device: list[torch.Tensor | None] | None = None
 
-    # The `tensor.to(dynamic=...)` declaration the page index tables and mask stacks are
-    # moved with. None when their page counts round onto the KV buckets instead.
-    page_range: dict[int, dict[str, int]] | None = None
+    # The range of page counts the page index tables and mask stacks are copied to the
+    # device with. None when page counts are rounded up to the KV buckets instead.
+    page_range: dict[str, int] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
@@ -545,8 +565,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.
-        # Only a tiled walk takes a declared page count. A sliding window pads to its own
-        # per-bucket bound and keeps its buckets.
+        # Only the for_each_tile loop can run a page count unknown at compile time. Sliding
+        # window layers pad each sequence to a bound taken from its KV bucket, so they keep
+        # the buckets.
         self._attn_bucketer = SpyreAttnBucketer(
             vllm_config,
             declare_pages=tile_loop.USE_FOR_EACH_TILE
@@ -1040,8 +1061,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             if active_block_indices is not None:
                 blocks_s = active_block_indices[s]
             elif self._attn_bucketer.page_range is not None:
-                # Repeat the last real page, as forward() does: a declared count can be
-                # floored past the block table's width.
+                # Pad with the last real page, as forward() does: raising the count to the
+                # range minimum can take it past the block table's width.
                 real = real_num_blocks[s]
                 blocks_s = list(range(real)) + [real - 1] * (n - real)
             else:
@@ -2029,13 +2050,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self._folded = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._folded
 
-    @staticmethod
-    def _page_range(index_table: torch.Tensor) -> dict[int, dict[str, int]] | None:
-        """The page table's ``tensor.to(dynamic=...)`` declaration, None for a bucketed one."""
-        if index_table.device.type != "spyre":
-            return None
-        return get_reserved_dims(index_table)
-
     def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
 
@@ -2300,7 +2314,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
         if attn_metadata.page_range is not None:
-            return [declare_pages(table, attn_metadata.page_range, device) for table in tables_cpu]
+            return [
+                _to_device_with_page_range(table, attn_metadata.page_range, device)
+                for table in tables_cpu
+            ]
         # Fresh offset-0 allocations (torch-spyre#3770).
         return [convert(table, device=device) for table in tables_cpu]
 
@@ -2335,7 +2352,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         scale, v_scale = self._read_scales()
         prefill_fn, decode_fn = self._page_attn_fns(query.device)
-        page_range = self._page_range(index_table)
+        # None unless the table was copied to Spyre with a page range, on its dim 0.
+        reserved = get_reserved_dims(index_table)
+        page_range = reserved[0] if reserved else None
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
@@ -2506,8 +2525,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # cache key misses. Narrowing belongs before the convert, not here.
             index_table = index_tables[seq_idx]
             mask_stack = _mirror_mask_stack(attn_metadata, seq_idx, _target_device)
-            # A view drops a declared tensor's reservation, and a declared stack already
-            # holds exactly the walked pages.
+            # With a page range the stack already has exactly len(active_bs) tiles, and
+            # slicing it would drop the range.
             if attn_metadata.page_range is None:
                 # Indexed by position within active_bs; a prefix keeps storage_offset 0.
                 mask_stack = mask_stack[: len(active_bs)]

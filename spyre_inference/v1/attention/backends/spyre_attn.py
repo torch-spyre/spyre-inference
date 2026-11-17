@@ -214,6 +214,7 @@ def _build_query_row_tables(
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
+# Compiled even under --enforce-eager: the eager page gather fails (torch-spyre#4334).
 _page_attn_prefill_compiled = torch.compile(
     page_attn_prefill_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
@@ -1367,11 +1368,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     page index. A float8 cache stores ``K / k_scale`` and ``V / v_scale``, dequantized on
     read.
 
-    The KV store is always compiled. The attention kernels are compiled under
-    STOCK_TORCH_COMPILE, and on Spyre under --enforce-eager too: their page gather is a
-    2-D subscript, and eager aten.index takes only a single 1-D index (torch-spyre#4334,
-    tracked by test_spyre_indirect_page_gather_2d_index). Off Spyre an eager run calls
-    them uncompiled.
+    The KV store and the attention kernels are always compiled, under --enforce-eager
+    too: the page gather is a 2-D subscript, and eager aten.index takes only a single
+    1-D index (torch-spyre#4334, tracked by test_spyre_indirect_page_gather_2d_index).
     """
 
     # False for layers that keep no KV cache (encoder self-attention).
@@ -1479,17 +1478,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "Using SpyreAttentionBackend with a head-major paged KV cache, LX-resident pages"
         )
 
-    def _attn_compiled(self, device: torch.device) -> bool:
-        """Whether attention runs compiled: always on Spyre, whose eager page gather fails
-        (torch-spyre#4334); elsewhere only under STOCK_TORCH_COMPILE."""
-        return self._compile_attn or device.type == "spyre"
-
-    def _page_attn_fns(self, device: torch.device) -> tuple[Callable, Callable]:
-        """The per-sequence (prefill, decode) kernels."""
-        if self._attn_compiled(device):
-            return _page_attn_prefill_compiled, _page_attn_decode_compiled
-        return page_attn_prefill_kernel, page_attn_decode_kernel
-
     def _staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Constant-shaped query and output buffers the kernel is called on.
 
@@ -1504,9 +1492,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         if self._staging is None:
             shape = (self.staging_rows, self.num_heads, self.head_size)
-            layout = (
-                row_outermost_layout(shape, self.model_dtype) if device.type == "spyre" else None
-            )
+            layout = row_outermost_layout(shape, self.model_dtype)
             self._staging = (
                 convert(
                     torch.zeros(shape, dtype=self.model_dtype),
@@ -1557,19 +1543,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
-    def _batched_decode_supported(self, device: torch.device) -> bool:
+    def _batched_decode_supported(self) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
         # Set SPYRE_BATCHED_DECODE=0 to force the per-seq loop for all sizes.
-        if not envs.SPYRE_BATCHED_DECODE:
-            return False
-        # The 2-D page index lowers to aten.index, which upcasts the int32 index
-        # to int64 and fails eager; eager takes the per-seq loop instead.
-        return self._attn_compiled(device)
+        return envs.SPYRE_BATCHED_DECODE
 
     def _batched_decode_preconditions_met(
         self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
     ) -> bool:
-        if not self._batched_decode_supported(kv_pages.device):
+        if not self._batched_decode_supported():
             return False
         # Layer 0's builder gates on the decode count and the bucket lattice.
         if attn_metadata.padded_num_seqs is None:
@@ -1655,15 +1637,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         raised, so it cannot take down engine startup; dispatch then compiles it on
         first use.
         """
-        device = kv_cache[0].device
-        if not self._attn_compiled(device):
-            return 0
-
         num_pages = kv_cache[0].shape[0]
         variants = builder.attn_bucketer.variants()
         decode_variants = (
             builder.attn_bucketer.batched_decode_variants()
-            if self._batched_decode_supported(device)
+            if self._batched_decode_supported()
             else []
         )
         t_start = time.time()
@@ -1980,11 +1958,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         if self._kv_row_pool_device is None:
             rows = torch.arange(num_pages * self.num_kv_heads, dtype=torch.int32)
-            layout = (
-                temporary_chunk_major_page_index_layout(num_pages, self.num_kv_heads)
-                if device.type == "spyre"
-                else None
-            )
+            layout = temporary_chunk_major_page_index_layout(num_pages, self.num_kv_heads)
             self._kv_row_pool_device = convert(
                 rows.reshape(num_pages, self.num_kv_heads, 1), device=device, device_layout=layout
             )
@@ -2090,7 +2064,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
     ) -> bool:
         groups = attn_metadata.decode_groups
-        if groups is None or not self._batched_decode_supported(kv_pages.device):
+        if groups is None or not self._batched_decode_supported():
             return False
         # The recorder's bound, per group (torch-spyre#4033).
         return all(g.padded_num_seqs * g.blocks_per_chunk < kv_pages.shape[0] for g in groups)
@@ -2245,7 +2219,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        out: torch.Tensor | None,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         # The kernels index `row_table` whole rather than slicing it to padded_query_len,
         # so a wrong width is a shape mismatch at trace time — a surprise compile in the
@@ -2259,13 +2233,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"index table has {index_table.shape[0]} rows for {num_blocks} blocks"
         )
         scale, v_scale = self._read_scales()
-        prefill_fn, decode_fn = self._page_attn_fns(query.device)
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
             return _run_with_capped_cores(
                 self.num_kv_heads * padded_query_len,
-                prefill_fn,
+                _page_attn_prefill_compiled,
                 query=query,
                 query_row_index=row_table,
                 k_pages=k_pages,
@@ -2291,7 +2264,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # measured no difference, so it is left as is.
         return _run_with_capped_cores(
             self.num_kv_heads * padded_query_len,
-            decode_fn,
+            _page_attn_decode_compiled,
             query=query,
             query_row_index=row_table,
             k_pages=k_folded,
@@ -2344,8 +2317,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
-        # Let the kernel write its output buffer directly, saving a copy per layer.
-        store_out = self._attn_compiled(_target_device)
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
@@ -2382,9 +2353,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 f"{self.staging_rows}; the staging buffers cannot hold it"
             )
             q_staging[:batch_rows] = query_dev
-        # Where this loop writes. With a fused store the kernel writes the staging
-        # buffer and it is copied back once, after the loop.
-        dest = out_staging if store_out else output
 
         self._assert_query_fits_staging(max(aligned_query_lens, default=1))
 
@@ -2396,7 +2364,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # over sequences or GQA optimization
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
-            query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
             # Restrict to active (non-fully-masked) blocks when sliding window
@@ -2420,7 +2387,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if len(active_bs) == 0:
                 # Every KV position is outside every query's window. Attention
                 # over the empty set is undefined; write zeros.
-                dest[q_start:q_end] = 0.0
+                out_staging[q_start:q_end] = 0.0
                 continue
 
             # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
@@ -2450,16 +2417,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_stack,
                 len(active_bs),
                 aligned_query_lens[seq_idx],
-                out_staging if store_out else None,
+                out_staging,
             )
-
             assert result.dtype == output.dtype
-            if store_out:
-                # The kernel wrote `out_staging` itself; copied back below.
-                continue
-            dest[q_start:q_end] = result[:query_len]
 
-        if store_out and not pre_staged:
+        # The kernels wrote `out_staging`; copy it back once.
+        if not pre_staged:
             if batched_done:
                 # Decode rows are already in output; copy only the prefill suffix.
                 prefill_token_start = attn_metadata.num_decode_tokens

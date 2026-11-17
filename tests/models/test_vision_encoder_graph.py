@@ -95,7 +95,7 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).mean(dim=0)
 
 
-def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
+def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0, max_model_len=4096):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
@@ -103,10 +103,11 @@ def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
+            max_model_len=max_model_len,
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: videos if modality == "video" else 4,
                 mm_encoder_tp_mode=tp_mode,
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=2),
     )
@@ -122,6 +123,13 @@ def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     manager = _manager(_FakeVisionModel(max_tokens=300))
     assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
     assert all(b * MERGE_PATCHES % 64 == 0 for b in manager.token_budgets)
+
+
+def test_largest_budget_is_capped_at_max_model_len():
+    """An item longer than the context is rejected before the encoder, so no budget holds it."""
+    manager = _manager(_FakeVisionModel(max_tokens=300), max_model_len=128)
+    assert manager.token_budgets == [16, 32, 64, 128]
+    _manager(_FakeVisionModel(max_tokens=300), max_model_len=128, budgets=[64, 128])
 
 
 def test_user_budgets_below_the_largest_item_fail_at_startup():
@@ -511,8 +519,8 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     runner.spyre_shape_bucketer = SimpleNamespace(bucket_sizes=[1, 4, 16])
     merged = []
     merge = model.vision_merge
-    model.vision_merge = lambda text, image, mask: merged.append(text.shape[0]) or merge(
-        text, image, mask
+    model.vision_merge = lambda text, image, mask: (
+        merged.append(text.shape[0]) or merge(text, image, mask)
     )
     runner.mm_budget = SimpleNamespace(mm_max_toks_per_item={"image": 300})
     runner._spyre_device = torch.device("cpu")
@@ -605,10 +613,8 @@ def test_upstream_returns_text_alone_when_handed_no_image_tokens():
     host = SimpleNamespace(
         _has_oov_mm_tokens=False,
         get_language_model=lambda: SimpleNamespace(embed_input_ids=lambda ids: text),
-        _embed_text_input_ids=lambda ids,
-        embed,
-        is_multimodal: SupportsMultiModal._embed_text_input_ids(
-            host, ids, embed, is_multimodal=is_multimodal
+        _embed_text_input_ids=lambda ids, embed, is_multimodal: (
+            SupportsMultiModal._embed_text_input_ids(host, ids, embed, is_multimodal=is_multimodal)
         ),
     )
     original = vllm_utils._merge_multimodal_embeddings

@@ -447,6 +447,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._is_pooling = vllm_config.model_config.runner_type == "pooling"
         self._max_model_len = vllm_config.model_config.max_model_len
         self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
+        # Set for a draft's groups: one KV group can hold both causal and non-causal
+        # draft layers, so upstream's per-KV-group causality can't reach them.
+        self.causal_override: bool | None = None
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
 
@@ -828,6 +831,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # validity mask (the single query at position context_len can only
         # attend to KV positions [0, kv_len) = [0, context_len]), so applying
         # the causal mask to them is a correct no-op.
+        if self.causal_override is not None:
+            causal = self.causal_override
         apply_causal_mask = causal and max_query_len > 1
 
         num_seqs = common_attn_metadata.num_reqs
@@ -977,7 +982,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
-        self._slot_mapping.publish(slot_mapping)
+        self.publish_slot_mapping(slot_mapping)
 
         num_decode_seqs, _, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
@@ -1210,6 +1215,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 BatchedDecodeGroup(len(members), torch.tensor(members, dtype=torch.int32), *fields)
             )
         return out
+
+    def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
+        """Set the KV-write slots this builder's layers read on their next forward."""
+        self._slot_mapping.publish(slot_mapping)
 
     def build_for_variant(
         self, bucket: SpyreAttnBucket, causal: bool = True
@@ -2131,10 +2140,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             output[:num_decode_seqs].copy_(store[:num_decode_seqs].clone())
 
     def _group_store_rows(self, rows: list[int], padded_num_seqs: int) -> torch.Tensor:
-        # Padded to the seq bucket so the store compiles once per bucket; padding writes the
-        # top staging rows, which no batch reaches.
-        pad = [self.staging_rows - 1 - k for k in range(padded_num_seqs - len(rows))]
-        return torch.tensor(rows + pad, dtype=torch.int32)
+        # Padded to the seq bucket so the store compiles once per bucket. Padding writes the
+        # spare last row: any row below it may hold another group's output.
+        scratch = self.staging_rows - 1
+        assert all(r < scratch for r in rows), f"decode rows {rows} reach the scratch row {scratch}"
+        return torch.tensor(rows + [scratch] * (padded_num_seqs - len(rows)), dtype=torch.int32)
 
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device

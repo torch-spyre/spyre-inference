@@ -145,3 +145,36 @@ def test_groups_cover_only_the_decode_prefix(decode_config, monkeypatch):
     md = _build([32000, 2000, 300], query_lens=[1, 1, 100])
     assert md.num_decode_seqs == 2
     assert _members(md) == [[0], [1]]
+
+
+@pytest.mark.parametrize(
+    ("kv_lens", "members"),
+    [
+        ([32000, 2000, 2000, 2000, 2000, 2000, 32000, 32000], [[0, 6, 7], [1, 2, 3, 4, 5]]),
+        ([32000, 32000, 32000, 2000, 2000, 2000, 2000, 2000], [[0, 1, 2], [3, 4, 5, 6, 7]]),
+    ],
+)
+def test_group_padding_never_overwrites_a_live_row(decode_config, monkeypatch, kv_lens, members):
+    """With decodes filling the token budget, padding must not land on another group's rows."""
+    from types import SimpleNamespace
+
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        SpyreAttentionImpl,
+        _scatter_rows_kernel,
+    )
+
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    md = _build(kv_lens)
+    assert _members(md) == members
+    staging_rows = len(kv_lens) + 1
+    owner = SimpleNamespace(staging_rows=staging_rows)
+    store = torch.zeros(staging_rows, 1)
+    for g in md.decode_groups:
+        rows = g.rows_cpu.tolist()
+        dst = SpyreAttentionImpl._group_store_rows(owner, rows, g.padded_num_seqs)
+        assert dst.shape == (g.padded_num_seqs,)
+        assert set(dst[len(rows) :].tolist()) <= {staging_rows - 1}
+        out = torch.full((g.padded_num_seqs, 1), -1.0)
+        out[: len(rows), 0] = torch.tensor(rows, dtype=torch.float) + 1
+        _scatter_rows_kernel(store, dst.long(), out)
+    assert store[: len(kv_lens), 0].tolist() == [r + 1.0 for r in range(len(kv_lens))]

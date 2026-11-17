@@ -15,7 +15,7 @@ defaults:
     load-format: auto
     compilation-config.mode: STOCK_TORCH_COMPILE
     trust-remote-code: true
-    allowed-local-media-path: /home/senuser/
+    allowed-local-media-path: ${SPYRE_VISION_IMAGES_DATASET}
   parameters:
     dataset-name: custom_image
     dataset-path: ${SPYRE_VISION_DATASET}

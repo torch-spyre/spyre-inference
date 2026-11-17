@@ -202,6 +202,16 @@ def test_mask_mirror_normalizes_singleton_strides_and_keeps_its_cached_copy(shap
     assert _mirror_mask_stack(metadata, 0, torch.device("cpu")) is mirrored
 
 
+@pytest.mark.parametrize("pinned", [True, False])
+def test_a_pinned_builder_ignores_the_metadatas_causality(builder, pinned):
+    """A draft's groups share one KV group, whose single causal value would otherwise
+    apply to every draft layer."""
+    builder.causal_override = pinned
+    bucket = SpyreAttnBucket(1, 16)
+    for requested in (True, False):
+        assert builder.build_for_variant(bucket, causal=requested).causal is pinned
+
+
 def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
     default_vllm_config, monkeypatch
 ):

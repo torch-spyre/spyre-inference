@@ -48,12 +48,18 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inl
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
+from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _set_spyre_compilation_settings,
     _SpyreModelWrapper,
+    warm_sample_row_gathers,
 )
-from spyre_inference.v1.worker.spyre_shape_bucketer import SpyreShapeBucketer, encoder_shape_tables
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    SpyreShapeBucketer,
+    encoder_shape_tables,
+    logits_row_buckets,
+)
 
 if TYPE_CHECKING:
     from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
@@ -212,17 +218,24 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
         logger.info("Attention graph recording disabled (CompilationMode.NONE)")
         return
     builders: dict[str, SpyreAttentionMetadataBuilder] = {}
-    for groups in runner.attn_groups:
+    # The target's groups also list the draft layers; the draft's builders serve them.
+    draft_groups = getattr(runner.speculator, "attn_groups", [])
+    for groups in runner.attn_groups + draft_groups:
         for group in groups:
             builder = group.metadata_builders[0] if group.metadata_builders else None
             if isinstance(builder, SpyreAttentionMetadataBuilder):
                 builders.update(dict.fromkeys(group.layer_names, builder))
+    causal_by_layer = dict.fromkeys(builders, True)
+    if runner.speculator is not None:
+        draft = runner.speculator.model
+        causal_by_layer.update(
+            zip(draft.get_draft_kv_cache_layer_names(), draft.get_draft_attn_causal(), strict=True)
+        )
     record_attention_graphs(
         runner.compilation_config.static_forward_context,
         runner.spyre_kv_caches,
         builders,
-        # Speculative decoding, whose draft layers can be non-causal, is refused at load.
-        causal_by_layer=dict.fromkeys(builders, True),
+        causal_by_layer=causal_by_layer,
     )
 
 
@@ -234,6 +247,10 @@ def run(runner: "SpyreModelRunnerV2") -> None:
     t0 = time.time()
     # Under inference_mode like MRV2's execute_model: grad mode is a guard on every
     # compiled graph, so warming outside it misses each one at serving time.
+    bucketer = SpyreShapeBucketer.for_config(runner.vllm_config)
+    row_widths = (
+        [] if bucketer is None else logits_row_buckets(bucketer.bucket_sizes, runner.max_num_reqs)
+    )
     with _set_spyre_compilation_settings(runner.vllm_config), torch.inference_mode():
         widest = None
         for call in calls:
@@ -242,8 +259,14 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             )
             if runner.pooling_runner is not None:
                 _warm_pooling(runner, hidden_states)
-            elif widest is None:
+                continue
+            warm_sample_row_gathers(
+                cast(_SpyreModelWrapper, runner.model), hidden_states, row_widths
+            )
+            if widest is None:
                 widest = sample_hidden_states
+        if isinstance(runner.speculator, SpyreDFlashSpeculator):
+            runner.speculator.warm_draft_batches()
         if runner.pooling_runner is not None and not runner.model_config.enforce_eager:
             _warm_encoder_inline_paths(runner, {c.num_tokens for c in calls})
         if not runner.model_config.enforce_eager:

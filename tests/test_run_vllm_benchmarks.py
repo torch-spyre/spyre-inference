@@ -26,6 +26,7 @@ breaks these invariants fails here.
 """
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -255,6 +256,23 @@ def test_missing_dataset_aborts_the_run(monkeypatch, tmp_path):
     assert excinfo.value.code == 2
 
 
+def test_unset_dataset_var_falls_back_to_the_archive(monkeypatch, tmp_path):
+    """The vision var has a fetch-cache default now, so unset resolves and an
+    absent file is fatal like any other trace, not a skip."""
+    monkeypatch.delenv("SPYRE_VISION_DATASET", raising=False)
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
+    config = _serve_config("${SPYRE_VISION_DATASET}")
+    runner._resolve_dataset_path(config)
+
+    expected = tmp_path / "spyre-inference/datasets/vision/oracle_invoices_2026.11.10/dataset.jsonl"
+    assert config["parameters"]["dataset-path"] == str(expected)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner._select_configs([config], set(), set())
+
+    assert excinfo.value.code == 2
+
+
 def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path):
     """Filtering runs first, so an absent trace only matters for a selected test."""
     monkeypatch.setenv("SPYRE_CICS_DATASET", str(tmp_path / "absent.jsonl"))
@@ -263,6 +281,84 @@ def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path
 
     assert runner._select_configs([config], {"other-model"}, set()) == []
     assert runner._select_configs([config], set(), {4}) == []
+
+
+# ── vision dataset: server_parameters expansion and archive defaults ──
+
+
+def test_server_parameters_expand_env(monkeypatch, tmp_path):
+    """allowed-local-media-path must not reach vllm serve as a literal ${VAR}."""
+    media = tmp_path / "media"
+    media.mkdir()
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    monkeypatch.setenv("SPYRE_VISION_IMAGES_DATASET", str(media))
+    monkeypatch.setenv("SPYRE_CICS_DATASET", str(trace))
+    config = _serve_config("${SPYRE_CICS_DATASET}")
+    config["server_parameters"]["allowed-local-media-path"] = "${SPYRE_VISION_IMAGES_DATASET}"
+    runner._derive_config(config)
+
+    (selected,) = runner._select_configs([config], set(), set())
+
+    assert selected["server_parameters"]["allowed-local-media-path"] == str(media)
+
+
+def test_missing_media_dir_aborts_the_run(monkeypatch, tmp_path):
+    """A dataset whose image dir is absent cannot run, like an absent trace."""
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    config = _serve_config(str(trace))
+    config["server_parameters"]["allowed-local-media-path"] = str(tmp_path / "absent")
+    runner._derive_config(config)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner._select_configs([config], set(), set())
+
+    assert excinfo.value.code == 2
+
+
+def test_archive_defaults_point_into_the_cache(tmp_path):
+    """Unset vision vars fall back to the extracted archive's cache location."""
+    monkeypatch = pytest.MonkeyPatch()
+    with monkeypatch.context() as mp:
+        mp.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
+        mp.delenv("SPYRE_VISION_DATASET", raising=False)
+        mp.delenv("SPYRE_VISION_IMAGES_DATASET", raising=False)
+        env = runner._dataset_path_defaults()
+
+    out = tmp_path / "spyre-inference/datasets/vision/oracle_invoices_2026.11.10"
+    assert env["SPYRE_VISION_DATASET"] == str(out / "dataset.jsonl")
+    assert env["SPYRE_VISION_IMAGES_DATASET"] == str(out)
+
+
+def test_materialize_rewrites_image_paths_absolute(tmp_path, monkeypatch):
+    """The archive ships relative image paths; the cache copy must be absolute."""
+    import tarfile
+
+    images = tmp_path / "img"
+    images.mkdir()
+    (images / "a.jpg").write_bytes(b"not-really-a-jpeg")
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text('{"prompt": "p", "image_files": ["img/a.jpg"]}\n')
+    archive = tmp_path / "ds.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(prompts, arcname="prompts.jsonl")
+        tar.add(images, arcname="img")
+
+    spec = {"path": "ds.tar.gz", "sha256": "0" * 64, "media_var": "SPYRE_VISION_IMAGES_DATASET"}
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path / "cache"))
+    out = tmp_path / "cache" / "ds"
+    # The archive sits where the fetch step would have put it.
+    (tmp_path / "cache").mkdir()
+    archive.rename(tmp_path / "cache" / "ds.tar.gz")
+
+    dataset, media = runner.fetch_bench_datasets.materialize(tmp_path / "cache" / "ds.tar.gz", spec)
+
+    assert media == out
+    assert dataset == out / "dataset.jsonl"
+    row = json.loads(dataset.read_text().splitlines()[0])
+    assert row["image_files"] == [str(out / "img" / "a.jpg")]
+    assert Path(row["image_files"][0]).is_file()
 
 
 def test_config_without_tp_aborts_the_run():

@@ -51,6 +51,10 @@ inputs:
   use_prebaked_image:
     description: When 'true', skip the RPM install + spyre-inference build and use the runner image's stack as-is
     required: true
+  image_rpms:
+    description: When 'true', skip the baseline RPM install and use the runner image's Spyre RPMs; spyre-inference and torch-spyre are still built from source
+    required: false
+    default: 'false'
   storage_root:
     description: Repo-scoped uv-cache root on the shared mount, forwarded to the uv-nfs-cache action (e.g. $STORAGE_1_DIR/.cache/uv)
     required: true
@@ -90,9 +94,16 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Reject image_rpms with override RPMs
+      if: ${{ inputs.image_rpms == 'true' && inputs.rpm_names != '' }}
+      shell: bash
+      run: |
+        echo "::error::image_rpms cannot be combined with rpm_names: override RPMs layer onto the baseline install, which image_rpms skips."
+        exit 1
+
     # Install the baseline RPMs from spyre-rpms.lock; skipped when use_prebaked_image is true, so the run uses the image's Spyre stack as-is (see issue #543).
     - name: Install Spyre RPMs
-      if: ${{ inputs.use_prebaked_image != 'true' }}
+      if: ${{ inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' }}
       uses: ./.github/actions/spyre-rpm-install
 
     # Install the uv binary only. The cache itself is shipped from the shared
@@ -108,7 +119,7 @@ runs:
     # action's post step writes the main scope on push-to-main and an isolated
     # pr-<N> scope on PRs). Merge queue needs no gate: it is not a writer.
     - name: uv cache (NFS)
-      if: ${{ inputs.use_prebaked_image != 'true' }}
+      if: ${{ inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' }}
       uses: ./.github/actions/uv-nfs-cache
       with:
         storage-root: ${{ inputs.storage_root }}
@@ -152,10 +163,15 @@ runs:
       shell: bash
       env:
         TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        IMAGE_RPMS: ${{ inputs.image_rpms }}
         SPYRE_KERNELS_WHEEL_DIR: ${{ runner.temp }}/kernels-wheel
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
+        # uv keys a git-built wheel on the rev alone, so a wheel built against other RPMs would be reused; force a rebuild against the image's.
+        if [[ "$IMAGE_RPMS" == "true" ]]; then
+          uv cache clean torch-spyre
+        fi
         if [[ -n "$TORCH_SPYRE_REF" ]]; then
           # Build torch-spyre from the dispatched ref straight from GitHub; --frozen skips resolution during add, the non-frozen sync below resolves everything.
           uv add --frozen \
@@ -201,7 +217,7 @@ runs:
     # RPMs are overridden, since the lockfiles then no longer describe the stack.
     - name: Restore compile cache (NFS)
       id: compile-cache
-      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
+      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
       continue-on-error: true
       shell: bash
       env:

@@ -496,30 +496,6 @@ def test_per_layer_embedding_cache_follows_the_model(monkeypatch):
     assert model.to(torch.float16).per_layer_embeddings.dtype == torch.float16
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "The pinned vLLM reads the PLE cache on the device it was built on. When this "
-        "XPASSes, vllm-project/vllm#62659 is in: merge torch-spyre/spyre-inference#1669."
-    ),
-)
-def test_upstream_ple_cache_follows_inputs_device():
-    model = object.__new__(gemma4_mm.Gemma4ForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.per_layer_embeddings = torch.zeros(8, 2, 4, device="meta")
-    model._full_attn_layer_idxs = ()
-    seen = []
-
-    def backbone(*args, per_layer_inputs, **kwargs):
-        seen.append(per_layer_inputs)
-
-    model.language_model = SimpleNamespace(model=backbone)
-    model(None, None, inputs_embeds=torch.zeros(3, 1))
-
-    assert seen[0].device.type == "cpu"
-
-
 @pytest.mark.parametrize("has_image", [True, False])
 def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration

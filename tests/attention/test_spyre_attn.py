@@ -60,7 +60,7 @@ from spyre_inference.v1.attention.ops.reshape_and_cache import (
     quantize_kv,
     reshape_and_cache_kernel,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+from spyre_inference.v1.attention.spyre_attn_bucketer import _SPYRE_CORE_COUNT, SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
 
@@ -2408,9 +2408,10 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks: compiled at 4, then
-    # reused at 2 and 3.
+    # One entry per core, as a wide KV row gets. The fixture's max_model_len 2048 at block
+    # size 128 is 16 pages. At eight sequences a chunk holds 4 pages of each, so the kernel
+    # runs 2 to 4 chunks: compiled at 4, then reused at 2 and 3.
+    monkeypatch.setattr(spyre_attn, "batched_decode_entries", lambda *_: _SPYRE_CORE_COUNT)
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -2464,8 +2465,10 @@ def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so batches of 1 to 4 pages all run as one chunk.
+    # One entry per core, as a wide KV row gets. The fixture's max_model_len 2048 at block
+    # size 128 is 16 pages. At eight sequences a chunk holds 4 pages of each, so batches of
+    # 1 to 4 pages all run as one chunk.
+    monkeypatch.setattr(spyre_attn, "batched_decode_entries", lambda *_: _SPYRE_CORE_COUNT)
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -3194,8 +3197,6 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     )
     from spyre_inference.v1.attention.spyre_attn_bucketer import (
         SpyreAttnBatchedDecodeBucket,
-        SpyreAttnBucketer,
-        batched_decode_chunking,
     )
 
     torch.set_default_device("cpu")
@@ -3225,21 +3226,23 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     assert impl._batched_decode_supported()
 
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
-    blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-    bucket = SpyreAttnBatchedDecodeBucket(
-        num_seqs=num_seqs,
-        num_blocks=num_blocks,
-        blocks_per_chunk=blocks_per_chunk,
-        num_chunks=num_chunks,
-    )
 
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
-        builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=dynamic_chunks)
+        # One entry per core, as a wide KV row gets: max_model_len 2048 at block size 64 is
+        # 32 pages, so 4 sequences take 4 chunks of 8 pages each and get a chunk range.
+        builder._attn_bucketer = SpyreAttnBucketer(
+            vllm_config, _SPYRE_CORE_COUNT, declare_pages=dynamic_chunks
+        )
+        blocks_per_chunk, num_chunks = builder.attn_bucketer.decode_chunking(num_seqs, num_blocks)
+        bucket = SpyreAttnBatchedDecodeBucket(
+            num_seqs=num_seqs,
+            num_blocks=num_blocks,
+            blocks_per_chunk=blocks_per_chunk,
+            num_chunks=num_chunks,
+        )
         if dynamic_chunks:
-            # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
-            # pages each.
             (bucket,) = [
                 v
                 for v in builder.attn_bucketer.batched_decode_variants()

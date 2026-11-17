@@ -2918,7 +2918,9 @@ class with <code>SpyreVisionEncoderMixin</code> (<code>models/_vision_encoder.py
 upstream's <code>SupportsEncoderCudaGraph</code> protocol, so the bucketing is upstream's:
 <code>EncoderCudaGraphManager</code> picks power-of-two token budgets (or takes
 <code>encoder_cudagraph_token_budgets</code>), packs a step's images into them, pads the inputs and splits
-the output per image. <code>SpyreEncoderGraphManager</code>
+the output per image. The mixin caps the largest budget at <code>max_model_len</code>: an image's encoder
+tokens are among its prompt's, so a larger one never reaches the encoder (granite vision, whose
+padded tiles can outnumber its placeholders, keeps its own range). <code>SpyreEncoderGraphManager</code>
 (<code>v1/worker/spyre_encoder_graph.py</code>) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention

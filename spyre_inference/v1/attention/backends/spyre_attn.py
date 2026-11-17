@@ -1901,13 +1901,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
         )
         shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
-        pages = [
-            torch.empty(shape, dtype=dtype, device=device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            for _ in range(2)
-        ]
-        # Through a byte view: the device fill has no fp8 pattern.
-        for p in pages:
-            p.view(torch.uint8).zero_()
+        if dtype == torch.float8_e4m3fn:
+            # The device fill has no fp8 pattern, and torch-spyre's fill rejects (or
+            # faults on) a byte view of the page (#1684), so fp8 zeroes on the host.
+            pages = [
+                torch.zeros(shape, dtype=dtype).to(device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                for _ in range(2)
+            ]
+        else:
+            pages = [
+                torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_()  # ty: ignore[no-matching-overload]
+                for _ in range(2)
+            ]
         return SpyrePagedKVCache(*pages)
 
     def _kernel_kv_scales(self) -> tuple[float | None, float | None]:

@@ -180,6 +180,8 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
 
 
 MULTIMODAL_MODEL = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
+# Per-tensor FP8 sibling: quant_method "fp8", static activations.
+MULTIMODAL_FP8_MODEL = "mistralai/Ministral-3-14B-Instruct-2512"
 # Short enough to keep both warmups (TP=1, then TP=2) inside one test's budget: the 176x176
 # image and the prompt fit, and attention records only the buckets up to it.
 MULTIMODAL_MAX_MODEL_LEN = 256
@@ -211,22 +213,29 @@ def _image_conversation():
     ]
 
 
-def _generate_image(tp: int) -> list[list[int]]:
+def _generate_ministral(tp: int, model: str = MULTIMODAL_MODEL, images: int = 1) -> list[list[int]]:
+    """Greedy tokens for a text prompt, then the image prompt when ``images`` is set.
+
+    ``images=0`` builds the tower as a placeholder, skipping its weights and warmup.
+    """
     from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model=MULTIMODAL_MODEL,
+        model=model,
         config_format="mistral",
         tensor_parallel_size=tp,
         dtype="float16",
         max_model_len=MULTIMODAL_MAX_MODEL_LEN,
         max_num_seqs=1,
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={"image": images},
         # One decoding sequence, and a prefill of the whole prompt.
         compilation_config={"compile_sizes": [1, MULTIMODAL_MAX_MODEL_LEN]},
     )
+    conversations = [[{"role": "user", "content": "Count to ten: one, two, three"}]]
+    if images:
+        conversations.append(_image_conversation())
     try:
-        outs = llm.chat([_image_conversation()], SamplingParams(max_tokens=8, temperature=0.0))
+        outs = llm.chat(conversations, SamplingParams(max_tokens=8, temperature=0.0))
         result = [list(o.outputs[0].token_ids) for o in outs]
     finally:
         llm.llm_engine.engine_core.shutdown(timeout=60)
@@ -240,18 +249,27 @@ def _generate_image(tp: int) -> list[list[int]]:
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.multimodal
+@pytest.mark.fp8
 @pytest.mark.skipif(
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 @pytest.mark.timeout(3600)
 def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
-    """TP=1 vs TP=2 greedy prefix match on one image prompt, compiled: the vision blocks
-    and projection run their TP all_reduces inside the compiled graphs, and serving must
-    not compile anything."""
+    """TP=1 vs TP=2 greedy prefix match on a text and an image prompt, compiled: the vision
+    blocks and projection run their TP all_reduces inside the compiled graphs, and serving
+    must not compile anything.
+
+    The FP8 checkpoint, loaded through ``SpyreFp8Config``, must then track the BF16 TP=2
+    run on the text prompt. It runs text only: FP8 changes the decoder's linears alone.
+    """
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    _assert_matches_tp1(_generate_image(tp=1), _generate_image(tp=2))
+    tp1 = _generate_ministral(tp=1)
+    bf16 = _generate_ministral(tp=2)
+    _assert_matches_tp1(tp1, bf16)
+    fp8 = _generate_ministral(tp=2, model=MULTIMODAL_FP8_MODEL, images=0)
+    _assert_matches_tp1(bf16[:1], fp8, names=("bf16", "fp8"))
 
 
 @pytest.mark.e2e_smoke

@@ -76,7 +76,7 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
         if self.tp_size == 1:
             self.register_buffer(
                 "_spyre_unit_row",
-                torch.ones(self.embedding_dim, dtype=self.weight.dtype),
+                torch.ones(self.embedding_dim, dtype=self.params_dtype),
                 persistent=False,
             )
         else:

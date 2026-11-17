@@ -57,6 +57,7 @@ docs/examples
 .hive/*
 !.hive/agents/
 !.hive/deps/
+!.hive/review-perspectives.yaml
 
 
 # Micro-benchmark run artifacts (scripts/microbench default --output-dir)

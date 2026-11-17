@@ -57,9 +57,9 @@ class _Block(nn.Module):
 class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
     """Item ``i`` is ``tokens[i]`` patches per offset group, all holding ``i + 1``."""
 
-    def __init__(self, max_tokens: int = 300, num_blocks: int = 1) -> None:
+    def __init__(self, max_tokens: int = 300, num_blocks: int = 1, merge: int = MERGE_PATCHES):
         super().__init__()
-        self.patches_per_token = MERGE_PATCHES
+        self.patches_per_token = merge
         self.max_tokens_per_item = max_tokens
         self.out_hidden_size = 8
         self.vision_buffers = {"patches": VisionBuffer(8), "segments": VisionBuffer(None, pad=-1.0)}
@@ -80,7 +80,7 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
     def vision_inputs(self, mm_kwargs):
         ids = mm_kwargs.get("ids", range(len(mm_kwargs["tokens"])))
         seg = torch.cat([torch.full((t,), float(i + 1)) for i, t in zip(ids, mm_kwargs["tokens"])])
-        seg = seg.repeat(MERGE_PATCHES).to(torch.float16)
+        seg = seg.repeat(self.patches_per_token).to(torch.float16)
         return {"patches": seg[:, None].expand(-1, 8).contiguous(), "segments": seg}
 
     def vision_embed(self, values):
@@ -92,14 +92,14 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
     def vision_project(self, x, taps):
         self.forward_patches.append(x.shape[0])
         self.seen_taps.append(taps)
-        return x.reshape(MERGE_PATCHES, -1, x.shape[-1]).mean(dim=0)
+        return x.reshape(self.patches_per_token, -1, x.shape[-1]).mean(dim=0)
 
 
-def _vllm_config(budgets=None, tp_mode="weights", videos=0):
+def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
-            encoder_cudagraph_max_vision_items_per_batch=0,
+            encoder_cudagraph_max_vision_items_per_batch=max_items,
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
@@ -235,6 +235,79 @@ def test_items_per_call_cap_also_caps_the_frames():
         del type(model).vision_max_items_per_call
     assert manager.max_batch_size == 2
     assert manager.max_frames_per_batch == 2 * 8
+
+
+def _one_token_model() -> _FakeVisionModel:
+    return _FakeVisionModel(max_tokens=1, merge=64)
+
+
+def test_items_limited_by_tokens_packs_up_to_the_largest_budget():
+    model = _one_token_model()
+    type(model).vision_items_limited_by_tokens = True
+    type(model).vision_max_items_per_call = 63
+    try:
+        manager = _manager(model, budgets=[1, 2, 4, 8])
+        manager.capture(graph_pool=None)
+        model.forward_patches.clear()
+        outputs = manager.execute({"tokens": [1] * 10})
+    finally:
+        del type(model).vision_items_limited_by_tokens, type(model).vision_max_items_per_call
+    assert model.forward_patches == [8 * 64, 2 * 64]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full((1, 8), float(i + 1), dtype=torch.float16))
+
+
+def test_default_keeps_upstreams_item_limit():
+    model = _one_token_model()
+    manager = _manager(model, budgets=[1, 2, 4, 8])
+    manager.capture(graph_pool=None)
+    model.forward_patches.clear()
+    manager.execute({"tokens": [1] * 5})
+    assert manager.max_batch_size == 1
+    assert model.forward_patches == [64] * 5
+
+
+def test_items_limited_by_tokens_requires_a_layout_cap():
+    model = _one_token_model()
+    type(model).vision_items_limited_by_tokens = True
+    try:
+        with pytest.raises(ValueError, match="vision_max_items_per_call"):
+            _manager(model, budgets=[1, 2, 4, 8])
+    finally:
+        del type(model).vision_items_limited_by_tokens
+
+
+@pytest.mark.parametrize(
+    ("layout_cap", "user_cap", "expected"), [(3, 0, 3), (3, 2, 2), (63, 0, 63), (63, 40, 40)]
+)
+def test_items_limited_by_tokens_respects_both_caps(layout_cap, user_cap, expected):
+    """A user limit above the smallest budget is valid here, though upstream rejects it."""
+    model = _one_token_model()
+    type(model).vision_items_limited_by_tokens = True
+    type(model).vision_max_items_per_call = layout_cap
+    try:
+        manager = _manager(model, budgets=[1, 2, 4, 8], max_items=user_cap, videos=1)
+    finally:
+        del type(model).vision_items_limited_by_tokens, type(model).vision_max_items_per_call
+    assert manager.max_batch_size == expected
+    assert manager.max_frames_per_batch == expected * manager.config.max_frames_per_video
+    assert manager.token_budgets == [1, 2, 4, 8]
+    assert manager.vllm_config.compilation_config.encoder_cudagraph_max_vision_items_per_batch == (
+        user_cap
+    )
+
+
+def test_items_limited_by_tokens_keeps_small_budgets_under_a_user_item_limit():
+    """Upstream would raise the smallest auto budget to the user's item limit."""
+    model = _FakeVisionModel(max_tokens=8, merge=64)
+    type(model).vision_items_limited_by_tokens = True
+    type(model).vision_max_items_per_call = 63
+    try:
+        manager = _manager(model, max_items=4)
+    finally:
+        del type(model).vision_items_limited_by_tokens, type(model).vision_max_items_per_call
+    assert manager.token_budgets == [1, 2, 4, 8]
+    assert manager.max_batch_size == 4
 
 
 def test_taps_reach_vision_project_in_declared_order():

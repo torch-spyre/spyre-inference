@@ -2371,15 +2371,19 @@ def test_spyre_attn_decode_compiles_at_a_prime_page_count(
 
 
 @pytest.mark.parametrize(
-    ("seq_lens", "use_sinks"),
+    ("seq_lens", "use_sinks", "token_budget"),
     [
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], False, id="long_and_shorts"),
-        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], False, id="graded"),
+        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], False, None, id="long_and_shorts"),
+        pytest.param([(1, 6000), (1, 3000), (1, 1000), (1, 300)], False, None, id="graded"),
         pytest.param(
-            [(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], False, id="with_prefill"
+            [(1, 7000), (1, 200), (1, 200), (1, 200), (64, 300)], False, None, id="with_prefill"
         ),
         # Sinks barely move the 7000-token row, so the short group is what catches a miss.
-        pytest.param([(1, 7000), (1, 200), (1, 200), (1, 200)], True, id="long_and_shorts_sinks"),
+        pytest.param(
+            [(1, 7000), (1, 200), (1, 200), (1, 200)], True, None, id="long_and_shorts_sinks"
+        ),
+        # Decodes fill the budget: one spare staging row, and the short group pads by three.
+        pytest.param([(1, 7000)] + [(1, 200)] * 5 + [(1, 7000)] * 2, False, 8, id="full_budget"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2391,7 +2395,13 @@ def test_spyre_attn_decode_compiles_at_a_prime_page_count(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_spyre_attn_grouped_decode_matches_reference(
-    default_vllm_config, monkeypatch, seq_lens, use_sinks, configure_compilation, configure_device
+    default_vllm_config,
+    monkeypatch,
+    seq_lens,
+    use_sinks,
+    token_budget,
+    configure_compilation,
+    configure_device,
 ):
     from vllm.config import get_current_vllm_config
 
@@ -2401,6 +2411,8 @@ def test_spyre_attn_grouped_decode_matches_reference(
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 8192
+    if token_budget is not None:
+        cfg.scheduler_config.max_num_batched_tokens = token_budget
 
     groups_run = []
     run_grouped = SpyreAttentionImpl._run_grouped_decode

@@ -756,6 +756,31 @@ class TestDeclaredPages:
         assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
         assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [2, 2, 7, 32]
 
+    def test_prefill_page_counts_are_multiples_of_eight_from_sixteen(self):
+        from torch_spyre._inductor import config as ts_config
+
+        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is not None
+        assert b.page_range["max"] == 31
+        assert b.prefill_page_range == {"min": 16, "max": 32, "granularity": 8}
+        assert ts_config.max_buckets >= 32
+        assert [b.find_declared_pages(n, prefill=True) for n in (1, 8, 16, 17, 32)] == [
+            16,
+            16,
+            16,
+            24,
+            32,
+        ]
+
+    def test_prefill_keeps_single_pages_above_the_exported_max_buckets(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        monkeypatch.setenv("MAX_BUCKETS", "31")
+        ts_config.max_buckets = 31
+        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is not None
+        assert b.prefill_page_range == b.page_range
+
     def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)

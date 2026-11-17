@@ -251,6 +251,30 @@ def _declared_page_range(max_pages: int) -> dict[str, int] | None:
     return {"min": min_pages, "max": max_pages, "granularity": 1}
 
 
+# Prefill reads this many pages per loop step, so its page counts are multiples of it.
+PREFILL_PAGE_GRANULARITY = 8
+
+
+def _prefill_page_range(page_range: dict[str, int]) -> dict[str, int]:
+    """Return ``page_range`` with its bounds rounded up to multiples of
+    ``PREFILL_PAGE_GRANULARITY``.
+
+    The minimum is two loop steps, since torch.compile compiles a single loop step
+    separately, as it does a single page. Returns ``page_range`` unchanged when the
+    rounded range holds a single page count or is above an exported ``MAX_BUCKETS``.
+    """
+    from torch_spyre._inductor import config as ts_config
+
+    g = PREFILL_PAGE_GRANULARITY
+    min_pages = max(-(-page_range["min"] // g) * g, 2 * g)
+    max_pages = -(-page_range["max"] // g) * g
+    if "MAX_BUCKETS" not in os.environ:
+        ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
+    if not min_pages < max_pages <= ts_config.max_buckets:
+        return page_range
+    return {"min": min_pages, "max": max_pages, "granularity": g}
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -367,8 +391,11 @@ class SpyreAttnBucketer:
         # With a page range, the per-sequence kernels take the page count at run time, so
         # they compile once per query bucket rather than once per (query, KV) bucket pair.
         self._page_range: dict[str, int] | None = None
+        self._prefill_page_range: dict[str, int] | None = None
         if declare_pages:
             self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
+        if self._page_range is not None:
+            self._prefill_page_range = _prefill_page_range(self._page_range)
 
         validate_kv_ladder_env()
 
@@ -450,11 +477,19 @@ class SpyreAttnBucketer:
         kernel runs. None when page counts are rounded up to ``num_blocks_buckets``."""
         return self._page_range
 
-    def find_declared_pages(self, num_blocks: int) -> int:
-        """The page count a sequence of ``num_blocks`` pages runs at: its own, or the
-        range minimum if that is larger."""
-        assert self._page_range is not None
-        return max(num_blocks, self._page_range["min"])
+    @property
+    def prefill_page_range(self) -> dict[str, int] | None:
+        """``page_range`` for a prefill sequence (query width > 1), whose page counts are
+        multiples of ``PREFILL_PAGE_GRANULARITY``."""
+        return self._prefill_page_range
+
+    def find_declared_pages(self, num_blocks: int, prefill: bool = False) -> int:
+        """The page count a sequence of ``num_blocks`` pages runs at: its own, rounded up
+        to the range granularity, or the range minimum if that is larger."""
+        page_range = self._prefill_page_range if prefill else self._page_range
+        assert page_range is not None
+        g = page_range["granularity"]
+        return max(-(-num_blocks // g) * g, page_range["min"])
 
     def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
         """The num_blocks buckets batched decode records and dispatches onto at this batch size.

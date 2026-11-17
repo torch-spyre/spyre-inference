@@ -202,8 +202,9 @@ def _mirror_mask_stack(
         stack_cpu = stack_cpu.contiguous().as_strided(
             stack_cpu.shape, (query_rows * block_size, block_size, 1)
         )
-        if attn_metadata.page_range is not None:
-            stack_device = _to_device_with_page_range(stack_cpu, attn_metadata.page_range, device)
+        page_range = attn_metadata.seq_page_range(seq_idx)
+        if page_range is not None:
+            stack_device = _to_device_with_page_range(stack_cpu, page_range, device)
         else:
             # `convert` copies, so even a nonzero-offset host view arrives contiguous at
             # offset 0, ready for an in-graph dim-0 slice.
@@ -242,14 +243,17 @@ def _walked_pages(
     """Return the number of pages the kernel loops over, ``page_index_table``'s length.
 
     With a ``page_range`` that length is symbolic during tracing. The checks give the
-    compiler its bounds and tell it that ``mask_stack`` has the same length, so one
-    compiled kernel runs every page count in the range.
+    compiler its bounds, tell it that ``mask_stack`` has the same length and, with a
+    granularity above 1, that the length is a multiple of it. One compiled kernel then
+    runs every page count in the range.
     """
     num_blocks = page_index_table.shape[0]
     if page_range is not None:
         torch._check(num_blocks >= page_range["min"])
         torch._check(num_blocks <= page_range["max"])
         torch._check(mask_stack.shape[0] == num_blocks)
+        if page_range["granularity"] > 1:
+            torch._check(num_blocks % page_range["granularity"] == 0)
     return num_blocks
 
 
@@ -330,6 +334,16 @@ def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
         return 1
     # A divisor of num_blocks itself: a sliding window's block count is not a bucket.
     return math.gcd(_PAGE_GROUP, num_blocks, max(1, num_blocks // 4))
+
+
+def _prefill_page_group_for_range(
+    page_range: dict[str, int], num_heads: int, head_size: int
+) -> int:
+    """Return the prefill page group for a page range: a divisor of its granularity, so it
+    divides every page count in the range."""
+    if num_heads * head_size > _PAGE_GROUP_MAX_QUERY_WIDTH:
+        return 1
+    return math.gcd(_PAGE_GROUP, page_range["granularity"])
 
 
 def _lx_max_cores(output_units: int) -> int:
@@ -464,6 +478,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # The range of page counts the page index tables and mask stacks are copied to the
     # device with. None when page counts are rounded up to the KV buckets instead.
     page_range: dict[str, int] | None = None
+    # The same for a prefill sequence (aligned query length > 1), whose page counts are
+    # multiples of the prefill page group.
+    prefill_page_range: dict[str, int] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
@@ -492,6 +509,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
+
+    def seq_page_range(self, seq_idx: int) -> dict[str, int] | None:
+        """Return the page range sequence ``seq_idx``'s page table and mask stack are
+        copied to the device with."""
+        if self.page_range is not None and self.aligned_query_lens[seq_idx] > 1:
+            return self.prefill_page_range
+        return self.page_range
 
 
 class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetadata]):
@@ -597,7 +621,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             self._zero_tiles[aligned_query_len] = tile
         return tile
 
-    def _pad_num_blocks(self, num_blocks: int) -> int:
+    def _pad_num_blocks(self, num_blocks: int, prefill: bool = False) -> int:
         """Round an active-block count up onto the recorder's num_blocks buckets.
 
         block_table is allocated at width ceil(max_model_len / block_size) for
@@ -608,7 +632,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # denominator, so zero real blocks must stay zero.
             return 0
         if self._attn_bucketer.page_range is not None:
-            return self._attn_bucketer.find_declared_pages(num_blocks)
+            return self._attn_bucketer.find_declared_pages(num_blocks, prefill)
         padded = self._attn_bucketer.find_blocks_bucket(num_blocks)
         # The buckets cover ceil(max_model_len / block_size), and the scheduler
         # bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
@@ -960,7 +984,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             for s in range(num_seqs):
                 n = (int(seq_lens[s].item()) + block_size - 1) // block_size
                 real_num_blocks.append(n)
-            padded_num_blocks = [self._pad_num_blocks(n) for n in real_num_blocks]
+            padded_num_blocks = [
+                self._pad_num_blocks(n, aligned_query_lens[s] > 1)
+                for s, n in enumerate(real_num_blocks)
+            ]
 
             # Padded tiles need no special construction — kv_valid = kv_pos <
             # seq_lens already emits finfo.min past the true length.
@@ -1153,6 +1180,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             aligned_query_lens=aligned_query_lens,
             padded_num_blocks=padded_num_blocks,
             page_range=self._attn_bucketer.page_range,
+            prefill_page_range=self._attn_bucketer.prefill_page_range,
             num_decode_seqs=num_decode_seqs,
             num_decode_tokens=num_decode_tokens,
             decode_uniformity=decode_uniformity,
@@ -2312,13 +2340,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Per sequence, the device index table this impl's kernel gathers pages with."""
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
-        if attn_metadata.page_range is not None:
-            return [
-                _to_device_with_page_range(table, attn_metadata.page_range, device)
-                for table in tables_cpu
-            ]
-        # Fresh offset-0 allocations (torch-spyre#3770).
-        return [convert(table, device=device) for table in tables_cpu]
+        tables = []
+        for s, table in enumerate(tables_cpu):
+            page_range = attn_metadata.seq_page_range(s)
+            if page_range is not None:
+                tables.append(_to_device_with_page_range(table, page_range, device))
+            else:
+                # Fresh offset-0 allocations (torch-spyre#3770).
+                tables.append(convert(table, device=device))
+        return tables
 
     def index_tables(self, attn_metadata: "SpyreAttentionMetadata", device: torch.device) -> list:
         """`build_index_tables`, memoized so only the step's first layer pays for it."""
@@ -2374,8 +2404,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 out=out,
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
-                # A group must divide every page count of a declared range.
-                page_group=1
+                page_group=_prefill_page_group_for_range(page_range, self.num_heads, self.head_size)
                 if page_range is not None
                 else _prefill_page_group(num_blocks, self.num_heads, self.head_size),
             )

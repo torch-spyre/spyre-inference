@@ -278,10 +278,15 @@ use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel
 sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
 sequence that fits in one page also gets a masked copy of it as a second page.
 
+Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
+prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
+their own page count.
+
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
 export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
-`--max-model-len / block_size`.
+`--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
+below that rounded value, prefill reads one page per loop step instead.
 
 The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
 bucket pair, when any of these holds:

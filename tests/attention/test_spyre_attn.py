@@ -40,6 +40,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
     _prefill_page_group,
+    _prefill_page_group_for_range,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
 from spyre_inference.v1.attention.ops import tile_loop
@@ -2050,6 +2051,17 @@ def test_prefill_page_group_divides_every_block_count():
     block count is not a bucket, so every count must get a divisor."""
     for num_blocks in range(1, 1025):
         assert num_blocks % _prefill_page_group(num_blocks, 8, 128) == 0, num_blocks
+
+
+@pytest.mark.parametrize(
+    "granularity, num_heads, head_size, expected",
+    [(8, 8, 128, 8), (1, 8, 128, 1), (8, 16, 128, 1)],
+)
+def test_prefill_page_group_for_range_divides_the_granularity(
+    granularity, num_heads, head_size, expected
+):
+    page_range = {"min": 16, "max": 256, "granularity": granularity}
+    assert _prefill_page_group_for_range(page_range, num_heads, head_size) == expected
 
 
 def test_prefill_page_group_must_divide_num_blocks():

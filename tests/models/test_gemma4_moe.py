@@ -1165,6 +1165,8 @@ def test_layers_prepared_on_threads_match_the_caller_path(monkeypatch):
     """Thread-prepared stacks, on their own streams, equal the synchronous ones bit for bit."""
     import threading
 
+    from torch_spyre._C import get_spyre_tensor_layout
+
     from spyre_inference import moe as moe_module
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer, prepare_moe_layers_on_threads
 
@@ -1178,14 +1180,26 @@ def test_layers_prepared_on_threads_match_the_caller_path(monkeypatch):
         )
         for _ in range(3)
     ]
+    # The last layer carries expert biases: their stacks go through the pool threads too.
+    biases = (
+        torch.randn(EXPERTS, 2 * INTER, dtype=torch.float16) * 0.5,
+        torch.randn(EXPERTS, HIDDEN, dtype=torch.float16) * 0.5,
+    )
 
     def layers():
         out = []
-        for w13, w2 in stacks:
+        for i, (w13, w2) in enumerate(stacks):
             layer = _RoutedExperts(w13.clone(), w2.clone())
             layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
+            if i == len(stacks) - 1:
+                layer.w13_bias = torch.nn.Parameter(biases[0].clone(), requires_grad=False)
+                layer.w2_bias = torch.nn.Parameter(biases[1].clone(), requires_grad=False)
             out.append(layer)
         return out
+
+    def same_device_tensor(got_x, want_x):
+        torch.testing.assert_close(got_x.cpu(), want_x.cpu(), rtol=0, atol=0)
+        assert get_spyre_tensor_layout(got_x) == get_spyre_tensor_layout(want_x)
 
     expected = layers()
     for layer in expected:
@@ -1207,10 +1221,15 @@ def test_layers_prepared_on_threads_match_the_caller_path(monkeypatch):
     assert all(prepared_on[id(layer)].startswith("spyre-moe-prep") for layer in threaded[1:])
     for want, got in zip(expected, threaded, strict=True):
         for name in ("spyre_moe_gate", "spyre_moe_up", "spyre_moe_down"):
-            torch.testing.assert_close(
-                getattr(got, name).cpu(), getattr(want, name).cpu(), rtol=0, atol=0
-            )
+            same_device_tensor(getattr(got, name), getattr(want, name))
         assert got.spyre_moe_chunks == want.spyre_moe_chunks
+        assert (got.spyre_moe_biases is None) == (want.spyre_moe_biases is None)
+        if want.spyre_moe_biases is not None:
+            for name in ("gate", "up", "down", "down_chunks"):
+                same_device_tensor(
+                    getattr(got.spyre_moe_biases, name), getattr(want.spyre_moe_biases, name)
+                )
+    assert threaded[-1].spyre_moe_biases is not None
 
 
 def test_prepare_layer_honors_chunk_override(monkeypatch):

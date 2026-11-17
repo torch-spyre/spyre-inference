@@ -131,10 +131,8 @@ class SpyreMoERecipe:
 
     activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
-    # ``prepare_down_weight(stack, experts)`` transforms a chunk of the source ``[E, H, M]``
-    # down stack: ``stack`` is ``w2[experts]`` for a slice ``experts`` of the expert axis.
-    # It is called once per chunk while the stack streams to the card, so the whole
-    # transformed stack is never built on the host.
+    # Called per chunk of experts while the down stack streams to the card: ``stack`` is
+    # ``w2[experts]``, so the whole transformed stack is never built on the host.
     prepare_down_weight: Callable[[torch.Tensor, slice], torch.Tensor] | None = None
 
 
@@ -639,18 +637,13 @@ def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
     return SpyreTensorLayout(list(weight.shape), list(weight.stride()), weight.dtype, [1, 0, 2])
 
 
-# Host bytes one chunk of an expert stack stages on its way to the card. The copy is
-# host-bound (~0.5 GiB/s a thread: the device-format conversion), so chunking costs no
-# time, and a chunk's transpose stays in cache where a whole 0.5 GiB stack's thrashes:
-# measured on gemma-4-26B-A4B stacks, 8 threads, 30 MiB chunks move a stack 26% faster
-# than one staged copy of it, and a load's transient host memory is threads × this, or
-# twice that for a recipe with a down transform, whose output is staged once more.
+# Host bytes a chunk of an expert stack stages: the copy is host-bound, and a chunk's
+# transpose stays in cache where a whole stack's does not.
 _EXPERT_CHUNK_BYTES = 32 << 20
 
 
 def _gather_layout(weight: torch.Tensor) -> SpyreTensorLayout | None:
-    """The ``[E, C, F]`` gather layout ``dma_moe_expert_weight_to_spyre`` builds, or None
-    when ``F`` does not span whole sticks."""
+    """The ``[E, C, F]`` gather layout of the ``dma_*`` helpers; None off whole sticks."""
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 
     experts, contract, free = weight.shape
@@ -672,19 +665,14 @@ def _to_spyre_expert_weight(
     kernel_order: bool = False,
     prepare: Callable[[torch.Tensor, slice], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device.
-
-    The stack goes in chunks of experts: each chunk is transformed by ``prepare(chunk,
-    experts)`` when given, padded and made contiguous on the host, ``_EXPERT_CHUNK_BYTES``
-    at a time, and copied into its slice of the device tensor, so a stack never stages a
-    whole host copy of itself.
-    """
+    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device
+    in chunks of experts, each transformed by ``prepare(chunk, experts)`` when given."""
     from torch_spyre._C import copy_tensor
     from torch_spyre.model_utils import spyre_empty_with_layout
 
     if not torch.spyre.is_initialized():
         torch.empty(0, dtype=weight.dtype, device="spyre")
-    # The padded stack's shape and strides, without materialising it.
+    assert len(pad) <= 4, "pad never touches the expert axis, so chunks pad like the stack"
     padded = torch.empty(weight.shape, dtype=weight.dtype, device="meta")
     if any(pad):
         padded = F.pad(padded, pad)
@@ -707,12 +695,6 @@ def _to_spyre_expert_weight(
 def _chunked_down_transform(
     transform: Callable[[torch.Tensor, slice], torch.Tensor],
 ) -> Callable[[torch.Tensor, slice], torch.Tensor]:
-    """Run a recipe's down transform on chunks of the transposed stack.
-
-    The recipe sees its chunk in the source ``[E, H, M]`` orientation; the transposes are
-    views.
-    """
-
     def prepare(part: torch.Tensor, experts: slice) -> torch.Tensor:
         return transform(part.transpose(1, 2), experts).transpose(1, 2)
 
@@ -828,14 +810,9 @@ def _prepare_biases(
     return biases
 
 
-# ── Routed-expert layers prepared on threads while a model loads ──────────────────────
-#
-# Each layer's host relayout and copy to the device are independent of every other
-# layer's. Inside ``prepare_moe_layers_on_threads`` the loader's calls to
-# ``process_weights_after_loading`` hand all but the first layer to a pool of threads;
-# outside it every layer is prepared on the caller, as before. The pool belongs to that
-# context: leaving it waits for the layers, re-raises the first failure and joins the
-# threads, also when the load itself raises, so nothing of one load outlives it.
+# Routed-expert layers prepared on threads while a model loads. The pool belongs to one
+# ``prepare_moe_layers_on_threads`` context: leaving it waits, re-raises the first failure
+# and joins the threads, also when the load raises.
 
 _DEFAULT_PREP_THREADS = 8
 _MAX_PREP_THREADS = 16
@@ -844,11 +821,7 @@ _prep_thread = threading.local()
 
 
 def _prep_thread_count() -> int:
-    """``SPYRE_MOE_PREP_THREADS``, else min(8, torch's threads); 1 to 16.
-
-    torch's thread count is this worker's share of the CPU budget (threading_config), so
-    at TP > 1 each rank sizes its pool from its own share.
-    """
+    """``SPYRE_MOE_PREP_THREADS``, else min(8, torch's threads, this rank's CPU share); 1 to 16."""
     threads = envs.SPYRE_MOE_PREP_THREADS
     if threads < 0:
         raise ValueError(f"SPYRE_MOE_PREP_THREADS must be 0 or more, got {threads}")
@@ -858,16 +831,13 @@ def _prep_thread_count() -> int:
 
 
 def _start_prep_thread(device_index: int) -> None:
-    """Same device as the loading thread, and a stream of its own."""
     torch.spyre.set_device(device_index)
     _prep_thread.stream = torch.spyre.Stream()
 
 
 class _MoePrep:
-    """The routed-expert layers of one load: the first on the caller, the rest on threads."""
-
     def __init__(self) -> None:
-        self._threads: int | None = None  # read on the first MoE layer, so dense loads never do
+        self._threads: int | None = None
         self._pool: ThreadPoolExecutor | None = None
         self._futures: list[Future[None]] = []
         self._started = False
@@ -901,13 +871,11 @@ class _MoePrep:
             _prepare_layer(layer)
 
     def wait(self) -> None:
-        """Wait for the layers handed to threads; re-raise the first failure."""
         futures, self._futures = self._futures, []
         for future in futures:
             future.result()
 
     def shutdown(self) -> None:
-        """Drop the layers not started and join the threads."""
         self._futures.clear()
         if self._pool is not None:
             self._pool.shutdown(cancel_futures=True)
@@ -921,14 +889,10 @@ _active_prep: contextvars.ContextVar[_MoePrep | None] = contextvars.ContextVar(
 
 @contextmanager
 def prepare_moe_layers_on_threads() -> Iterator[None]:
-    """Prepare the routed-expert layers of the model loaded inside on threads.
+    """Prepare the MoE layers of the model loaded inside on ``SPYRE_MOE_PREP_THREADS`` threads.
 
-    Inside, ``process_weights_after_loading`` runs a model's first MoE layer on the
-    caller, which also starts the runtime, and hands the others to a pool of
-    ``SPYRE_MOE_PREP_THREADS`` threads. Leaving the context waits for every layer and
-    re-raises the first failure; when the body raises, the layers not started are
-    dropped and the threads joined. Outside, the layers are prepared on the caller, in
-    order.
+    The first layer runs on the caller, which starts the runtime; leaving the context waits
+    for the rest and re-raises the first failure. Outside it, layers run on the caller.
     """
     prep = _MoePrep()
     token = _active_prep.set(prep)
@@ -941,7 +905,6 @@ def prepare_moe_layers_on_threads() -> Iterator[None]:
 
 
 def _prepare_layer_soon(layer: RoutedExperts) -> None:
-    """Prepare one routed-expert layer: on the active load's threads, else here."""
     prep = _active_prep.get()
     if prep is None:
         _prepare_layer(layer)
@@ -1000,9 +963,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     layer.spyre_moe_chunks = chunks
     layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
     layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
-    # gate and up are views of w13: drop them too, or the stack stays alive through the
-    # down copy.
-    del layer.w13_weight, w13, gate, up
+    del layer.w13_weight, w13, gate, up  # gate and up are views of w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     prepare = _chunked_down_transform(transform_down) if transform_down is not None else None

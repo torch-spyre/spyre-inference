@@ -228,12 +228,8 @@ def _generate_ministral(tp: int, model: str = MULTIMODAL_MODEL, images: int = 1)
         max_model_len=MULTIMODAL_MAX_MODEL_LEN,
         max_num_seqs=1,
         limit_mm_per_prompt={"image": images},
-        # One decoding sequence, and a prefill of the whole prompt. One encoder budget that
-        # holds the test image: each budget is a full tower compile.
-        compilation_config={
-            "compile_sizes": [1, MULTIMODAL_MAX_MODEL_LEN],
-            "encoder_cudagraph_token_budgets": [128],
-        },
+        # One decoding sequence, and a prefill of the whole prompt.
+        compilation_config={"compile_sizes": [1, MULTIMODAL_MAX_MODEL_LEN]},
     )
     conversations = [[{"role": "user", "content": "Count to ten: one, two, three"}]]
     if images:

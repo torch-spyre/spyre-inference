@@ -13,6 +13,9 @@ SHELL := /bin/bash
 #   trunk       — same coverage as regression; push-to-main CI label
 #   perf        — vLLM benchmark suite (perf-tests target), not a pytest
 #                 marker subset
+#   quality     — Bench quality: records the scores the accuracy gate measures
+#                 (bench-quality target), advisory. The pytest gate itself keeps
+#                 its names (test-quality, test-quality-shard) and is unchanged.
 # Empty / unset defaults to "regression". This Makefile is the single source
 # of truth for the valid TEST_TYPE set and its validation -- _test_matrix.yaml
 # resolves TEST_TYPE via `make -s print-test-type TEST_TYPE=...` instead of
@@ -22,6 +25,8 @@ TEST_TYPE ?= regression
 empty :=
 space := $(empty) $(empty)
 VALID_TEST_TYPES := unit integration regression trunk perf
+# Runs through `make tests` only (Bench); print-test-type refuses it so the CI test matrix cannot be asked for it.
+BENCH_ONLY_TEST_TYPES := quality
 VALID_TEST_TYPES_DISPLAY := $(subst $(space), | ,$(VALID_TEST_TYPES))
 
 # "smoke" is the internal marker-combo this Makefile maps "integration" to
@@ -33,7 +38,7 @@ $(info ::error::TEST_TYPE=smoke is not a valid tier -- use TEST_TYPE=integration
 $(error TEST_TYPE=smoke rejected)
 endif
 
-ifeq ($(filter $(TEST_TYPE),$(VALID_TEST_TYPES)),)
+ifeq ($(filter $(TEST_TYPE),$(VALID_TEST_TYPES) $(BENCH_ONLY_TEST_TYPES)),)
 $(info ::error::Invalid test_type '$(TEST_TYPE)'. Valid: $(VALID_TEST_TYPES_DISPLAY))
 $(error Invalid TEST_TYPE '$(TEST_TYPE)')
 endif
@@ -101,6 +106,8 @@ MARK_EXPR :=
 UPSTREAM_ARG := --upstream
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
+else ifeq ($(TEST_TYPE),quality)
+MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
 # Unit-level part only: tests/e2e enters integration via e2e_smoke (see tests-integration).
 MARK_EXPR := -m "not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)"
@@ -140,6 +147,8 @@ help: ## Show this help message
 	@echo "  (COVERAGE_DATA=dir of data files, COVERAGE_TOOL=coverage for a standalone runner)"
 
 print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_test_matrix.yaml) resolve TEST_TYPE via `make -s print-test-type TEST_TYPE=...` without duplicating this Makefile's validation logic.
+	@if [ -n "$(filter $(TEST_TYPE),$(BENCH_ONLY_TEST_TYPES))" ]; then \
+	  echo "TEST_TYPE=$(TEST_TYPE) runs through make tests (Bench), not the CI test matrix" >&2; exit 2; fi
 	@echo "$(TEST_TYPE)"
 
 # Marker set for GHA's _test_matrix.yaml is intentionally NOT duplicated in
@@ -412,9 +421,11 @@ tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstre
 # jobs, not one unfiltered run -- mirror that here so
 # `make test TEST_TYPE=regression` is GHA-parity, one flat JUnit file per
 # combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
-tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default regression) or set MARK_OVERRIDE directly.
+tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf|quality (default regression) or set MARK_OVERRIDE directly.
 	if [ "$(TEST_TYPE)" = "perf" ]; then \
 	  $(MAKE) perf-tests RESULTS_DIR="$(RESULTS_DIR)"; \
+	elif [ -z "$(MARK_OVERRIDE)" ] && [ "$(TEST_TYPE)" = "quality" ]; then \
+	  $(MAKE) bench-quality; \
 	elif [ -z "$(MARK_OVERRIDE)" ] && [ "$(TEST_TYPE)" = "integration" ]; then \
 	  $(MAKE) tests-integration RESULTS_DIR="$(RESULTS_DIR)"; \
 	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "regression" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
@@ -508,3 +519,9 @@ perf-legs: ## Print the CI perf legs (one per selected model and TP, with the ca
 		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)" \
 		--suite "$(BENCH_SUITE)"
+
+# spyre-bench wrappers (advisory; a no-op without the engine). `bench-run` gets the same AIU setup as run-one.
+BENCH_PREFIX = $(AIU_SETUP_CMD);
+include mk/bench.mk
+include mk/bench-nightly.mk
+include mk/bench-quality.mk

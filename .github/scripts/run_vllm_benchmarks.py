@@ -109,6 +109,12 @@ def parse_args():
         "matched against each config's tensor-parallel-size",
     )
     parser.add_argument(
+        "--tests",
+        type=str,
+        default="",
+        help="comma-separated test names to run (empty = all); matched case-insensitively",
+    )
+    parser.add_argument(
         "--bench-types",
         type=str,
         default="",
@@ -192,8 +198,10 @@ def _missing_dataset(config: dict) -> str | None:
     return None
 
 
-def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
-    """Keep configs whose model and TP are selected (empty selects all).
+def _select_configs(
+    configs: list, models: set[str], tps: set[int], tests: set[str] | None = None
+) -> list:
+    """Keep configs whose model, TP and (when given) test name are selected (empty selects all).
 
     A selected config whose dataset is absent is fatal, not skipped: skipping
     would let a serve-only model job report success while measuring nothing.
@@ -201,6 +209,8 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
     selected = []
     missing_datasets = []
     for config in configs:
+        if tests and str(config.get("test_name", "")).lower() not in tests:
+            continue
         model = _config_model(config)
         if models and not (model and model.lower() in models):
             log.info("Skipping %s (model %s not selected)", config.get("test_name"), model)
@@ -664,6 +674,7 @@ def run_benchmarks_from_file(
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
+    tests: set[str] | None = None,
 ) -> list[BenchResult]:
     """Run every selected benchmark in a config file."""
     if not config_file.exists():
@@ -676,7 +687,7 @@ def run_benchmarks_from_file(
 
     pins = _pinned_revisions()
     results = []
-    for config in _select_configs(configs, models, tps):
+    for config in _select_configs(configs, models, tps, tests):
         test_name = config.get("test_name", "unknown")
         _pin_revision(config, pins)
         env_config = config.get("environment_variables", {})
@@ -786,6 +797,15 @@ def write_junit(path: Path, results: list[BenchResult]) -> None:
 VALID_BENCH_TYPES = ("latency", "throughput", "serve")
 
 
+def _unknown_tests(config_files: list[tuple[str, Path]], tests: set[str]) -> set[str]:
+    """Requested test names that no selected config file holds (a typo would run nothing)."""
+    known: set[str] = set()
+    for _, config_file in config_files:
+        for config in (_load_configs(config_file) or []) if config_file.exists() else []:
+            known.add(str(config.get("test_name", "")).lower())
+    return tests - known
+
+
 def _suite_config_files(configs_dir: Path, suite: str, bench_types: set[str]) -> dict[str, Path]:
     """Map each selected bench type to its `<type>-tests[-<suite>].yaml` config."""
     suffix = f"-{suite}" if suite else ""
@@ -814,6 +834,7 @@ def main():
     except ValueError:
         log.error("--tps takes comma-separated integers, got %r", args.tps)
         sys.exit(2)
+    tests = {t.strip().lower() for t in args.tests.split(",") if t.strip()}
     bench_types = {b.strip().lower() for b in args.bench_types.split(",") if b.strip()}
     unknown = bench_types - set(VALID_BENCH_TYPES)
     if unknown:
@@ -843,6 +864,11 @@ def main():
         print(json.dumps(list_legs(files, models, tps)))
         return
 
+    unknown = _unknown_tests(files, tests)
+    if unknown:
+        log.error("--tests names no entry of the selected configs: %s", sorted(unknown))
+        sys.exit(2)
+
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -855,6 +881,7 @@ def main():
             aiu_world_size=args.aiu_world_size,
             models=models,
             tps=tps,
+            tests=tests,
         )
     failed = sum(r.error is not None for r in results)
 

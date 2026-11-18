@@ -1,0 +1,30 @@
+# test_name of vllm-benchmarks/benchmarks/spyre/serve-tests-dev.yaml, lower-cased.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-granite41-8b-tp4-all, description: 'decoder serving replaying a recorded agentic trace (vllm bench serve)', owner: spyre-inference}
+spec:
+  type: perf
+  level: service
+  tier: extended
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/serve}
+  run:
+    cache: warm
+    repeats: 1
+    command: [python3, .github/scripts/bench_perf_vllm.py, run, --case, '{case}', --repeat-dir, '{repeat_dir}', --raw-dir, '{raw_dir}', '--', uv, run, --active, --no-sync, python3, .github/scripts/run_vllm_benchmarks.py, --configs-dir, vllm-benchmarks/benchmarks/spyre, --suite, dev, --bench-types, serve, --tests, '{case}', --results-dir, '{raw_dir}']
+  identity:
+    mode: ingest
+    profile: vllm
+    name: serve_granite41-8b_tp4_all
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: serve}
+      - {key: tensor_parallel, value: 4}
+      - {key: input_len, value: ''}
+      - {key: output_len, value: ''}
+  variants:
+    - name: serve_granite41-8b_tp4_all
+      environment: spyre-4card
+      system: {type: llm/vllm, backend: spyre, token: granite-4.1-8b, model: granite-4.1-8b, precision: fp16, tp: 4, flags: {load-format: auto, max-num-seqs: 4, max-num-batched-tokens: 512, enable-prefix-caching: true, max-model-len: 32768}}
+      workload: {type: llm/serve, endpoint: /v1/completions, load: {executor: closed, concurrency: 4, requests: 100}, inputs: [{name: prompts, dataset: slot-02}], sampling: {ignore_eos: true}, flags: {dataset-name: custom, custom-output-len: -1, disable-shuffle: true, percentile-metrics: 'ttft,tpot,itl,e2el', metric-percentiles: '99,100'}}

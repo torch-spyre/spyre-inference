@@ -87,7 +87,6 @@ for rpm_name in $RPM_NAMES; do
     echo "  ${url}"
     # The token goes to curl on stdin as a config file (-K -), never in argv:
     # argv is world-readable through /proc/<pid>/cmdline on a shared runner.
-    # This matches .github/scripts/fetch_bench_datasets.py.
     curl -fSL \
         -o "${RPMS_DOWNLOAD_DIR}/${filename}" \
         -K - \

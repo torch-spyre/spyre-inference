@@ -1,0 +1,8 @@
+# STUB, DISABLED: the shape a second architecture needs. Enabling it is a data change here (enabled, cases, skip_models)
+# plus the launcher's own settings; the recorder, the Benchmarks and the Make targets stay as they are.
+arch: ppc64le
+enabled: false
+max_cards: 1
+on_capacity: skip
+cases: []
+skip_models: []

@@ -139,6 +139,12 @@ class _SpyreRotaryMixin:
             else None
         )
 
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        # A process's first multi-threaded host cos (MKL vector math) can differ in the last
+        # bits from run to run; a one-element call first makes the cache reproducible.
+        torch.zeros(1).cos()
+        return super()._compute_cos_sin_cache()
+
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
         # holds no other movable tensor, so there is nothing to relocate. We instead prime

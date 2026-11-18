@@ -150,6 +150,27 @@ def test_malformed_file_returns_none(tmp_path, raw):
     assert runner._load_configs(_write(tmp_path, raw)) is None
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["../escape", "a/b", "a\\b", "..", ".", ".hidden", "", None],
+)
+def test_unsafe_test_name_fails_to_load(tmp_path, name):
+    """test_name is joined into the results dir for .json/.cmd/.log files, so
+    anything but a single path-safe segment must fail the whole file."""
+    config = {"test_name": name, "parameters": {"model": "m", "tensor_parallel_size": 1}}
+    assert runner._load_configs(_write(tmp_path, [config])) is None
+
+
+def test_safe_test_name_still_loads(tmp_path):
+    (config,) = runner._load_configs(
+        _write(
+            tmp_path,
+            [{"test_name": "serve_granite41-8b_tp1", "parameters": {"model": "m"}}],
+        )
+    )
+    assert config["test_name"] == "serve_granite41-8b_tp1"
+
+
 # ── derived values ──
 
 

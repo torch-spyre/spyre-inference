@@ -65,7 +65,7 @@ sub-stick half) run directly in the compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice on Spyre, compiled as its own graph (`maybe_compile`, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)) unless compilation is off; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
-| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which `SpyreFp8LMHeadMethod` DMAs into `qfp8wt` as is, compiled even under `enforce_eager` |
+| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which `SpyreFp8LMHeadMethod` DMAs into `qfp8wt` as is, compiled even under `enforce_eager`. For `quantization="fp8"` checkpoints the plugin replaces vLLM's config with `SpyreFp8Config` (`quantization/fp8.py`): a fused module's per-tensor shard scales become one `[1]` scale when they match and an `[N, 1]` per-channel scale when they differ, so the FP8 weight is never requantized (upstream requantizes through `_C`, which the vLLM build here lacks). Compressed-tensors, Quark and ModelOpt per-tensor checkpoints still take upstream's requant |
 
 ### Transposed linear weights
 
@@ -193,6 +193,21 @@ per-core working set. For Gemma 4 with `top_k=8` and 32 cores this selects `C=4`
 whole-stick chunks. Alias entry `e·C + c` is chunk `c` of expert `e`. TP narrows only `M`, so
 the slicing is unchanged at every TP degree.
 
+Each stack goes to the card in chunks of experts: a chunk is padded and made contiguous on the
+host and copied into its slice of the device tensor. The copy is host-bound (the device-format
+conversion), so the chunking costs no time, and a chunk's transpose stays in cache where a
+whole stack's does not.
+
+The relayout and copy of one layer's stacks are independent of every other layer's, so loading
+prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
+worker's share of the CPU budget, at most 16; `1` prepares them in order). The pool lives for
+one load: the loader waits for every layer before anything reads the model, and a load that
+fails joins its threads. A recipe's down-weight transform (Gemma folds its expert scale
+there) runs per chunk too, and a `swigluoai` stack's gate and up rows are read as strided
+views, so no recipe builds a whole stack either: a load's transient host memory is the
+threads times one chunk, or two chunks for a recipe with a down transform, whose output is
+staged once more before the copy.
+
 Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
 expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input
 is one broadcast, the gate/up chunk sum reduces a contiguous axis and the down parts reshape
@@ -305,7 +320,9 @@ class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. 
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
 `EncoderCudaGraphManager` picks power-of-two token budgets (or takes
 `encoder_cudagraph_token_budgets`), packs a step's images into them, pads the inputs and splits
-the output per image. `SpyreEncoderGraphManager`
+the output per image. The mixin caps the largest budget at `max_model_len`: an image's encoder
+tokens are among its prompt's, so a larger one never reaches the encoder (granite vision, whose
+padded tiles can outnumber its placeholders, keeps its own range). `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention

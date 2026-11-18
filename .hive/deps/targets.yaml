@@ -1,0 +1,78 @@
+# Dependency groups the hive "deps" agent keeps current for spyre-inference.
+# Read by the deps prompt on every kick. Edit in a normal PR; the next kick
+# uses the new text. Public by design: nothing private belongs here.
+#
+# One group = one bump PR = one topic key. The agent works on at most one
+# group per kick, in the order listed, and never opens a second PR for a
+# group whose topic already has an open PR.
+#
+# Group fields:
+#   topic         topic-claim key; the agent claims it (hive-topic claim) before
+#                 it bumps, and the PR shows as [topic: <topic>] in the
+#                 FIX-BEFORE-NEW and held-PR blocks
+#   enabled       false = listed for context, never bumped automatically
+#   title_prefix  every bump PR title for this group starts with this text;
+#                 the fallback way to find the open PR when no claim exists
+#   mechanism     skill:<name> runs that repo skill in unattended mode;
+#                 edit = change the pins listed under packages[].where, relock
+#   packages      what moves together in this group
+#     policy      main-head | latest-release | latest-rc
+#     where       where the pin lives (for mechanism: edit)
+#   known_bad     versions that broke this repo, kept by maintainers. An "open"
+#                 row caps the group: never bump to that version or anything
+#                 after it. A row marked "fixed in <version>" stops capping
+#                 once a candidate includes the fix. The agent never edits
+#                 this file. When it finds a dependency bug it opens an
+#                 upstream issue titled "[deps] <package> <version>: ...",
+#                 and that issue caps the group the same way while it is open.
+#                 Add a row here to cap a version by hand.
+
+groups:
+  - topic: deps-torch-spyre
+    enabled: true
+    title_prefix: "chore(deps): bump torch-spyre"
+    mechanism: skill:upgrade-torch-spyre
+    packages:
+      - name: torch-spyre
+        source: github:torch-spyre/torch-spyre
+        policy: main-head
+        where: "[tool.uv.sources] torch-spyre rev, spyre-rpms.lock"
+    known_bad: []
+    # - version: 1a2b3c4d             # first bad commit
+    #   breaks: "tests/e2e/test_x.py::test_y (assertion ...)"
+    #   found_by: "#1612"
+    #   issue: https://github.com/torch-spyre/torch-spyre/issues/<n>
+    #   status: open                  # or: fixed in <sha>
+
+  - topic: deps-vllm
+    enabled: false                    # flip to true to let the agent bump vLLM too
+    title_prefix: "chore(deps): bump vllm"
+    mechanism: skill:upgrade-vllm
+    packages:
+      - name: vllm
+        source: github:vllm-project/vllm
+        policy: latest-release
+        where: "[tool.uv.sources] vllm rev + [project.dependencies] range (move the <upper bound too)"
+    known_bad: []
+
+  - topic: deps-torch
+    enabled: false
+    title_prefix: "chore(deps): bump torch"
+    mechanism: edit
+    packages:
+      - name: torch
+        source: pypi:torch
+        policy: latest-release
+        where: "[build-system] requires, [project.dependencies], [tool.uv.sources] tag, [tool.uv.extra-build-dependencies]"
+      - name: torchvision
+        source: pypi:torchvision
+        policy: latest-release
+        where: "[project.dependencies], override-dependencies, [tool.uv.sources] tag"
+    known_bad: []
+
+# Never bumped by the agent (listed so it knows the pin is deliberate).
+hold:
+  - name: transformers
+    why: "capped on purpose (see the comment in pyproject.toml)"
+  - name: spyre-rpms
+    why: "moves only inside a torch-spyre bump, through the upgrade-torch-spyre skill"

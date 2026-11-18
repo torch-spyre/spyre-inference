@@ -52,6 +52,12 @@ docs/examples
 # tmp files of agent harness
 .plans/
 .kilo/
+# hive's per-run scratch inside an agent workspace (kick prompt, transcript,
+# PR text). The agent definition and dependency targets are committed.
+.hive/*
+!.hive/agents/
+!.hive/deps/
+!.hive/review-perspectives.yaml
 
 
 # Micro-benchmark run artifacts (scripts/microbench default --output-dir)

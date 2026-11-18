@@ -108,6 +108,41 @@ def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
     return t.reshape(merge * merge, (hp // merge) * (wp // merge), *t.shape[4:])
 
 
+def split_weight_by_group(weight: torch.Tensor, groups: int, *, group_major: bool) -> torch.Tensor:
+    """A ``[D_out, groups * D]`` weight as ``[groups, D, D_out]``, one slice per offset group.
+
+    The columns hold the groups' features in the order the upstream merge concatenates them,
+    which ``group_major`` names: True if the group index is the slow axis (``group * D + d``, as
+    Idefics3's ``pixel_shuffle``), False if it is the fast one (``d * groups + group``, as
+    Pixtral's ``unfold`` over ``(c, ki, kj)``). With patches laid out by ``offset_major``,
+    ``(tokens @ slice).sum`` over the groups then equals the upstream merge plus its projection.
+    """
+    out_dim, in_dim = weight.shape
+    if group_major:
+        split = weight.reshape(out_dim, groups, in_dim // groups).permute(1, 2, 0)
+    else:
+        split = weight.reshape(out_dim, in_dim // groups, groups).permute(2, 1, 0)
+    return split.contiguous()
+
+
+def fold_conv_patch_embedding(conv: nn.Module, width: int) -> nn.Module:
+    """A patch-embedding conv (stride = kernel) as a ``[width, D]`` linear weight, ready to swap in.
+
+    The ``[D, C, p, p]`` weight is flattened to ``(c, py, px)`` columns, zero-padded to ``width``
+    (the patch buffer's width) and transposed, so ``patches @ weight`` is the conv. Returns a bare
+    holder with that ``weight`` and the conv's ``bias`` when it has one: nothing runs the conv, so
+    the runner must not place a tiled conv copy of the weight on the card as well. Assign it over
+    the conv, on the host, after weights are loaded.
+    """
+    weight = conv.weight.detach().flatten(1)
+    weight_t = F.pad(weight, (0, width - weight.shape[1])).t().contiguous()
+    holder = nn.Module()
+    holder.weight = nn.Parameter(weight_t, requires_grad=False)
+    if getattr(conv, "bias", None) is not None:
+        holder.bias = conv.bias
+    return holder
+
+
 # Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
 _MASK_MIN = torch.finfo(torch.float16).min / 2
 # Most items per call with `segment_buffer`: the one-hot is a stick wide, its last column padding.

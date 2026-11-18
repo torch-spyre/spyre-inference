@@ -185,11 +185,16 @@ jobs:
 
       # The workflow_run ingests can't read this run's inputs, so the threaded run_id travels as
       # the same "run-id" artifact _test_matrix.yaml uploads (it gets no run_id here, so it doesn't).
+      # Guarded like _test_matrix.yaml's copy: an unguarded upload ships a 0-byte run-id.txt on a
+      # standalone dispatch, and recover-threaded-run-id fails hard on an artifact that exists but
+      # holds no id — killing push-hw-diagnostics-to-clickhouse before it parses any logs.
       - name: Record threaded run_id for ingest
+        if: ${{ inputs.run_id != '' }}
         env:
           RUN_ID: ${{ inputs.run_id || '' }}
         run: printf '%s' "${RUN_ID}" > run-id.txt
       - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: run-id

@@ -731,3 +731,82 @@ class TestLargeBatchLadder:
         envs.clear_env_cache()
         with pytest.raises(ValueError, match=match):
             SpyreAttnBucketer(make_config())
+
+
+class TestDeclaredPages:
+    """The per-sequence kernels take a page range instead of the KV buckets when it fits."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_ts_limits(self):
+        from torch_spyre._inductor import config as ts_config
+
+        # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+        # config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+            yield
+
+    def test_one_variant_per_query_bucket(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        variants = b.variants()
+        assert {v.num_blocks for v in variants} == {b.num_blocks_buckets[-1]}
+        assert [v.padded_query_len for v in variants] == sorted(b.query_buckets, reverse=True)
+
+    def test_page_range_spans_two_pages_to_max_model_len(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
+        assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [2, 2, 7, 32]
+
+    def test_prefill_page_counts_are_multiples_of_eight_from_sixteen(self):
+        from torch_spyre._inductor import config as ts_config
+
+        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is not None
+        assert b.page_range["max"] == 31
+        assert b.prefill_page_range == {"min": 16, "max": 32, "granularity": 8}
+        assert ts_config.max_buckets >= 32
+        assert [b.find_declared_pages(n, prefill=True) for n in (1, 8, 16, 17, 32)] == [
+            16,
+            16,
+            16,
+            24,
+            32,
+        ]
+
+    def test_prefill_keeps_single_pages_above_the_exported_max_buckets(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        monkeypatch.setenv("MAX_BUCKETS", "31")
+        ts_config.max_buckets = 31
+        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is not None
+        assert b.prefill_page_range == b.page_range
+
+    def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
+        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        assert b.page_range is not None
+        assert b.page_range["min"] == 8
+        assert b.find_declared_pages(3) == 8
+
+    def test_a_context_at_an_exported_min_reserved_dim_size_keeps_the_buckets(self, monkeypatch):
+        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
+        b = SpyreAttnBucketer(make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is None
+        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+
+    def test_max_buckets_grows_to_cover_max_model_len(self):
+        from torch_spyre._inductor import config as ts_config
+
+        b = SpyreAttnBucketer(make_config(max_model_len=32768), declare_pages=True)
+        assert b.page_range == {"min": 2, "max": 32768 // BLOCK_SIZE, "granularity": 1}
+        assert ts_config.max_buckets == 32768 // BLOCK_SIZE
+
+    def test_a_context_above_the_exported_max_buckets_keeps_the_buckets(self, monkeypatch):
+        monkeypatch.setenv("MAX_BUCKETS", "32")
+        b = SpyreAttnBucketer(make_config(max_model_len=4096 + BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is None
+        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+
+    def test_without_declare_pages_keeps_the_buckets(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.page_range is None

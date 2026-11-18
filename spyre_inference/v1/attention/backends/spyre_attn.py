@@ -1879,10 +1879,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         # Several requested buckets realize onto one kernel: a sliding window pads the
         # block count to its own per-bucket maximum, below the num_blocks bucket.
-        # Without a window build() rounds onto the bucketer's own buckets, so a
-        # mismatch means the two have drifted and dispatch can ask for a kernel
-        # warmup never recorded.
-        if realized != bucket and builder.sliding_window is None:
+        # Without a window build() rounds onto the bucketer's own buckets, or with a page
+        # range onto its page counts, so a mismatch means the two have drifted and
+        # dispatch can ask for a kernel warmup never recorded.
+        expected = bucket
+        if builder.attn_bucketer.page_range is not None:
+            expected = replace(
+                bucket,
+                num_blocks=builder.attn_bucketer.find_declared_pages(
+                    bucket.num_blocks, prefill=bucket.padded_query_len > 1
+                ),
+            )
+        if realized != expected and builder.sliding_window is None:
             logger.warning(
                 "Attention variant %s realized as %s without a sliding window; the "
                 "bucketer and build() have diverged and some shapes will compile on "
@@ -2551,9 +2559,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # cache key misses. Narrowing belongs before the convert, not here.
             index_table = index_tables[seq_idx]
             mask_stack = _mirror_mask_stack(attn_metadata, seq_idx, _target_device)
+            page_range = attn_metadata.seq_page_range(seq_idx)
             # With a page range the stack already has exactly len(active_bs) tiles, and
             # slicing it would drop the range.
-            if attn_metadata.page_range is None:
+            if page_range is None:
                 # Indexed by position within active_bs; a prefix keeps storage_offset 0.
                 mask_stack = mask_stack[: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
@@ -2575,7 +2584,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 index_table,
                 mask_stack,
                 len(active_bs),
-                attn_metadata.page_range,
+                page_range,
                 aligned_query_lens[seq_idx],
                 out_staging if store_out else None,
             )

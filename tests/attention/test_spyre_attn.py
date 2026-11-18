@@ -542,6 +542,47 @@ def test_mixed_batch_dispatches_decode_at_query_width_one(
 
 
 @pytest.mark.parametrize(
+    ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
+)
+def test_prefill_and_decode_walk_their_own_page_ranges(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """In one batch, a prefill sequence walks the prefill page range 8 pages per loop step
+    and a decode sequence walks the decode range."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    walks = {}
+    real_run = spyre_attn._run_with_capped_cores
+
+    def spy_run(output_units, fn, /, **kwargs):
+        walks[kwargs["padded_query_len"]] = (kwargs["page_range"], kwargs.get("page_group"))
+        return real_run(output_units, fn, **kwargs)
+
+    monkeypatch.setattr(spyre_attn, "_run_with_capped_cores", spy_run)
+
+    # The fixture's max_model_len 2048 at block 64 is 32 pages, enough for prefill to get
+    # a range of its own. 18 pages of prefill KV round up to 24.
+    _run_spyre_attn_test(
+        seq_lens=[(64, 1100), (1, 300)],
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        # 8 x 128 query heads keep prefill page grouping eligible.
+        num_query_heads=8,
+        num_kv_heads=2,
+    )
+
+    (prefill_width,) = walks.keys() - {1}
+    prefill_range, prefill_group = walks[prefill_width]
+    decode_range, decode_group = walks[1]
+    assert prefill_range is not None and prefill_range["granularity"] == 8
+    assert prefill_group == 8
+    assert decode_range is not None and decode_range["granularity"] == 1
+    assert decode_group is None
+
+
+@pytest.mark.parametrize(
     ("seq_lens", "sliding_window"),
     [
         pytest.param([(1, 256), (32, 256)], None, id="mixed"),

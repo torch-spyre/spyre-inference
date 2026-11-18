@@ -281,11 +281,22 @@ def _run_spyre_attn_test(
     if expect_fused_store is not None or expect_query_widths is not None:
         real_run = attn_impl._run_page_attn
 
-        def spy_run(query, row_table, k_pages, v_pages, index_table, mask_stack, nb, pql, out):
+        def spy_run(
+            query, row_table, k_pages, v_pages, index_table, mask_stack, nb, page_range, pql, out
+        ):
             fused_calls.append(out is not None)
             dispatched_widths.add(pql)
             return real_run(
-                query, row_table, k_pages, v_pages, index_table, mask_stack, nb, pql, out
+                query,
+                row_table,
+                k_pages,
+                v_pages,
+                index_table,
+                mask_stack,
+                nb,
+                page_range,
+                pql,
+                out,
             )
 
         attn_impl._run_page_attn = spy_run

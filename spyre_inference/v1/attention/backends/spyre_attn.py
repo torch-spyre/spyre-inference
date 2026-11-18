@@ -33,7 +33,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
-from torch_spyre._C import get_reserved_dims
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -2336,6 +2335,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         index_table: torch.Tensor,
         mask_stack: torch.Tensor,
         num_blocks: int,
+        page_range: dict[str, int] | None,
         padded_query_len: int,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -2352,9 +2352,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         scale, v_scale = self._read_scales()
         prefill_fn, decode_fn = self._page_attn_fns(query.device)
-        # None unless the table was copied to Spyre with a page range, on its dim 0.
-        reserved = get_reserved_dims(index_table)
-        page_range = reserved[0] if reserved else None
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
@@ -2532,8 +2529,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_stack = mask_stack[: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
             assert mask_stack.shape[0] == len(active_bs)
-            if isinstance(index_table, torch.Tensor):
-                assert index_table.shape[0] == len(active_bs)
+            assert index_table.shape[0] == len(active_bs)
 
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(
@@ -2550,6 +2546,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 index_table,
                 mask_stack,
                 len(active_bs),
+                attn_metadata.page_range,
                 aligned_query_lens[seq_idx],
                 out_staging if store_out else None,
             )

@@ -322,6 +322,22 @@ def _derive_config(config: dict) -> None:
         config["parameters"].setdefault("model", server_model)
 
 
+def _safe_test_name(config: dict) -> bool:
+    """`test_name` must be one path-safe segment: it is joined into the
+    results dir for the .json/.cmd/.log/.host_resources files (and the serve
+    variants), so a `/` or `..` would escape it or sprout subdirectories."""
+    name = config.get("test_name")
+    return (
+        isinstance(name, str)
+        and name not in ("", ".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and os.sep not in name
+        and (os.altsep is None or os.altsep not in name)
+        and not name.startswith(".")
+    )
+
+
 def _load_configs(config_file: Path) -> list | None:
     """Read a config file -- a bare list of tests, or a `defaults`/`tests`
     mapping whose tests are merged over `defaults`. None if malformed."""
@@ -342,6 +358,13 @@ def _load_configs(config_file: Path) -> list | None:
         return None
 
     for config in configs:
+        if not _safe_test_name(config):
+            log.error(
+                "test_name %r in %s is not a single path-safe segment",
+                config.get("test_name"),
+                config_file,
+            )
+            return None
         _derive_config(config)
     return configs
 

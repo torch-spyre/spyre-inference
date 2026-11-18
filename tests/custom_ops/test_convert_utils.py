@@ -24,7 +24,6 @@ import sys
 
 import pytest
 import torch
-
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
@@ -79,7 +78,9 @@ def test_convert_tensor_tree_walks_and_filters(default_vllm_config):
     assert out["b"][1] == "keep" and out["b"][2] is None and out["c"] == 5
     torch.testing.assert_close(out["a"], fp16.float())
 
-    out = convert_tensor_tree(tree, dtype=torch.float32, predicate=lambda t: t.dtype == torch.float16)
+    out = convert_tensor_tree(
+        tree, dtype=torch.float32, predicate=lambda t: t.dtype == torch.float16
+    )
     assert out["a"].dtype == torch.float32
     assert out["b"][0] is fp32  # excluded by the predicate
 

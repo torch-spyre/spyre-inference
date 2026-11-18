@@ -1901,12 +1901,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
         )
         shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
-        return SpyrePagedKVCache(
-            *(
-                torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_()  # ty: ignore[no-matching-overload]
-                for _ in range(2)
-            )
-        )
+
+        def _zeroed():
+            return torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_()  # ty: ignore[no-matching-overload]
+
+        return SpyrePagedKVCache(_zeroed(), _zeroed())
 
     def _kernel_kv_scales(self) -> tuple[float | None, float | None]:
         """The (k_scale, v_scale) store arguments; both None for a model-dtype cache."""

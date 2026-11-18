@@ -53,7 +53,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec, 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention import attn_layer
-from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import (
     batched_decode_kernel,
 )
@@ -214,15 +213,9 @@ def _build_query_row_tables(
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
-_page_attn_prefill_compiled = torch.compile(
-    page_attn_prefill_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
-)
-_page_attn_decode_compiled = torch.compile(
-    page_attn_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
-)
-_batched_decode_compiled = torch.compile(
-    batched_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
-)
+_page_attn_prefill_compiled = torch.compile(page_attn_prefill_kernel, dynamic=False, fullgraph=True)
+_page_attn_decode_compiled = torch.compile(page_attn_decode_kernel, dynamic=False, fullgraph=True)
+_batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False, fullgraph=True)
 
 
 # Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
@@ -1137,14 +1130,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Holds under a window too: first_active <= num_blocks - 1.
         mask_bs_bb[n:, 0] = torch.finfo(self.model_dtype).min
         # Block-major, so each blocks_per_chunk tile is contiguous. The KV axis
-        # is only materialized for the tiled walk, whose body cannot propagate a
-        # broadcast window's layout through a trip.
-        kv_extent = self.num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1
+        # is materialized: the tiled body cannot propagate a broadcast window's
+        # layout through a trip.
         mask_by_chunk_cpu = (
             mask_bs_bb.transpose(0, 1)
             .unsqueeze(2)
             .unsqueeze(3)
-            .expand(padded_batch_blocks, b_seqs, kv_extent, 1, block_size)
+            .expand(padded_batch_blocks, b_seqs, self.num_kv_heads, 1, block_size)
             .contiguous()
         )
         return (
@@ -2153,14 +2145,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.chunk_page_ids_cpu is not None
         assert attn_metadata.mask_by_chunk_cpu is not None
         attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
-        if not tile_loop.USE_FOR_EACH_TILE:
-            attn_metadata.chunk_page_ids_dev = convert(
-                attn_metadata.chunk_page_ids_cpu, device=device
-            )
-            attn_metadata.mask_by_chunk_dev = convert(
-                attn_metadata.mask_by_chunk_cpu, device=device
-            )
-            return
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
         b = attn_metadata.padded_num_seqs

@@ -24,6 +24,8 @@ from spyre_testing_plugin.attn_helpers import (
     assert_close_outliers,
     random_block_tables,
     ref_attn,
+    split_by_chunk,
+    use_python_for_each_tile,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
@@ -42,7 +44,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _prefill_page_group,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
-from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import (
     batched_decode_kernel,
 )
@@ -1270,13 +1271,12 @@ def test_batched_decode_chunking_covers_every_block(
             f"num_seqs={num_seqs}: chunks cover {padded} of {max_blocks} blocks"
         )
         # The mask carries the same axis, so a mismatch here is the reshape that
-        # would have raised inside build(). Its KV axis follows the walk in force:
-        # broadcast for the plain loop, materialized for the tiled one.
+        # would have raised inside build(). Its KV axis is materialized.
         assert md.mask_by_chunk_cpu is not None
         assert md.mask_by_chunk_cpu.shape == (
             padded,
             md.padded_num_seqs,
-            num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1,
+            num_kv_heads,
             1,
             block_size,
         )
@@ -1996,7 +1996,8 @@ def _prefill_case(num_blocks: int, page_group: int, soft_cap: float, sinks: bool
 @pytest.mark.parametrize("page_group", [2, 4, 8])
 def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group, for_each_tile):
     """Grouping reassociates the online softmax, so the result must not move."""
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
+    if not for_each_tile:
+        use_python_for_each_tile(monkeypatch)
     torch.set_default_device("cpu")
     for soft_cap, sinks in ((0.0, False), (30.0, False), (0.0, True)):
         expected = page_attn_prefill_kernel(**_prefill_case(8, 1, soft_cap, sinks))
@@ -2044,7 +2045,7 @@ def test_prefill_page_group_keeps_the_group_as_a_batch_axis(monkeypatch):
     """No traced tensor merges the group into the token axis; one K/V gather per group."""
     from torch.fx.experimental.proxy_tensor import make_fx
 
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
     torch.set_default_device("cpu")
     page_group, num_blocks, block_size = 4, 8, 16
     case = _prefill_case(num_blocks, page_group, 0.0)
@@ -2066,7 +2067,7 @@ def test_prefill_page_group_keeps_the_group_as_a_batch_axis(monkeypatch):
 def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     """A float8 cache read through the scales equals the model-dtype read of its values."""
 
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size, num_blocks, padded_q = 2, 4, 128, 64, 3, 4
     num_heads = num_kv_heads * qpk
@@ -2100,10 +2101,7 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
 
 
 def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
-    from spyre_inference.v1.attention.ops import batched_decode
-
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
     set_random_seed(0)
     num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
     num_seqs, bpc, num_chunks = 2, 2, 3
@@ -2115,6 +2113,7 @@ def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
     page_ids = torch.randint(0, 6, (num_chunks * bpc, num_seqs), dtype=torch.int64)
     mask = torch.zeros(num_chunks * bpc, num_seqs, 1, 1, block_size, dtype=DTYPE)
     mask[-1, ..., 32:] = float("-inf")
+    page_ids, mask = split_by_chunk(page_ids, mask, bpc)
     scale = head_size**-0.5
     common = dict(
         query=query,
@@ -2750,10 +2749,7 @@ def test_multi_seq_decode_matches_fp32_reference(
     Card-free and fp32, so it pins the reduction, the read and the entry-major, kv-minor
     row order the mask is broadcast in, rather than the fp16 tolerances.
     """
-    from spyre_inference.v1.attention.ops import batched_decode
-
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -2792,6 +2788,7 @@ def test_multi_seq_decode_matches_fp32_reference(
         .expand(padded_blocks, b_seqs, num_kv_heads, qpk, block_size)
         .contiguous()
     )
+    chunk_page_ids, mask_by_chunk = split_by_chunk(chunk_page_ids, mask_by_chunk, bpc)
 
     query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
     query_padded[:num_seqs] = query

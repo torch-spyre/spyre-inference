@@ -446,14 +446,10 @@ dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
-with KV length. `SPYRE_ATTN_FOR_EACH_TILE=1` walks that axis with torch-spyre's
-`for_each_tile` instead, leaving one body plus a tile spec, and the same applies to the
-batched-decode kernel's walk over block chunks. The kernels carry the online softmax as
-a `(tile_max, tile_sum, tile_output)` triple either way. `walk_tiles` selects the walk;
-the same flag also controls `fullgraph` and the batched-decode page-index upload.
-`SPYRE_ATTN_FOR_EACH_TILE=1` is the default; setting it to `0` uses Python loops as a
-rollback path. The flag is read once at import, so set it before importing
-`spyre_inference`.
+with KV length. The kernels therefore walk that axis with torch-spyre's `for_each_tile`,
+leaving one body plus a tile spec, and the same applies to the batched-decode kernel's
+walk over block chunks. The kernels carry the online softmax as a
+`(tile_max, tile_sum, tile_output)` triple.
 
 ### LX-resident pages
 

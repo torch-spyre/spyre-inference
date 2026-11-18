@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from spyre_testing_plugin.attn_helpers import drop_cpu_device_layouts, use_python_for_each_tile
 from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import _print_warning_once
@@ -43,7 +44,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
-from spyre_inference.v1.attention.ops import batched_decode, tile_loop
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
 )
@@ -71,9 +71,8 @@ def compiles() -> int:
 @pytest.fixture()
 def impl(default_vllm_config, monkeypatch):
     # CPU graph-reuse tests use the Python walk; Spyre e2e tests cover tiled lowering.
-    # The batched kernel reads its own copy of the flag.
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
+    drop_cpu_device_layouts(monkeypatch)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
@@ -238,7 +237,7 @@ def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
     assert mask[0, 0, -1] == torch.finfo(mask.dtype).min
 
     # Exercise the kernel bodies on CPU without the Spyre tiled-loop lowering.
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
     shape = backend.get_kv_cache_shape(1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
     k_pages, v_pages = (torch.zeros(shape, dtype=torch.float16) for _ in range(2))
     v_pages[0, :, -1] = 1

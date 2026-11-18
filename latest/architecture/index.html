@@ -2820,6 +2820,19 @@ per-core working set. For Gemma 4 with <code>top_k=8</code> and 32 cores this se
 <code>SPYRE_MOE_CHUNKS</code> overrides the derived value; the override must still split <code>H</code> into
 whole-stick chunks. Alias entry <code>e·C + c</code> is chunk <code>c</code> of expert <code>e</code>. TP narrows only <code>M</code>, so
 the slicing is unchanged at every TP degree.</p>
+<p>Each stack goes to the card in chunks of experts: a chunk is padded and made contiguous on the
+host and copied into its slice of the device tensor. The copy is host-bound (the device-format
+conversion), so the chunking costs no time, and a chunk's transpose stays in cache where a
+whole stack's does not.</p>
+<p>The relayout and copy of one layer's stacks are independent of every other layer's, so loading
+prepares the layers on <code>SPYRE_MOE_PREP_THREADS</code> threads (default <code>min(8, torch threads)</code>, this
+worker's share of the CPU budget, at most 16; <code>1</code> prepares them in order). The pool lives for
+one load: the loader waits for every layer before anything reads the model, and a load that
+fails joins its threads. A recipe's down-weight transform (Gemma folds its expert scale
+there) runs per chunk too, and a <code>swigluoai</code> stack's gate and up rows are read as strided
+views, so no recipe builds a whole stack either: a load's transient host memory is the
+threads times one chunk, or two chunks for a recipe with a down transform, whose output is
+staged once more before the copy.</p>
 <p>Decode orders the <code>top_k·C</code> entries row-major (row, then chunk): the entry index is the widened
 expert index times <code>C</code> plus a <code>[1, C, 1]</code> offset, both device tensors made at load, so the input
 is one broadcast, the gate/up chunk sum reduces a contiguous axis and the down parts reshape

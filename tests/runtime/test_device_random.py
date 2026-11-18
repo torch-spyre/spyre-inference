@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device inverse-CDF sampling, checked on CPU.
+"""Device random sampling, checked on CPU.
 
-The card runs the same function once cumsum, topk and the fp16 upcast do.
-The token is not the host Gumbel token. It is the inverse CDF of the masked
-softmax, so the same uniform draws the same id.
+The card runs the same functions once cumsum, topk and the fp16 upcast do.
+``inverse_cdf_token_ids`` is the masked-softmax inverse CDF, so the same
+uniform draws the same id. ``gumbel_max_token_ids`` is argmax of the masked
+scores plus Gumbel noise. Neither is the host Gumbel token.
 """
 
 import torch
@@ -78,7 +79,7 @@ def _reference(logits, pad_mask, temperature, uniform, top_k, top_p):
 def _draw(logits, uniform, temperature, top_k=None, top_p=None, org=VOCAB):
     mask = dr.padding_mask(logits.shape[-1], org, logits.device)
     k_max = 0 if top_k is None else int(top_k.max())
-    got = dr.random_token_ids(logits, mask, temperature, uniform, top_k, k_max, top_p)
+    got = dr.inverse_cdf_token_ids(logits, mask, temperature, uniform, top_k, k_max, top_p)
     expected = _reference(logits, mask, temperature, uniform, top_k, top_p)
     return got, expected
 
@@ -126,9 +127,7 @@ def test_same_uniform_is_the_same_token_in_any_row() -> None:
     temperature = torch.ones(1)
     alone, _ = _draw(row, uniform, temperature)
     batch = row.expand(3, VOCAB).contiguous()
-    got, expected = _draw(
-        batch, torch.tensor([0.1, 0.4, 0.9]), torch.ones(3)
-    )
+    got, expected = _draw(batch, torch.tensor([0.1, 0.4, 0.9]), torch.ones(3))
     assert torch.equal(got, expected)
     assert got[1] == alone[0]
 
@@ -181,9 +180,7 @@ def test_sampler_output_is_one_int32_id_per_row() -> None:
     assert out.sampled_token_ids.dtype == torch.int32
     assert out.sampled_token_ids.shape == (3, 1)
     assert out.logprobs_tensors is None
-    assert torch.equal(
-        out.sampled_token_ids.flatten(), torch.tensor([3, 11, 0], dtype=torch.int32)
-    )
+    assert torch.equal(out.sampled_token_ids.flatten(), torch.tensor([3, 11, 0], dtype=torch.int32))
 
 
 def test_sampling_context_restores() -> None:
@@ -191,3 +188,74 @@ def test_sampling_context_restores() -> None:
     with dr.activated():
         assert dr.sampling_active()
     assert not dr.sampling_active()
+
+
+def _gumbel_reference(values: torch.Tensor) -> torch.Tensor:
+    uniform = torch.rand(values.shape, device=values.device, dtype=torch.float32)
+    return torch.argmax(values + (-torch.log(-torch.log(uniform))), dim=-1)
+
+
+def test_gumbel_max_matches_argmax_of_scores_plus_gumbel() -> None:
+    torch.manual_seed(0)
+    logits = torch.randn(4, VOCAB).half()
+    temperature = torch.tensor([0.7, 1.0, 1.3, 0.5])
+    mask = dr.padding_mask(VOCAB, VOCAB, logits.device)
+    torch.manual_seed(4)
+    got = dr.gumbel_max_token_ids(logits, mask, temperature, None, 0, None)
+    torch.manual_seed(4)
+    values = logits.masked_fill(mask, float("-inf")).float() / temperature.unsqueeze(1)
+    assert torch.equal(got, _gumbel_reference(values))
+
+
+def test_gumbel_max_skips_the_host_uniform() -> None:
+    torch.manual_seed(1)
+    logits = torch.randn(2, VOCAB).half()
+    temperature = torch.ones(2)
+    mask = dr.padding_mask(VOCAB, VOCAB, logits.device)
+    uniform = torch.tensor([0.1, 0.9])
+    torch.manual_seed(8)
+    direct = dr.gumbel_max_token_ids(logits, mask, temperature, None, 0, None)
+    torch.manual_seed(8)
+    via_sample = dr.sample(
+        logits, mask, temperature, uniform, None, None, compile_kernel=False, draw="gumbel"
+    )
+    assert torch.equal(direct, via_sample)
+    inverse = dr.sample(
+        logits, mask, temperature, uniform, None, None, compile_kernel=False, draw="inverse_cdf"
+    )
+    alone, _ = _draw(logits, uniform, temperature)
+    assert torch.equal(inverse, alone)
+
+
+def test_gumbel_max_never_picks_a_masked_token() -> None:
+    logits = torch.full((6, PADDED), -1.0).half()
+    logits[:, VOCAB:] = 100
+    logits[:, 3] = 4
+    temperature = torch.ones(6)
+    mask = dr.padding_mask(PADDED, VOCAB, logits.device)
+    top_k = torch.ones(6, dtype=torch.long)
+    for seed in range(5):
+        torch.manual_seed(seed)
+        got = dr.gumbel_max_token_ids(logits, mask, temperature, top_k, 1, None)
+        assert torch.equal(got, torch.full((6,), 3))
+
+
+def test_unknown_draw_is_rejected() -> None:
+    logits = torch.zeros(1, VOCAB).half()
+    mask = dr.padding_mask(VOCAB, VOCAB, logits.device)
+    try:
+        dr.sample(
+            logits,
+            mask,
+            torch.ones(1),
+            torch.tensor([0.5]),
+            None,
+            None,
+            compile_kernel=False,
+            draw="softmax",
+        )
+    except ValueError as exc:
+        assert "inverse_cdf" in str(exc)
+        assert "gumbel" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")

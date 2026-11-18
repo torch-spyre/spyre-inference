@@ -30,7 +30,8 @@ Data flow in the current WIP version:
 - What stays on CPU is host-side bookkeeping: slot mapping, attention metadata
   (index tables, mask tiles) built by the metadata builder, the logits index and
   sampling. An all-random batch with ``SPYRE_DEVICE_RANDOM`` draws on the card
-  instead. A few model-specific workarounds still route one op through the host
+  instead (``SPYRE_DEVICE_RANDOM_DRAW`` selects inverse CDF or Gumbel-max).
+  A few model-specific workarounds still route one op through the host
   (see ``spyre_inference.multimodal`` and ``spyre_inference.models``).
 """
 
@@ -1106,7 +1107,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._arm_device_random()
 
     def _device_random_now(self) -> bool:
-        """Whether this step's sample can be an on-device inverse CDF.
+        """Whether this step's sample can be an on-device random draw.
 
         Stays off during warmup so the dummy sampler still receives ``[B, V]`` logits.
         Prompt logprobs and speculative decoding read the full rows, so they stay

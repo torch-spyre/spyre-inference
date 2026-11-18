@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
     SPYRE_DEVICE_RANDOM: bool = False
+    SPYRE_DEVICE_RANDOM_DRAW: str = "inverse_cdf"
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
@@ -140,12 +141,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # threads otherwise slow the next step).
     "SPYRE_LOGITS_CPU_GATHER": lambda: os.getenv("SPYRE_LOGITS_CPU_GATHER", "0") == "1",
     # When "1", an all-random batch with no penalties, masks, logprobs or structured
-    # outputs draws on the card and copies back only the token ids. One host uniform
-    # per row, then an inverse CDF. Requires torch-spyre #5853 (cumsum) and #5856
-    # (fp16 upcast). Top-k also needs #5846 and, past k = 128, #5854. Top-p needs the
-    # device sort from #5854. Off until those land. Single card only. Tokens match the
-    # softmax distribution, not the host Gumbel kernel.
+    # outputs draws on the card and copies back only the token ids. The draw is
+    # ``SPYRE_DEVICE_RANDOM_DRAW``. Requires the fp16 upcast (#5856). Top-k also needs
+    # #5846 and, past k = 128, #5854. Top-p needs the device sort from #5854. Off until
+    # those land. Single card only. Tokens match the chosen draw, not the host Gumbel
+    # kernel.
     "SPYRE_DEVICE_RANDOM": lambda: os.getenv("SPYRE_DEVICE_RANDOM", "0") == "1",
+    # Which draw ``SPYRE_DEVICE_RANDOM`` runs:
+    #  - "inverse_cdf" (default): one host uniform, then cumsum of the softmax (#5853)
+    #  - "gumbel": argmax of the masked scores plus Gumbel noise drawn on the device
+    "SPYRE_DEVICE_RANDOM_DRAW": lambda: os.getenv("SPYRE_DEVICE_RANDOM_DRAW", "inverse_cdf"),
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
     # instead of topping itself up with a short chunk of the next. Any non-positive

@@ -14,15 +14,20 @@
 
 """Random sampling on the Spyre card.
 
-One host uniform per row, then an inverse CDF on the device:
+Two draws, selected by ``SPYRE_DEVICE_RANDOM_DRAW``:
 
-    token = (cumsum(softmax(masked_logits / T)) < u * total).sum(-1)
+* ``inverse_cdf`` — one host uniform per row, then
+  ``(cumsum(softmax(masked_logits / T)) < u * total).sum(-1)``.
+  This is route 1 from torch-spyre #5851. The same ``u`` is the same token
+  in any row. It needs device ``cumsum`` (#5853).
+* ``gumbel`` — ``argmax(masked_logits / T + gumbel)``. The noise is
+  ``-log(-log U)`` from ``torch.rand`` on the score device, not the
+  on-device Threefry generator.
 
-Only the ``[B]`` token ids are copied back. This is route 1 from torch-spyre
-#5851. It needs device ``cumsum`` (#5853) and the fp16 upcast (#5856). Top-k
-reads ``topk`` values (#5846, and #5854 when k > 128). Top-p sorts the row
-(#5854). The draw matches the softmax distribution, not the host Gumbel
-kernel's token for the same seed. The same ``u`` is the same token in any row.
+Only the ``[B]`` token ids are copied back. Both draws need the fp16 upcast
+(#5856). Top-k reads ``topk`` values (#5846, and #5854 when k > 128). Top-p
+sorts the row (#5854). Neither draw matches the host Gumbel kernel's token
+for the same seed.
 
 Penalties, masks, logprobs, logits processors and structured outputs stay on
 the host path. A batch that is not all-random stays there too.
@@ -36,8 +41,10 @@ import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from spyre_inference import envs
+
 _active: ContextVar[bool] = ContextVar("spyre_device_random", default=False)
-_compiled: Callable[..., torch.Tensor] | None = None
+_compiled: dict[str, Callable[..., torch.Tensor]] = {}
 
 
 def sampling_active() -> bool:
@@ -116,13 +123,33 @@ def _apply_top_p(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
     return logits.masked_fill(drop_rank.gather(-1, rank), float("-inf"))
 
 
+def _masked_logits(
+    logits: torch.Tensor,
+    pad_mask: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    k_max: int,
+    top_p: torch.Tensor | None,
+) -> torch.Tensor:
+    """Pad, temperature, top-k and top-p. Both draws start from this row."""
+    # Mask the pad in the logits' dtype, then upcast. An fp32 mask of a host bool
+    # does not compile on current torch-spyre; fp16 does, and #5856 covers the cast.
+    values = logits.masked_fill(pad_mask, float("-inf")).float()
+    values = values / temperature.unsqueeze(1)
+    if top_k is not None:
+        values = _apply_top_k(values, top_k, k_max)
+    if top_p is not None:
+        values = _apply_top_p(values, top_p)
+    return values
+
+
 def _inverse_cdf(logits: torch.Tensor, uniform: torch.Tensor) -> torch.Tensor:
     cdf = torch.cumsum(torch.softmax(logits, dim=-1), dim=-1)
     total = torch.amax(cdf, dim=-1, keepdim=True)
     return torch.sum(cdf < uniform.unsqueeze(1) * total, dim=-1)
 
 
-def random_token_ids(
+def inverse_cdf_token_ids(
     logits: torch.Tensor,
     pad_mask: torch.Tensor,
     temperature: torch.Tensor,
@@ -132,15 +159,43 @@ def random_token_ids(
     top_p: torch.Tensor | None,
 ) -> torch.Tensor:
     """``[B, V]`` logits to ``[B]`` ids. ``pad_mask`` is ``[V]`` and broadcasts over rows."""
-    # Mask the pad in the logits' dtype, then upcast. An fp32 mask of a host bool
-    # does not compile on current torch-spyre; fp16 does, and #5856 covers the cast.
-    values = logits.masked_fill(pad_mask, float("-inf")).float()
-    values = values / temperature.unsqueeze(1)
-    if top_k is not None:
-        values = _apply_top_k(values, top_k, k_max)
-    if top_p is not None:
-        values = _apply_top_p(values, top_p)
+    values = _masked_logits(logits, pad_mask, temperature, top_k, k_max, top_p)
     return _inverse_cdf(values, uniform)
+
+
+def gumbel_max_token_ids(
+    logits: torch.Tensor,
+    pad_mask: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    k_max: int,
+    top_p: torch.Tensor | None,
+) -> torch.Tensor:
+    """``argmax(masked_logits / T + gumbel)``. ``pad_mask`` is ``[V]``.
+
+    ``U`` is drawn on the score device, one value per score. This does not
+    read the host uniform used by ``inverse_cdf_token_ids``.
+    """
+    values = _masked_logits(logits, pad_mask, temperature, top_k, k_max, top_p)
+    # torch.rand on the score device, not the on-device Threefry generator.
+    uniform = torch.rand(values.shape, device=values.device, dtype=torch.float32)
+    gumbel = -torch.log(-torch.log(uniform))
+    return torch.argmax(values + gumbel, dim=-1)
+
+
+_DRAW_FNS: dict[str, Callable[..., torch.Tensor]] = {
+    "inverse_cdf": inverse_cdf_token_ids,
+    "gumbel": gumbel_max_token_ids,
+}
+
+
+def selected_draw(draw: str | None = None) -> str:
+    """``SPYRE_DEVICE_RANDOM_DRAW`` unless ``draw`` is passed."""
+    name = envs.SPYRE_DEVICE_RANDOM_DRAW if draw is None else draw
+    if name not in _DRAW_FNS:
+        choices = ", ".join(_DRAW_FNS)
+        raise ValueError(f"SPYRE_DEVICE_RANDOM_DRAW must be one of {choices}, got {name!r}")
+    return name
 
 
 def sample(
@@ -152,42 +207,48 @@ def sample(
     top_p: torch.Tensor | None,
     *,
     compile_kernel: bool,
+    draw: str | None = None,
 ) -> torch.Tensor:
-    """Move the per-row vectors across, then run the draw.
+    """Move the per-row vectors across, then run the selected draw.
 
     ``k_max`` is a Python int, so each distinct top-k compiles its own graph.
     Top-p does too. Those graphs are not registered with the compile guard:
     the k is only known when a request arrives. Warmup compiles the
-    temperature-only graph at each row width.
+    temperature-only graph at each row width, for the draw selected at startup.
     """
     device = logits.device
     temperature = temperature.to(device=device, dtype=torch.float32)
-    uniform = uniform.to(device=device, dtype=torch.float32)
     k_max = 0
     if top_k is not None:
         top_k = top_k.to(device=device)
         k_max = int(top_k.max())
     if top_p is not None:
         top_p = top_p.to(device=device, dtype=torch.float32)
-    return _kernel(compile_kernel)(logits, pad_mask, temperature, uniform, top_k, k_max, top_p)
+    name = selected_draw(draw)
+    fn = _kernel(compile_kernel, name)
+    if name == "gumbel":
+        return fn(logits, pad_mask, temperature, top_k, k_max, top_p)
+    uniform = uniform.to(device=device, dtype=torch.float32)
+    return fn(logits, pad_mask, temperature, uniform, top_k, k_max, top_p)
 
 
-def _kernel(compile_kernel: bool) -> Callable[..., torch.Tensor]:
-    global _compiled
+def _kernel(compile_kernel: bool, draw: str) -> Callable[..., torch.Tensor]:
     if not compile_kernel:
-        return random_token_ids
-    if _compiled is None:
+        return _DRAW_FNS[draw]
+    compiled = _compiled.get(draw)
+    if compiled is None:
         from vllm.platforms import current_platform
 
         # Not @maybe_compile: SpyreLogitsProcessor already stores one compiled
         # kernel for the TP all-gather, and a second method would replace it.
-        _compiled = torch.compile(
-            random_token_ids,
+        compiled = torch.compile(
+            _DRAW_FNS[draw],
             backend=current_platform.simple_compile_backend,
             fullgraph=True,
             dynamic=False,
         )
-    return _compiled
+        _compiled[draw] = compiled
+    return compiled
 
 
 def sampler_output(token_ids: torch.Tensor) -> SamplerOutput:

@@ -32,6 +32,7 @@ class SpyreBlockTables(BlockTables):
         num_reqs_padded: int,
         out: tuple[torch.Tensor, ...] | None = None,
         out_ptrs: torch.Tensor | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         raise NotImplementedError
 

@@ -28,6 +28,17 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+
+class DTDRefused(ValueError):
+    pass
+
+
+class _NoDTD(ET.TreeBuilder):
+    # Real JUnit XML has no DTD, and refusing one closes entity-expansion DoS.
+    def doctype(self, name, pubid, system):
+        raise DTDRefused(f"JUnit XML must not declare a DTD: {name} (entity-expansion DoS guard)")
+
+
 # emoji, word (word is plain text so a browser ctrl+f for "xpass" hits the row).
 STATUS_META = {
     "error": ("🔥", "error"),
@@ -102,8 +113,8 @@ def _case_id(case: ET.Element) -> str:
 
 def parse_file(path: str) -> tuple[str, float, list[Case]] | None:
     try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError) as e:
+        root = ET.parse(path, ET.XMLParser(target=_NoDTD())).getroot()
+    except (OSError, ET.ParseError, DTDRefused) as e:
         print(f"Skipping unreadable {path}: {e}", file=sys.stderr)
         return None
 

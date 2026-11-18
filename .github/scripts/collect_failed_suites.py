@@ -28,7 +28,10 @@ import glob
 import json
 import os
 import subprocess
+import zipfile
 from pathlib import Path
+
+from download_xml_artifacts import UnsafeZipMember, assert_zip_confined, safe_segment
 
 FAILED_SUITES_DIR = Path("failed_suites")
 
@@ -54,8 +57,17 @@ def list_artifacts(repo: str, run_id: str, attempt: str) -> list[dict]:
 
 def download_and_extract(repo: str, artifacts: list[dict]) -> None:
     FAILED_SUITES_DIR.mkdir(exist_ok=True)
+    base = FAILED_SUITES_DIR.resolve()
+    downloaded = 0
     for artifact in artifacts:
-        out_dir = FAILED_SUITES_DIR / artifact["name"]
+        name = artifact["name"]
+        if not safe_segment(name):
+            print(f"::warning::skipping failed-suite artifact with unsafe name {name!r}")
+            continue
+        out_dir = FAILED_SUITES_DIR / name
+        if out_dir.resolve().parent != base:
+            print(f"::warning::skipping failed-suite artifact {name!r}: escapes {base}")
+            continue
         out_dir.mkdir(parents=True, exist_ok=True)
         zip_path = out_dir.with_suffix(".zip")
         result = subprocess.run(
@@ -64,8 +76,14 @@ def download_and_extract(repo: str, artifacts: list[dict]) -> None:
             check=True,
         )
         zip_path.write_bytes(result.stdout)
+        try:
+            assert_zip_confined(zip_path, out_dir)
+        except (UnsafeZipMember, zipfile.BadZipFile) as exc:
+            print(f"::warning::skipping failed-suite artifact {name!r}: {exc}")
+            continue
         subprocess.run(["unzip", "-q", "-o", str(zip_path), "-d", str(out_dir)], check=True)
-    print(f"Downloaded {len(artifacts)} failed-suite descriptor(s).")
+        downloaded += 1
+    print(f"Downloaded {downloaded} failed-suite descriptor(s).")
 
 
 def build_retry_matrix() -> dict:

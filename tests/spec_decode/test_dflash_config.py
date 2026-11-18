@@ -18,28 +18,11 @@ import pytest
 import torch
 
 from spyre_inference.v1.spec_decode.config import (
+    MAX_DFLASH_BATCH_SIZE,
     normalize_speculative_config,
     validate_dflash_config,
 )
 from spyre_inference.v1.spec_decode.dflash import accepted_context_length
-
-
-def test_platform_rejects_v2_before_constructing_a_worker(monkeypatch):
-    from spyre_inference import threading_config
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    config = NS(
-        model_config=None,
-        parallel_config=NS(
-            data_parallel_size=1, pipeline_parallel_size=1, tensor_parallel_size=1, world_size=1
-        ),
-        speculative_config=NS(use_dflash=lambda: True),
-    )
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
-    monkeypatch.setattr(TorchSpyrePlatform, "log_server_boot", lambda config: None)
-    monkeypatch.setattr(threading_config, "configure_threading", lambda world_size: None)
-    with pytest.raises(ValueError, match="requires SPYRE_MODEL_RUNNER=v1"):
-        TorchSpyrePlatform.check_and_update_config(config)
 
 
 @pytest.mark.parametrize(
@@ -52,22 +35,14 @@ def test_context_excludes_rejected_rows_and_uncomputed_correction(
     assert accepted_context_length(scheduled, drafts, sampled) == expected
 
 
-def test_xpress_bridge_preserves_checkpoint_and_disables_only_default_prefix_cache():
-    original = dict(
-        method="xpress", model="checkpoint", num_speculative_tokens=15, xpress_num_passes=0
-    )
-    args = NS(
-        speculative_config=original, additional_config={"unrelated": 1}, enable_prefix_caching=None
-    )
+def test_dflash_bridge_disables_padding_and_only_the_default_prefix_cache():
+    original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128)
+    args = NS(speculative_config=original, enable_prefix_caching=None)
     normalize_speculative_config(args)
-    assert original["method"] == "xpress"
-    assert args.speculative_config == dict(
-        method="dflash",
-        model="checkpoint",
-        num_speculative_tokens=15,
-        disable_padded_drafter_batch=True,
+    assert original == dict(
+        method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128
     )
-    assert args.additional_config == {"unrelated": 1, "spyre_xpress": {"num_passes": 0}}
+    assert args.speculative_config == original | {"disable_padded_drafter_batch": True}
     assert args.enable_prefix_caching is False
     args.speculative_config = original
     args.enable_prefix_caching = True
@@ -75,31 +50,42 @@ def test_xpress_bridge_preserves_checkpoint_and_disables_only_default_prefix_cac
     assert args.enable_prefix_caching is True
 
 
-def test_upstream_dflash_spelling_and_shortlist_override_are_preserved():
-    args = NS(
-        speculative_config=dict(method="dflash", model="checkpoint", xpress_topc=256),
-        additional_config={"unrelated": 1},
-        enable_prefix_caching=None,
-    )
+def test_other_methods_pass_through():
+    args = NS(speculative_config=dict(method="ngram"), enable_prefix_caching=None)
     normalize_speculative_config(args)
+    assert args.speculative_config == dict(method="ngram")
+    assert args.enable_prefix_caching is None
+
+
+@pytest.mark.parametrize("method", [{}, {"method": None}])
+@pytest.mark.parametrize("prefix_cache", [None, False, True])
+def test_inferred_dflash_normalizes_before_vllm_cache_defaults(method, prefix_cache):
+    original = dict(model="z-lab/Qwen3-8B-DFlash", **method)
+    args = NS(speculative_config=original, enable_prefix_caching=prefix_cache)
     normalize_speculative_config(args)
     assert args.speculative_config == dict(
-        method="dflash", model="checkpoint", disable_padded_drafter_batch=True
+        model=original["model"], method="dflash", disable_padded_drafter_batch=True
     )
-    assert args.additional_config == {"unrelated": 1, "spyre_xpress": {"topc": 256}}
-    assert args.enable_prefix_caching is False
+    assert args.enable_prefix_caching is (prefix_cache is True)
+    assert original == dict(model="z-lab/Qwen3-8B-DFlash", **method)
 
 
-@pytest.mark.parametrize("name", ["xpress_topc", "xpress_num_passes"])
-@pytest.mark.parametrize("value", [-1, True, 1.5, "512"])
-def test_invalid_cli_refiner_options_fail_before_vllm(name, value):
-    args = NS(
-        speculative_config={"method": "dflash", name: value},
-        additional_config=None,
-        enable_prefix_caching=None,
-    )
-    with pytest.raises(ValueError, match=name):
-        normalize_speculative_config(args)
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        {"model": "draft"},
+        {"model": "eagle-DFlash"},
+        {"model": "EAGLE3-DFlash"},
+        {"model": "DFlash", "method": "eagle3"},
+        {"model": "DFlash", "method": "draft_model"},
+    ],
+)
+def test_dflash_inference_preserves_other_methods(spec):
+    args = NS(speculative_config=spec, enable_prefix_caching=None)
+    normalize_speculative_config(args)
+    assert args.speculative_config is spec
+    assert args.enable_prefix_caching is None
 
 
 @pytest.fixture
@@ -109,6 +95,7 @@ def config():
         architectures=["DFlashQwen3XPressModel"],
         hidden_size=4096,
         vocab_size=151936,
+        num_hidden_layers=5,
         layer_types=["full_attention"] * 5,
         dflash_config={"target_layer_ids": [1, 9, 17, 25, 33]},
         xpress_block_size=16,
@@ -118,13 +105,22 @@ def config():
     return NS(
         speculative_config=NS(
             use_dflash=lambda: True,
-            draft_model_config=NS(hf_config=draft, quantization=None, dtype=torch.float16),
+            draft_shares_target_positions=lambda: True,
+            max_model_len=None,
+            draft_model_config=NS(
+                hf_config=draft,
+                architecture="DFlashQwen3XPressModel",
+                quantization=None,
+                dtype=torch.float16,
+                max_model_len=2048,
+            ),
             num_speculative_tokens=15,
             max_num_new_slots_for_drafting=15,
             draft_sample_method="greedy",
         ),
         model_config=NS(
             hf_text_config=target,
+            max_model_len=2048,
             is_multimodal_model=False,
             dtype=torch.float16,
             enforce_eager=False,
@@ -133,11 +129,10 @@ def config():
         parallel_config=NS(tensor_parallel_size=1, pipeline_parallel_size=1),
         scheduler_config=NS(max_num_seqs=1, max_num_batched_tokens=64),
         cache_config=NS(enable_prefix_caching=False),
-        additional_config={"spyre_xpress": {}},
     )
 
 
-@pytest.mark.parametrize("batch", [1])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4])
 def test_published_contract_is_accepted(config, batch):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = 128
@@ -146,47 +141,115 @@ def test_published_contract_is_accepted(config, batch):
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
 
-@pytest.mark.parametrize("architecture", ["Qwen3XPressModel", "DFlashQwen3XPressModel"])
-@pytest.mark.parametrize(
-    "checkpoint,override,expected",
-    [(None, None, 128), (512, None, 512), (512, 128, 128), (128, 0, 0), (0, 256, 256)],
-)
-def test_checkpoint_detection_and_topc_precedence(
-    config, architecture, checkpoint, override, expected
-):
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text"])
+def test_gemma4_xpress_contract_is_accepted(config, model_type):
+    target = config.model_config.hf_text_config
+    target.model_type = model_type
+    target.hidden_size, target.vocab_size, target.num_hidden_layers = 2816, 262144, 30
     draft = config.speculative_config.draft_model_config.hf_config
-    draft.architectures = [architecture]
+    draft.hidden_size, draft.vocab_size = target.hidden_size, target.vocab_size
+    draft.layer_types = ["sliding_attention"] * 4 + ["full_attention"]
+    draft.sliding_window = 2048
+    draft.dflash_config = {"target_layer_ids": [1, 6, 11, 17, 22, 27], "mask_token_id": 4}
+    validate_dflash_config(config)
+    assert draft.xpress_topc == 128
+    assert draft.layer_types == ["sliding_attention"] * 4 + ["full_attention"]
+
+
+@pytest.mark.parametrize(
+    "requested,shares_positions,expected",
+    [(None, True, 8192), (1024, True, 1024), (None, False, 2048)],
+)
+def test_draft_context_limit_respects_target_positions(
+    config, requested, shares_positions, expected
+):
+    config.model_config.max_model_len = 8192
+    spec = config.speculative_config
+    spec.max_model_len = requested
+    spec.draft_shares_target_positions = lambda: shares_positions
+    spec.draft_model_config.max_model_len = requested or 2048
+    validate_dflash_config(config)
+    assert spec.draft_model_config.max_model_len == expected
+
+
+@pytest.mark.parametrize("window", [None, 0, -1, True])
+def test_sliding_draft_requires_a_window(config, window):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.layer_types[0] = "sliding_attention"
+    draft.sliding_window = window
+    with pytest.raises(ValueError, match="positive window"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("layer_types", [["full_attention"], ["linear_attention"] * 5])
+def test_invalid_draft_attention_types_are_rejected(config, layer_types):
+    config.speculative_config.draft_model_config.hf_config.layer_types = layer_types
+    with pytest.raises(ValueError, match="per draft layer"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("model_type,multimodal", [("llama", False), ("gemma4_text", True)])
+def test_unsupported_targets_are_rejected(config, model_type, multimodal):
+    config.model_config.hf_text_config.model_type = model_type
+    config.model_config.is_multimodal_model = multimodal
+    with pytest.raises(ValueError, match="text targets"):
+        validate_dflash_config(config)
+
+
+@pytest.mark.parametrize("checkpoint,expected", [(None, 128), (1, 1), (512, 512), (1024, 1024)])
+def test_spyre_topc_default_applies_only_when_unset(config, checkpoint, expected):
+    # Upstream writes --xpress-topc onto the draft config before this runs.
+    draft = config.speculative_config.draft_model_config.hf_config
     draft.xpress_topc = checkpoint
-    config.additional_config = {} if override is None else {"spyre_xpress": {"topc": override}}
     validate_dflash_config(config)
     assert draft.xpress_topc == expected
 
 
-@pytest.mark.parametrize("value", [-1, True, 1.5, 151937])
-def test_invalid_checkpoint_topc_is_rejected(config, value):
-    config.speculative_config.draft_model_config.hf_config.xpress_topc = value
-    with pytest.raises(ValueError, match="xpress_topc"):
+@pytest.mark.parametrize("topc", [0, 1025, 2048])
+def test_unsupported_shortlists_fail_before_model_loading(config, topc):
+    config.speculative_config.draft_model_config.hf_config.xpress_topc = topc
+    with pytest.raises(ValueError, match="requires 1 to 1024 candidates"):
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("source", ["checkpoint", "additional_config"])
+@pytest.mark.parametrize("topc", [128, 1024, 2048])
+def test_shortlist_width_is_normalized_to_the_real_vocabulary(config, topc):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.xpress_topc = topc
+    draft.vocab_size = config.model_config.hf_text_config.vocab_size = 73
+    validate_dflash_config(config)
+    assert draft.xpress_topc == 73
+
+
 @pytest.mark.parametrize("value", [-1, True, 1.5])
-def test_invalid_refinement_passes_fail_before_model_loading(config, source, value):
-    if source == "checkpoint":
-        config.speculative_config.draft_model_config.hf_config.xpress_num_passes = value
-    else:
-        config.additional_config["spyre_xpress"]["num_passes"] = value
+def test_invalid_refinement_passes_fail_before_model_loading(config, value):
+    config.speculative_config.draft_model_config.hf_config.xpress_num_passes = value
     with pytest.raises(ValueError, match="xpress_num_passes must be a nonnegative integer"):
         validate_dflash_config(config)
 
 
-def test_plain_dflash_does_not_accept_xpress_options(config):
+def test_plain_dflash_is_not_given_refiner_defaults(config):
     draft = config.speculative_config.draft_model_config.hf_config
     draft.architectures = ["DFlashDraftModel"]
+    config.speculative_config.draft_model_config.architecture = "DFlashDraftModel"
     del draft.xpress_rank
-    with pytest.raises(ValueError, match="XPress options"):
+    validate_dflash_config(config)
+    assert not hasattr(draft, "xpress_topc")
+
+
+@pytest.mark.parametrize("architecture", [None, "DFlash2DraftModel", "MuseGlimmerAssistantModel"])
+def test_unsupported_draft_architecture_fails_before_model_loading(config, architecture):
+    config.speculative_config.draft_model_config.architecture = architecture
+    config.speculative_config.draft_model_config.hf_config = NS()
+    with pytest.raises(ValueError, match="Unsupported Spyre DFlash/XPress draft architecture"):
         validate_dflash_config(config)
-    config.additional_config = {}
+
+
+def test_draft_validation_uses_the_architecture_vllm_selected(config):
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.architectures = ["UnknownDraftModel", "DFlashDraftModel", "Qwen3XPressModel"]
+    config.speculative_config.draft_model_config.architecture = "DFlashDraftModel"
+    del draft.xpress_rank
     validate_dflash_config(config)
 
 
@@ -201,10 +264,10 @@ def test_shifted_anchor_layout_is_rejected(config, nested):
         validate_dflash_config(config)
 
 
-def test_v2_runner_is_rejected_before_model_loading(config, monkeypatch):
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
-    with pytest.raises(ValueError, match="SPYRE_MODEL_RUNNER=v1"):
-        validate_dflash_config(config)
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_both_runners_are_accepted(config, monkeypatch, runner):
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
+    validate_dflash_config(config)
 
 
 @pytest.mark.parametrize(
@@ -235,7 +298,7 @@ def test_incompatible_checkpoint_or_serving_configuration_fails_early(config, in
     elif invalid == "prefix_cache":
         config.cache_config.enable_prefix_caching = True
     elif invalid == "batch":
-        config.scheduler_config.max_num_seqs = 2
+        config.scheduler_config.max_num_seqs = MAX_DFLASH_BATCH_SIZE + 1
     elif invalid == "bf16":
         config.model_config.dtype = torch.bfloat16
     elif invalid == "draft_bf16":
@@ -248,16 +311,39 @@ def test_incompatible_checkpoint_or_serving_configuration_fails_early(config, in
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("batch,budget", [(1, 15), (1, 16), (1, 30)])
+@pytest.mark.parametrize(
+    "batch,budget", [(1, 15), (1, 16), (1, 30), (2, 31), (2, 61), (3, 64), (4, 63), (4, 123)]
+)
 def test_draft_batch_requires_enough_token_capacity(config, batch, budget):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget
-    with pytest.raises(ValueError, match="draft block"):
+    with pytest.raises(ValueError, match="per-request drafting reservation"):
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("batch,budget", [(1, 31)])
+@pytest.mark.parametrize("batch,budget", [(1, 31), (2, 62), (3, 93), (4, 124)])
 def test_token_budget_includes_the_vllm_drafting_reservation(config, batch, budget):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget
     validate_dflash_config(config)
+
+
+def test_v1_keeps_upstreams_other_refusals_but_allows_xpress(monkeypatch):
+    from vllm.config.vllm import VllmConfig
+
+    from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "_get_v1_model_runner_unsupported_features",
+        lambda self: [
+            "prefill context parallel",
+            "xpress speculative decoding",
+            "mixed sliding/full dflash drafts",
+        ],
+    )
+    allow_xpress_on_v1()
+    allow_xpress_on_v1()
+    assert VllmConfig._get_v1_model_runner_unsupported_features(None) == [
+        "prefill context parallel"
+    ]

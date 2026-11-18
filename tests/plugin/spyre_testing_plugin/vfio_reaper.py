@@ -115,12 +115,17 @@ def reap_vfio_holders(
     log: Callable[[str], None] = print,
     timeout: float = 5.0,
     poll: float = 0.1,
+    settle: float = 0.0,
 ) -> None:
     """SIGKILL every process holding a Spyre card fd, then poll until the card is
     free. If it can't be freed, warn and keep going: a best-effort cleanup should
     not abort the whole session (the holder may be an unrelated VFIO device or a
     process we can't kill), and any genuinely card-blocked test still fails loudly
-    on its own."""
+    on its own.
+
+    The fds leave /proc as soon as the holder dies, but the kernel may still be
+    releasing the device, and an open right after fails with ``0x332b`` "PCIe
+    address was not found". `settle` waits that much longer after a kill."""
     holders = _pids_holding_vfio(exclude_pids)
     if not holders:
         return
@@ -130,4 +135,5 @@ def reap_vfio_holders(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, signal.SIGKILL)
 
-    wait_until_card_free(exclude_pids, log=log, timeout=timeout, poll=poll)
+    if wait_until_card_free(exclude_pids, log=log, timeout=timeout, poll=poll):
+        time.sleep(settle)

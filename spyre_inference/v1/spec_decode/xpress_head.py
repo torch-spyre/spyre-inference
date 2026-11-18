@@ -12,70 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-License-Identifier: Apache-2.0
-
-# TEMPORARY VENDORED ADAPTATION: vllm-project/vllm#54448 postdates vLLM 0.32.0.
-# Source: https://github.com/vllm-project/vllm/blob/ce9467b757c024a55fea4d0919ac2e682f28a894/vllm/model_executor/models/qwen3_xpress.py
-# On upgrade, subclass upstream Qwen3XPressForCausalLM/head and retain only Spyre overrides.
-# Cleanup: https://github.com/torch-spyre/spyre-inference/issues/1417
-# test_xpress_vendored.py flags native support. Serving compiles these step helpers;
-# the CPU Jacobi oracle lives in tests/spec_decode/xpress_reference.py.
-
-from collections.abc import Mapping
+# Upstream's Jacobi loop is Triton-only; Spyre compiles these step helpers instead.
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead as _UpstreamHead
 
 
-class XPressRefinerHead(nn.Module):
-    """Causal block refiner, with the raw checkpoint mixer folded at load time."""
+def select_feedback(scores, embeddings, order, previous):
+    batch, slots, count = scores.shape
+    valid = order >= 0
+    maxima = torch.where(valid, scores, -torch.inf).amax(dim=-1, keepdim=True)
+    choices = torch.where(scores == maxima, order, count)
+    # Spyre's notequal misses NaNs; negative priorities select the first NaN.
+    choices = torch.where(scores == scores, choices, order - count)
+    choices = torch.where(valid, choices, count)
+    first = choices.amin(dim=-1, keepdim=True)
+    first = torch.where(first < 0, first + count, first)
+    selected = (order == first).to(scores.dtype)
+    # TODO: replace BMM and the candidate cache once torch-spyre supports
+    # embedding gathers with device-generated INT32 indices.
+    winners = torch.bmm(
+        selected.view(batch * slots, 1, count), embeddings.view(batch * slots, count, -1)
+    ).view(batch, slots, -1)
+    return first.squeeze(-1), torch.cat((previous[:, :2], winners[:, :-1]), dim=1)
 
-    _PUBLISHED_KEYS = {
-        "w1.weight": "w1.weight",
-        "down_h.weight": "down_h.weight",
-        "down_g.weight": "down_g.weight",
-        "in_proj.weight": "in_proj.weight",
-        "mix.L": "mix_L",
-        "mlp.gate_proj.weight": "mlp_gate.weight",
-        "mlp.up_proj.weight": "mlp_up.weight",
-        "mlp.down_proj.weight": "mlp_down.weight",
-        "w2.weight": "w2.weight",
-    }
 
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        block_size: int,
-        rank: int = 256,
-        mlp_hidden: int = 512,
-        topc: int = 128,
-    ) -> None:
-        super().__init__()
-        if min(vocab_size, hidden_size, rank, mlp_hidden) <= 0 or block_size < 2:
-            raise ValueError(
-                "XPress requires positive dimensions and a block of at least two tokens"
-            )
-        self.block_size = block_size
-        self.rank = rank
-        if type(topc) is not int or topc < 0:
-            raise ValueError("topc must be a nonnegative integer")
-        self.topc = topc
-        self.w1 = nn.Embedding(vocab_size, rank)
-        self.down_h = nn.Linear(hidden_size, rank, bias=False)
-        self.down_g = nn.Linear(hidden_size, rank, bias=False)
-        self.in_proj = nn.Linear(3 * rank, rank, bias=False)
-        self.mix_L = nn.Parameter(torch.eye(block_size).expand(rank, -1, -1).clone())
-        self.mlp_gate = nn.Linear(rank, mlp_hidden, bias=False)
-        self.mlp_up = nn.Linear(rank, mlp_hidden, bias=False)
-        self.mlp_down = nn.Linear(mlp_hidden, rank, bias=False)
-        self.w2 = nn.Linear(rank, vocab_size, bias=False)
-        self.register_buffer("_mix_kjc", None, persistent=False)
-        self.register_buffer("_readout_t", None, persistent=False)
-        self.register_buffer("_hidden_proj_t", None, persistent=False)
-        self.register_buffer("_token_proj_t", None, persistent=False)
+class XPressRefinerHead(_UpstreamHead):
+    """Upstream's head, construction and loading included, with Spyre step helpers."""
+
+    _mix_kjc: torch.Tensor | None = None
+    _hidden_proj_t: torch.Tensor | None = None
+    _token_proj_t: torch.Tensor | None = None
+
+    def build_fused_buffers(self) -> None:
+        # Only the Triton kernels read these; prepare_for_spyre builds the device layouts.
+        pass
 
     def prepare_for_spyre(self) -> None:
         """Build device layouts after the checkpoint is loaded in its serving dtype."""
@@ -96,23 +69,6 @@ class XPressRefinerHead(nn.Module):
             convert(weight, device, device_layout=row_outermost_layout(weight.shape, weight.dtype)),
             requires_grad=False,
         )
-        # Match the target LM head's output tiling; trim only full sticks.
-        padded = F.pad(weight, (0, 0, 0, (-weight.shape[0]) % 2048))
-        self._readout_t = padded.t().contiguous().to(device)
-
-    def load_checkpoint_weights(self, weights: Mapping[str, torch.Tensor]) -> None:
-        """Load raw checkpoint weights; use load_state_dict for an already folded mixer."""
-        prefix, mapping = "xpress_head.", self._PUBLISHED_KEYS
-        names = {name[len(prefix) :] for name in weights if name.startswith(prefix)}
-        if names != mapping.keys():
-            raise ValueError(
-                f"Invalid XPress head weights: missing={sorted(mapping.keys() - names)}, "
-                f"unexpected={sorted(names - mapping.keys())}"
-            )
-        state = {dest: weights[prefix + source] for source, dest in mapping.items()}
-        raw = state["mix_L"].to(dtype=self.mix_L.dtype)
-        state["mix_L"] = raw.tril() + torch.eye(self.block_size, dtype=raw.dtype, device=raw.device)
-        self.load_state_dict(state, strict=True)
 
     def _mix_and_mlp(self, x):
         # Keep rank as the contiguous dimension for Spyre's stick layout.
@@ -131,29 +87,16 @@ class XPressRefinerHead(nn.Module):
             return cache @ self._hidden_proj_t
         return F.linear(cache, self.in_proj.weight[:, : 2 * self.rank])
 
-    def refine_latent(self, previous_ids, projected_cache):
-        embeddings = self.w1(previous_ids)
+    def prepare_feedback(self, candidates, previous_ids):
+        return self.w1(candidates), self.w1(previous_ids), F.embedding(candidates, self.w2.weight)
+
+    def refine_feedback(self, base, previous_embeddings, projected_cache, readout):
         token_projection = (
-            embeddings @ self._token_proj_t
+            previous_embeddings @ self._token_proj_t
             if self._token_proj_t is not None
-            else F.linear(embeddings, self.in_proj.weight[:, 2 * self.rank :])
+            else F.linear(previous_embeddings, self.in_proj.weight[:, 2 * self.rank :])
         )
-        return self._mix_and_mlp(projected_cache + token_projection)[:, 1:]
-
-    def gather_readout(self, candidates):
-        """Candidate IDs must be flat for Spyre's embedding kernel."""
-        return F.embedding(candidates, self.w2.weight)
-
-    def refine_full(self, base, previous_ids, projected_cache):
-        latent = self.refine_latent(previous_ids, projected_cache)
-        if self._readout_t is not None:
-            bias = (latent @ self._readout_t)[..., : self.w2.out_features]
-        else:
-            bias = self.w2(latent)
-        return base + bias
-
-    def refine_candidates(self, base, previous_ids, projected_cache, readout):
-        latent = self.refine_latent(previous_ids, projected_cache)
+        latent = self._mix_and_mlp(projected_cache + token_projection)[:, 1:]
         batch, slots, candidates = base.shape
         bias = torch.bmm(
             readout.reshape(batch * slots, candidates, self.rank),

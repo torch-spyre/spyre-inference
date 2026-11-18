@@ -200,7 +200,8 @@ def test_rope_tables_match_upstream_complex_rope():
     torch.manual_seed(3)
     rows, cols = torch.randint(0, side, (2, 40))
     q, k = torch.randn(2, 1, 40, 2, head_dim).unbind(0)
-    freqs = pixtral.precompute_freqs_cis_2d(head_dim, side, side, 10000.0)[rows, cols]
+    freqs = torch.view_as_real(pixtral.precompute_freqs_cis_2d(head_dim, side, side, 10000.0))
+    freqs = freqs[rows, cols]
     want_q, want_k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs)
 
     flat = rows * side + cols

@@ -21,11 +21,11 @@ import pytest
 import torch
 from xpress_reference import merged_refine
 
-from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead
+from spyre_inference.v1.spec_decode.xpress_head import XPressRefinerHead, select_feedback
 
 
 @pytest.mark.parametrize("batch", [1, 4])
-@pytest.mark.parametrize("topc", [0, 128, 512])
+@pytest.mark.parametrize("topc", [128, 512])
 @pytest.mark.parametrize("passes", [0, 1, 6])
 def test_refinement_matches_merged_vllm(batch, topc, passes):
     torch.manual_seed(20261027)
@@ -39,15 +39,13 @@ def test_refinement_matches_merged_vllm(batch, topc, passes):
         scores = base[:, 1:]
         actual = scores.argmax(-1)
         cache = head.project_hidden_cache(hidden)
-        candidates = readout = None
-        if topc:
-            scores, candidates = scores.topk(topc, dim=-1)
-            readout = head.gather_readout(candidates.flatten())
+        scores, candidates = scores.topk(topc, dim=-1)
+        previous = torch.cat((anchors[:, None], anchors[:, None], actual[:, :-1]), dim=1)
+        embeddings, feedback, readout = head.prepare_feedback(candidates.flatten(), previous)
         for _ in range(passes):
-            previous = torch.cat((anchors[:, None], anchors[:, None], actual[:, :-1]), dim=1)
-            if candidates is None:
-                actual = head.refine_full(scores, previous, cache).argmax(-1)
-            else:
-                logits = head.refine_candidates(scores, previous, cache, readout)
-                actual = candidates.gather(-1, logits.argmax(-1, keepdim=True)).squeeze(-1)
+            logits = head.refine_feedback(scores, feedback, cache, readout)
+            indices, feedback = select_feedback(
+                logits, embeddings, torch.arange(topc).half(), feedback
+            )
+            actual = candidates.gather(-1, indices.long().unsqueeze(-1)).squeeze(-1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

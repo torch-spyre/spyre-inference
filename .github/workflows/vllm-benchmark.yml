@@ -104,7 +104,6 @@ jobs:
     timeout-minutes: 240
     env:
       CI: ''
-      VLLM_CPU_KVCACHE_SPACE: '16'
       DTLOG_LEVEL: error
       FLEX_COMPUTE: SENTIENT
       FLEX_DEVICE: PF

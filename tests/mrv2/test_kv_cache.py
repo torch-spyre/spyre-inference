@@ -29,9 +29,6 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
-from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
-    SpyreHeadMajorAttentionImpl,
-)
 from spyre_inference.v1.worker.spyre import attn_groups, kv_cache, triton_gate
 
 from .fakes import make_fake_kv_cache_config
@@ -81,23 +78,13 @@ def fake_pages(monkeypatch: pytest.MonkeyPatch):
         calls.append((cls, num_blocks, spec))
         return SpyrePagedKVCache(object(), object())
 
-    for impl in (SpyreAttentionImpl, SpyreHeadMajorAttentionImpl):
-        monkeypatch.setattr(impl, "allocate_pages", classmethod(allocate))
+    monkeypatch.setattr(SpyreAttentionImpl, "allocate_pages", classmethod(allocate))
     return calls
 
 
-@pytest.mark.parametrize(
-    "impls",
-    [
-        pytest.param([SpyreAttentionImpl] * 2, id="token_major"),
-        pytest.param([SpyreHeadMajorAttentionImpl] * 2, id="head_major"),
-        pytest.param([SpyreAttentionImpl, SpyreHeadMajorAttentionImpl], id="mixed"),
-    ],
-)
-def test_each_layer_gets_its_own_pages_in_its_backends_layout(
-    monkeypatch, fake_pages, impls
-) -> None:
+def test_each_layer_gets_its_own_pages(monkeypatch, fake_pages) -> None:
     runner = _runner(torch.device("cpu"))
+    impls = [SpyreAttentionImpl] * _NUM_LAYERS
 
     returned, forward_context = _run_init_kv_cache(monkeypatch, runner, impls, "cpu")
 
@@ -140,22 +127,6 @@ def test_init_raises_when_the_swap_did_not_apply(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="allocated no Spyre KV pages"):
         kv_cache.init(_runner(torch.device("cpu")), config)
-
-
-def test_speculative_decoding_is_refused(monkeypatch) -> None:
-    """The speculator calls init_attn_backend through its own import, past the swap."""
-    called = []
-    monkeypatch.setattr(
-        upstream_model_runner.GPUModelRunner,
-        "initialize_kv_cache",
-        lambda self, c, **k: called.append(True),
-    )
-    runner = _runner(torch.device("cpu"))
-    runner.speculator = object()
-
-    with pytest.raises(NotImplementedError, match="Speculative decoding"):
-        kv_cache.init(runner, make_fake_kv_cache_config())
-    assert called == []
 
 
 @pytest.mark.parametrize("is_profiling", [False, True])
@@ -210,7 +181,6 @@ _UPSTREAM_ATTRIBUTES = (
     "attn_groups",
     "kernel_block_sizes",
     "block_tables",
-    "pcp_manager",
     "ubatch_runner",
     "cudagraph_manager",
     "kv_caches",
@@ -276,25 +246,14 @@ def test_initialize_kv_cache_sets_every_upstream_attribute() -> None:
 
 
 @pytest.mark.spyre_device
-@pytest.mark.parametrize(
-    "impl",
-    [
-        pytest.param(SpyreAttentionImpl, id="token_major"),
-        pytest.param(SpyreHeadMajorAttentionImpl, id="head_major"),
-    ],
-)
-def test_pages_allocate_on_spyre_in_both_layouts(monkeypatch, impl) -> None:
+def test_pages_allocate_on_spyre(monkeypatch) -> None:
     if not spyre_available():
         pytest.skip("Spyre device not available")
     runner = _runner(torch.device("spyre"))
 
-    _, forward_context = _run_init_kv_cache(monkeypatch, runner, [impl] * 2, "cpu")
+    _, forward_context = _run_init_kv_cache(monkeypatch, runner, [SpyreAttentionImpl] * 2, "cpu")
 
-    want = (
-        (_NUM_BLOCKS, 1, _BLOCK, _HEAD)
-        if impl is SpyreHeadMajorAttentionImpl
-        else (_NUM_BLOCKS, _BLOCK, 1, _HEAD)
-    )
+    want = (_NUM_BLOCKS, 1, _BLOCK, _HEAD)
     for name, pages in runner.spyre_kv_caches.items():
         assert pages.k_pages.device.type == "spyre"
         assert tuple(pages.k_pages.shape) == tuple(pages.v_pages.shape) == want

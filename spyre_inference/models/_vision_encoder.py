@@ -204,6 +204,9 @@ class SpyreVisionEncoderMixin:
     vision_taps: ClassVar[tuple[int, ...]] = ()
     # Most items one encoder call can carry, when the layout bounds it (e.g. a one-hot width).
     vision_max_items_per_call: ClassVar[int | None] = None
+    # Limit items per call by budget tokens and vision_max_items_per_call (then required)
+    # instead of upstream's smallest budget, e.g. for a tower with one token per image.
+    vision_items_limited_by_tokens: ClassVar[bool] = False
 
     @property
     def vision_pad_groups(self) -> int:
@@ -244,6 +247,12 @@ class SpyreVisionEncoderMixin:
         deepstack features).
         """
         return torch.where(mask, image, text)
+
+    def vision_embed_text(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The prompt's ``[T, H]`` text embedding: upstream's, with no image tokens."""
+        return super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
 
     # --- 3. Used by the runner ---
 
@@ -289,6 +298,11 @@ class SpyreVisionEncoderMixin:
         (e.g. it adds newline tokens) returns its largest item's encoder tokens as the maximum.
         """
         return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
+
+    @property
+    def vision_pack_tokens(self) -> int | None:
+        """Most tokens one call packs from several items; ``None`` packs as upstream does."""
+        return None
 
     def prepare_encoder_cudagraph_capture_inputs(
         self,
@@ -425,7 +439,7 @@ class SpyreVisionEncoderMixin:
         image tokens arrive on the host: they are placed there at the bucketed ``[T, H]``, so
         the card sees one shape per token bucket whatever the image token count.
         """
-        text = super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
+        text = self.vision_embed_text(input_ids, is_multimodal)
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return text
         assert is_multimodal is not None, "image tokens need is_multimodal"

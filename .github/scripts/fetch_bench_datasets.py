@@ -68,84 +68,79 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 from argparse import ArgumentParser
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
-# Artifacts this repo pulls from the store, keyed by the env var that names the
-# local copy. `path` is relative to ARTIFACTORY_DATA_PATH and `sha256` is the
-# integrity gate; see the module docstring. Keeping the path per entry means a
-# new dataset or artifact anywhere under the root is a line here rather than
-# another secret.
-#
-# All thirteen files in the trace prefix are listed, not only the two that a
-# benchmark config selects today (aiops and cics). A fork PR gets no secrets and
-# so cannot fetch a missing artifact for itself, which would make every new
-# trace-replaying config wait on a config change PLUS a cache dispatch. Mirroring
-# the whole prefix costs one transfer on a shared volume and removes that wait.
-# The digests match .github/cache_config/hf_models_and_datasets.yaml, which the
-# writer dispatch uses to populate that cache; keep the two in step.
-#
-# A consumer that needs only a subset (a Jenkins node with its own local cache and
-# credentials of its own, say) can fetch per artifact rather than the whole table.
-_TRACES = "spyre-inference/vllm-bench-data/converted_traces/2025.11.03_e2ee1b0_reordered"
+import yaml
 
-ARTIFACTS = {
-    "SPYRE_AIOPS_DATASET": {
-        "path": f"{_TRACES}/aiops_results_2025.11.03_e2ee1b0_correct_order.jsonl",
-        "sha256": "468cf059f2ec3b14108efc09baffabf5c5a440172a25660673d5a8fa029d0637",
-    },
-    "SPYRE_ALL_SEQUENCES_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order.jsonl",
-        "sha256": "6df5d4de50a28b6ed7ad1d0b8794417899d18548627529a526bef93967906e3c",
-    },
-    "SPYRE_ALL_SEQUENCES_TRUNCATED_16K_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_16k.jsonl",
-        "sha256": "03b9e0d4b4432e0094f84b98fa89e6bfb2b402d35fef84421558d77ea36f5197",
-    },
-    "SPYRE_ALL_SEQUENCES_TRUNCATED_1K_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_1k.jsonl",
-        "sha256": "6ad8b08d2a600a24993a9570100e14e8d40ffe1308802ee12698f0d7b37c0b90",
-    },
-    "SPYRE_ALL_SEQUENCES_TRUNCATED_2K_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_2k.jsonl",
-        "sha256": "9b28b894978bd940ba860187d932de86de382534f04e1b284b61af5877418adb",
-    },
-    "SPYRE_ALL_SEQUENCES_TRUNCATED_32K_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_32k.jsonl",
-        "sha256": "a9d6a8a6cf849a60b56dbc8bd1b1eb9b95babb6a2d6a7747878e167869637b5d",
-    },
-    "SPYRE_ALL_SEQUENCES_TRUNCATED_4K_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_4k.jsonl",
-        "sha256": "8d76a859a67677a091290dad395d03acf88719688128530d7a943c4f23b1acff",
-    },
-    "SPYRE_ALL_SEQUENCES_TRUNCATED_8K_DATASET": {
-        "path": f"{_TRACES}/all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_8k.jsonl",
-        "sha256": "bd6579a7dbce7c80c3908e3150455eb13af940ee900c354539e7f6491512fce7",
-    },
-    "SPYRE_CICS_DATASET": {
-        "path": f"{_TRACES}/cics_results_2025.11.03_e2ee1b0_correct_order.jsonl",
-        "sha256": "e0efa895b4a22b601748c7dda9e8a2db146773fb8735fc45ee2920c042b40fb7",
-    },
-    "SPYRE_DB2_DATASET": {
-        "path": f"{_TRACES}/db2_results_2025.11.03_e2ee1b0_correct_order.jsonl",
-        "sha256": "b219891bee31b62d82f83ddc4b478bf75ac9039762b22b1afac5fc437cb2bac1",
-    },
-    "SPYRE_DB2_TRUNCATED_32K_DATASET": {
-        "path": f"{_TRACES}/db2_results_2025.11.03_e2ee1b0_correct_order_truncated_32k.jsonl",
-        "sha256": "9c0584930498e268b0af52adfc411c71d34a9065c16742381281ef578d911283",
-    },
-    "SPYRE_IMS_DATASET": {
-        "path": f"{_TRACES}/ims_results_2025.11.03_e2ee1b0_correct_order.jsonl",
-        "sha256": "49a284e3f10027bb430f168a4fba7310d7dcb3147565ffed1bb87d1fc6fe9c18",
-    },
-    "SPYRE_TLS_DATASET": {
-        "path": f"{_TRACES}/tls_results_2025.11.03_e2ee1b0_correct_order.jsonl",
-        "sha256": "9b1cc4d35e3626d1a6bbe0f998caa039b70d694241f25835a2083e1854e14028",
-    },
-}
+# The registry of datasets this repo pulls from the store: .github/cache_config/
+# artifactory_datasets.yaml, keyed per file by the env var that names the local
+# copy, so this script and the cache-writer dispatch share one source of truth.
+# `path` is relative to the datasets root and `sha256` is the integrity gate;
+# see the module docstring.
+_CONFIG = Path(__file__).resolve().parents[1] / "cache_config" / "artifactory_datasets.yaml"
+
+
+def _load_registry():
+    with _CONFIG.open(encoding="utf-8") as handle:
+        groups = (yaml.safe_load(handle) or {}).get("artifactory_datasets") or []
+    artifacts, archives = {}, {}
+    for group in groups:
+        for entry in group.get("files", []):
+            spec = {
+                "path": f"{group['path'].strip('/')}/{entry['name']}",
+                "sha256": str(entry["sha256"]),
+            }
+            if entry.get("archive"):
+                spec["media_var"] = entry["media_env"]
+                archives[entry["env"]] = spec
+            else:
+                artifacts[entry["env"]] = spec
+    if not artifacts and not archives:
+        raise RuntimeError(f"{_CONFIG} defines no datasets")
+    return artifacts, archives
+
+
+ARTIFACTS, ARCHIVES = _load_registry()
 
 DEFAULT_CACHE_DIR = "~/.cache/spyre/artifacts"
+
+
+def extract_dir(cache: Path, spec: dict) -> Path:
+    return Path(str(cache / spec["path"]).removesuffix(".tar.gz"))
+
+
+def archive_defaults(cache: Path = None) -> dict[str, str]:
+    cache = cache or cache_dir()
+    defaults = {}
+    for var, spec in ARCHIVES.items():
+        out = extract_dir(cache, spec)
+        defaults[var] = str(out / "dataset.jsonl")
+        defaults[spec["media_var"]] = str(out)
+    return defaults
+
+
+def materialize(archive: Path, spec: dict) -> tuple[Path, Path]:
+    """Extract a verified archive; return (dataset_jsonl, media_dir)."""
+    out = extract_dir(cache_dir(), spec)
+    source = out / "prompts.jsonl"
+    local = out / "dataset.jsonl"
+    if not out.is_dir() or not source.is_file():
+        with file_lock(archive):
+            if not out.is_dir() or not source.is_file():
+                out.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(archive) as tar:
+                    tar.extractall(out, filter="data")
+    if not source.is_file():
+        raise FetchUnavailable(f"{archive}: extraction is missing prompts.jsonl")
+    rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+    with local.open("w") as handle:
+        for row in rows:
+            row["image_files"] = [str(out / p) for p in row["image_files"]]
+            handle.write(json.dumps(row) + "\n")
+    return local, out
 
 
 def cache_dir() -> Path:
@@ -367,6 +362,47 @@ def main() -> None:
                 # instead of the fetch that could not get it.
                 continue
         print(f"export {var}={path}")
+
+    for var, spec in ARCHIVES.items():
+        media = spec["media_var"]
+        # Same preset rule as the single files, plus the media dir.
+        preset = os.environ.get(var)
+        preset_media = os.environ.get(media)
+        if preset and Path(preset).is_file() and preset_media and Path(preset_media).is_dir():
+            print(f"export {var}={preset}")
+            print(f"export {media}={preset_media}")
+            continue
+
+        archive = destination / spec["path"]
+        if args.command == "env":
+            out = extract_dir(destination, spec)
+            print(f"export {var}={out / 'dataset.jsonl'}")
+            print(f"export {media}={out}")
+            continue
+
+        state = cache_state(archive, spec["sha256"])
+        if state != "ok":
+            if args.command != "fetch":
+                (missing if state == "absent" else corrupt).append(archive)
+                continue
+            if cache_dir_error is not None:
+                unavailable.append((var, cache_dir_error))
+                continue
+            try:
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                with file_lock(archive):
+                    if cache_state(archive, spec["sha256"]) != "ok":
+                        download(spec["path"], archive, spec["sha256"])
+            except (FetchUnavailable, OSError) as exc:
+                unavailable.append((var, exc))
+                continue
+        try:
+            dataset, out = materialize(archive, spec)
+        except (FetchUnavailable, OSError, tarfile.TarError) as exc:
+            unavailable.append((var, exc))
+            continue
+        print(f"export {var}={dataset}")
+        print(f"export {media}={out}")
 
     if unavailable:
         # Loud, but NOT fatal. Most benchmark configs replay no trace and stay

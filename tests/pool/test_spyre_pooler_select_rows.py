@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test select_rows row-gather correctness, including the storage_offset
-check that avoids an unnecessary clone for full, unsliced buffers."""
+"""Test select_rows row-gather correctness, including sources that are views
+into a larger buffer."""
 
 import sys
 
@@ -51,9 +51,7 @@ def test_select_rows_cpu_handles_2d_pack_indices():
 @pytest.mark.parametrize("num_scheduled_tokens", [5, 10, 20])
 def test_select_rows_on_spyre_from_full_prefix_slice(num_scheduled_tokens):
     """hidden_states arrives as a slice of a larger persistent buffer, mirroring
-    vLLM's `hidden_states[:num_scheduled_tokens]` trim before pooling. A nonzero
-    storage_offset (mid-buffer slice) triggers a clone; a zero-offset slice
-    (num_scheduled_tokens == buffer_size) does not."""
+    vLLM's `hidden_states[:num_scheduled_tokens]` trim before pooling."""
     torch.manual_seed(2)
     buffer_size, hidden_size = 20, 64
     buffer = torch.randn(buffer_size, hidden_size, dtype=torch.float16)
@@ -76,8 +74,7 @@ def test_select_rows_on_spyre_from_full_prefix_slice(num_scheduled_tokens):
 
 
 def test_select_rows_on_spyre_offset_matches_sliced_rows():
-    """A mid-buffer slice has a nonzero storage_offset; select_rows clones it
-    before index_select so the native scheduler can map the source correctly."""
+    """A mid-buffer slice has a nonzero storage_offset, which index_select honors."""
     torch.manual_seed(3)
     buffer = torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4).to(torch.float16)
     sliced = buffer[5:15]  # rows 5..14 of the base buffer
@@ -90,8 +87,7 @@ def test_select_rows_on_spyre_offset_matches_sliced_rows():
 
 
 def test_select_rows_on_spyre_non_view_hidden_states():
-    """A fresh (non-view) tensor has storage_offset 0; select_rows skips the
-    clone and indexes it directly."""
+    """A fresh (non-view) tensor is indexed directly."""
     torch.manual_seed(4)
     hidden = torch.randn(10, 16, dtype=torch.float16)
     assert hidden.storage_offset() == 0

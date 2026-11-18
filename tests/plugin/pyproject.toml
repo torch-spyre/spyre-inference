@@ -21,7 +21,7 @@ dependencies = [
     "pytest-rerunfailures",
     "pytest-shard",
     "pytest-timeout",
-    "sentence-transformers>=5.2.0",  # required for embedding tests
+    "sentence-transformers>=5.6.0",  # required for embedding tests
     "tblib",  # for pickling test exceptions
 ]
 requires-python = ">=3.11"

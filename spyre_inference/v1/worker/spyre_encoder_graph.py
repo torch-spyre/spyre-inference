@@ -50,7 +50,23 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         dtype: torch.dtype,
         model: SpyreVisionEncoderMixin,
     ) -> None:
-        super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
+        cap = model.vision_max_items_per_call
+        by_tokens = model.vision_items_limited_by_tokens
+        if by_tokens and cap is None:
+            raise ValueError(
+                f"{type(model).__name__} sets vision_items_limited_by_tokens, which needs "
+                "vision_max_items_per_call (e.g. SEGMENT_ITEMS for segment_buffer())."
+            )
+        # Upstream bounds items per call by the smallest budget for its per-item capture split,
+        # which Spyre never does: an opted-in model hides the user's limit and applies it below.
+        comp_config = vllm_config.compilation_config
+        user_max_items = comp_config.encoder_cudagraph_max_vision_items_per_batch
+        if by_tokens:
+            comp_config.encoder_cudagraph_max_vision_items_per_batch = 0
+        try:
+            super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
+        finally:
+            comp_config.encoder_cudagraph_max_vision_items_per_batch = user_max_items
         # One graph set per budget: upstream's extra capture axes are not supported.
         if self._capture_axes:
             raise NotImplementedError("encoder capture_axes are not supported on Spyre.")
@@ -68,6 +84,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
         self.token_budgets = aligned(self.token_budgets)
         self.path_token_budgets = {p: aligned(b) for p, b in self.path_token_budgets.items()}
+        logger.info("Vision encoder budgets: %s", self.path_token_budgets)
         # Fail at startup rather than compile mid-request when user budgets miss an item.
         largest_item = model.get_encoder_cudagraph_budget_range(vllm_config)[1]
         if self.token_budgets[-1] < largest_item:
@@ -76,15 +93,56 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 f"item ({largest_item} tokens), which would then compile "
                 "mid-request. Raise compilation_config.encoder_cudagraph_token_budgets."
             )
-        # Respect a layout limit on items per encoder call when packing. Upstream derived the
-        # frame limit from the wider item count, so it shrinks with it.
-        cap = model.vision_max_items_per_call
-        if cap is not None and cap < self.max_batch_size:
+        if by_tokens:
+            assert cap is not None
+            self.max_batch_size = min(cap, user_max_items) if user_max_items > 0 else cap
+            if (
+                self.max_frames_per_batch
+                and comp_config.encoder_cudagraph_max_frames_per_batch is None
+            ):
+                self.max_frames_per_batch = self.max_batch_size * self.config.max_frames_per_video
+        # Otherwise respect a layout limit on items per encoder call when packing. Upstream
+        # derived the frame limit from the wider item count, so it shrinks with it.
+        elif cap is not None and cap < self.max_batch_size:
             self.max_batch_size = cap
             self.max_frames_per_batch = min(
                 self.max_frames_per_batch, cap * self.config.max_frames_per_video
             )
+        self._pack_tokens = model.vision_pack_tokens
+        self._pack_budgets: dict[str, list[int]] = {}
+        if self._pack_tokens is not None:
+            for path, budgets in self.path_token_budgets.items():
+                fit = self._path_fitting_budget(path, self._pack_tokens)
+                self._pack_budgets[path] = (
+                    budgets if fit is None else [b for b in budgets if b <= fit]
+                )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+
+    def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
+        pack = self._pack_tokens
+        if pack is None:
+            return super()._execute_local(mm_kwargs)
+        tokens = self._get_per_item_out_tokens(mm_kwargs)
+        small = [i for i, t in enumerate(tokens) if t <= pack]
+        budgets = self.path_token_budgets
+        outputs: dict[int, torch.Tensor] = {}
+        try:
+            # Upstream reads path_token_budgets per call: the packed group sees only the
+            # capped budgets, and a lone large item every budget.
+            self.path_token_budgets = self._pack_budgets
+            if len(small) == len(tokens):
+                return super()._execute_local(mm_kwargs)
+            if small:
+                group = self._select_items(mm_kwargs, small)[0]
+                outputs.update(zip(small, super()._execute_local(group), strict=True))
+            self.path_token_budgets = budgets
+            for i, t in enumerate(tokens):
+                if t > pack:
+                    (outputs[i],) = super()._execute_local(self._select_items(mm_kwargs, [i])[0])
+        finally:
+            self.path_token_budgets = budgets
+        return [outputs[i] for i in range(len(tokens))]
 
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()

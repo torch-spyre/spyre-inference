@@ -400,3 +400,11 @@ def drop_cpu_device_layouts(monkeypatch) -> None:
         return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", to)
+
+
+def use_kv_buckets(monkeypatch) -> None:
+    """Make the per-sequence kernels use the KV buckets rather than a page range."""
+    monkeypatch.setattr(
+        "spyre_inference.v1.attention.spyre_attn_bucketer._declared_page_range",
+        lambda max_pages: None,
+    )

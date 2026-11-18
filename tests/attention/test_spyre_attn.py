@@ -25,6 +25,7 @@ from spyre_testing_plugin.attn_helpers import (
     random_block_tables,
     ref_attn,
     split_by_chunk,
+    use_kv_buckets,
     use_python_for_each_tile,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -42,6 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
     _prefill_page_group,
+    _prefill_page_group_for_range,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import SpyreEncoderAttentionImpl
 from spyre_inference.v1.attention.ops.batched_decode import (
@@ -282,11 +284,22 @@ def _run_spyre_attn_test(
     if expect_fused_store is not None or expect_query_widths is not None:
         real_run = attn_impl._run_page_attn
 
-        def spy_run(query, row_table, k_pages, v_pages, index_table, mask_stack, nb, pql, out):
+        def spy_run(
+            query, row_table, k_pages, v_pages, index_table, mask_stack, nb, page_range, pql, out
+        ):
             fused_calls.append(out is not None)
             dispatched_widths.add(pql)
             return real_run(
-                query, row_table, k_pages, v_pages, index_table, mask_stack, nb, pql, out
+                query,
+                row_table,
+                k_pages,
+                v_pages,
+                index_table,
+                mask_stack,
+                nb,
+                page_range,
+                pql,
+                out,
             )
 
         attn_impl._run_page_attn = spy_run
@@ -528,6 +541,47 @@ def test_mixed_batch_dispatches_decode_at_query_width_one(
         configure_device=configure_device,
         expect_query_widths={1, chunk_bucket},
     )
+
+
+@pytest.mark.parametrize(
+    ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
+)
+def test_prefill_and_decode_walk_their_own_page_ranges(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """In one batch, a prefill sequence walks the prefill page range 8 pages per loop step
+    and a decode sequence walks the decode range."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    walks = {}
+    real_run = spyre_attn._run_with_capped_cores
+
+    def spy_run(output_units, fn, /, **kwargs):
+        walks[kwargs["padded_query_len"]] = (kwargs["page_range"], kwargs.get("page_group"))
+        return real_run(output_units, fn, **kwargs)
+
+    monkeypatch.setattr(spyre_attn, "_run_with_capped_cores", spy_run)
+
+    # The fixture's max_model_len 2048 at block 64 is 32 pages, enough for prefill to get
+    # a range of its own. 18 pages of prefill KV round up to 24.
+    _run_spyre_attn_test(
+        seq_lens=[(64, 1100), (1, 300)],
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        # 8 x 128 query heads keep prefill page grouping eligible.
+        num_query_heads=8,
+        num_kv_heads=2,
+    )
+
+    (prefill_width,) = walks.keys() - {1}
+    prefill_range, prefill_group = walks[prefill_width]
+    decode_range, decode_group = walks[1]
+    assert prefill_range is not None and prefill_range["granularity"] == 8
+    assert prefill_group == 8
+    assert decode_range is not None and decode_range["granularity"] == 1
+    assert decode_group is None
 
 
 @pytest.mark.parametrize(
@@ -1691,7 +1745,9 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
         pytest.param(1025, 32, id="kv1025_to_32"),
     ],
 )
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len, expected):
+    # A page range keeps each sequence's own page count, so test the bucketed path.
+    use_kv_buckets(monkeypatch)
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
     assert expected in buckets
@@ -1704,11 +1760,13 @@ def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expect
     assert [t.shape[0] for t in metadata.page_index_tables_cpu] == [expected]
 
 
-def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config):
+def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config, monkeypatch):
     """Padded blocks are exactly finfo.min; the real prefix is bit-identical
     regardless of how much headroom the block table has beyond the bucket
     build() actually pads to -- build() always pads to a bucket (no unpadded
     fallback), so both tables here must have at least that much headroom."""
+    # A page range pads nothing, so test the bucketed path.
+    use_kv_buckets(monkeypatch)
     torch.set_default_device("cpu")
     block_size = 64
     kv_len, query_len = 300, 32
@@ -1737,14 +1795,18 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config)
         )
 
 
-def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
+@pytest.mark.parametrize("declare_pages", [False, True], ids=["bucketed", "declared"])
+def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config, monkeypatch, declare_pages):
     """Zero real blocks must not be padded: a fully-masked tile would divide by zero."""
+    if not declare_pages:
+        use_kv_buckets(monkeypatch)
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
 
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_stacks[0].shape[0] == 0
-    assert metadata.padded_num_blocks[1] == 2
+    if not declare_pages:
+        assert metadata.padded_num_blocks[1] == 2
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):
@@ -2033,6 +2095,17 @@ def test_prefill_page_group_divides_every_block_count():
     block count is not a bucket, so every count must get a divisor."""
     for num_blocks in range(1, 1025):
         assert num_blocks % _prefill_page_group(num_blocks, 8, 128) == 0, num_blocks
+
+
+@pytest.mark.parametrize(
+    "granularity, num_heads, head_size, expected",
+    [(8, 8, 128, 8), (1, 8, 128, 1), (8, 16, 128, 1)],
+)
+def test_prefill_page_group_for_range_divides_the_granularity(
+    granularity, num_heads, head_size, expected
+):
+    page_range = {"min": 16, "max": 256, "granularity": granularity}
+    assert _prefill_page_group_for_range(page_range, num_heads, head_size) == expected
 
 
 def test_prefill_page_group_must_divide_num_blocks():
@@ -2336,6 +2409,54 @@ def test_spyre_attn_dispatches_by_query_width(
     )
 
     assert sorted(called) == ["decode", "prefill"], called
+
+
+@pytest.mark.parametrize(
+    ("query_len", "kernel_name"),
+    [(1, "page_attn_decode"), (64, "page_attn_prefill")],
+    ids=["decode", "prefill"],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_kernel_serves_every_page_count(
+    default_vllm_config,
+    monkeypatch,
+    query_len,
+    kernel_name,
+    configure_compilation,
+    configure_device,
+):
+    """One compiled per-sequence kernel per query width serves every page count up to
+    max_model_len, a one-page sequence included, and matches the reference."""
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch_spyre._inductor import config as ts_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    # The fixture's max_model_len 2048 at block size 128 gives a range of 2 to 16 pages. The
+    # kernel compiles at 16, as in warmup, and is reused at 1 page (run as 2), 3 and 8.
+    kernel_code = getattr(spyre_attn, kernel_name).__code__
+    # Restores the MIN_RESERVED_DIM_SIZE the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8):
+        for kv_len in (2048, query_len + 10, 300, 1000):
+            _run_spyre_attn_test(
+                seq_lens=[(query_len, kv_len)],
+                block_size=128,
+                sliding_window=None,
+                configure_compilation=configure_compilation,
+                configure_device=configure_device,
+                # 8 x 128 query heads keep prefill page grouping eligible.
+                num_query_heads=8,
+                num_kv_heads=2,
+            )
+            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
 
 
 @pytest.mark.parametrize(

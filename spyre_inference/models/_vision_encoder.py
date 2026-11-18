@@ -248,6 +248,12 @@ class SpyreVisionEncoderMixin:
         """
         return torch.where(mask, image, text)
 
+    def vision_embed_text(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The prompt's ``[T, H]`` text embedding: upstream's, with no image tokens."""
+        return super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
+
     # --- 3. Used by the runner ---
 
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
@@ -290,8 +296,12 @@ class SpyreVisionEncoderMixin:
 
         Overridable: a model whose processor does not count in image tokens out of the encoder
         (e.g. it adds newline tokens) returns its largest item's encoder tokens as the maximum.
+
+        Capped at ``max_model_len``: an item's encoder tokens are among its prompt's, so a
+        larger item is rejected before it reaches the encoder and its budgets are unreachable.
         """
-        return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
+        largest = min(self.max_tokens_per_item, vllm_config.model_config.max_model_len)
+        return self.vision_patch_multiple // self.patches_per_token, largest
 
     @property
     def vision_pack_tokens(self) -> int | None:
@@ -433,7 +443,7 @@ class SpyreVisionEncoderMixin:
         image tokens arrive on the host: they are placed there at the bucketed ``[T, H]``, so
         the card sees one shape per token bucket whatever the image token count.
         """
-        text = super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
+        text = self.vision_embed_text(input_ids, is_multimodal)
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return text
         assert is_multimodal is not None, "image tokens need is_multimodal"

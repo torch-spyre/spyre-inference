@@ -95,7 +95,7 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).mean(dim=0)
 
 
-def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
+def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0, max_model_len=4096):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
@@ -103,10 +103,11 @@ def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
+            max_model_len=max_model_len,
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: videos if modality == "video" else 4,
                 mm_encoder_tp_mode=tp_mode,
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=2),
     )
@@ -122,6 +123,13 @@ def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     manager = _manager(_FakeVisionModel(max_tokens=300))
     assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
     assert all(b * MERGE_PATCHES % 64 == 0 for b in manager.token_budgets)
+
+
+def test_largest_budget_is_capped_at_max_model_len():
+    """An item longer than the context is rejected before the encoder, so no budget holds it."""
+    manager = _manager(_FakeVisionModel(max_tokens=300), max_model_len=128)
+    assert manager.token_budgets == [16, 32, 64, 128]
+    _manager(_FakeVisionModel(max_tokens=300), max_model_len=128, budgets=[64, 128])
 
 
 def test_user_budgets_below_the_largest_item_fail_at_startup():

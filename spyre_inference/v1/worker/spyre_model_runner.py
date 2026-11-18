@@ -70,6 +70,7 @@ from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
+from spyre_inference.moe import prepare_moe_layers_on_threads
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -372,6 +373,29 @@ class _SpyreHiddenStates(torch.Tensor):
         out = cast(Any, rows[:num_rows])
         out._spyre_padded_rows = rows
         return out
+
+
+def warm_sample_row_gathers(
+    model: _SpyreModelWrapper, hidden_states: torch.Tensor, row_widths: list[int]
+) -> None:
+    """Compile the sampled-row gather and the lm_head on its output, per row bucket.
+
+    A multi-row gather returns a padded device layout that ``_dummy_sampler_run``'s
+    rows lack, and the lm_head graph guards on layout.
+    """
+    if not isinstance(hidden_states, _SpyreHiddenStates):
+        return
+    for rows in row_widths:
+        if rows <= hidden_states.shape[0]:
+            indices = torch.arange(rows, dtype=torch.int64)
+            model.compute_logits(hidden_states[indices])
+            # On an exact body bucket, arange takes the decode path and reuses the body.
+            # A mixed step can still gather there: tokens [1, 1, 2] give a 4-token body
+            # and index [0, 1, 3], padded to [0, 1, 3, 3]. Warm that gather with a
+            # reversed index; it compiles per shape, not per value. From two rows up:
+            # without a 1 bucket, one sampled row pads to [1, 1].
+            if rows == hidden_states.shape[0] and rows > 1:
+                model.compute_logits(hidden_states[indices.flip(0)])
 
 
 class _SpyreModelWrapper:
@@ -719,9 +743,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         install_pad_loaders(model_loader, self.model_config)
 
         # Load model on CPU
-        self.model = model_loader.load_model(
-            vllm_config=self.vllm_config, model_config=self.model_config
-        )
+        with prepare_moe_layers_on_threads():
+            self.model = model_loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
         check_spyre_model(self.model, get_model_architecture(self.model_config)[1])
         self.model_memory_usage = 0  # No GPU memory profiling for Spyre
 
@@ -1387,25 +1412,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_sample_row_gathers(self, hidden_states: torch.Tensor, row_widths: list[int]) -> None:
-        """Compile the sampled-row gather and the lm_head on its output, per row bucket.
-
-        A multi-row gather returns a padded device layout that ``_dummy_sampler_run``'s
-        rows lack, and the lm_head graph guards on layout.
-        """
-        if not isinstance(hidden_states, _SpyreHiddenStates):
-            return
-        model = cast(_SpyreModelWrapper, self.model)
-        for rows in row_widths:
-            if rows <= hidden_states.shape[0]:
-                indices = torch.arange(rows, dtype=torch.int64)
-                model.compute_logits(hidden_states[indices])
-                # On an exact body bucket, arange takes the decode path and reuses the body.
-                # A mixed step can still gather there: tokens [1, 1, 2] give a 4-token body
-                # and index [0, 1, 3], padded to [0, 1, 3, 3]. Warm that gather with a
-                # reversed index; it compiles per shape, not per value. From two rows up:
-                # without a 1 bucket, one sampled row pads to [1, 1].
-                if rows == hidden_states.shape[0] and rows > 1:
-                    model.compute_logits(hidden_states[indices.flip(0)])
+        # Before reading self.model: host-path hidden states have no gather to warm.
+        if isinstance(hidden_states, _SpyreHiddenStates):
+            warm_sample_row_gathers(cast(_SpyreModelWrapper, self.model), hidden_states, row_widths)
 
     @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:

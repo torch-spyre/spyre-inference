@@ -120,12 +120,6 @@ def _derive_moe_chunks(
     return best_chunks
 
 
-# Traced batches of 256 to 512 tokens run grouped. Below, a core of a four-group map takes
-# under 32 token rows; at 1,024 tokens it is slower than one expert per trip at TP 4.
-_MIN_GROUPED_TOKENS = 256
-_MAX_GROUPED_TOKENS = 512
-
-
 @dataclass(frozen=True)
 class SpyreMoERecipe:
     """The upstream MoE semantics implemented by Spyre's current kernels.
@@ -140,8 +134,18 @@ class SpyreMoERecipe:
     # Called per chunk of experts while the down stack streams to the card: ``stack`` is
     # ``w2[experts]``, so the whole transformed stack is never built on the host.
     prepare_down_weight: Callable[[torch.Tensor, slice], torch.Tensor] | None = None
-    # Experts per trip of the traced all-expert loop; ``SPYRE_MOE_EXPERT_GROUP`` overrides it.
+    # G experts per trip of the traced all-expert loop for stick-aligned batches of
+    # ``expert_group_tokens`` = (fewest, most) tokens; other batches run one. Where grouping
+    # pays depends on the model's expert shapes, so a recipe that sets G > 1 sets the range.
     expert_group: int = 1
+    expert_group_tokens: tuple[int, int] | None = None
+
+    def experts_per_trip(self, tokens: int) -> int:
+        """Experts per trip of the traced all-expert loop for a batch of ``tokens``."""
+        if self.expert_group == 1 or self.expert_group_tokens is None:
+            return 1
+        fewest, most = self.expert_group_tokens
+        return self.expert_group if fewest <= tokens <= most else 1
 
 
 # vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
@@ -260,21 +264,30 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
                 f"Spyre swigluoai uses limit={_SWIGLUOAI_LIMIT} and alpha={_SWIGLUOAI_ALPHA}; "
                 f"the layer asks for limit={limit}, alpha={alpha}."
             )
-    if envs.SPYRE_MOE_EXPERT_GROUP is not None:
-        recipe = replace(recipe, expert_group=envs.SPYRE_MOE_EXPERT_GROUP)
     if recipe.expert_group != 1:
-        if not _expert_group_fits(layer, recipe.expert_group):
+        fewest, most = recipe.expert_group_tokens or (0, 0)
+        if recipe.expert_group < 1 or not 1 <= fewest <= most:
             raise ValueError(
-                f"SPYRE_MOE_EXPERT_GROUP / SpyreMoERecipe.expert_group={recipe.expert_group} "
-                "must divide the experts and the cores, and the cores a stick of tokens."
+                f"SpyreMoERecipe.expert_group={recipe.expert_group} needs a group of at least 1 "
+                "and expert_group_tokens=(fewest, most) with 1 <= fewest <= most, got "
+                f"{recipe.expert_group_tokens}."
             )
-        logger.info_once(
-            "Spyre MoE: %d experts per trip in the in-graph expert loop for stick-aligned "
-            "batches of %d to %d tokens; other batches keep one expert per trip.",
-            recipe.expert_group,
-            _MIN_GROUPED_TOKENS,
-            _MAX_GROUPED_TOKENS,
-        )
+        if _expert_group_fits(layer, recipe.expert_group):
+            logger.info_once(
+                "Spyre MoE: %d experts per trip in the in-graph expert loop for stick-aligned "
+                "batches of %d to %d tokens; other batches keep one expert per trip.",
+                recipe.expert_group,
+                fewest,
+                most,
+            )
+        else:
+            # The core count belongs to the deployment, so the recipe's group yields to it.
+            logger.warning_once(
+                "Spyre MoE: the recipe's %d experts per trip do not fit this layer's experts "
+                "and the cores; running one expert per trip.",
+                recipe.expert_group,
+            )
+            recipe = replace(recipe, expert_group=1)
     layer = cast("RoutedExperts", layer)
     layer.spyre_moe_recipe = recipe
     layer.spyre_moe_regions = {}
@@ -550,7 +563,8 @@ def _moe_persistent_in_graph(
 
         cores = spyre_config.sencores
         # A trip's tiles carry G experts on a leading axis, which the body's ops broadcast
-        # over. One core map {G, T} serves x's per-group copy, the trip and the accumulators.
+        # over. One core map {G, T} serves x's per-group copy, the trip and the accumulators;
+        # a broadcast x gives the same values but is slower at 256 rows.
         with spyre_hint(named_dims=["G", "T", "C"], work_div={"G": group, "T": cores // group}):
             x_groups = x.expand(group, *x.shape).contiguous()
             result, _ = for_each_tile(
@@ -1134,11 +1148,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer.spyre_moe_down,
                 recipe.activation,
                 layer.spyre_moe_biases,
-                group=(
-                    recipe.expert_group
-                    if _MIN_GROUPED_TOKENS <= tokens <= _MAX_GROUPED_TOKENS
-                    else 1
-                ),
+                group=recipe.experts_per_trip(tokens),
             )
         moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.

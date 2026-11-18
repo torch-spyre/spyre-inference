@@ -2962,7 +2962,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td><code>vision_buffers</code>, <code>patches_per_token</code>, <code>out_hidden_size</code></td>
 <td>yes</td>
 <td>host inputs (fp16, or integer indices) and their padding values; patches per image token; output width</td>
-<td>patches, one-hot segments, positions; <code>M²</code>; text hidden size</td>
+<td>patches, key-padding row, positions; <code>M²</code>; text hidden size</td>
 <td>patches, one-hot segments, x and y positions; <code>k²</code> (pooling kernel); text hidden size</td>
 </tr>
 <tr>
@@ -2976,14 +2976,14 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td><code>vision_inputs(mm_kwargs)</code></td>
 <td>yes</td>
 <td>host buffers, unpadded; validated against <code>vision_buffers</code></td>
-<td>offset-major patches, segments, RoPE positions</td>
+<td>one image's offset-major patches, a zero key-padding row, RoPE positions</td>
 <td>valid patches only, offset-major by position; segments; x and y</td>
 </tr>
 <tr>
 <td><code>vision_embed(values)</code></td>
 <td>yes</td>
 <td>graph 1: patches -&gt; block input embeddings and shared block inputs</td>
-<td>patch linear, <code>ln_pre</code>, image mask</td>
+<td>patch linear, <code>ln_pre</code>, <code>[1, 1, 1, P]</code> key-padding mask</td>
 <td>patch linear plus position embeddings and RoPE, gathered per axis; image mask</td>
 </tr>
 <tr>
@@ -3025,7 +3025,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td><code>vision_max_items_per_call</code></td>
 <td>no</td>
 <td>layout bound on items per encoder call</td>
-<td>63 (one-hot width)</td>
+<td>1 (so the mask only hides padding)</td>
 <td>63 (one-hot width)</td>
 </tr>
 <tr>
@@ -3075,9 +3075,11 @@ placeholders and <code>embed_input_ids</code> are inherited unchanged.</p>
   its own tail. The patch merge is then a free view to <code>[M², tokens, D]</code>, a batched matmul
   and a sum. Upstream's <code>unfold</code> regroup has no lowering, and a <code>[L, D] → [L/M², M²·D]</code>
   reshape feeding a matmul cannot be laid out.</li>
-<li>The image mask is <code>segments @ segmentsᵀ</code> over a one-hot <code>[L, 64]</code> segment matrix (the last
-  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
-  cannot lay out.</li>
+<li>Pixtral encodes one image per call, so its mask is a <code>[P]</code> key-padding row (0 for real
+  patches, <code>finfo.min / 2</code> for padding slots) broadcast over queries. Gemma 4 packs images,
+  and its image mask is <code>segments @ segmentsᵀ</code> over a one-hot <code>[L, 64]</code> segment matrix (the
+  last column reserved for padding slots), not a column-minus-row broadcast, which
+  torch-spyre cannot lay out.</li>
 <li>RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
   <code>GatherTable</code> (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
   one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a

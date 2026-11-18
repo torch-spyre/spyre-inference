@@ -121,6 +121,11 @@ override-dependencies = [
     # requests is used by many dependencies, make sure it's patched for CVEs
     "requests>=2.32.4",
 
+    # datasets caps fsspec<=2025.3.0, which is vulnerable to the Jinja2 SSTI RCE in
+    # ReferenceFileSystem (CVE-2026-104851 / GHSA-27vj-qcqg-25rc, fixed 2026.6.0);
+    # huggingface-hub and torch take fsspec with no upper bound.
+    "fsspec>=2026.6.0",
+
     # pyzmq (transitive vllm dep, built from sdist on ppc64le/s390x) <27.2.0 fails to build
     # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
     # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.

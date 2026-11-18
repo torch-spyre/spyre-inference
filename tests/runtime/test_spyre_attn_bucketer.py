@@ -151,21 +151,25 @@ class TestBuckets:
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
-        assert bucketer.query_buckets == [1, 512]
+        assert bucketer.query_buckets == [1, 64, 128, 256, 512]
 
     def test_query_buckets_are_multiples_of_the_step(self):
         b = SpyreAttnBucketer(make_config(max_num_batched_tokens=2048))
-        assert b.query_buckets == [1, 512, 1024, 1536, 2048]
+        assert b.query_buckets == [1, 64, 128, 256, 512, 1024, 1536, 2048]
+
+    def test_pooling_keeps_the_coarse_query_buckets(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=4096, runner_type="pooling"))
+        assert b.query_buckets == [1, 512]
 
     def test_query_bucket_step_capped_by_max_num_batched_tokens(self):
         b = SpyreAttnBucketer(make_config(max_num_batched_tokens=300))
-        assert b.query_buckets == [1, 300]
+        assert b.query_buckets == [1, 64, 128, 256, 300]
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
         assert b.kv_buckets == _list_default(3000)
         assert b.kv_buckets[-1] == 3000
-        assert b.query_buckets == [1, 100]
+        assert b.query_buckets == [1, 64, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
         for limit in (1, 2, 3, 64, 100, 4096, 32768):
@@ -298,15 +302,16 @@ class TestFindBucket:
 
     def test_rounds_up(self, bucketer):
         assert bucketer.find_kv_bucket(257) == 512
-        assert bucketer.find_query_bucket(33) == 512
+        assert bucketer.find_query_bucket(65) == 128
 
     def test_query_len_one_maps_to_decode_bucket(self, bucketer):
         assert bucketer.find_query_bucket(1) == 1
 
-    def test_query_above_decode_rounds_to_the_step(self, bucketer):
-        """Only two buckets by default, so every non-decode query pads to the step."""
-        for query_len in (2, 33, 129, 511, 512):
-            assert bucketer.find_query_bucket(query_len) == 512
+    def test_query_above_decode_rounds_to_a_power_of_two(self, bucketer):
+        """A short prefill pads to the next power of two from one stick, not the step."""
+        expected = {2: 64, 64: 64, 65: 128, 129: 256, 257: 512, 512: 512}
+        for query_len, bucket in expected.items():
+            assert bucketer.find_query_bucket(query_len) == bucket
 
     def test_kv_below_block_size_rounds_to_block_size(self, bucketer):
         assert bucketer.find_kv_bucket(1) == BLOCK_SIZE
@@ -320,9 +325,19 @@ class TestFindBucket:
         """The length the recorder builds its synthetic sequence at, and the one
         ``variants()`` prunes against."""
         assert bucketer.min_real_query_len(1) == 1
-        assert bucketer.min_real_query_len(512) == 2
+        assert bucketer.min_real_query_len(64) == 2
+        assert bucketer.min_real_query_len(512) == 257
         b = SpyreAttnBucketer(make_config(max_num_batched_tokens=2048))
-        assert [b.min_real_query_len(q) for q in b.query_buckets] == [1, 2, 513, 1025, 1537]
+        assert [b.min_real_query_len(q) for q in b.query_buckets] == [
+            1,
+            2,
+            65,
+            129,
+            257,
+            513,
+            1025,
+            1537,
+        ]
 
     def test_min_real_query_len_rounds_back_onto_its_own_bucket(self, bucketer):
         for bucket in bucketer.query_buckets:
@@ -356,14 +371,14 @@ class TestVariants:
     def test_prunes_query_buckets_no_real_query_len_can_reach(self, bucketer):
         """Pruning bounds the *smallest real* query_len that reaches a bucket, not
         the bucket itself: a 2-token query on a 1-block sequence still legitimately
-        pads to 512."""
+        pads to 64."""
         ascending = sorted(bucketer.query_buckets)
         min_real = {b: (ascending[i - 1] + 1 if i else 1) for i, b in enumerate(ascending)}
         for v in bucketer.variants():
             assert min_real[v.padded_query_len] <= v.num_blocks * BLOCK_SIZE
 
     @pytest.mark.parametrize("kv_len", [1, 256, 257, 2048])
-    @pytest.mark.parametrize("query_len", [1, 32, 33, 512])
+    @pytest.mark.parametrize("query_len", [1, 32, 33, 65, 512])
     def test_every_rounded_size_lands_on_a_recorded_variant(self, bucketer, kv_len, query_len):
         """The whole point of recording: no runtime batch may miss the cache.
 

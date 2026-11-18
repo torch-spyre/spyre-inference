@@ -423,6 +423,17 @@ class SpyreGranite4VisionForConditionalGeneration(
         merge = getattr(self, "_spyre_vision_merge", self.vision_merge)
         return merge(text, convert(mask[:, None], device=text.device))
 
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Upstream's forward, but its post-step clear of ``_ds_buffers[:n]`` zeroes whole
+        buffers: torch-spyre rejects ``zero_`` on a row prefix of a device tensor."""
+        dirty = self._ds_num_tokens > 0
+        self._ds_num_tokens = 0
+        hidden_states = super().forward(*args, **kwargs)
+        if dirty:
+            for buf in self._ds_buffers:
+                buf.zero_()
+        return hidden_states
+
     # --- private helpers ---
 
     @staticmethod

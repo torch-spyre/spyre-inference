@@ -323,6 +323,40 @@ def test_embed_input_ids_hands_each_level_to_the_decoder_buffers():
     assert model._ds_num_tokens == tokens
 
 
+@pytest.mark.parametrize("written", [0, 5])
+def test_forward_clears_whole_deepstack_buffers(monkeypatch, written):
+    """The decoder sees the written buffers; afterwards they are zero, with no ``zero_`` on a
+    row prefix (torch-spyre rejects a partial-view fill)."""
+    from spyre_inference.models.granite4_vision import (
+        SpyreGranite4VisionForConditionalGeneration as Spyre,
+    )
+
+    seen = []
+
+    def upstream_forward(self, *args, **kwargs):
+        seen.append([b.clone() for b in self._ds_buffers])
+        # Upstream's own clear, which forward must disarm.
+        assert self._ds_num_tokens == 0
+        return "hidden"
+
+    monkeypatch.setattr(
+        granite4_vision.Granite4VisionForConditionalGeneration, "forward", upstream_forward
+    )
+    model = Spyre.__new__(Spyre)
+    nn.Module.__init__(model)
+    stale = torch.full((16, LM_HIDDEN), 3.0)
+    model._ds_buffers = [stale.clone() for _ in range(2)]
+    model._ds_num_tokens = written
+
+    assert Spyre.forward(model, torch.zeros(4), torch.zeros(4)) == "hidden"
+
+    for buf in seen[0]:
+        torch.testing.assert_close(buf, stale, atol=0, rtol=0)
+    for buf in model._ds_buffers:
+        torch.testing.assert_close(buf, stale if written == 0 else torch.zeros_like(stale))
+    assert model._ds_num_tokens == 0
+
+
 @pytest.mark.parametrize(
     "positions",
     [[0, 3, 7], [1, 2, 5, 6], [0, 1, 2, 3], [4, 5, 6, 7]],

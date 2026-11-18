@@ -6,7 +6,7 @@ Companion to `SKILL.md`. Read this when the failing surface is the Spyre attenti
 
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — the decoder backend: `SpyreAttentionImpl` (head-major allocation, per-head KV-write index, kernels), `SpyreAttentionMetadataBuilder` (shared with the encoder backend), and the per-sequence / batched-decode dispatch.
 - `spyre_inference/v1/attention/backends/spyre_encoder_attn.py` — encoder-only (no KV cache) attention.
-- `spyre_inference/v1/attention/ops/` — the kernel source code (`page_attn*.py`, `batched_decode*.py`, `reshape_and_cache*.py`), the cache device layouts (`layout.py`) and the tiled-walk driver (`tile_loop.py`). Kernel docstrings and inline comments name the torch-spyre limitation each shape choice routes around.
+- `spyre_inference/v1/attention/ops/` — the kernel source code (`page_attn*.py`, `batched_decode*.py`, `reshape_and_cache*.py`) and the cache device layouts (`layout.py`). Kernel docstrings and inline comments name the torch-spyre limitation each shape choice routes around.
 - `spyre_inference/v1/attention/attn_layer.py` — the traced KV write and query staging that replace `Attention.forward`.
 - `tests/attention/test_spyre_attn.py` — builds real metadata via `SpyreAttentionMetadataBuilder`, seeds the cache through the impl's own store, calls `SpyreAttentionImpl.forward` (always compiled, on Spyre), compares against a CPU reference (`ref_attn`) with `assert_close_outliers` (base `atol=0.3, rtol=0.2` when a query is 32+ rows, `atol=0.2, rtol=0.2` otherwise; up to 5 outliers at twice the resulting tolerances) — if mismatch ratios are near 100 % with differences > 1.0, suspect a **structural** bug, not fp16 noise.
 
@@ -109,7 +109,7 @@ When the failing surface is attention, in addition to the generic starter set, a
 - **Attention mask off-by-one / wrong padded shape / wrong causal boundary.** `_build_attention_mask` (no sliding window) and `_build_single_tile` (sliding window) build per-block tiles padded to `aligned_query_len × block_size`. Off-by-one in causal/padding masking produces near-100 % mismatches that look like "random output." Print the mask stack for a small case and verify masked positions are `finfo(fp16).min` (-65504), unmasked are `0`, and the causal boundary matches `context_lens + q_pos`.
 - **Page index table wrong.** `page_index_tables_cpu[s][i, 0]` must be the physical page of sequence `s`'s `i`-th *active* block (a position within `active_block_indices` under a window, not an absolute block index). A wrong order leaves the mask tiles misaligned with the pages they mask — silent disaster.
 - **Batched vs per-sequence path.** Even one decode sequence can take the batched kernel when it is supported (compiled and sufficient page capacity); set `SPYRE_BATCHED_DECODE=0` to force the per-sequence loop and see whether the failure follows the path.
-- **Tiled vs Python walk.** `SPYRE_ATTN_FOR_EACH_TILE=0` runs the identical kernel bodies under a Python loop; a failure that disappears there is a `for_each_tile` / torch-spyre pin problem. The flag is read at import.
+- **Tiled vs Python walk.** CPU tests swap `for_each_tile` for a Python loop (`use_python_for_each_tile` in `spyre_testing_plugin.attn_helpers`) that runs the identical kernel bodies. A failure those CPU tests don't reproduce points at the `for_each_tile` lowering or the torch-spyre pin.
 - **A shape that escapes the `SpyreAttnBucketer` kv/query buckets** dispatches to an unrecorded kernel (correctness, not just recompilation cost).
 
 ## Pipeline bisection for `forward()`

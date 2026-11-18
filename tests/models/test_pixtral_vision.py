@@ -14,9 +14,10 @@
 
 """``SpyrePixtralForConditionalGeneration``'s vision pipeline against upstream Pixtral.
 
-The pipeline reorders patches, folds the conv into a linear, permutes the merger weight
-and pads to a bucket; these tests pin each of those to the upstream result on CPU. The
-on-card twin at the bottom skips without a device.
+The pipeline lays every image's merge blocks onto one canvas, runs the patch conv and
+reorders its output offset-major, permutes the merger weight and pads to a bucket; these
+tests pin each of those to the upstream result on CPU. The on-card twins at the bottom skip
+without a device.
 """
 
 import inspect
@@ -29,7 +30,7 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 
 pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
 
-PATCH = 7  # 3*7*7 = 147 values per patch: exercises the patch-width padding to 192
+PATCH = 7
 MERGE = 2
 
 
@@ -127,8 +128,19 @@ def _spyre_model(args, dtype=torch.float16):
 
 def _images() -> list[torch.Tensor]:
     torch.manual_seed(1)
-    # Non-square, 96 + 24 = 120 patches: off the 64 stick, so padding slots are live.
+    # 4x6 + 3x2 = 30 merge blocks: one 32-block canvas row, so padding blocks are live.
     return [torch.randn(3, 8 * PATCH, 12 * PATCH), torch.randn(3, 6 * PATCH, 4 * PATCH)]
+
+
+def _wrap_images() -> list[torch.Tensor]:
+    torch.manual_seed(5)
+    # 6 + 56 + 8 merge blocks on 32-block rows: the second image starts mid-row and wraps onto
+    # the next, and the third straddles two rows.
+    return [
+        torch.randn(3, 6 * PATCH, 4 * PATCH),
+        torch.randn(3, 16 * PATCH, 14 * PATCH),
+        torch.randn(3, 2 * PATCH, 16 * PATCH),
+    ]
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -152,24 +164,59 @@ def test_pipeline_matches_upstream(tp_group, num_images):
         assert _cosine(got, want) > 0.999
 
 
-def test_padding_does_not_leak_into_images(tp_group):
-    """Bucket padding must not change any image's embedding: padding slots have their own
-    segment, and each offset block is padded separately."""
-    args = _args(num_layers=1)
+def test_images_pack_into_whole_canvas_rows(tp_group):
+    """Every image's merge blocks share one canvas, padded to whole rows of ``CANVAS_WIDTH``."""
+    args = _args()
     model = _spyre_model(args)
+    block = PATCH * MERGE
+    assert model.vision_patch_multiple == 32 * MERGE**2
+    assert model.vision_item_tokens({"images": _images()}) == [24, 6]
+    assert model.vision_encoder.patch_conv.weight.shape == (args.hidden_size, 3, PATCH, PATCH)
+    values = model.prepare_encoder_cudagraph_replay_buffers({"images": _images()}, 0, 0).values
+    assert values["image"].shape == (3, block, 32 * block)
+    assert values["positions"].shape == (32 * MERGE**2,)
+    bufs = model.prepare_encoder_cudagraph_capture_inputs(
+        64, 1, 1, torch.device("cpu"), torch.float16
+    ).values
+    assert bufs["image"].shape == (3, 2 * block, 32 * block)
+
+
+def test_packed_images_wrap_across_canvas_rows(tp_group):
+    args = _args()
+    images = _wrap_images()
+
+    with torch.inference_mode():
+        expected = _reference(args, images)
+        actual = _spyre_model(args).embed_multimodal(images=images)
+
+    assert [t.shape for t in actual] == [t.shape for t in expected]
+    for got, want in zip(actual, expected, strict=True):
+        assert _cosine(got, want) > 0.999
+
+
+def test_image_above_image_size_is_rejected(tp_group):
+    model = _spyre_model(_args())
+    with pytest.raises(ValueError, match="16-patch image_size limit"):
+        model.vision_item_tokens({"images": [torch.randn(3, 18 * PATCH, 2 * PATCH)]})
+
+
+def test_padding_does_not_leak_into_images(tp_group):
+    """Bucket padding must not change any image's embedding: padding blocks have their own
+    segment, the canvas pads whole rows, and each offset group pads at its own tail."""
+    model = _spyre_model(_args(num_layers=1))
     images = _images()
     values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
-    config = model.get_encoder_cudagraph_config()
+    padding = model.get_encoder_cudagraph_config().padding_logics
 
     def run(num_patches):
         bufs = model._vision_empty(num_patches)
         for key, src in values.items():
-            config.padding_logics.get(key, lambda d, s: d[: s.shape[0]].copy_(s))(bufs[key], src)
+            padding[key](bufs[key], src)
         return model.encoder_cudagraph_forward(bufs)
 
     with torch.inference_mode():
-        tight, loose = run(128), run(256)
-    n = sum(t.shape[0] for t in model.embed_multimodal(images=images))
+        tight, loose = run(128), run(384)
+    n = sum(model.vision_item_tokens({"images": images}))
     torch.testing.assert_close(tight[:n], loose[:n], atol=1e-3, rtol=1e-3)
 
 
@@ -258,15 +305,15 @@ def test_construction_reaches_upstream_init_and_protocol():
 
 
 def test_loaded_vision_weights_are_reshaped_in_place(tp_group):
-    """The patch-conv and merging weights become the graphs' layouts under their own names,
-    so one copy of each reaches the card."""
+    """The patch-conv weight stays ``[D, C, p, p]`` in a plain holder and the merging weight
+    becomes the graph's layout, each under its own name, so one copy of each reaches the card."""
     args = _args()
     model = _spyre_model(args)
     tower, merger = model.vision_encoder, model.patch_merger
     from spyre_inference.custom_ops.conv import SpyreConv2d
 
     assert not isinstance(tower.patch_conv, SpyreConv2d), "the runner would tile a conv copy"
-    assert tower.patch_conv.weight.shape == (model._patch_width, args.hidden_size)
+    assert tower.patch_conv.weight.shape == (args.hidden_size, 3, PATCH, PATCH)
     assert merger.merging_layer.weight.shape == (MERGE**2, args.hidden_size, args.hidden_size)
     names = {name for name, _ in model.named_parameters()} | {n for n, _ in model.named_buffers()}
     assert not any("spyre_patch_weight" in n or "spyre_merge_weight" in n for n in names)
@@ -288,35 +335,26 @@ def test_pipeline_matches_upstream_on_spyre(tp_group):
         assert _cosine(got, want) > 0.995
 
 
-@pytest.mark.parametrize("token_budget", [32, 64])
-def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
-    """The three compiled graphs at one bucket, fed the way the manager feeds them."""
+@pytest.mark.parametrize(
+    ("image_set", "token_budget"),
+    [("one-row", 32), ("one-row", 64), ("wrap", 96)],
+    ids=["one-row-32", "one-row-64", "wrap-96"],
+)
+def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, image_set, token_budget):
+    """The three compiled graphs at one bucket, fed the way the manager feeds them; ``wrap``
+    fills three canvas rows with images that cross row ends."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
-    from spyre_inference.custom_ops.utils import convert
-
     args = _args()
-    images = _images()
+    images = _images() if image_set == "one-row" else _wrap_images()
     model = _spyre_model(args).to("spyre")
     model.compile_vision_graphs()
-    values = model.prepare_encoder_cudagraph_replay_buffers({"images": images}, 0, 0).values
-    config = model.get_encoder_cudagraph_config()
-    bufs = model.prepare_encoder_cudagraph_capture_inputs(
-        token_budget, 1, 1, torch.device("cpu"), torch.float16
-    ).values
-    for key, src in values.items():
-        config.padding_logics.get(key, lambda d, s: (d.zero_(), d[: s.shape[0]].copy_(s)))(
-            bufs[key], src
-        )
 
     with torch.inference_mode():
         expected = torch.cat(_reference(args, images))
-        out = model.encoder_cudagraph_forward(
-            {k: convert(v, device="spyre") for k, v in bufs.items()}
-        )
-    actual = convert(out, device="cpu")[: expected.shape[0]]
-    assert _cosine(actual, expected) > 0.995
+        out = model.encoder_cudagraph_forward(_padded_device_inputs(model, images, token_budget))
+    assert _cosine(out[: expected.shape[0]], expected) > 0.995
 
 
 def _padded_device_inputs(model, images, token_budget):

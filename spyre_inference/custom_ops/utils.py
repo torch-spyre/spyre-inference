@@ -107,18 +107,14 @@ def _async_source(tensor: torch.Tensor, owned: bool) -> torch.Tensor:
     return tensor.clone()
 
 
-def _to_layout_async(tensor: torch.Tensor, device, dtype, device_layout) -> torch.Tensor:
+def _to_layout_async(tensor: torch.Tensor, device, device_layout) -> torch.Tensor:
     # torch-spyre's layout-aware `Tensor.to` always uploads blocking.
     from torch_spyre._C import copy_tensor, spyre_empty_with_layout
 
-    owned = dtype is not None and dtype != tensor.dtype
-    if owned:
-        tensor = tensor.to(dtype=dtype)
-    tensor = _async_source(tensor, owned)
     dst = spyre_empty_with_layout(
-        tensor.size(), tensor.stride(), tensor.dtype, device_layout, device=torch.device(device)
+        tensor.size(), tensor.stride(), tensor.dtype, device_layout, device=device
     )
-    copy_tensor(tensor, dst, non_blocking=True)
+    copy_tensor(_async_source(tensor, owned=False), dst, non_blocking=True)
     return dst
 
 
@@ -160,8 +156,16 @@ def convert(tensor, device=None, dtype=None, device_layout=None):
         # both a host->device placement and a same-device relayout (copy_from_d2d),
         # so a layout-aware conversion must not insist on a device transfer: a
         # cache already moved to Spyre still needs its rows placed outermost.
-        if tensor.device.type == "cpu" and device is not None and device.type == "spyre":
-            return _to_layout_async(tensor, device, dtype, device_layout)
+        # Only a dense same-dtype upload is async: `Tensor.to` converts dtype on the device
+        # and honours the source strides, which the async copy does not.
+        if (
+            tensor.device.type == "cpu"
+            and device is not None
+            and device.type == "spyre"
+            and dtype in (None, tensor.dtype)
+            and tensor.is_contiguous()
+        ):
+            return _to_layout_async(tensor, device, device_layout)
         return tensor.to(
             tensor.device if device is None else device,
             dtype=tensor.dtype if dtype is None else dtype,

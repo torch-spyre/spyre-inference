@@ -38,23 +38,31 @@ def test_async_source_copies_only_unstaged_caller_buffers(dtype, owned, copied):
     assert (_async_source(src, owned).data_ptr() != src.data_ptr()) == copied
 
 
-def test_layout_convert_to_cpu_target_stays_on_tensor_to(monkeypatch):
+@pytest.mark.parametrize(
+    "source,device,dtype",
+    [
+        (torch.zeros(4, dtype=torch.int32), "cpu", None),
+        (torch.zeros(4, dtype=torch.float32), "spyre", torch.float16),
+        (torch.zeros(8, dtype=torch.int32)[::2], "spyre", None),
+    ],
+    ids=["cpu-target", "dtype-change", "strided"],
+)
+def test_layout_convert_falls_back_to_tensor_to(source, device, dtype, monkeypatch):
     from spyre_inference.custom_ops import utils
 
     def no_async(*args, **kwargs):
-        raise AssertionError("a CPU target must not take the Spyre upload path")
+        raise AssertionError("must not take the async layout upload")
 
     layouts = []
-    original_to = torch.Tensor.to
 
-    def cpu_to(tensor, *args, **kwargs):
-        layouts.append(kwargs.pop("device_layout", None))
-        return original_to(tensor, *args, **kwargs)
+    def record_to(tensor, *args, **kwargs):
+        layouts.append(kwargs.get("device_layout"))
+        return tensor
 
     monkeypatch.setattr(utils, "_to_layout_async", no_async)
-    monkeypatch.setattr(torch.Tensor, "to", cpu_to)
+    monkeypatch.setattr(torch.Tensor, "to", record_to)
     sentinel = object()
-    utils.convert(torch.zeros(4, dtype=torch.int32), device="cpu", device_layout=sentinel)
+    utils.convert(source, device=device, dtype=dtype, device_layout=sentinel)
     assert layouts == [sentinel]
 
 

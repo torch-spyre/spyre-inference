@@ -16,64 +16,96 @@
 
 Each upstream ``MuseGlimmerRMSNorm`` becomes a vLLM norm; these check that the
 replacement computes what transformers does for every variant the model builds, run
-through ``forward_native`` on CPU. The text-only default is EngineArgs plumbing, mocked
-at the ``get_config`` seam as in ``test_gemma4.py``.
+through ``forward_native`` on CPU. The text-only default is checked through the real
+``EngineArgs.create_model_config`` on a default config saved to disk, so it pins vLLM's
+resulting limits rather than the hook's output.
 """
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import MuseGlimmerConfig
+from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.models import muse_glimmer as mg
 
-from spyre_inference.models.muse_glimmer import force_language_model_only
+from spyre_inference.models import apply_prelaunch_overrides
+from spyre_inference.models.muse_glimmer import disable_vision
+from spyre_inference.platform import TorchSpyrePlatform
 
 hfm = pytest.importorskip("transformers.models.muse_glimmer.modeling_muse_glimmer")
 
 
+@pytest.fixture
+def glimmer_dir(tmp_path):
+    MuseGlimmerConfig().save_pretrained(tmp_path)
+    return str(tmp_path)
+
+
+def _model_config(model, **kwargs):
+    TorchSpyrePlatform.pre_register_and_update()
+    return EngineArgs(model=model, skip_tokenizer_init=True, **kwargs).create_model_config()
+
+
+@pytest.mark.parametrize("limits", [None, {"image": 0}, {"video": 0}])
+def test_glimmer_checkpoint_serves_text_only(glimmer_dir, limits):
+    """vLLM defaults an unnamed modality to 999, which would keep the tower."""
+    mc = _model_config(glimmer_dir, limit_mm_per_prompt=limits)
+    assert mc.multimodal_config.language_model_only
+    for modality in ("image", "video"):
+        assert mc.multimodal_config.get_limit_per_prompt(modality) == 0
+    assert not mc._supports_multimodal_inputs()
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("value", [1, {"count": 2}, {}])
+def test_requested_image_or_video_is_refused(glimmer_dir, modality, value):
+    with pytest.raises(NotImplementedError, match=f"{modality} input is not supported"):
+        _model_config(glimmer_dir, limit_mm_per_prompt={modality: value})
+
+
 def _engine_args(**overrides):
-    defaults = dict(
-        model="meta-models/Muse-Glimmer-30B",
-        hf_config_path=None,
-        trust_remote_code=False,
-        revision=None,
-        code_revision=None,
-        config_format="auto",
-        hf_token=None,
-        language_model_only=False,
-        limit_mm_per_prompt={},
-    )
+    defaults = dict(language_model_only=False, limit_mm_per_prompt={})
     return SimpleNamespace(**(defaults | overrides))
 
 
-def _patch_get_config(monkeypatch, model_type):
-    monkeypatch.setattr(
-        "vllm.transformers_utils.config.get_config",
-        lambda *args, **kwargs: SimpleNamespace(model_type=model_type),
-    )
+def _glimmer_config(**fields):
+    return SimpleNamespace(model_type="muse_glimmer", **fields)
 
 
-def test_glimmer_checkpoint_defaults_to_text_only(monkeypatch):
-    """The tower is then a placeholder: not loaded, and image requests are refused."""
-    _patch_get_config(monkeypatch, "muse_glimmer")
+def test_language_model_only_is_left_alone():
+    engine_args = _engine_args(language_model_only=True, limit_mm_per_prompt={"image": 1})
+    disable_vision(engine_args, _glimmer_config(vision_config=object()))
+    assert engine_args.limit_mm_per_prompt == {"image": 1}
+
+
+@pytest.mark.parametrize(
+    "hf_config",
+    [
+        _glimmer_config(),
+        SimpleNamespace(model_type="gemma4", vision_config=object()),
+        None,
+    ],
+    ids=["no-vision-config", "other-model", "config-load-failed"],
+)
+def test_checkpoints_without_a_glimmer_tower_are_left_alone(hf_config):
     engine_args = _engine_args()
-    force_language_model_only(engine_args)
-    assert engine_args.language_model_only
+    disable_vision(engine_args, hf_config)
+    assert engine_args == _engine_args()
 
 
-def test_explicit_multimodal_limits_are_left_alone(monkeypatch):
-    _patch_get_config(monkeypatch, "muse_glimmer")
-    engine_args = _engine_args(limit_mm_per_prompt={"image": 1})
-    force_language_model_only(engine_args)
-    assert not engine_args.language_model_only
+def test_a_config_load_failure_leaves_engine_args_to_model_config(monkeypatch, glimmer_dir):
+    """The probe swallows the error, so ModelConfig raises the real one."""
 
+    def _raise(*args, **kwargs):
+        raise OSError("unreadable config")
 
-def test_other_models_are_left_alone(monkeypatch):
-    _patch_get_config(monkeypatch, "gemma4")
-    engine_args = _engine_args()
-    force_language_model_only(engine_args)
-    assert not engine_args.language_model_only
+    monkeypatch.setattr("vllm.transformers_utils.config.get_config", _raise)
+    engine_args = EngineArgs(model=glimmer_dir)
+    before = vars(engine_args).copy()
+    apply_prelaunch_overrides(engine_args)
+    assert vars(engine_args) == before
 
 
 def _close(norm, ref, x):

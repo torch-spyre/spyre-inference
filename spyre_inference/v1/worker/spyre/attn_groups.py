@@ -14,8 +14,8 @@
 
 """MRV2: attention-group construction (vllm/v1/worker/gpu/attn_utils.py:init_attn_backend).
 
-Upstream's init_attn_backend, then the sliding-window split V1 also uses
-(split_attn_groups_by_window).
+Upstream's init_attn_backend on a config whose per-layer specs cover the KV-sharing
+layers, then the sliding-window split; both are shared with V1.
 """
 
 from collections.abc import Callable
@@ -25,11 +25,14 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import get_attn_cg_support
+from vllm.v1.worker.gpu.attn_utils import get_attn_cg_support, get_shared_kv_cache_layers
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup
 
-from spyre_inference.v1.worker.kv_cache_setup import split_attn_groups_by_window
+from spyre_inference.v1.worker.kv_cache_setup import (
+    split_attn_groups_by_window,
+    with_kv_sharing_layer_specs,
+)
 
 
 def init(
@@ -40,9 +43,25 @@ def init(
     *args: Any,
     **kwargs: Any,
 ) -> tuple[list[list[AttentionGroup]], Any, list[int]]:
+    kv_cache_config = with_kv_sharing_layer_specs(
+        kv_cache_config, get_shared_kv_cache_layers(vllm_config)
+    )
     attn_groups, attn_cg_support, kernel_block_sizes = upstream_init_attn_backend(
         kv_cache_config, vllm_config, device, *args, **kwargs
     )
+    if split_by_window(attn_groups, vllm_config, device, kernel_block_sizes):
+        # Upstream computed it over the pre-split groups.
+        attn_cg_support = get_attn_cg_support(attn_groups, vllm_config)
+    return attn_groups, attn_cg_support, kernel_block_sizes
+
+
+def split_by_window(
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    device: torch.device,
+    kernel_block_sizes: list[int | None],
+) -> bool:
+    """Split groups by sliding window in place; True when any group split."""
     split_attn_groups_by_window(attn_groups, get_layers_from_vllm_config(vllm_config, Attention))
     # Upstream builds builders before the split, so the groups it creates have none.
     split = False
@@ -61,7 +80,4 @@ def init(
                 ),
                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
             )
-    if split:
-        # Upstream computed it over the pre-split groups.
-        attn_cg_support = get_attn_cg_support(attn_groups, vllm_config)
-    return attn_groups, attn_cg_support, kernel_block_sizes
+    return split

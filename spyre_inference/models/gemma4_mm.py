@@ -424,6 +424,12 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         model_config = vllm_config.model_config
         model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Upstream allocates the PLE cache (E2B/E4B) on the host as a plain attribute, which
+        # does not follow the model to Spyre; a buffer does.
+        ple = getattr(self, "per_layer_embeddings", None)
+        if ple is not None:
+            del self.per_layer_embeddings
+            self.register_buffer("per_layer_embeddings", ple, persistent=False)
         self._init_spyre_vision()
 
     def _init_spyre_vision(self) -> None:
@@ -600,3 +606,23 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         """The pool only: the tail runs in ``postprocess_encoder_output``."""
         x = x.squeeze(0)
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).sum(dim=0)
+
+    def vision_embed_text(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
+    ) -> torch.Tensor:
+        # Upstream masks the image ids for the PLE lookup with a `where` on the host's bool
+        # mask, which does not lower on Spyre; an integer mask compared on the card does, so
+        # mask them here and hand upstream text only.
+        # The merge overwrites the image rows, so their token-0 text embedding never shows.
+        if (
+            self.per_layer_embeddings is not None
+            and is_multimodal is not None
+            and is_multimodal.any()
+        ):
+            mask = convert(is_multimodal, device=input_ids.device, dtype=input_ids.dtype)
+            input_ids = _ids_outside_mask(input_ids, mask)
+        return super().vision_embed_text(input_ids, None)
+
+
+def _ids_outside_mask(input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return torch.where(mask != 0, torch.zeros_like(input_ids), input_ids)

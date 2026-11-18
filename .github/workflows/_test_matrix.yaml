@@ -45,6 +45,13 @@ on:
         required: false
         type: boolean
         default: false
+      image_rpms:
+        description: >-
+          When true, skip the baseline RPM install and use the runner image's Spyre RPMs, while still building
+          spyre-inference and torch-spyre (torch_spyre_ref) from source. Not combinable with rpm_names.
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -219,6 +226,8 @@ jobs:
   # fails the workflow.
   resolve_durations:
     name: Resolve test durations pin
+    # perf runs only the perf legs below, so no functional job takes a runner for it.
+    if: ${{ inputs.test_type != 'perf' }}
     runs-on: ubuntu-latest
     continue-on-error: true
     outputs:
@@ -274,13 +283,18 @@ jobs:
         id: delta
         env:
           PREBAKED: ${{ inputs.use_prebaked_image }}
+          IMAGE_RPMS: ${{ inputs.image_rpms }}
           RPM_NAMES: ${{ inputs.rpm_names }}
           TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
         run: |
           SHA="$(git rev-parse HEAD)"
           TOKENS="spyre-inference@${SHA:0:12}"
           if [[ "${PREBAKED}" != "true" ]]; then
-            TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            if [[ "${IMAGE_RPMS}" == "true" ]]; then
+              TOKENS="${TOKENS} image-rpms"
+            else
+              TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            fi
             if [[ -n "${TORCH_SPYRE_REF}" ]]; then
               TOKENS="${TOKENS} torch-spyre@${TORCH_SPYRE_REF}"
             fi
@@ -305,6 +319,7 @@ jobs:
   # It also owns the changed-files detection the test jobs gate on.
   build_kernels:
     name: Build csrc/ sampling kernels
+    if: ${{ inputs.test_type != 'perf' }}
     # Same image as the x86_64 test configs, so compiler, glibc and Python match. A compile needs
     # no card, so it takes the card-less pool, which only carries the standing image label.
     runs-on: ${{ fromJSON(format('["x86_64","{0}","linux","{1}"]', (inputs.runner_label || github.event_name == 'merge_group') && 'spyre_pf_x1' || 'spyre_pf_x0', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
@@ -458,6 +473,7 @@ jobs:
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
     needs: [resolve_durations, build_kernels]
+    if: ${{ inputs.test_type != 'perf' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1016,6 +1032,7 @@ jobs:
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
@@ -1050,7 +1067,7 @@ jobs:
   collect_failed_suites:
     name: Collect suites for pod-level retry
     needs: test
-    if: always()
+    if: ${{ always() && inputs.test_type != 'perf' }}
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.collect.outputs.matrix }}
@@ -1107,6 +1124,7 @@ jobs:
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
@@ -1122,7 +1140,7 @@ jobs:
   test_result:
     name: Test matrix result
     needs: [build_kernels, collect_failed_suites, test_retry]
-    if: always()
+    if: ${{ always() && inputs.test_type != 'perf' }}
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate combined result
@@ -1150,7 +1168,7 @@ jobs:
   coverage:
     name: Aggregate coverage
     needs: [test, test_retry]
-    if: always()
+    if: ${{ always() && inputs.test_type != 'perf' }}
     # Informational -- must never fail the reusable workflow (and thus the
     # callers' required-check gate).
     continue-on-error: true
@@ -1227,7 +1245,7 @@ jobs:
   durations:
     name: Aggregate test durations
     needs: [test, test_retry]
-    if: always()
+    if: ${{ always() && inputs.test_type != 'perf' }}
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -1280,7 +1298,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-report:
     name: Aggregate test report
-    needs: [test, test_retry]
+    needs: [test, test_retry, perf]
     if: always()
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -1317,14 +1335,48 @@ jobs:
   # test_type=perf. Weekly-only, like the sibling torch-spyre perf job:
   # benchmarks are long and hardware-contended, never gated on a PR.
   # ---------------------------------------------------------------------------
-  perf:
-    name: Perf benchmarks (vLLM)
+  # One perf leg per (model, TP) in the CI benchmark configs, sized to the cards its TP needs.
+  perf_legs:
+    name: Plan perf legs
     needs: resolve
     if: >-
       ${{ !cancelled()
           && github.event_name != 'pull_request'
           && needs.resolve.outputs.resolved_test_type == 'perf' }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
+    runs-on: ubuntu-latest
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: List perf legs
+        id: legs
+        run: |
+          pip install pyyaml
+          LEGS="$(make -s perf-legs)"
+          echo "${LEGS}"
+          if [[ "${LEGS}" == "[]" ]]; then
+            echo "::error::No benchmark config selected; perf would pass having run nothing."
+            exit 1
+          fi
+          echo "legs=${LEGS}" >> "$GITHUB_OUTPUT"
+
+  perf:
+    name: Perf benchmarks (vLLM) (${{ matrix.leg.model }} TP${{ matrix.leg.tp }})
+    needs: perf_legs
+    if: ${{ needs.perf_legs.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.perf_legs.outputs.legs) }}
+    runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x{0}","linux","{1}"]', matrix.leg.cards, inputs.runner_label || 'image_torch_spyre')) }}
     timeout-minutes: 720
     env:
       CI: ''
@@ -1353,7 +1405,7 @@ jobs:
       # use_prebaked_image is true, so the run uses the image's Spyre stack
       # as-is. See issue #543.
       - name: Install Spyre RPMs
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/spyre-rpm-install
 
       # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
@@ -1365,10 +1417,16 @@ jobs:
 
       # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
       - name: uv cache (NFS)
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/uv-nfs-cache
         with:
           storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+
+      - name: Reject image_rpms with override RPMs
+        if: ${{ inputs.image_rpms && inputs.rpm_names != '' }}
+        run: |
+          echo "::error::image_rpms cannot be combined with rpm_names: override RPMs layer onto the baseline install, which image_rpms skips."
+          exit 1
 
       - name: Install override Spyre RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -1387,16 +1445,21 @@ jobs:
           # Echo the exact runner-label selectors this job's runs-on used
           # (mirrors the perf runs-on expression: the fixed pool labels plus
           # the per-PR runner_label override, or the standing image label).
-          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
+          runner_labels: ${{ format('["x86_64","spyre_pf_x{0}","linux","{1}"]', matrix.leg.cards, inputs.runner_label || 'image_torch_spyre') }}
 
       # Prebaked runs use the image's venv: a cached torch-spyre wheel may be built against other RPMs.
       - name: Build spyre-inference
         if: ${{ !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+          IMAGE_RPMS: "${{ inputs.image_rpms }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+          # uv keys a git-built wheel on the rev alone, so a wheel built against other RPMs would be reused; force a rebuild against the image's.
+          if [[ "$IMAGE_RPMS" == "true" ]]; then
+            uv cache clean torch-spyre
+          fi
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
             # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
             # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
@@ -1430,11 +1493,33 @@ jobs:
           SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
           # Prebaked runs use the image's tree: an unbuilt checkout would shadow its spyre_inference._C kernels.
           SRC_DIR: ${{ inputs.use_prebaked_image && env.PREBAKED_SPYRE_INFERENCE_DIR || '.' }}
+          LEG_MODEL: ${{ matrix.leg.model }}
+          LEG_TP: ${{ matrix.leg.tp }}
+          LEG_KEY: ${{ matrix.leg.key }}
         run: |
-          echo "Running vLLM benchmark suite (TEST_TYPE=perf) from ${SRC_DIR}..."
+          echo "Running vLLM benchmark suite (TEST_TYPE=perf) for ${LEG_MODEL} TP${LEG_TP} from ${SRC_DIR}..."
           make -C "${SRC_DIR}" tests TEST_TYPE=perf RESULTS_DIR="${GITHUB_WORKSPACE}/${RESULTS_DIR}" \
-            SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
+            SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}" \
+            MODELS="${LEG_MODEL}" TPS="${LEG_TP}" \
+            JUNIT_XML="${GITHUB_WORKSPACE}/junit-perf-${LEG_KEY}.xml"
           echo "benchmarks done"
+
+      # Same sidecar the pytest legs upload: the workflow_run ingest hashes arch into run_id.
+      - name: Record leg arch for the ingest
+        if: always()
+        run: printf '%s' "$(uname -m)" > "leg-arch-perf-${{ matrix.leg.key }}.txt"
+
+      # Pass/fail per benchmark, no metrics: push-to-clickhouse.yaml ingests it like the pytest legs' JUnit.
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-perf-${{ matrix.leg.key }}
+          path: |
+            junit-perf-${{ matrix.leg.key }}.xml
+            leg-arch-perf-${{ matrix.leg.key }}.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       # A dispatch by SHA names no branch; claim the dispatch ref only when it contains the
       # commit, rather than recording the SHA as a branch. curl, not `gh`: the runner image has no
@@ -1480,8 +1565,10 @@ jobs:
           # The orchestrator's run_id, so these rows join the artifact_results it wrote.
           v2-run-id: ${{ inputs.run_id }}
           state: ${{ steps.bench.outcome == 'success' && 'passed' || 'failed' }}
-          rpm-lock: ${{ !inputs.use_prebaked_image && 'spyre-rpms.lock' || '' }}
+          leg-key: ${{ matrix.leg.key }}
+          rpm-lock: ${{ !inputs.use_prebaked_image && !inputs.image_rpms && 'spyre-rpms.lock' || '' }}
           installed: >-
+            ${{ inputs.image_rpms && 'image-rpms' || '' }}
             ${{ inputs.rpm_names }}
             ${{ inputs.torch_spyre_ref && format('torch-spyre@{0}', inputs.torch_spyre_ref) || '' }}
           job-id: '0'

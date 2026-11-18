@@ -31,9 +31,10 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 
 ## Gemma-4: text-only use of a vision checkpoint
 
-Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
-`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and build a vision
-tower — weights to load and graphs to warm up that a text-only workload never runs.
+Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B`,
+`google/gemma-4-26B-A4B`, `google/gemma-4-E2B` and `google/gemma-4-E4B` load as
+`Gemma4ForConditionalGeneration` and build a vision tower — weights to load and graphs to
+warm up that a text-only workload never runs.
 
 To use one of those repositories for text only, pin its decoder architecture:
 
@@ -81,8 +82,16 @@ The body pads the packed token count to the next `compile_sizes` bucket, and war
 dummies every bucket. The lm_head sits outside every body graph and compiles its own, so
 it needs the same treatment: it projects one row per *sampled* request, a width that
 would otherwise take every value in `1..--max-num-seqs` as requests finish. Those rows
-pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each width, so
-no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
+pad onto *row buckets*: the `compile_sizes` buckets capped at `--max-num-seqs` times one
+plus the number of speculative tokens, for example `{1, 2, 4, 8}` at `--max-num-seqs 8`.
+Warmup projects each width, so no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
+
+The sampled rows are gathered on Spyre, so only the logits are copied to the host.
+Warmup compiles that gather, and the lm_head on its output, for every row bucket at
+every body bucket it fits in. The lm_head then sees a different device layout than the
+host path gives it, so logits can differ at fp16 rounding level. The host gather is used without
+buckets (`--enforce-eager` or an empty `compile_sizes`), for prompt-logprob rows, for
+auxiliary hidden-state outputs, and in the V2 model runner.
 
 ## Encoder / pooling compile buckets
 
@@ -257,11 +266,61 @@ num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
 `SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
 less warmup.
 
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
-default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), warmup
+records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
+
+#### One per-sequence kernel for every page count
+
+The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
+use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.
+
+Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
+prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
+their own page count.
+
+The page tables and mask stacks are copied to the device with torch-spyre's
+`tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+`--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
+below that rounded value, prefill reads one page per loop step instead.
+
+The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
+bucket pair, when any of these holds:
+
+- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
+  `MAX_BUCKETS`; startup logs a warning;
+- `SPYRE_ATTN_FOR_EACH_TILE=0` is set;
+- the layer uses sliding-window attention.
+
+The batched decode kernel always uses the KV buckets.
+
+## KV cache size
+
+The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
+card's free memory (`torch.accelerator.get_memory_info`) and gives the KV cache what is
+left of `--gpu-memory-utilization` (default 0.92) × total. The cache keeps every block
+that memory pays for, usually far more than `--max-num-seqs` requests at `--max-model-len`
+need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.
+
+Each Spyre layer allocates its own page per block, so the budget is converted into blocks
+at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
+groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
+one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
+regions, so a model with few layers gets fewer blocks than its budget: they must still pack
+into the regions. When memory runs out before a full batch fits, a warning names the knobs,
+and requests wait for pages instead of all running at full length.
+
+The profile run is skipped, as the first forward on Spyre would trace the model before
+the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`
+headroom. Lower it if a forward fails to allocate. `--kv-cache-memory-bytes` skips the
+measurement; `--num-gpu-blocks-override` replaces the block count it yields, so the
+warning above checks the override instead. `VLLM_CPU_KVCACHE_SPACE`, which sets the
+KV cache size on vLLM's CPU backend, is ignored, with a warning when it is set to a size;
+setting it to a size next to `--kv-cache-memory-bytes` is an error.
 
 ## FP8 KV cache
 
@@ -272,13 +331,11 @@ each cached token takes:
 vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
-It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
-...) are rejected at startup. It does not raise capacity: the platform pins the block count
-to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
-same number of tokens in half the device memory. Attention still computes in the model
-dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
-when it has none. The speedup grows with the number of cached tokens each decode step
+It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+...) are rejected at startup. Since the KV cache is sized from free device memory (see
+[KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
+Attention still computes in the model dtype: pages are dequantized on read with the
+checkpoint's per-layer KV scales, or 1.0 when it has none. The speedup grows with the number of cached tokens each decode step
 reads, so it is small at short contexts; check accuracy against an fp16 cache before
 relying on it.
 

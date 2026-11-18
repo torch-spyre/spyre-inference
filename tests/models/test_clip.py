@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for `spyre_inference/models/clip.py`. `get_config` is monkeypatched
-to a stub -- no real HF config fetch -- and only the layout test needs a card."""
+"""Tests for `spyre_inference/models/clip.py`. The checkpoint config is a stub -- no
+real HF config fetch -- and only the layout test needs a card."""
 
 from __future__ import annotations
 
@@ -40,69 +40,36 @@ from spyre_inference.models.clip import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import build_encoder_plan
 
 
-def _fake_engine_args(model_type: str | None, enable_chunked_prefill=None):
-    return types.SimpleNamespace(
-        enable_chunked_prefill=enable_chunked_prefill,
-        hf_config_path=None,
-        model="some/model",
-        trust_remote_code=False,
-        revision=None,
-        code_revision=None,
-        config_format="auto",
-        hf_token=None,
-        _model_type=model_type,
-    )
+def _fake_engine_args(enable_chunked_prefill=None):
+    return types.SimpleNamespace(enable_chunked_prefill=enable_chunked_prefill)
 
 
-def _patch_get_config(monkeypatch, model_type: str | None):
-    import spyre_inference.models.clip as clip_mod
-
-    def _fake_get_config(*args, **kwargs):
-        return types.SimpleNamespace(model_type=model_type)
-
-    monkeypatch.setattr(
-        "vllm.transformers_utils.config.get_config", _fake_get_config, raising=False
-    )
-    return clip_mod
+def _config(model_type: str | None):
+    return types.SimpleNamespace(model_type=model_type)
 
 
-def test_disables_chunked_prefill_for_clip(monkeypatch):
-    _patch_get_config(monkeypatch, "clip")
-    args = _fake_engine_args("clip")
+def test_disables_chunked_prefill_for_clip():
+    args = _fake_engine_args()
 
-    force_disable_chunked_prefill(args)
+    force_disable_chunked_prefill(args, _config("clip"))
 
     assert args.enable_chunked_prefill is False
 
 
-def test_leaves_non_clip_models_untouched(monkeypatch):
-    _patch_get_config(monkeypatch, "bert")
-    args = _fake_engine_args("bert")
+def test_leaves_non_clip_models_untouched():
+    args = _fake_engine_args()
 
-    force_disable_chunked_prefill(args)
+    force_disable_chunked_prefill(args, _config("bert"))
 
     assert args.enable_chunked_prefill is None
 
 
-def test_respects_an_explicit_user_choice(monkeypatch):
-    _patch_get_config(monkeypatch, "clip")
-    args = _fake_engine_args("clip", enable_chunked_prefill=True)
+def test_respects_an_explicit_user_choice():
+    args = _fake_engine_args(enable_chunked_prefill=True)
 
-    force_disable_chunked_prefill(args)
+    force_disable_chunked_prefill(args, _config("clip"))
 
     assert args.enable_chunked_prefill is True
-
-
-def test_tolerates_config_load_failure(monkeypatch):
-    def _raise(*args, **kwargs):
-        raise RuntimeError("no network")
-
-    monkeypatch.setattr("vllm.transformers_utils.config.get_config", _raise, raising=False)
-    args = _fake_engine_args(None)
-
-    force_disable_chunked_prefill(args)  # must not raise
-
-    assert args.enable_chunked_prefill is None
 
 
 def test_text_tower_is_built_with_causal_encoder_attention(monkeypatch):

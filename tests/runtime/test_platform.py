@@ -14,7 +14,6 @@
 
 """Unit tests for platform.py configuration logic."""
 
-import math
 import os
 from types import SimpleNamespace
 
@@ -106,6 +105,21 @@ def test_memory_info_falls_back_to_host_ram(monkeypatch):
     assert total >= free
 
 
+def test_memory_info_raises_for_the_spyre_device(monkeypatch):
+    """The worker sizes the KV cache from the Spyre device's answer; host RAM there would
+    size the device cache from the host."""
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    def _unimplemented(*args, **kwargs):
+        raise NotImplementedError("getMemoryInfo is not implemented for this allocator yet.")
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", _unimplemented, raising=True)
+    _disable_torch_accelerator()
+
+    with pytest.raises(NotImplementedError, match="KV cache"):
+        torch.accelerator.get_memory_info(torch.device("spyre", 1))
+
+
 def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
     from spyre_inference.platform import _disable_torch_accelerator
 
@@ -115,95 +129,93 @@ def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
     assert torch.accelerator.get_memory_info() == (123, 456)
 
 
-def test_num_gpu_blocks_override_homogeneous():
-    """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
+@pytest.mark.parametrize(
+    ("cpu_kvcache_space", "warns"), [(None, False), ("0", False), ("64", True)]
+)
+@pytest.mark.parametrize("runner_type", ["generate", "pooling"])
+def test_kv_cache_size_is_left_to_the_worker(
+    monkeypatch, caplog, runner_type, cpu_kvcache_space, warns
+):
+    """Neither the block count nor the KV budget is fixed here: the worker measures the
+    card (spyre-inference#901), and both flags stay user bypasses. A leftover
+    VLLM_CPU_KVCACHE_SPACE, which CpuPlatform would turn into a fixed budget, is dropped,
+    with a warning only when it asks for a size."""
+    import logging
+
     from spyre_inference.platform import TorchSpyrePlatform
 
+    if cpu_kvcache_space is None:
+        monkeypatch.delenv("VLLM_CPU_KVCACHE_SPACE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_CPU_KVCACHE_SPACE", cpu_kvcache_space)
     model_config = ModelConfig(
         model="Qwen/Qwen3-0.6B",
         max_model_len=1024,
         dtype=torch.float16,
         trust_remote_code=True,
     )
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-    blocks_per_seq = math.ceil(
-        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
-    )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
-
-
-def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
-    """Hybrid models get the same block count: one collapsed KV cache group.
-
-    ``disable_hybrid_kv_cache_manager`` merges every layer into a single group, so the
-    single-group formula applies unchanged.
-    """
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    # Simulate a hybrid model with two interleaved attention types.
-    interleaved = ["sliding_attention", "full_attention"] * 13
-    model_config.hf_config.layer_types = interleaved
-    model_config.hf_text_config.layer_types = interleaved
-
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-    blocks_per_seq = math.ceil(
-        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
-    )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
-
-
-def test_num_gpu_blocks_override_skipped_for_pooling():
-    """Encoder/pooling models have no KV cache — do not invent a block count."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    object.__setattr__(model_config, "runner_type", "pooling")
-
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    object.__setattr__(model_config, "runner_type", runner_type)
+    # VllmConfig already runs the platform's check_and_update_config once.
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
+        vllm_config = VllmConfig(
+            model_config=model_config,
+            cache_config=CacheConfig(block_size=64),
+            compilation_config=CompilationConfig(custom_ops=["all"]),
+        )
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.num_gpu_blocks_override is None
+    assert vllm_config.cache_config.kv_cache_memory_bytes is None
+    assert "VLLM_CPU_KVCACHE_SPACE" not in os.environ
+    warned = any("Ignoring VLLM_CPU_KVCACHE_SPACE" in r.getMessage() for r in caplog.records)
+    assert warned == warns
+
+
+@pytest.mark.parametrize(("cpu_kvcache_space", "conflicts"), [("0", False), ("64", True)])
+def test_a_cpu_kv_cache_space_next_to_kv_cache_memory_bytes(
+    monkeypatch, cpu_kvcache_space, conflicts
+):
+    """Both name a KV cache size, so which one the user meant is ambiguous; a 0 names
+    none, and the flag stays as given."""
+    monkeypatch.setenv("VLLM_CPU_KVCACHE_SPACE", cpu_kvcache_space)
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+
+    def build() -> VllmConfig:
+        return VllmConfig(
+            model_config=model_config,
+            cache_config=CacheConfig(block_size=64, kv_cache_memory_bytes=3 << 30),
+            compilation_config=CompilationConfig(custom_ops=["all"]),
+        )
+
+    if conflicts:
+        with pytest.raises(ValueError, match="both set the KV cache size"):
+            build()
+    else:
+        assert build().cache_config.kv_cache_memory_bytes == 3 << 30
+    assert "VLLM_CPU_KVCACHE_SPACE" not in os.environ
+
+
+def test_rejects_kv_sharing_fast_prefill():
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=128,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    cache_config = CacheConfig(block_size=64, kv_sharing_fast_prefill=True)
+
+    with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
+        VllmConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            compilation_config=CompilationConfig(custom_ops=["all"]),
+        )
 
 
 def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):

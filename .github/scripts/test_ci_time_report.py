@@ -1,0 +1,676 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import io
+import json
+import pathlib
+import subprocess
+import sys
+import zipfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import ci_time_report as ctr  # noqa: E402
+
+_REPO = pathlib.Path(__file__).resolve().parents[2]
+HOUR = 3600.0
+
+
+def _baseline(**extra):
+    # A 1 h tier, so pct == net minutes / 0.6.
+    return {"tests/a.py::test_big": 3000.0, "tests/b.py::test_small": 600.0, **extra}
+
+
+def _pr(d, suite="S"):
+    return {n: (s, suite) for n, s in d.items()}
+
+
+def test_new_tests_count_against_the_tier():
+    pr = _pr({**_baseline(), "tests/c.py::test_new": 180.0})
+    r = ctr.compute(pr, [_baseline()] * 5)
+    assert [t.nodeid for t in r.new] == ["tests/c.py::test_new"]
+    assert r.baseline_s == HOUR
+    assert r.pct == 5.0 and r.over
+
+
+def _collected(nodeids):
+    return {ctr.junit_key(n) for n in nodeids}
+
+
+def test_a_rename_nets_out():
+    base = _baseline(**{"tests/c.py::test_x[old]": 300.0})
+    pr = _pr({**_baseline(), "tests/c.py::test_x[new]": 300.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr))
+    assert len(r.new) == 1 and list(r.removed) == ["tests/c.py::test_x[old]"]
+    assert r.net_s == 0 and not r.over
+
+
+def test_a_skipped_test_is_not_removed():
+    # Durations omit skipped tests, e.g. trunk-only ones in a regression-tier PR run.
+    trunk_only = "tests/e2e/test_xpress_batch.py::test_qwen3_xpress_batch_four[defaults]"
+    base = _baseline(**{trunk_only: 320.0})
+    pr = _pr({**_baseline(), "tests/e2e/test_xpress_batch.py::test_new": 600.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected([*pr, trunk_only]))
+    assert r.removed == {} and r.net_s == 600.0
+
+
+def test_removed_needs_the_newest_baseline_and_most_runs():
+    gone_on_base = _baseline(**{"tests/c.py::test_old": 300.0})
+    r = ctr.compute(_pr(_baseline()), [_baseline()] + [gone_on_base] * 4, collected=set())
+    assert r.removed == {}
+    r = ctr.compute(_pr(_baseline()), [gone_on_base] * 2 + [_baseline()] * 3, collected=set())
+    assert r.removed == {}
+
+
+def test_known_in_any_baseline_run_is_not_new():
+    pr = _pr({**_baseline(), "tests/c.py::test_sometimes": 120.0})
+    r = ctr.compute(pr, [_baseline()] * 4 + [_baseline(**{"tests/c.py::test_sometimes": 1.0})])
+    assert r.new == []
+
+
+def test_tests_new_on_the_base_branch_are_not_the_prs():
+    pr = _pr({**_baseline(), "tests/main_only.py::test_merged_meanwhile": 600.0})
+    r = ctr.compute(pr, [_baseline()] * 5, base_only_files={"tests/main_only.py"})
+    assert r.new == [] and len(r.on_base) == 1 and r.net_s == 0
+
+
+def test_a_new_leg_counts_its_setup():
+    r = ctr.compute(_pr(_baseline()), [_baseline()] * 5, legs={"Spyre probe tests": 1})
+    assert r.net_s == ctr.LEG_OVERHEAD_S
+    assert r.over  # 7.2 min of a 1 h tier
+
+
+def test_baseline_total_is_the_median():
+    runs = [_baseline(), _baseline(), {k: 3 * v for k, v in _baseline().items()}]
+    assert ctr.compute(_pr(_baseline()), runs).baseline_s == HOUR
+
+
+def test_only_baseline_runs_cap_is_used():
+    extra = [_baseline(**{"tests/z.py::test_ancient": 9.0})]
+    pr = _pr({**_baseline(), "tests/z.py::test_ancient": 9.0})
+    r = ctr.compute(pr, [_baseline()] * ctr.BASELINE_RUNS + extra)
+    assert [t.nodeid for t in r.new] == ["tests/z.py::test_ancient"]
+
+
+def test_clean_durations_drops_garbage():
+    raw = {
+        "ok": 1.5,
+        "int": 2,
+        "neg": -1,
+        "nan": float("nan"),
+        "inf": 1e9,
+        "s": "x",
+        "b": True,
+        3: 1,
+    }
+    assert ctr.clean_durations(raw) == {"ok": 1.5, "int": 2.0}
+    assert ctr.clean_durations(["not", "a", "dict"]) == {}
+    assert ctr.clean_durations({"x" * 5000: 1.0}) == {}
+
+
+def test_long_node_ids_stay_distinct_and_display_shortened():
+    a, b = "t::" + "x" * 400 + "[a]", "t::" + "x" * 400 + "[b]"
+    assert len(ctr.clean_durations({a: 1.0, b: 2.0})) == 2
+    assert ctr._code(a).endswith("…`") and len(ctr._code(a)) < 310
+
+
+def test_reads_retry_transient_failures(monkeypatch):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(ctr.subprocess, "run", run)
+    monkeypatch.setattr(ctr.time, "sleep", lambda s: None)
+    assert ctr.gh_json("/x") == {} and len(calls) == 3
+
+
+def test_suite_name_strips_shard_and_markup():
+    assert ctr.suite_name("Spyre e2e smoke TP=2 (shard 1/2)") == "Spyre e2e smoke TP=2"
+    assert "@" not in ctr.suite_name("x @everyone | [l](http://e)")
+    assert ctr.suite_name("@@@") == "(unnamed leg)"
+
+
+def test_matrix_legs_of_the_real_matrix():
+    legs = ctr.matrix_legs((_REPO / ctr.MATRIX_PATH).read_text())
+    assert legs and all("cfg" in leg for leg in legs)
+    counts = ctr.tier_leg_counts(legs)
+    assert "Spyre attention smoke" not in counts
+    assert counts["Non-distributed spyre tests"] >= 1
+
+
+def test_leg_delta_by_suite_survives_a_reshard():
+    head = {"Smoke": 12, "New suite": 1}
+    base = {"Smoke": 11, "Old suite": 2}
+    assert ctr.leg_delta(head, base) == {"New suite": 1, "Old suite": -2, "Smoke": 1}
+    assert ctr.leg_delta({"A": 2}, {"A": 2}) == {}
+
+
+def test_slot_suites_recovers_retry_legs_in_sorted_descriptor_order():
+    legs = [{"cfg": f"Suite {i} (shard 1/1)"} for i in range(12)]
+    # Sorted as strings: failed-suite-1-10 precedes failed-suite-1-2.
+    suites = ctr.slot_suites(legs, ["failed-suite-1-2", "failed-suite-1-10"])
+    assert suites["retry-0"] == "Suite 10" and suites["retry-1"] == "Suite 2"
+    assert suites["3"] == "Suite 3"
+
+
+def test_merge_pr_legs_keeps_the_original_suite_and_larger_time():
+    slices = {"retry-0": {"t::a": 50.0, "t::b": 5.0}, "0": {"t::a": 10.0}}
+    merged = ctr.merge_pr_legs(slices, {"0": "Smoke"})
+    assert merged["t::a"] == (50.0, "Smoke")
+    assert merged["t::b"] == (5.0, ctr.RETRY_SUITE)
+
+
+def test_comment_escapes_pr_controlled_node_ids():
+    evil = "tests/x.py::test_y[`@everyone`|\n<!-- ci-time-report -->]"
+    r = ctr.compute(_pr({**_baseline(), evil: 600.0}), [_baseline()] * 5)
+    body = ctr.render_comment(r)
+    assert body.startswith(ctr.MARKER + "\n")
+    line = next(ln for ln in body.splitlines() if "test_y" in ln)
+    assert line.startswith("- `") and "`@everyone`" not in line and "\\|" in line
+    assert body.count(ctr.MARKER) == 2  # the escaped copy sits inside a code span
+
+
+def test_comment_wording_above_and_below():
+    over = ctr.compute(_pr({**_baseline(), "tests/c.py::test_new": 600.0}), [_baseline()] * 5)
+    assert "Please confirm" in ctr.render_comment(over)
+    under = ctr.compute(_pr(_baseline()), [_baseline()] * 5)
+    assert "below" in ctr.render_comment(under) and "Please confirm" not in ctr.render_comment(
+        under
+    )
+
+
+def test_summary_lists_new_removed_and_base_only():
+    base = _baseline(**{"tests/c.py::test_old": 60.0})
+    pr = _pr({**_baseline(), "tests/c.py::test_new": 90.0, "tests/m.py::test_main": 5.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/m.py"})
+    s = ctr.render_summary(r)
+    assert "test_new" in s and "test_old" in s and "possibly the base branch's" in s
+
+
+def _fake_gh(monkeypatch, comments, write_rc=0):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if "--input" in cmd:
+            assert "evil" not in " ".join(cmd)
+            return subprocess.CompletedProcess(cmd, write_rc, stdout="", stderr="##[error]evil")
+        out = json.dumps([comments]) if "comments?per_page" in cmd[2] else "{}"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(ctr.subprocess, "run", run)
+    return calls
+
+
+def _report(minutes):
+    return ctr.compute(_pr({**_baseline(), "tests/c.py::t": minutes * 60}), [_baseline()] * 5)
+
+
+def test_no_comment_below_threshold_without_a_previous_one(monkeypatch):
+    calls = _fake_gh(monkeypatch, [])
+    r = _report(0.5)
+    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r.over)
+    assert all("POST" not in c and "PATCH" not in c for c in calls)
+
+
+def test_posts_once_then_edits_in_place(monkeypatch):
+    calls = _fake_gh(monkeypatch, [])
+    r = _report(10)
+    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r.over)
+    assert any("POST" in c and "/repos/o/r/issues/7/comments" in c for c in calls)
+
+    mine = {"id": 99, "user": {"login": ctr.BOT_LOGIN}, "body": ctr.MARKER + "\nold"}
+    spoof = {"id": 5, "user": {"login": "someone"}, "body": ctr.MARKER}
+    calls = _fake_gh(monkeypatch, [spoof, mine])
+    r = _report(0.5)  # back under: still edits the existing comment
+    ctr.upsert_comment("o/r", 7, ctr.render_comment(r), r.over)
+    assert any("PATCH" in c and "/repos/o/r/issues/comments/99" in c for c in calls)
+
+
+def test_read_json_artifact_reads_in_memory_and_ignores_paths(monkeypatch):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("../../escape.json", json.dumps({"t::a": 1.0, "t::b": "x"}))
+    monkeypatch.setattr(ctr, "gh_bytes", lambda path: buf.getvalue())
+    assert ctr.read_json_artifact("o/r", {"id": 1, "name": "durations-data-0"}) == {"t::a": 1.0}
+    assert ctr.read_json_artifact("o/r", {"id": 1, "name": "x", "size_in_bytes": 1 << 40}) == {}
+
+
+def test_newest_by_name_keeps_the_latest_attempt():
+    arts = [
+        {"name": "durations-data-0", "id": 2, "created_at": "2026-11-10T02:00:00Z"},
+        {"name": "durations-data-0", "id": 1, "created_at": "2026-11-10T01:00:00Z"},
+        {"name": "junit-x", "id": 3, "created_at": "2026-11-10T03:00:00Z"},
+    ]
+    assert {k: v["id"] for k, v in ctr.newest_by_name(arts, "durations-data-").items()} == {
+        "durations-data-0": 2
+    }
+
+
+def test_comment_lists_only_slow_new_tests_and_links():
+    pr = _pr({**_baseline(), "tests/c.py::test_slow": 600.0, "tests/c.py::test_fast": 2.0})
+    r = ctr.compute(pr, [_baseline()] * 5)
+    body = ctr.render_comment(r, "https://x/runs/1", "https://x/runs/2")
+    assert "test_slow" in body and "test_fast" not in body
+    assert "[PR run](https://x/runs/1)" in body and "(https://x/runs/2)" in body
+
+
+def _matrix(*cfgs):
+    include = "".join(
+        f"          - cfg: {c}\n            test_types: {t}\n            test_target: t{i}\n"
+        for i, (c, t) in enumerate(cfgs)
+    )
+    return f"jobs:\n  test:\n    strategy:\n      matrix:\n        include:\n{include}"
+
+
+def _fake_build(monkeypatch, pr_files, matrices, junit="baseline", legs_with_junit=9):
+    run = {"id": 1, "head_sha": "head", "run_attempt": 1}
+    run |= {"created_at": "2026-11-10T12:00:00Z", "updated_at": "2026-11-10T13:00:00Z"}
+    run["referenced_workflows"] = [{"path": f"o/r/{ctr.MATRIX_PATH}@merge", "sha": "merge"}]
+    pr = {"number": 7, "base": {"ref": "main"}}
+    arts = [{"name": "durations-data-0", "id": 1}]
+    arts += [{"name": f"junit-t{i}", "id": 2 + i} for i in range(legs_with_junit)]
+    monkeypatch.setattr(ctr, "run_artifacts", lambda repo, rid: arts)
+
+    def read(repo, a, sfx, parse):
+        if a["name"].startswith("durations-data-"):
+            return _baseline()
+        if junit is None:
+            return None
+        keys = _collected(_baseline() if junit == "baseline" else junit)
+        return ctr.Junit(keys, keys)
+
+    monkeypatch.setattr(ctr, "read_artifact", read)
+    monkeypatch.setattr(ctr, "baseline_runs", lambda *a: [({"head_sha": "b"}, _baseline())] * 5)
+    monkeypatch.setattr(ctr, "pr_changed_files", lambda repo, n: pr_files)
+    monkeypatch.setattr(ctr, "base_only_test_files", lambda *a: set())
+    monkeypatch.setattr(ctr, "file_at", lambda repo, path, ref: matrices[ref])
+    monkeypatch.setattr(ctr, "gh_json", lambda path, **kw: {"merge_base_commit": {"sha": "fork"}})
+    return ctr.build_report("o/r", run, pr)
+
+
+def test_new_legs_are_diffed_against_the_merge_base(monkeypatch):
+    fork = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    head = _matrix(
+        ("Smoke (shard 1/1)", "regression trunk"),
+        ("Probes (shard 1/1)", "regression trunk"),
+        ("Smoke e2e (shard 1/1)", "integration"),
+    )
+    # The base tip gained a shard since the PR forked.
+    tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
+    matrices = {"fork": fork, "head": head, "merge": tip}
+    r = _fake_build(monkeypatch, {ctr.MATRIX_PATH}, matrices)
+    assert r.leg_delta == {"Probes": 1}
+    assert r.net_s == ctr.LEG_OVERHEAD_S
+
+
+def test_a_pr_that_leaves_the_matrix_alone_adds_no_legs(monkeypatch):
+    tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"merge": tip, "head": _matrix()})
+    assert r.leg_delta == {} and r.net_s == 0
+    assert "unchanged" in ctr.render_summary(r)
+
+
+def test_junit_keys_match_pytest_classnames():
+    xml = b"""<testsuites><testsuite>
+      <testcase classname="tests.e2e.test_x" name="test_a[p]"/>
+      <testcase classname="tests.test_y.TestK" name="test_b"><skipped/></testcase>
+      <testcase classname="" name="test_upstream[m]"/>
+    </testsuite></testsuites>"""
+    cases = ctr.junit_cases(xml)
+    for nodeid in [
+        "tests/e2e/test_x.py::test_a[p]",
+        "tests/test_y.py::TestK::test_b",
+        "::test_upstream[m]",
+    ]:
+        assert ctr.junit_key(nodeid) in cases
+
+
+def test_junit_with_a_dtd_is_refused():
+    xml = b'<!DOCTYPE x [<!ENTITY a "aaaa">]><testsuites>&a;</testsuites>'
+    try:
+        ctr.junit_cases(xml)
+    except ValueError:
+        return
+    raise AssertionError("DTD accepted")
+
+
+def test_renamed_file_counts_its_old_path(monkeypatch):
+    page = [{"filename": "tests/b.py", "previous_filename": "tests/a.py"}, {"filename": "x"}]
+    monkeypatch.setattr(ctr, "gh_json", lambda path, **kw: [page])
+    assert ctr.pr_changed_files("o/r", 1) == {"tests/a.py", "tests/b.py", "x"}
+
+
+def test_find_comment_ignores_quotes_of_the_marker(monkeypatch):
+    quoting = {"id": 1, "user": {"login": ctr.BOT_LOGIN}, "body": "echo: " + ctr.MARKER}
+    mine = {"id": 2, "user": {"login": ctr.BOT_LOGIN}, "body": ctr.MARKER + "\nx"}
+    _fake_gh(monkeypatch, [quoting, mine])
+    assert ctr.find_comment("o/r", 7)["id"] == 2
+
+
+def test_find_pr_matches_the_head_repo_and_prefers_open(monkeypatch):
+    run = {"head_repository": {"owner": {"login": "me"}, "full_name": "me/r"}, "head_branch": "a&b"}
+    pulls = [
+        {"number": 1, "state": "closed", "head": {"repo": {"full_name": "me/r"}}},
+        {"number": 2, "state": "open", "head": {"repo": {"full_name": "other/r"}}},
+        {"number": 3, "state": "open", "head": {"repo": {"full_name": "me/r"}}},
+    ]
+    paths = []
+    monkeypatch.setattr(ctr, "gh_json", lambda path, **kw: paths.append(path) or pulls)
+    assert ctr.find_pr("o/r", run)["number"] == 3
+    assert "head=me%3Aa%26b&" in paths[0]
+    assert ctr.find_pr("o/r", {"head_repository": None}) is None
+
+
+def test_read_json_artifact_survives_garbage(monkeypatch):
+    monkeypatch.setattr(ctr, "gh_bytes", lambda path: b"not a zip")
+    assert ctr.read_json_artifact("o/r", {"id": 1, "name": "durations-data-0"}) == {}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("d.json", "[" * 100000)
+    monkeypatch.setattr(ctr, "gh_bytes", lambda path: buf.getvalue())
+    assert ctr.read_json_artifact("o/r", {"id": 1, "name": "durations-data-0"}) == {}
+
+
+def test_a_run_missing_a_legs_junit_is_skipped(monkeypatch):
+    # A green run whose second leg never got a runner: no JUnit, so no verdict.
+    tip = _matrix(("Smoke (shard 1/2)", "regression trunk"), ("Smoke (shard 2/2)", "regression"))
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"merge": tip}, legs_with_junit=1)
+    assert isinstance(r, str) and "1 regression legs" in r and "shard 2/2" in r
+
+
+def test_an_unreadable_artifact_is_skipped(monkeypatch):
+    tip = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    r = _fake_build(monkeypatch, {"tests/x.py"}, {"merge": tip}, junit=None)
+    assert isinstance(r, str) and "could not be read" in r
+
+
+def test_missing_legs_ignores_other_tiers():
+    legs = ctr.matrix_legs(
+        _matrix(("A (shard 1/1)", "regression"), ("Smoke e2e (shard 1/1)", "integration"))
+    )
+    assert ctr.missing_legs(legs, {}) == ["A (shard 1/1)"]
+    assert ctr.missing_legs(legs, {"junit-t0": {}}) == []
+
+
+def test_actions_stdout_never_carries_node_ids(monkeypatch, tmp_path, capsys):
+    evil = "tests/x.py::test_y[##[error file=README.md;line=1]x ::warning::y]"
+    r = ctr.compute(_pr({**_baseline(), evil: 600.0}), [_baseline()] * 5)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    args = type("A", (), {"summary_file": ""})()
+    ctr.publish(args, ctr.render_summary(r), ctr._headline(r))
+    out = capsys.readouterr().out
+    assert "##[" not in out and "::" not in out and out.startswith("This PR adds")
+    assert "##[error" in summary.read_text()
+
+
+def test_local_runs_print_the_report(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    ctr.publish(type("A", (), {"summary_file": ""})(), "## CI time report\n", "status")
+    assert "## CI time report" in capsys.readouterr().out
+
+
+def _fake_compare(monkeypatch, commits, total=None, files=("tests/test_shared.py",)):
+    cmp = {"commits": commits, "total_commits": len(commits) if total is None else total}
+
+    def gh(path, **kw):
+        return cmp if "/compare/" in path else {"files": [{"filename": f} for f in files]}
+
+    monkeypatch.setattr(ctr, "gh_json", gh)
+
+
+def test_base_changed_files_exclude_commits_after_the_pr_run(monkeypatch):
+    run = {"created_at": "2026-11-10T12:00:00Z"}
+    pr = {"base": {"ref": "main"}}
+    before = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
+    after = {"sha": "b", "commit": {"committer": {"date": "2026-11-10T13:00:00Z"}}}
+    _fake_compare(monkeypatch, [before, after], files=("tests/test_shared.py", "README.md"))
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/test_shared.py"}
+    _fake_compare(monkeypatch, [after])
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == set()
+
+
+def test_a_far_moved_base_branch_gives_no_verdict(monkeypatch):
+    run = {"created_at": "2026-11-10T12:00:00Z"}
+    pr = {"base": {"ref": "main"}}
+    old = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
+    new = {"sha": "b", "commit": {"committer": {"date": "2026-11-10T13:00:00Z"}}}
+    _fake_compare(monkeypatch, [old] * (ctr._MAX_BASE_COMMITS + 1))
+    assert "moved too far" in ctr.base_only_test_files("o/r", "base", run, pr)
+    # A truncated listing that never reaches past the PR run is not trusted either.
+    _fake_compare(monkeypatch, [old], total=300)
+    assert "moved too far" in ctr.base_only_test_files("o/r", "base", run, pr)
+    # Commits merged after the PR run don't count toward the cap.
+    _fake_compare(monkeypatch, [old] + [new] * 40, total=300)
+    assert ctr.base_only_test_files("o/r", "base", run, pr) == {"tests/test_shared.py"}
+
+
+def test_a_new_test_in_a_file_both_sides_changed_is_not_charged():
+    # The base branch's expensive test and the PR's cheap one land in the same file.
+    pr = _pr(
+        {
+            **_baseline(),
+            "tests/test_shared.py::test_main": 900.0,
+            "tests/test_shared.py::test_pr": 10.0,
+        }
+    )
+    r = ctr.compute(pr, [_baseline()] * 5, base_only_files={"tests/test_shared.py"})
+    assert r.new == [] and len(r.on_base) == 2 and not r.over
+
+
+def test_slots_decode_with_the_matrix_the_run_executed(monkeypatch):
+    # The base tip has since put "Quality" first; slot 0 of this run was still "Smoke".
+    ran = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    tip = _matrix(("Quality (shard 1/1)", "regression trunk"), ("Smoke (shard 1/1)", "regression"))
+    pr = _pr({**_baseline(), "tests/c.py::test_new": 60.0})
+    monkeypatch.setattr(
+        ctr,
+        "merge_pr_legs",
+        lambda slices, suites: {n: (s, suites["0"]) for n, (s, _) in pr.items()},
+    )
+    r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": ran, "main": tip})
+    assert [t.suite for t in r.new] == ["Smoke"]
+
+
+def test_an_unknown_executed_matrix_gives_no_verdict(monkeypatch):
+    r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": "jobs: {}\n"})
+    assert isinstance(r, str) and "matrix this run executed" in r
+
+
+def test_baselines_are_searched_before_the_pr_run_and_paged(monkeypatch):
+    queries = []
+    full = [{"id": i} for i in range(30)]  # first page: no durations artifacts kept
+
+    def gh(path, **kw):
+        queries.append(path)
+        return {"workflow_runs": full if "page=1" in path else [{"id": 99}] * 5}
+
+    monkeypatch.setattr(ctr, "gh_json", gh)
+    monkeypatch.setattr(
+        ctr, "run_artifacts", lambda repo, rid: [{"name": "test-durations", "id": rid}]
+    )
+    monkeypatch.setattr(
+        ctr, "read_json_artifact", lambda repo, a: _baseline() if a["id"] == 99 else {}
+    )
+    out = ctr.baseline_runs("o/r", "main", "<=2026-11-03T23:39:08Z")
+    assert len(out) == ctr.BASELINE_RUNS
+    assert "created=%3C%3D2026-11-03T23%3A39%3A08Z" in queries[0]
+    assert "page=2" in queries[-1]
+
+
+def test_a_failed_comment_write_logs_no_body(monkeypatch, capsys):
+    _fake_gh(monkeypatch, [], write_rc=1)
+    r = _report(10)
+    body = ctr.render_comment(r).replace("tests/c.py::t", "tests/c.py::t[##[error]evil]")
+    try:
+        ctr.upsert_comment("o/r", 7, body, r.over)
+    except SystemExit as e:
+        assert e.code == 1
+    else:
+        raise AssertionError("no exit on a failed write")
+    captured = capsys.readouterr()
+    assert "evil" not in captured.out + captured.err
+
+
+# Written by pytest 9.2.0 --junitxml for the node ids in _PYTEST_IDS.
+_PYTEST_JUNIT = b"""<testsuites><testsuite name="pytest">
+<testcase classname="tests.test_ids" name="test_operator[torch::op]"/>
+<testcase classname="tests.test_ids.TestK" name="test_m"/>
+<testcase classname="" name="tests.sub.test_opt"><skipped message="collection skipped"/></testcase>
+</testsuite></testsuites>"""
+_PYTEST_IDS = ["tests/test_ids.py::test_operator[torch::op]", "tests/test_ids.py::TestK::test_m"]
+
+
+def test_junit_keys_match_real_pytest_output():
+    cases = ctr.junit_cases(_PYTEST_JUNIT)
+    assert all(ctr.junit_key(n) in cases for n in _PYTEST_IDS)
+    # A class on a path-less (upstream) id keeps the empty module component.
+    assert ctr.junit_key("::TestUpstream::test_method[p]") == (".TestUpstream", "test_method[p]")
+
+
+def test_junit_tells_executed_from_skipped():
+    xml = b"""<testsuite>
+      <testcase classname="m" name="ran"/>
+      <testcase classname="m" name="xf"><skipped type="pytest.xfail"/></testcase>
+      <testcase classname="m" name="sk"><skipped type="pytest.skip"/></testcase>
+    </testsuite>"""
+    j = ctr.junit_cases(xml)
+    assert j.executed == {("m", "ran")} and ("m", "xf") in j and ("m", "sk") in j
+
+
+def test_executed_tests_without_durations_give_no_verdict(monkeypatch):
+    # The leg's JUnit shows a test that ran, but its duration file never got written.
+    tip = _matrix(("Smoke (shard 1/1)", "regression trunk"))
+    junit = {**_baseline(), "tests/c.py::test_new": 600.0}
+    r = _fake_build(monkeypatch, {"tests/c.py"}, {"merge": tip}, junit=junit)
+    assert isinstance(r, str) and "1 tests the PR run executed have no recorded duration" in r
+
+
+def test_a_non_object_durations_file_is_unreadable():
+    try:
+        ctr._durations(b"[]")
+    except ValueError:
+        return
+    raise AssertionError("accepted a list")
+
+
+def test_a_collection_skipped_module_is_not_removed():
+    # pytest lists an importorskip'd module once, as its collector, never its tests.
+    j = ctr.junit_cases(_PYTEST_JUNIT)
+    assert j.skipped_modules == {"tests.sub.test_opt"} and ("", "tests.sub.test_opt") not in j
+    base = _baseline(
+        **{"tests/sub/test_opt.py::test_expensive": 1200.0, "::test_upstream[a]": 60.0}
+    )
+    pr = _pr({**_baseline(), "tests/c.py::test_new": 600.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), skipped_modules=j.skipped_modules)
+    assert r.removed == {} and r.net_s == 600.0
+    # Without a collection skip the same absence is a removal.
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), skipped_modules=set())
+    assert set(r.removed) == {"tests/sub/test_opt.py::test_expensive", "::test_upstream[a]"}
+
+
+def test_a_base_branch_rename_is_neither_charged_nor_credited():
+    # Main renamed a 900 s test after the newest baseline; the PR adds 600 s elsewhere.
+    base = _baseline(**{"tests/test_shared.py::test_old_name": 900.0})
+    pr = _pr(
+        {**_baseline(), "tests/test_shared.py::test_new_name": 900.0, "tests/c.py::test_pr": 600.0}
+    )
+    r = ctr.compute(
+        pr, [base] * 5, collected=_collected(pr), base_only_files={"tests/test_shared.py"}
+    )
+    assert r.removed == {} and r.net_s == 600.0
+
+
+def _skip_run(monkeypatch, comments):
+    run = {
+        "path": f".github/workflows/{ctr.WORKFLOW}",
+        "repository": {"full_name": "o/r"},
+        "head_sha": "h",
+        "html_url": "https://x/runs/1",
+    }
+    pr = {"number": 7, "head": {"sha": "h"}}
+    monkeypatch.setattr(ctr, "find_pr", lambda repo, r: pr)
+    monkeypatch.setattr(ctr, "build_report", lambda repo, r, p: "a leg uploaded no JUnit report")
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    calls = _fake_gh(monkeypatch, comments)
+
+    def gh(path, **kw):
+        return run if "/actions/runs/" in path else [comments]
+
+    monkeypatch.setattr(ctr, "gh_json", gh)
+    args = type(
+        "A", (), {"repo": "o/r", "run_id": 1, "post": True, "json": "", "summary_file": ""}
+    )()
+    ctr.cmd_report(args)
+    return calls
+
+
+def test_a_skipped_report_rewrites_an_earlier_comment(monkeypatch):
+    mine = {"id": 99, "user": {"login": ctr.BOT_LOGIN}, "body": ctr.MARKER + "\nplease confirm"}
+    calls = _skip_run(monkeypatch, [mine])
+    assert any("PATCH" in c and "/repos/o/r/issues/comments/99" in c for c in calls)
+
+
+def test_a_skipped_report_posts_nothing_new(monkeypatch):
+    calls = _skip_run(monkeypatch, [])
+    assert all("POST" not in c and "PATCH" not in c for c in calls)
+
+
+def test_the_skip_note_names_the_reason():
+    body = ctr.render_skipped("2 regression legs uploaded no JUnit report", "https://x/runs/1")
+    assert body.startswith(ctr.MARKER + "\n") and "2 regression legs" in body and "PR run" in body
+
+
+def test_collection_inputs():
+    for path in [
+        "uv.lock",
+        "pyproject.toml",
+        "tests/conftest.py",
+        "tests/plugin/spyre_testing_plugin/upstream_tests.yaml",
+        "tests/e2e/models.txt",
+        "spyre_inference/config/model_configs.yaml",
+        "spyre_inference/models/__init__.py",
+    ]:
+        assert ctr.collection_input(path), path
+    for path in ["tests/e2e/test_x.py", "spyre_inference/platform.py", "docs/a.md"]:
+        assert not ctr.collection_input(path), path
+
+
+def test_a_base_dependency_bump_gives_no_verdict(monkeypatch):
+    # Main bumped vLLM after the newest baseline: upstream test ids change with no tests/ edit.
+    run = {"created_at": "2026-11-10T12:00:00Z"}
+    old = {"sha": "a", "commit": {"committer": {"date": "2026-11-10T11:00:00Z"}}}
+    _fake_compare(monkeypatch, [old], files=("pyproject.toml", "uv.lock"))
+    reason = ctr.base_only_test_files("o/r", "base", run, {"base": {"ref": "main"}})
+    assert isinstance(reason, str) and "pyproject.toml" in reason and "uv.lock" in reason
+
+
+def test_ids_in_a_newer_base_run_belong_to_the_base_branch():
+    # Main bumped vLLM after the baseline, renaming upstream ids; its next green run,
+    # which landed after the PR run started, already has them.
+    base = _baseline(**{"::test_upstream[old]": 300.0})
+    newer = _baseline(**{"::test_upstream[new]": 300.0})
+    pr = _pr({**_baseline(), "::test_upstream[new]": 300.0, "tests/c.py::test_pr": 60.0})
+    r = ctr.compute(pr, [base] * 5, collected=_collected(pr), newer=[newer])
+    assert [t.nodeid for t in r.new] == ["tests/c.py::test_pr"]
+    # And what the newest base run dropped is not the PR's removal.
+    assert r.removed == {} and r.net_s == 60.0

@@ -37,7 +37,7 @@ F = TypeVar("F", bound=Callable)
 
 
 class CompileOutermost:
-    """Base for layers with one ``@maybe_compile`` kernel.
+    """Base for layers with ``@maybe_compile`` kernels cached per method.
 
     The mode is sampled here because construction is the only point where the vLLM
     config context is live; ``enforce_eager`` arrives as mode ``NONE``.
@@ -53,7 +53,7 @@ class CompileOutermost:
     """
 
     spyre_compile_enabled: bool
-    spyre_compiled_kernel: Callable | None
+    spyre_compiled_kernels: dict[Callable, Callable]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,7 +70,7 @@ class CompileOutermost:
             return
         mode = get_cached_compilation_config().mode
         self.spyre_compile_enabled = mode is not CompilationMode.NONE
-        self.spyre_compiled_kernel = None
+        self.spyre_compiled_kernels = {}
 
 
 def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
@@ -89,7 +89,8 @@ def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
         def wrapper(self, *args, **kwargs):
             if torch.compiler.is_compiling() or (not force and not self.spyre_compile_enabled):
                 return method(self, *args, **kwargs)
-            if self.spyre_compiled_kernel is None:
+            kernel = self.spyre_compiled_kernels.get(method)
+            if kernel is None:
                 logger.info_once(
                     "Compiling %s.%s as its own graph: %s.",
                     type(self).__name__,
@@ -102,13 +103,14 @@ def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
 
                     compile_guard.watch(method, f"{type(self).__name__}.{method.__name__}")
                 # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
-                self.spyre_compiled_kernel = torch.compile(
+                kernel = torch.compile(
                     method.__get__(self),
                     backend=current_platform.simple_compile_backend,
                     fullgraph=True,
                     dynamic=False,
                 )
-            return self.spyre_compiled_kernel(*args, **kwargs)
+                self.spyre_compiled_kernels[method] = kernel
+            return kernel(*args, **kwargs)
 
         return cast(F, wrapper)
 

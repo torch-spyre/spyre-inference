@@ -108,7 +108,6 @@ jobs:
       # Binary only; the cache is shipped from /storage-1. The review bot is a
       # pure consumer (no save step), so it only ever reads the mount.
       - name: Set up uv
-        if: env.REVIEW_MODE == 'hardware'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: false
@@ -155,6 +154,19 @@ jobs:
             | tar -xz -C /tmp
           install -m 0755 "/tmp/gh_${ver}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # From the default branch, before the agent can check out PR code, with only GH_TOKEN.
+      - name: CI time report
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          out="${RUNNER_TEMP}/ci-time-report.md"
+          env -u GITHUB_STEP_SUMMARY uv run --no-project --with pyyaml python3 -I \
+            .github/scripts/ci_time_report.py report --repo "${REPO}" --pr "${PR_NUMBER}" \
+            --summary-file "${out}" || echo "The CI time report is unavailable." > "${out}"
 
       - name: Claude review
         id: claude

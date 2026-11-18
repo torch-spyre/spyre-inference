@@ -65,7 +65,7 @@ sub-stick half) run directly in the compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice on Spyre, compiled as its own graph (`maybe_compile`, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)) unless compilation is off; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
-| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which `SpyreFp8LMHeadMethod` DMAs into `qfp8wt` as is, compiled even under `enforce_eager` |
+| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is DMA'd straight into `qfp8wt` at load (torch-spyre#4663), so `model.to("spyre")` skips it. `quantscalepertokenfp8` + `qfp8ch` + `spyre.scaled_mm` trace into the block graph, or compile as their own graph (`maybe_compile`) outside one. The LM head stays FP16 unless a compressed-tensors checkpoint ships it in FP8, which `SpyreFp8LMHeadMethod` DMAs into `qfp8wt` as is, compiled even under `enforce_eager`. For `quantization="fp8"` checkpoints the plugin replaces vLLM's config with `SpyreFp8Config` (`quantization/fp8.py`): a fused module's per-tensor shard scales become one `[1]` scale when they match and an `[N, 1]` per-channel scale when they differ, so the FP8 weight is never requantized (upstream requantizes through `_C`, which the vLLM build here lacks). Compressed-tensors, Quark and ModelOpt per-tensor checkpoints still take upstream's requant |
 
 ### Transposed linear weights
 
@@ -101,8 +101,8 @@ which slices gate/up on-device. Earlier revisions instead split the QKV weight o
 time into three per-part GEMMs — a `SplitQKV` container built by an `analyze_and_unfuse`
 pass — so that no fused output ever had to be sliced; one fused GEMM is faster than three,
 so that pass is gone. Attention gathers query rows rather than passing offset views into
-compiled kernels, and materializes fused K/V views before head-major cache writes (see
-[Head-major KV cache](#head-major-kv-cache)).
+compiled kernels, and materializes fused K/V views before cache writes (see
+[Attention Backend](#attention-backend)).
 
 ## Model adaptations
 
@@ -118,13 +118,13 @@ and `register_models()` first checks every key against vLLM's own registry, so a
 rename fails loudly instead of silently falling through to the unadapted class.
 
 Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
-`embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
+`embedding_class`; gemma-4 builds its self-decoder inline), the already-built instance is **retyped** to its Spyre subclass — same
 `__init__`, same parameters and module tree, but a Spyre `forward` and armed compile
 state. Prefer a documented upstream extension point where one exists: `CustomOp.register_oot` /
 `PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.
 
-Two adaptations worth knowing:
+Three adaptations worth knowing:
 
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
@@ -157,6 +157,19 @@ Two adaptations worth knowing:
   instead of the opaque `torch.ops.vllm.moe_forward` custom op, so a compiled block traces
   the expert forms into its own graph; an eager run dispatches them to compiled regions.
 
+- **Gemma-4 per-layer embeddings** (`models/gemma4.py`, E2B / E4B) retype the self-decoder
+  to `SpyreGemma4SelfDecoderLayers`. Its upstream PLE lookup, including the in-vocab mask,
+  always runs in a compiled region, including under `--enforce-eager`; an enclosing graph
+  absorbs it rather than nesting a compile. The lookup and row-splitting methods cache
+  their compiled callables independently. It cuts the backbone's per-layer rows in one
+  compiled graph and hands each block its own offset-0 row through the `[:, layer_idx, :]`
+  the backbone loop already does. A view of the packed tensor carries a different
+  `storage_offset` per layer, which torch-spyre guards on, so every layer would compile
+  its own block. The multimodal wrapper allocates its PLE cache on the host as a plain
+  attribute, so `models/gemma4_mm.py` re-registers it as a buffer that follows the model
+  to the device; that runs even text-only, since the default load keeps the wrapper with
+  every modality at 0.
+
 ### MoE expert weights
 
 `_prepare_layer` moves each layer's experts to the device once, as three stacks, and hands
@@ -179,6 +192,21 @@ per-core working set. For Gemma 4 with `top_k=8` and 32 cores this selects `C=4`
 `SPYRE_MOE_CHUNKS` overrides the derived value; the override must still split `H` into
 whole-stick chunks. Alias entry `e·C + c` is chunk `c` of expert `e`. TP narrows only `M`, so
 the slicing is unchanged at every TP degree.
+
+Each stack goes to the card in chunks of experts: a chunk is padded and made contiguous on the
+host and copied into its slice of the device tensor. The copy is host-bound (the device-format
+conversion), so the chunking costs no time, and a chunk's transpose stays in cache where a
+whole stack's does not.
+
+The relayout and copy of one layer's stacks are independent of every other layer's, so loading
+prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
+worker's share of the CPU budget, at most 16; `1` prepares them in order). The pool lives for
+one load: the loader waits for every layer before anything reads the model, and a load that
+fails joins its threads. A recipe's down-weight transform (Gemma folds its expert scale
+there) runs per chunk too, and a `swigluoai` stack's gate and up rows are read as strided
+views, so no recipe builds a whole stack either: a load's transient host memory is the
+threads times one chunk, or two chunks for a recipe with a down transform, whose output is
+staged once more before the copy.
 
 Decode orders the `top_k·C` entries row-major (row, then chunk): the entry index is the widened
 expert index times `C` plus a `[1, C, 1]` offset, both device tensors made at load, so the input
@@ -292,7 +320,9 @@ class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. 
 upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
 `EncoderCudaGraphManager` picks power-of-two token budgets (or takes
 `encoder_cudagraph_token_budgets`), packs a step's images into them, pads the inputs and splits
-the output per image. `SpyreEncoderGraphManager`
+the output per image. The mixin caps the largest budget at `max_model_len`: an image's encoder
+tokens are among its prompt's, so a larger one never reaches the encoder (granite vision, whose
+padded tiles can outnumber its placeholders, keeps its own range). `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
 compiles the encoder at that static shape during warmup, and replay uploads the padded
 inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
@@ -322,6 +352,7 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` |
 | `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
@@ -364,81 +395,77 @@ Constraints the layout follows:
 
 ## Attention Backend
 
-Decoder attention has two backends, which differ only in how a page is laid out; the
-default is the head-major one described below. `SpyreAttentionBackend` is the token-major
-layout (`SPYRE_ATTN_KV_LAYOUT=token_major`) and the structure both share, so it is
-described first. It implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache holds two dense tensors per layer on Spyre, one
-each for K and V, both shaped
-`[num_blocks, block_size, num_kv_heads, head_size]` — the shape
+`SpyreAttentionBackend` is the decoder attention backend. It implements paged attention
+using pure PyTorch operations (no custom CUDA kernels). The KV cache holds two dense
+tensors per layer on Spyre, one each for K and V, both shaped
+`[num_blocks, num_kv_heads, block_size, head_size]` — the shape
 `SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
 online softmax that iterates over pages without any compact-gather step, reading each
-page by indexing the dense tensor with a one-element int32 device tensor (an indirect
-access, so the compiled bundle carries a real index rather than a constant slice) and
-permuting the token-major page to head-major on device before the matmuls. The cache is
-allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`) so
-the write can scatter through a slot-major view of it:
+page by indexing the dense tensor with an int32 device tensor (an indirect access, so the
+compiled bundle carries a real index rather than a constant slice). A page arrives in the
+shape the matmuls want, so no per-page permute runs before them. The transpose moves to
+the write instead: a token's KV heads are `block_size` rows apart, so the store is one
+`index_copy_` per KV head (`kv_write_index` publishes one index per head) over a source
+materialized contiguously first.
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
-| 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter through a slot-major view of the paged cache (one per tensor, fused); only the slot-index vector is computed host-side and copied over |
+| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets (the per-sequence kernels usually keep each sequence's own block count instead, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
+| 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter, one per KV head, through a row view of the paged cache (fused into one kernel); only the row-index vectors are computed host-side and copied over |
 | 3. Page attention | Spyre | Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 4. Write-back | Spyre | Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy |
 
 The compiled kernels themselves — the per-sequence page attention, the batched decode
 path, the KV store, and the cache's device layout — live under
 `spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
-the host-side orchestration that calls them.
+the host-side orchestration that calls them. The worker allocates each layer's cache
+through its impl (`allocate_pages`), so the shape, the layout and the kernels cannot
+disagree.
+
+### Cross-layer KV sharing
+
+A layer with a `kv_sharing_target_layer_name` (gemma-4 E2B / E4B) allocates no cache: the
+runner aliases its target's pages in `initialize_kv_cache_tensors`. vLLM adds such a layer to
+its target's KV cache group but not to that group's `UniformTypeKVCacheSpecs`, so the
+per-layer spec lookup in `initialize_attn_backend` would `KeyError`; both runners hand the
+attention backend a copy (`with_kv_sharing_layer_specs`) that maps it to the target's spec,
+leaving the retained config's specs, and so its `page_size_bytes`, physical. YOCO fast prefill
+(`kv_sharing_fast_prefill`) swaps in an attention backend Spyre does not provide and is rejected.
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
 per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
 block counts that fit its smallest real query length; variants exceeding the allocated
-page count are skipped. Failed recordings are logged and compile on first use instead.
-When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default, which under the
-default tiled walk means the head-major layout) warmup enumerates its variants, the
-product of the KV-length (`num_blocks`) and num-sequences buckets; combinations that
-reach or exceed the allocated page count are skipped and declined at dispatch. A single
-step can carry a mix of prefill and decode sequences; each sequence is
-padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
-`SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+page count are skipped. When the per-sequence page count is dynamic (copied to the device
+with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
+bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
+it. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
+traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
+compile on first use instead.
+When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
+enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
+buckets; combinations that reach or exceed the allocated page count are skipped and
+declined at dispatch. A single step can carry a mix of prefill and decode sequences; each
+sequence is padded to its own query bucket (decodes use the length-1 bucket) before
+dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
 with KV length. `SPYRE_ATTN_FOR_EACH_TILE=1` walks that axis with torch-spyre's
 `for_each_tile` instead, leaving one body plus a tile spec, and the same applies to the
-batched-decode kernel's walk over block chunks. Both kernels carry the online softmax as
+batched-decode kernel's walk over block chunks. The kernels carry the online softmax as
 a `(tile_max, tile_sum, tile_output)` triple either way. `walk_tiles` selects the walk;
-the same flag also controls `fullgraph`, batched-decode eligibility, and layout/kernel
-branches. `SPYRE_ATTN_FOR_EACH_TILE=1` is the default; setting it to `0` uses Python loops
-as a rollback path. The flag is read once at import, so set it before importing
+the same flag also controls `fullgraph` and the batched-decode page-index upload.
+`SPYRE_ATTN_FOR_EACH_TILE=1` is the default; setting it to `0` uses Python loops as a
+rollback path. The flag is read once at import, so set it before importing
 `spyre_inference`.
 
-### Head-major KV cache
+### LX-resident pages
 
-`SpyreHeadMajorAttentionBackend` is the default decoder backend
-(`SPYRE_ATTN_KV_LAYOUT=head_major`). It stores a page as
-`[num_blocks, num_kv_heads, block_size, head_size]` instead. The page then arrives in the
-shape the matmuls want, so the per-page permute in step 3 disappears — that is the whole
-point of the layout. It moves the transpose to the write: a token's KV heads are
-`block_size` rows apart, so step 2 becomes one `index_copy_` per KV head (`kv_write_index`
-publishes one index per head) over a source materialized contiguously first, rather than a
-single store of one contiguous run per token.
-
-Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
-warmup recording and dispatch — is shared with the token-major backend. What differs is
-duplicated rather than parameterised: the advertised shape, the allocation
-(`head_major_kv_layout`), the KV-store kernel and the three attention kernels that
-read a page. The worker follows the
-layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot disagree.
-
-#### LX-resident pages
-
-The head-major per-sequence decode kernel (`page_attn_head_major_decode`, one query row)
-keeps a gathered page in the LX scratchpad from its gather to its last use instead of
+The per-sequence decode kernel (`page_attn_decode`, one query row) keeps a
+gathered page in the LX scratchpad from its gather to its last use instead of
 round-tripping through HBM. A query wider than one row amortises the page transfer over
-every row, so it takes `page_attn_head_major_prefill` instead: batched GQA over the unfolded
+every row, so it takes `page_attn_prefill` instead: batched GQA over the unfolded
 cache, one whole page per gather. Two shape choices get the decode kernel to LX residency. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
 gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
@@ -451,15 +478,15 @@ device dim 0, which is where an indexed axis has to sit for the gather to cost o
 rather than the whole tensor.
 
 Two things follow from those choices. The gather is a 2-D subscript, which lowers to
-`aten.index` and fails eager by upcasting its int32 index, so this backend always compiles
-attention even under `--enforce-eager` — attention compiles in its own domain, so the rest
-of the model still runs eager. Because the bmm's output axes
-(`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
-mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
-at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. Batched decode
-runs the other way round: its page index is uploaded one entry per stick here, which is
-what the tiled walk needs, so the batched kernel is reached on this layout and declined on
-token-major until that port lands.
+`aten.index` and fails eager on Spyre by upcasting its int32 index (torch-spyre#4334,
+tracked by `test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is
+always compiled on Spyre, even under `--enforce-eager` — attention compiles in its own
+domain, so the rest of the model still runs eager. Off Spyre an eager run calls the same
+kernels uncompiled, which is how the CPU-reference tests exercise them. Because the bmm's
+output axes (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling
+them would mean K-splitting a reduction a gather cannot mirror, the attention compile alone
+is capped at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's
+page index is uploaded one entry per stick, which is what the tiled walk needs.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
 planner's own verdicts. Read those from the allocation — `LifetimeBoundBuffer.address`, where
@@ -475,10 +502,10 @@ per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding a
 `blocks_per_chunk` by `num_kv_heads` and multiplies the chunk trips, which measured roughly
 1.5–2x more kernel time across the decode batches and contexts tried.
 
-#### FP8 KV cache
+### FP8 KV cache
 
-`--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the head-major pages as `float8_e4m3fn`,
-halving KV memory and the bytes each page read moves; the token-major layout rejects it.
+`--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the pages as `float8_e4m3fn`, halving KV
+memory and the bytes each page read moves.
 Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
 The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
@@ -502,24 +529,23 @@ Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
   to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
-  selects a denser preset
+  selects a denser preset. A layer with one KV head floors the ladder at two blocks: one
+  KV head on one page leaves the decode kernel no spare dim for the stick
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
-  default; under the default tiled walk, the head-major layout only):
-  powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); eligible
-  `(num_blocks, num_seqs)` combinations are recorded during warmup
+  default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
+  eligible `(num_blocks, num_seqs)` combinations are recorded during warmup
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a
   user-supplied `block_size` is rounded up to the next multiple of 64, and one that is then
   not a power of two is rejected
 - **Head configurations**: GQA, MHA (`num_queries_per_kv = 1`) and MQA (`num_kv_heads = 1`)
-  are all exercised, on both layouts (`tests/attention/test_spyre_attn.py`,
-  `tests/attention/test_spyre_head_major_attn.py`)
+  are all exercised (`tests/attention/test_spyre_attn.py`)
 - **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
-  layers stay unwindowed) and logits soft-capping on both layouts
-- **Not supported**: ALiBi, on either layout
+  layers stay unwindowed) and logits soft-capping
+- **Not supported**: ALiBi
 
 ### Encoder-only attention
 
@@ -638,11 +664,18 @@ The weight transposes happen before that, in each layer's
 call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
-- **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling). A pooling
-  model whose pooler runs on Spyre keeps its hidden states there instead, and the pooler
-  copies back only the pooled vectors
-- **`compute_logits`**: moves the CPU-sliced `hidden_states[logits_indices]` back onto
-  Spyre for the `SpyreParallelLMHead` matmul, which returns logits on Spyre
+- **Output**: a generative model's hidden states stay on Spyre. Upstream's
+  `hidden_states[logits_indices]` is routed through `select_rows`, which gathers the
+  sampled rows on Spyre onto a warmed row bucket (the padded sampled-row counts the lm_head
+  compiles for, see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets));
+  a decode step whose indices are the
+  identity reuses the padded body output with no gather. A pooling model whose pooler
+  runs on Spyre keeps its hidden states there too, and the pooler copies back only the
+  pooled vectors. Every other output, including the eager decoder's, which has no shape
+  bucketer, is converted to CPU
+- **`compute_logits`**: projects a gathered row bucket on Spyre directly. Any other
+  input, such as a prompt-logprob slice, is padded onto a row bucket on the host and moved
+  onto Spyre for the `SpyreParallelLMHead` matmul. Only the logits cross back to the host
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward`. The weight moves to Spyre with the rest of the model, and the
@@ -694,16 +727,27 @@ same way. That brings back the CPU kernels and drops the full-vocabulary sort:
   vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
   single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
   scan.
-- **Top-k + top-p** — `apply_top_k_top_p_sort_free` takes a `topk` window of `2 × max_k`
-  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
-  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
-  exact tie count when ties run past it. Top-p without top-k still sorts.
+- **Top-k / top-p** — with the filter ops loaded, `apply_top_k_top_p_kernels` masks in
+  place. Top-k keeps every tie with the k-th value and does not sort. Top-k together
+  with top-p sorts those survivors and cuts top-p exactly on them, so a k near the
+  vocabulary size is close to a full sort. Top-p alone, including a row whose k is disabled in a
+  mixed batch, uses vLLM's approximate CPU kernel: the kept set can differ from a full
+  sort by a few boundary tokens, and it does not drop below the requested probability
+  mass. Without those ops, top-k uses `topk`, top-k with top-p uses
+  `apply_top_k_top_p_sort_free`, and top-p alone sorts. Speculative decoding's
+  `apply_sampling_constraints` is separate from that sampler: it still calls vLLM's
+  `apply_top_k_top_p` and sorts. The shared `Sampler` only covers the token draw.
 
-The kernels live in `csrc/cpu/sampling_kernels.cpp` and are built with CMake from
+The kernels live in `csrc/cpu/sampling_kernels.cpp` and `csrc/cpu/topk_topp_sampler.cpp`,
+with the vector exp in `csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from
 `setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
 so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
-AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
-supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
+AVX2 fallback (`_C_AVX2`). `v1/sample/sampling_kernels.py` loads `_C` when
+`torch.cpu.get_capabilities()` reports `avx512_f`, `avx512_vl`, `avx512_bw` and
+`avx512_dq`, and `_C_AVX2` when it reports `avx2` and `fma3` but not that set.
+AVX512F alone is not enough: the build also uses VL, BW and DQ. The check ignores
+`ATEN_CPU_CAPABILITY`, so pinning ATen's dispatch level keeps the extension.
+The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
 cannot collide with a vLLM `_C` in the same environment. If the extension
 is missing or fails to import (a failed build, or a dev checkout that never built it), the

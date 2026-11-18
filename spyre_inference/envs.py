@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
     SPYRE_MODEL_RUNNER: str = "v1"
+    SPYRE_MRV2_KERNELS: str = "host"
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
@@ -40,7 +41,6 @@ if TYPE_CHECKING:
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
-    SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
+    SPYRE_MOE_PREP_THREADS: int = 0
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -63,9 +64,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
     # Which model runner the worker uses:
     #  - "v1": the V1 runner (default)
-    #  - "v2": the Model Runner V2 port (#906), in bring-up and not yet functional. On
-    #    x86 it runs MRV2's Triton kernels on triton-cpu.
+    #  - "v2": the Model Runner V2 port (#906), in bring-up
     "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v1",
+    # What runs MRV2's Triton kernels under SPYRE_MODEL_RUNNER=v2:
+    #  - "host": the csrc/ host ops kernels.bind() puts in their place; vLLM never
+    #    sees Triton (default, every arch)
+    #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference)
+    "SPYRE_MRV2_KERNELS": lambda: os.getenv("SPYRE_MRV2_KERNELS") or "host",
     # Granularity of the decoder's torch.compile graph:
     #  - "block": compile one transformer block at a time (default)
     #  - "model": compile the whole model as a single graph
@@ -112,21 +117,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
-    # Which KV cache layout the decoder attention backend uses, within a page:
-    #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which
-    #    drops the per-page permute the kernels do before the matmuls and is the only
-    #    layout with a batched decode kernel under the default tiled walk. It always
-    #    compiles attention, even under --enforce-eager.
-    #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size], the fallback
-    #    for a fully eager attention run.
-    "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "head_major",
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1" (default), enables the batched multi-sequence decode kernel.
-    # Under the default tiled walk it applies only to the
-    # head-major cache, which uses a split page index, so a token-major run keeps
-    # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.
@@ -159,6 +153,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MOE_CHUNKS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
     ),
+    # Threads that relayout and copy the routed-expert stacks of different MoE layers to the
+    # device at the same time during load. "0" (default) uses min(8, torch threads), this
+    # worker's share of the CPU budget, at most 16; "1" prepares one layer after another.
+    "SPYRE_MOE_PREP_THREADS": lambda: int(os.getenv("SPYRE_MOE_PREP_THREADS", "0")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

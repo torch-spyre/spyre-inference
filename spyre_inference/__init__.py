@@ -34,7 +34,7 @@ def register():
     # vLLM's plugin probe swallows exceptions here and falls back to another platform,
     # so errors are only logged; check_and_update_config rejects the resulting state.
     try:
-        if envs.SPYRE_MODEL_RUNNER == "v2":
+        if triton_gate.wants_triton(envs.SPYRE_MODEL_RUNNER, envs.SPYRE_MRV2_KERNELS):
             triton_gate.open()
         else:
             triton_gate.close()
@@ -42,6 +42,12 @@ def register():
         init_logger(__name__).exception("Spyre Triton gate could not be applied")
     # VllmConfig.__post_init__ reads use_v2_model_runner before the platform hook.
     pin_model_runner(envs.SPYRE_MODEL_RUNNER)
+    # flex and torch-spyre read these once, when the device runtime starts on the first
+    # device op in each worker, which is after this runs; an explicit value still wins.
+    # Preferred on a PF device only, not on a VF.
+    if os.environ.get("FLEX_DEVICE") == "PF":
+        for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
+            os.environ.setdefault(name, "1")
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 

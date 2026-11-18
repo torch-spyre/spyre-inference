@@ -47,7 +47,7 @@ outputs:
     description: The content-addressed key computed for this checkout.
 
 runs:
-  using: node20
+  using: node24
   main: main.js
   # Save only when the job is still green: never ship a cache from a run whose
   # build (or tests) failed, which could leave a partial tree under the key.

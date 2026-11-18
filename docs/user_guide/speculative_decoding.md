@@ -1,4 +1,36 @@
-# XPress speculative decoding
+# Speculative decoding
+
+Spyre supports two speculative methods: Gemma-4 MTP, on the V2 runner, and XPress
+(over DFlash), on either runner. The platform rejects any other method at startup.
+
+## Gemma-4 MTP
+
+Gemma-4 MTP drafts with the model's assistant checkpoint. The assistant runs one
+token per draft step and its layers read the target's KV cache, so it needs no KV of
+its own. It needs the V2 runner (`SPYRE_MODEL_RUNNER=v2`); V1 rejects it at startup.
+
+```bash
+export SPYRE_MODEL_RUNNER=v2
+uv run --no-sync vllm serve google/gemma-4-26B-A4B-it -tp 4 --max-model-len 32768 \
+  --max-num-seqs 32 \
+  --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}' \
+  --speculative-config '{"method": "mtp", "model": "google/gemma-4-26B-A4B-it-assistant", "num_speculative_tokens": 4}'
+```
+
+The platform adapts the configuration for MTP:
+
+- The drafter runs in float16, like the target.
+- Async scheduling is disabled; speculative decoding runs synchronously.
+- A verify step packs `1 + num_speculative_tokens` rows per running sequence. The
+  default compile sizes and attention buckets gain those widths, so verification runs
+  on the batched decode kernel, one row per verify token. Warmup takes longer as a
+  result.
+
+The drafter loads on the host, moves to Spyre and compiles per block like the target.
+Each draft forward pads onto a compiled body bucket. Upstream's speculator does the
+draft bookkeeping on the host.
+
+## XPress
 
 XPress runs a DFlash backbone once, refines a block of draft tokens, and lets
 the target model verify the proposals. The experimental Spyre integration loads

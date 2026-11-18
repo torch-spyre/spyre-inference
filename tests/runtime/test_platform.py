@@ -651,7 +651,9 @@ def test_fly_rejection_sampling_is_rejected(monkeypatch):
 
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
     monkeypatch.setattr(
-        vllm_config, "speculative_config", SimpleNamespace(rejection_sample_method="fly")
+        vllm_config,
+        "speculative_config",
+        SimpleNamespace(rejection_sample_method="fly", use_gemma4_mtp=lambda: False),
     )
 
     with pytest.raises(ValueError, match="rejection_sample_method='fly'"):

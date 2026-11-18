@@ -20,8 +20,9 @@
 // match it bit for bit.
 
 // MRV2 spec-decode host kernels: the rejection sampler
-// (gpu/spec_decode/rejection_sampler{,_utils}.py) and DFlash input prep
-// (gpu/spec_decode/dflash/speculator.py). Same contract as mrv2_kernels.cpp:
+// (gpu/spec_decode/rejection_sampler{,_utils}.py), DFlash input prep
+// (gpu/spec_decode/dflash/speculator.py) and the Gemma-4 MTP draft steps
+// (gpu/spec_decode/target_dependent_ar/speculator.py). Same contract as mrv2_kernels.cpp:
 // the grid, then the Triton kernel's own arguments by name and in order.
 // Block verification and watermarked resampling are refused by name.
 
@@ -656,6 +657,114 @@ void mrv2_prepare_dflash_inputs(
   }
 }
 
+// ---------------------------------------------- target_dependent_ar/speculator.py
+
+void mrv2_draft_prepare_prefill_inputs(
+    std::vector<int64_t> grid, const torch::Tensor& last_token_indices_ptr,
+    const torch::Tensor& draft_current_step_ptr, const torch::Tensor& draft_input_ids_ptr,
+    const torch::Tensor& draft_positions_ptr, const torch::Tensor& draft_query_start_loc_ptr,
+    const torch::Tensor& draft_seq_lens_ptr, const torch::Tensor& target_input_ids_ptr,
+    const torch::Tensor& target_positions_ptr, const torch::Tensor& idx_mapping_ptr,
+    const torch::Tensor& last_sampled_ptr, const torch::Tensor& next_prefill_tokens_ptr,
+    const torch::Tensor& num_sampled_ptr, const torch::Tensor& num_rejected_ptr,
+    const torch::Tensor& query_start_loc_ptr, const torch::Tensor& seq_lens_ptr,
+    int64_t max_num_reqs, int64_t BLOCK_SIZE) {
+  const Ints last_token_indices(last_token_indices_ptr), step(draft_current_step_ptr),
+      input_ids(draft_input_ids_ptr), positions(draft_positions_ptr),
+      draft_qsl(draft_query_start_loc_ptr), draft_seq_lens(draft_seq_lens_ptr),
+      target_ids(target_input_ids_ptr), target_pos(target_positions_ptr), idx(idx_mapping_ptr),
+      last_sampled(last_sampled_ptr), next_prefill(next_prefill_tokens_ptr),
+      num_sampled(num_sampled_ptr), num_rejected(num_rejected_ptr), qsl(query_start_loc_ptr),
+      seq_lens(seq_lens_ptr);
+  const int64_t num_reqs = grid[0];
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    const int64_t req = idx[r];
+    const int64_t query_start = qsl[r], query_end = qsl[r + 1];
+    const int64_t query_len = query_end - query_start - num_rejected[r];
+    const int64_t next_token =
+        num_sampled[r] > 0 ? int32_t(last_sampled[req]) : next_prefill[req];
+    // Shift the target's input ids by one.
+    for (int64_t i = 1; i < query_len; ++i)
+      input_ids.set(query_start + i - 1, target_ids[query_start + i]);
+    const int64_t last_token_index = query_start + query_len - 1;
+    last_token_indices.set(r, last_token_index);
+    input_ids.set(last_token_index, next_token);
+    for (int64_t i = 0; i < query_len; ++i)
+      positions.set(query_start + i, target_pos[query_start + i]);
+    draft_qsl.set(r, query_start);
+    draft_seq_lens.set(r, seq_lens[r]);
+    if (r == num_reqs - 1) {
+      step.set(0, 0);
+      for (int64_t i = num_reqs; i < max_num_reqs + 1; ++i) draft_qsl.set(i, query_end);
+      for (int64_t i = num_reqs; i < max_num_reqs; ++i) {
+        draft_seq_lens.set(i, 0);
+        last_token_indices.set(i, 0);
+      }
+    }
+  }
+}
+
+void mrv2_draft_prepare_decode_inputs(
+    std::vector<int64_t> grid, const torch::Tensor& draft_tokens_ptr,
+    int64_t draft_tokens_stride, const torch::Tensor& target_seq_lens_ptr,
+    const torch::Tensor& num_rejected_ptr, const torch::Tensor& input_ids_ptr,
+    const torch::Tensor& positions_ptr, const torch::Tensor& sample_src_positions_ptr,
+    const torch::Tensor& query_start_loc_ptr, const torch::Tensor& seq_lens_ptr,
+    int64_t max_model_len, int64_t max_num_reqs, int64_t BLOCK_SIZE,
+    bool ADVANCE_DRAFT_POSITIONS) {
+  const Ints draft_tokens(draft_tokens_ptr), target_seq_lens(target_seq_lens_ptr),
+      num_rejected(num_rejected_ptr), input_ids(input_ids_ptr), positions(positions_ptr),
+      sample_pos(sample_src_positions_ptr), qsl(query_start_loc_ptr), seq_lens(seq_lens_ptr);
+  const int64_t num_reqs = grid[0] - 1;
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    input_ids.set(r, draft_tokens[r * draft_tokens_stride]);
+    sample_pos.set(r, sample_pos[r] + 1);
+    int64_t seq_len = target_seq_lens[r] - num_rejected[r];
+    if (ADVANCE_DRAFT_POSITIONS) {
+      positions.set(r, std::min(positions[r] + 1, max_model_len - 1));
+      seq_len = std::min(seq_len + 1, max_model_len);
+    }
+    seq_lens.set(r, seq_len);
+  }
+  for (int64_t i = 0; i < max_num_reqs + 1; ++i) qsl.set(i, std::min(i, num_reqs));
+  for (int64_t i = num_reqs; i < max_num_reqs; ++i) seq_lens.set(i, 0);
+}
+
+void mrv2_update_draft_inputs(
+    std::vector<int64_t> grid, const torch::Tensor& output_draft_tokens_ptr,
+    int64_t output_draft_tokens_stride, const torch::Tensor& next_input_hidden_states_ptr,
+    int64_t next_input_hidden_states_stride, const torch::Tensor& input_ids_ptr,
+    const torch::Tensor& positions_ptr, const torch::Tensor& sample_src_positions_ptr,
+    const torch::Tensor& seq_lens_ptr, const torch::Tensor& draft_tokens_ptr,
+    const torch::Tensor& current_draft_step_ptr, const torch::Tensor& hidden_states_ptr,
+    int64_t hidden_states_stride, int64_t hidden_size, int64_t max_model_len,
+    int64_t num_speculative_steps, int64_t BLOCK_SIZE, bool ADVANCE_DRAFT_POSITIONS) {
+  const Ints output(output_draft_tokens_ptr), input_ids(input_ids_ptr),
+      positions(positions_ptr), sample_pos(sample_src_positions_ptr), seq_lens(seq_lens_ptr),
+      draft_tokens(draft_tokens_ptr), current_step(current_draft_step_ptr);
+  const int64_t num_reqs = grid[0];
+  const int64_t step = current_step[0];
+  for (int64_t r = 0; r < num_reqs; ++r)
+    output.set(r * output_draft_tokens_stride + step, draft_tokens[r]);
+  // The final step only records its draft.
+  if (step >= num_speculative_steps - 1 || num_reqs == 0) return;
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    sample_pos.set(r, sample_pos[r] + 1);
+    input_ids.set(r, draft_tokens[r]);
+    if (ADVANCE_DRAFT_POSITIONS) {
+      positions.set(r, std::min(positions[r] + 1, max_model_len - 1));
+      seq_lens.set(r, std::min(seq_lens[r] + 1, max_model_len));
+    }
+  }
+  // Every row's hidden state at once; copy_ casts as tl.store does.
+  const torch::Tensor& src = hidden_states_ptr;
+  const torch::Tensor& dst = next_input_hidden_states_ptr;
+  dst.as_strided({num_reqs, hidden_size}, {next_input_hidden_states_stride, 1},
+                 dst.storage_offset())
+      .copy_(src.as_strided({num_reqs, hidden_size}, {hidden_states_stride, 1},
+                            src.storage_offset()));
+}
+
 TORCH_LIBRARY_FRAGMENT(_spyre_C, ops) {
   ops.def("mrv2_flatten_sampled(int[] grid, Tensor flat_sampled_ptr, Tensor sampled_ptr, int sampled_stride, Tensor num_sampled_ptr, Tensor cu_num_logits_ptr) -> ()");
   ops.impl("mrv2_flatten_sampled", torch::kCPU, &mrv2_flatten_sampled);
@@ -671,4 +780,10 @@ TORCH_LIBRARY_FRAGMENT(_spyre_C, ops) {
   ops.impl("mrv2_insert_resampled", torch::kCPU, &mrv2_insert_resampled);
   ops.def("mrv2_prepare_dflash_inputs(int[] grid, Tensor out_input_ids_ptr, Tensor out_query_positions_ptr, Tensor out_is_padding_ptr, Tensor out_query_start_loc_ptr, Tensor out_seq_lens_ptr, Tensor out_query_slot_mapping_ptr, Tensor out_context_positions_ptr, Tensor out_context_slot_mapping_ptr, Tensor out_sample_indices_ptr, Tensor out_sample_pos_ptr, Tensor out_sample_idx_mapping_ptr, Tensor out_temperature_ptr, Tensor out_seeds_ptr, Tensor target_positions_ptr, Tensor target_query_start_loc_ptr, Tensor idx_mapping_ptr, Tensor last_sampled_ptr, Tensor next_prefill_tokens_ptr, Tensor num_sampled_ptr, Tensor num_rejected_ptr, Tensor temperature_ptr, Tensor seeds_ptr, Tensor block_table_ptr, int block_table_stride, int parallel_drafting_token_id, int block_size, int num_query_per_req, int num_speculative_steps, int max_num_reqs, int max_num_tokens, int max_model_len, int cp_rank, bool SAMPLE_FROM_ANCHOR, int PAD_SLOT_ID, int CP_SIZE, int CP_INTERLEAVE, int BLOCK_SIZE) -> ()");
   ops.impl("mrv2_prepare_dflash_inputs", torch::kCPU, &mrv2_prepare_dflash_inputs);
+  ops.def("mrv2_draft_prepare_prefill_inputs(int[] grid, Tensor last_token_indices_ptr, Tensor draft_current_step_ptr, Tensor draft_input_ids_ptr, Tensor draft_positions_ptr, Tensor draft_query_start_loc_ptr, Tensor draft_seq_lens_ptr, Tensor target_input_ids_ptr, Tensor target_positions_ptr, Tensor idx_mapping_ptr, Tensor last_sampled_ptr, Tensor next_prefill_tokens_ptr, Tensor num_sampled_ptr, Tensor num_rejected_ptr, Tensor query_start_loc_ptr, Tensor seq_lens_ptr, int max_num_reqs, int BLOCK_SIZE) -> ()");
+  ops.impl("mrv2_draft_prepare_prefill_inputs", torch::kCPU, &mrv2_draft_prepare_prefill_inputs);
+  ops.def("mrv2_draft_prepare_decode_inputs(int[] grid, Tensor draft_tokens_ptr, int draft_tokens_stride, Tensor target_seq_lens_ptr, Tensor num_rejected_ptr, Tensor input_ids_ptr, Tensor positions_ptr, Tensor sample_src_positions_ptr, Tensor query_start_loc_ptr, Tensor seq_lens_ptr, int max_model_len, int max_num_reqs, int BLOCK_SIZE, bool ADVANCE_DRAFT_POSITIONS) -> ()");
+  ops.impl("mrv2_draft_prepare_decode_inputs", torch::kCPU, &mrv2_draft_prepare_decode_inputs);
+  ops.def("mrv2_update_draft_inputs(int[] grid, Tensor output_draft_tokens_ptr, int output_draft_tokens_stride, Tensor next_input_hidden_states_ptr, int next_input_hidden_states_stride, Tensor input_ids_ptr, Tensor positions_ptr, Tensor sample_src_positions_ptr, Tensor seq_lens_ptr, Tensor draft_tokens_ptr, Tensor current_draft_step_ptr, Tensor hidden_states_ptr, int hidden_states_stride, int hidden_size, int max_model_len, int num_speculative_steps, int BLOCK_SIZE, bool ADVANCE_DRAFT_POSITIONS) -> ()");
+  ops.impl("mrv2_update_draft_inputs", torch::kCPU, &mrv2_update_draft_inputs);
 }

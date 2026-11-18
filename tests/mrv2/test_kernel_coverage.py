@@ -29,7 +29,8 @@ from .kernels import parity_cases, spec_decode_cases  # noqa: F401  (registers c
 
 # Modules MRV2's runner reaches outside vllm/v1/worker/gpu.
 _OUTSIDE_GPU = ("utils", "mamba_utils")
-# The speculators Spyre builds on V2 (XPress, over DFlash), plus the shared verifier.
+# The speculators Spyre builds on V2 (XPress over DFlash, and Gemma-4 MTP), plus the
+# shared verifier.
 _SPEC_DECODE = "gpu.spec_decode"
 _SPEC_DECODE_BOUND = tuple(
     f"{_SPEC_DECODE}.{m}"
@@ -38,6 +39,7 @@ _SPEC_DECODE_BOUND = tuple(
         "rejection_sampler_utils",
         "acceptance_estimator",
         "dflash.speculator",
+        "target_dependent_ar.speculator",
         "xpress.kernels",
     )
 )

@@ -239,7 +239,7 @@ def test_the_runner_replaces_upstreams_speculator(monkeypatch):
     monkeypatch.setattr(model_runner, "validate_dflash_config", lambda config: None)
     monkeypatch.setattr(
         model_runner,
-        "SpyreDFlashSpeculator",
+        "init_speculator",
         lambda config, device, spyre_device: ("spyre", device, spyre_device),
     )
     spyre = torch.device("meta")

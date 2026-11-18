@@ -76,6 +76,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
     batched_decode_chunking,
+    speculative_verify_len,
 )
 from spyre_inference.v1.worker import compile_guard
 
@@ -391,7 +392,8 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
     num_decode_seqs: int = 0  # leading decode-only seqs; == num_seqs for pure-decode batches
-    num_decode_tokens: int = 0  # == num_decode_seqs since each decode contributes one token
+    # Rows of the decode prefix: one per decode, k + 1 per speculative verify sequence.
+    num_decode_tokens: int = 0
     decode_uniformity: float = 0.0  # mean/max decode block count; 0.0 when batched path ineligible
     padded_num_seqs: int | None = None
     padded_batch_blocks: int | None = None
@@ -492,8 +494,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # compiles are exactly the ones build() can round onto.
         self._attn_bucketer = SpyreAttnBucketer(vllm_config)
 
+        # A Gemma-4 MTP verify row (1 + num_speculative_tokens queries) is a decode too:
+        # build() runs each of its query tokens as its own batched-decode row.
         self._init_reorder_batch_threshold(
-            reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
+            reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None,
+            supports_spec_as_decode=speculative_verify_len(vllm_config) > 1,
         )
 
     @property
@@ -1001,8 +1006,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
+            # One kernel row per decode query token. A speculative verify sequence's
+            # k + 1 tokens each read its pages under their own row of its causal mask
+            # tiles; a plain decode is the k == 0 case.
+            decode_query_lens = query_lens[:num_decode_seqs].tolist()
+            row_seqs = [s for s, n in enumerate(decode_query_lens) for _ in range(n)]
+            row_offsets = [q for n in decode_query_lens for q in range(n)]
             decode_blocks = blocks_per_seq[:num_decode_seqs]
-            b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
+            b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_tokens)
             b_blocks = (
                 self._attn_bucketer.find_batched_blocks_bucket(max(decode_blocks), b_seqs)
                 if b_seqs is not None
@@ -1013,7 +1024,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Mean/max block count: how uniform the contexts are, independent of
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
-                prefix = list(range(num_decode_seqs))
                 (
                     padded_num_seqs,
                     blocks_per_chunk,
@@ -1022,7 +1032,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     chunk_page_ids_cpu,
                     mask_by_chunk_cpu,
                 ) = self._batched_decode_tensors(
-                    prefix,
+                    row_seqs,
                     b_seqs,
                     b_blocks,
                     blocks_per_seq,
@@ -1030,10 +1040,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     query_start_loc,
                     active_block_indices,
                     attention_mask_stacks,
+                    row_offsets,
                 )
-                # Guards the identity scatter used by _run_batched_decode_dispatch.
-                assert query_start_loc[:num_decode_seqs].tolist() == prefix
-                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
+                # Guards the identity scatter used by _run_batched_decode_dispatch: the
+                # decode prefix's rows are its tokens, in order.
+                assert rep_row_ids_cpu[:num_decode_tokens].tolist() == list(
+                    range(num_decode_tokens)
+                )
+                # Jagged groups scatter by sequence, so only one-token decode rows group.
+                if (
+                    envs.SPYRE_JAGGED_DECODE
+                    and decode_uniformity < 1.0
+                    and num_decode_tokens == num_decode_seqs
+                ):
                     decode_groups = self._batched_decode_groups(
                         decode_blocks,
                         blocks_per_seq,
@@ -1084,9 +1103,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         query_start_loc: torch.Tensor,
         active_block_indices: list | None,
         attention_mask_stacks: list[torch.Tensor],
+        row_offsets: list[int] | None = None,
     ) -> tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batched-decode precomputes, one kernel row per entry of ``members``.
+
+        ``members`` holds each row's sequence, and ``row_offsets`` each row's query
+        position within it (all 0, one row per sequence, when omitted): the row reads
+        that query token and that row of the sequence's mask tiles.
+        """
         block_size = self.block_size
         n = len(members)
+        offsets = row_offsets if row_offsets is not None else [0] * n
         decode_blocks = [blocks_per_seq[m] for m in members]
         # Padding columns gather page 0 under an all--inf mask and
         # contribute zero; chunk 0 still holds every real row's block 0,
@@ -1095,7 +1122,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         padded_batch_blocks = num_chunks * blocks_per_chunk
         assert padded_batch_blocks >= b_blocks
         query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
-        query_row_ids[:n] = query_start_loc[members].to(torch.int32)
+        query_row_ids[:n] = (
+            query_start_loc[members] + torch.tensor(offsets, dtype=query_start_loc.dtype)
+        ).to(torch.int32)
         # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
         rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
 
@@ -1130,7 +1159,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # filled from those tiles; correct only because they are finfo.min.
             n_use = min(blocks_per_seq[m], b_blocks)
             if n_use:
-                mask_bs_bb[s, :n_use] = attention_mask_stacks[m][:n_use, 0]
+                mask_bs_bb[s, :n_use] = attention_mask_stacks[m][:n_use, offsets[s]]
         # A row past the batch is -inf in every block, so its softmax is NaN and
         # the in-graph store would publish it. A real row always has a valid
         # block 0, so its padded blocks can stay -inf and contribute zero.
@@ -2037,10 +2066,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
         # each chunk block-major to avoid an int32 index relayout; and the result
         # scatter is a single contiguous copy_ at offset 0, valid because the decode
-        # prefix's query rows are range(num_decode_seqs) (asserted in the builder).
+        # prefix's query rows are range(num_decode_tokens) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
-        num_decode_seqs = attn_metadata.num_decode_seqs
+        num_decode_rows = attn_metadata.num_decode_tokens
         num_heads = self.num_heads
         head_size = self.head_size
         block_size = attn_metadata.block_size
@@ -2077,14 +2106,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if store_out:
             return
 
-        # The decode prefix's query rows are range(num_decode_seqs), so the scatter
+        # The decode prefix's query rows are range(num_decode_tokens), so the scatter
         # is a contiguous prefix write at (0, 0). Neither per-row
         # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
         # via @compile_once and can return a stale binary) nor eager index_copy_
         # (rejects the int32 row index) is safe here.
         result_flat = result.reshape(b_seqs, num_heads, head_size)
-        src_block = result_flat[:num_decode_seqs].clone()
-        output[:num_decode_seqs].copy_(src_block)
+        src_block = result_flat[:num_decode_rows].clone()
+        output[:num_decode_rows].copy_(src_block)
 
     def _grouped_decode_preconditions_met(
         self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
@@ -2114,6 +2143,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 group.metadata = replace(
                     attn_metadata,
                     num_decode_seqs=group.num_seqs,
+                    num_decode_tokens=group.num_seqs,
                     padded_num_seqs=group.padded_num_seqs,
                     blocks_per_chunk=group.blocks_per_chunk,
                     padded_batch_blocks=group.padded_batch_blocks,
@@ -2136,8 +2166,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             assert group.rows_dev is not None
             _scatter_rows_compiled(store, group.rows_dev, group_out)
         if store is not output:
-            num_decode_seqs = attn_metadata.num_decode_seqs
-            output[:num_decode_seqs].copy_(store[:num_decode_seqs].clone())
+            num_decode_rows = attn_metadata.num_decode_tokens
+            output[:num_decode_rows].copy_(store[:num_decode_rows].clone())
 
     def _group_store_rows(self, rows: list[int], padded_num_seqs: int) -> torch.Tensor:
         # Padded to the seq bucket so the store compiles once per bucket. Padding writes the

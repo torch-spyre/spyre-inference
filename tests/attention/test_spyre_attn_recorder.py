@@ -145,6 +145,7 @@ def sliding_window_builder(default_vllm_config):
 
 def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
     config = MagicMock()
+    config.speculative_config = None
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens

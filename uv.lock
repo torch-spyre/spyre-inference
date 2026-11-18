@@ -891,7 +891,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "torch", version = "2.14.1a0+git5c48869", source = { git = "https://github.com/pytorch/pytorch?tag=v2.14.1#5c4886908584029761b579af026dcfb627c84070" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
+    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
     { name = "transformers" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2c/9e/d7f18bd9a0354088abc11a0c1f2c7698f7c49e5a709faedf6a46e388f693/compressed_tensors-0.17.0.tar.gz", hash = "sha256:15c20d06bdbcf35b51fc99fd125e7b9be1e1855567c33b7a46dfac26ad6fb126", size = 257091, upload-time = "2026-06-03T16:49:17.208Z" }
@@ -5365,7 +5365,7 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch", version = "2.14.1a0+git5c48869", source = { git = "https://github.com/pytorch/pytorch?tag=v2.14.1#5c4886908584029761b579af026dcfb627c84070" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
+    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
     { name = "tqdm" },
     { name = "transformers" },
     { name = "typing-extensions" },
@@ -5608,7 +5608,7 @@ source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.14.1a0+git5c48869", source = { git = "https://github.com/pytorch/pytorch?tag=v2.14.1#5c4886908584029761b579af026dcfb627c84070" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
+    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
     { name = "torch-spyre", extra = ["cpsat"] },
     { name = "torchvision", version = "0.29.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.29.1", source = { git = "https://github.com/pytorch/vision?tag=v0.29.1#1f1a920d685d46dfbe187934b785b7ecb7a182f2" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
@@ -5630,7 +5630,7 @@ dev = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", specifier = "==2.14.1", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.14.1" },
-    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=cab4721d4a3ff111338cc3edce0d495edb979012" },
+    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=75d8688bb5090e98c815b88471a50c351b6b4faf" },
     { name = "torchvision", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'", specifier = "==0.29.1", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'", git = "https://github.com/pytorch/vision?tag=v0.29.1" },
     { name = "transformers", specifier = "<5.17" },
@@ -5982,8 +5982,8 @@ wheels = [
 
 [[package]]
 name = "torch-spyre"
-version = "0.6.0.dev505+master.gcab4721d"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=cab4721d4a3ff111338cc3edce0d495edb979012#cab4721d4a3ff111338cc3edce0d495edb979012" }
+version = "0.6.0.dev537+main.g75d8688b"
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=75d8688bb5090e98c815b88471a50c351b6b4faf#75d8688bb5090e98c815b88471a50c351b6b4faf" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
@@ -5992,7 +5992,7 @@ dependencies = [
     { name = "regex" },
     { name = "torch", version = "2.14.1a0+git5c48869", source = { git = "https://github.com/pytorch/pytorch?tag=v2.14.1#5c4886908584029761b579af026dcfb627c84070" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
+    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
 ]
 
 [package.optional-dependencies]
@@ -6623,7 +6623,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "torch", version = "2.14.1a0+git5c48869", source = { git = "https://github.com/pytorch/pytorch?tag=v2.14.1#5c4886908584029761b579af026dcfb627c84070" }, marker = "platform_machine == 'ppc64le'" },
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or (platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform != 'darwin')" },
+    { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and sys_platform != 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin')" },
     { name = "transformers" },
     { name = "typing-extensions" },
 ]

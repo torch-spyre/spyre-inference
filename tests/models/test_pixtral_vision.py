@@ -351,7 +351,7 @@ def test_compiled_manager_runs_one_call_per_image_on_spyre(tp_group):
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: 0 if modality == "video" else 2,
                 mm_encoder_tp_mode="weights",
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )

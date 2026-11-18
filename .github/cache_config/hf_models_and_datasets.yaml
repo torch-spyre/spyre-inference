@@ -30,6 +30,7 @@ public_models:
     revision: e69e3580df7a7cd76b77e82ef739803fd88ee445
   - mistralai/Mistral-7B-Instruct-v0.3
   - mistralai/Ministral-3-14B-Instruct-2512-BF16
+  - mistralai/Ministral-3-14B-Instruct-2512
   - BAAI/bge-base-en-v1.5
   - sentence-transformers/all-MiniLM-L12-v2
   - repo: ibm-granite/granite-embedding-125m-english

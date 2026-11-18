@@ -347,6 +347,7 @@ def test_compiled_manager_runs_one_call_per_image_on_spyre(tp_group):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
+            max_model_len=4096,
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: 0 if modality == "video" else 2,
                 mm_encoder_tp_mode="weights",

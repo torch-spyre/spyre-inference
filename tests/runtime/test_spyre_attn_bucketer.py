@@ -26,6 +26,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _parse_buckets,
     _powers_of_two_up_to,
     batched_decode_chunking,
+    batched_decode_entries,
 )
 
 BLOCK_SIZE = 64
@@ -604,7 +605,7 @@ class TestBatchedDecodeVariants:
 
     def test_chunking_matches_the_shared_helper(self, enabled):
         for v in enabled.batched_decode_variants():
-            assert batched_decode_chunking(v.num_seqs, v.num_blocks) == (
+            assert enabled.decode_chunking(v.num_seqs, v.num_blocks) == (
                 v.blocks_per_chunk,
                 v.num_chunks,
             )
@@ -614,8 +615,38 @@ class TestBatchedDecodeVariants:
     def test_chunking_pads_when_the_ladder_is_not_a_power_of_two(self):
         """With power-of-two buckets the padding vanishes, so a drifting copy of the
         chunking rule would look correct."""
-        assert batched_decode_chunking(8, 8) == (4, 2)  # 4*2 == 8, no padding
-        assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
+        assert batched_decode_chunking(8, 16, 64) == (8, 2)  # 8*2 == 16, no padding
+        assert batched_decode_chunking(6, 16, 64) == (10, 2)  # 10*2 == 20, padded
+        assert batched_decode_chunking(6, 16, 32) == (5, 4)  # 5*4 == 20, padded
+
+    @pytest.mark.parametrize(
+        ("num_kv_heads", "head_size", "entries"),
+        [
+            (8, 128, 64),  # granite-4 8B at TP1
+            (2, 128, 64),  # granite-4 8B at TP4
+            (8, 256, 32),  # gemma-4 sliding-window layers at TP1
+            (4, 256, 64),  # gemma-4 sliding-window layers at TP2
+            (2, 512, 64),  # gemma-4 full-attention layers at TP1
+            (16, 256, 32),  # too wide even for one entry per core: never below one
+        ],
+    )
+    def test_entries_drop_to_one_per_core_for_a_wide_kv_row(self, num_kv_heads, head_size, entries):
+        assert batched_decode_entries(num_kv_heads, head_size) == entries
+
+    def test_bucketer_records_its_group_chunking(self, monkeypatch):
+        """Each layer group's bucketer records the chunking its builder dispatches onto."""
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        narrow = SpyreAttnBucketer(make_config(8192, 512, max_num_seqs=8), decode_entries=32)
+        wide = SpyreAttnBucketer(make_config(8192, 512, max_num_seqs=8))
+
+        def per_chunk(b: SpyreAttnBucketer) -> dict[tuple[int, int], int]:
+            return {
+                (v.num_seqs, v.num_blocks): v.blocks_per_chunk for v in b.batched_decode_variants()
+            }
+
+        assert per_chunk(narrow)[(8, 128)] == 4
+        assert per_chunk(wide)[(8, 128)] == 8
 
     def test_count_stays_tractable_at_long_context(self, monkeypatch):
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")

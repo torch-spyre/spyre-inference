@@ -51,18 +51,32 @@ logger = init_logger(__name__)
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 
-# Cores available to split a gather's entry axis across.
+# Gathered pages per batched-decode trip, as whole entries per core: an uneven split costs a
+# full trip for a partial gather. Each trip has a fixed cost, so two entries per core halve a
+# long context's trips, as long as both of a core's K and V pages fit on chip.
 _SPYRE_CORE_COUNT = 32
+_MAX_ENTRIES_PER_CORE = 2
+# Head elements (num_kv_heads * head_size, per entry) one core's trip may gather before a
+# second entry per core turns slower than one: the largest row measured faster at two.
+_CORE_ROW_BUDGET = 2 * 8 * 128
+BATCHED_DECODE_MAX_ENTRIES = _MAX_ENTRIES_PER_CORE * _SPYRE_CORE_COUNT
 
 
-def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
+def batched_decode_entries(num_kv_heads: int, head_size: int) -> int:
+    """Pages per batched-decode trip for a layer group of this per-card KV shape."""
+    per_core = _MAX_ENTRIES_PER_CORE
+    while per_core > 1 and per_core * num_kv_heads * head_size > _CORE_ROW_BUDGET:
+        per_core //= 2
+    return per_core * _SPYRE_CORE_COUNT
+
+
+def batched_decode_chunking(b_seqs: int, b_blocks: int, entries: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
-    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
-    them, more than one stick's worth hits a backend axis-merge limit. The block
-    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+    ``entries = b_seqs * blocks_per_chunk`` targets ``entries``: fewer takes more trips.
+    The block axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
-    blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    blocks_per_chunk = max(1, min(entries // b_seqs, b_blocks))
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
     return blocks_per_chunk, num_chunks
 
@@ -255,7 +269,12 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
+    def __init__(
+        self, vllm_config: VllmConfig, decode_entries: int = BATCHED_DECODE_MAX_ENTRIES
+    ) -> None:
+        # Per layer group (see batched_decode_entries), so the builder that dispatches and
+        # the recorder that walks this instance agree on every group's chunking.
+        self.decode_entries = decode_entries
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
@@ -402,12 +421,15 @@ class SpyreAttnBucketer:
     def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
         """The num_blocks buckets batched decode records and dispatches onto at this batch size.
 
-        The default ``SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`` is tuned to ``batched_decode_chunking``;
+        The default ``SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`` is tuned to ``decode_chunking``;
         revisit it if that chunking changes.
         """
         if num_seqs_bucket >= self._large_batch_min_seqs:
             return self._large_batch_blocks_buckets
         return self._num_blocks_buckets
+
+    def decode_chunking(self, num_seqs: int, num_blocks: int) -> tuple[int, int]:
+        return batched_decode_chunking(num_seqs, num_blocks, self.decode_entries)
 
     def find_batched_blocks_bucket(self, num_blocks: int, num_seqs_bucket: int) -> int | None:
         return self._round_up(num_blocks, self.batched_blocks_buckets(num_seqs_bucket))
@@ -461,7 +483,7 @@ class SpyreAttnBucketer:
             reverse=True,
         )
         for num_blocks, num_seqs in pairs:
-            blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+            blocks_per_chunk, num_chunks = self.decode_chunking(num_seqs, num_blocks)
             out.append(
                 SpyreAttnBatchedDecodeBucket(
                     num_seqs=num_seqs,

@@ -394,7 +394,7 @@ markers = [
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
-    "mlp: Spyre linear-layer tests: merged-column, QKV, row-parallel and replicated layers, and the transposed-weight linear method (tests/custom_ops/test_mlp.py, tests/custom_ops/test_linear.py)",
+    "mlp: Spyre linear-layer tests: merged-column, QKV, row-parallel, replicated and router-gate layers, and the transposed-weight linear method (tests/custom_ops/test_mlp.py, tests/custom_ops/test_linear.py, tests/custom_ops/test_gate_linear.py)",
     "parallel_lm_head: SpyreParallelLMHead custom-op tests (tests/custom_ops/test_parallel_lm_head.py)",
     "padding_workaround: LM-head vocab-padding tests for a torch-spyre work-division shape limit (tests/custom_ops/test_parallel_lm_head.py); remove with the workaround",
     "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",

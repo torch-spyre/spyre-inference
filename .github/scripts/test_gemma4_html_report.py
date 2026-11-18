@@ -12,26 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for the gemma4-benchmark HTML report's script-context escape.
-
-Labels derive from branch names and commit subjects, which a fork-PR author
-controls, so a `</script>`-carrying label must not be able to break out of the
-inline chart-data script element.
+"""gemma4-benchmark's html_report.py: the chart-data script embedding. Kept here so
+the pre-commit ingest-script-tests job runs it (it is not spyre-inference product code).
 """
+
+from __future__ import annotations
 
 import importlib.util
 import json
-from pathlib import Path
+import pathlib
 
 _SCRIPT = (
-    Path(__file__).resolve().parents[1]
-    / ".claude"
-    / "skills"
-    / "gemma4-benchmark-detailed"
-    / "scripts"
-    / "html_report.py"
+    pathlib.Path(__file__).resolve().parents[2]
+    / ".claude/skills/gemma4-benchmark-detailed/scripts/html_report.py"
 )
-_spec = importlib.util.spec_from_file_location("html_report", _SCRIPT)
+
+_spec = importlib.util.spec_from_file_location("gemma4_html_report", _SCRIPT)
 html_report = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(html_report)
 
@@ -50,14 +46,14 @@ def test_charts_js_safe_labels_unchanged():
     assert html_report.charts_js(payload) == '{"rows": [{"name": "main"}, {"name": "hf-adapters"}]}'
 
 
-def _fixture_suite(top: Path, branch_name: str) -> Path:
+def _fixture_suite(top: pathlib.Path, branch_name: str) -> pathlib.Path:
     """One minimal run_1102.sh-shaped run whose branch arm carries the payload."""
     out = top / "suite" / "run0" / "out_8"
     out.mkdir(parents=True)
     (out.parent / "workload.json").write_text('{"tp": 1, "itl": false}')
     (out / "meta.json").write_text('{"arm": "vllm", "rep": 0, "output_len": 8}')
     # The branch name reaches report.labels() -> the plain label -> CHARTS.
-    (out.parent / "env_vllm.json").write_text(
+    (out.parent / "env_branch.json").write_text(
         json.dumps({"spyre-inference": {"branch": branch_name, "commit": "0123456789abcdef"}})
     )
     (out / "latency.json").write_text('{"latencies": [1.0, 1.0, 1.0]}')

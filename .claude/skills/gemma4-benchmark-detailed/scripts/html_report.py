@@ -180,7 +180,7 @@ def charts_js(data: dict) -> str:
     would break out of the script element. Labels come from branch names and
     commit subjects, which a fork-PR author controls.
     """
-    return json.dumps(data).replace("</", "<\/")
+    return json.dumps(data).replace("</", "<\\/")
 
 
 def chart_data(ms: list[dict], plain: dict, ids: list[str]) -> list[dict]:

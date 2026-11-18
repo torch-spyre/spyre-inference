@@ -403,8 +403,10 @@ def drop_cpu_device_layouts(monkeypatch) -> None:
 
 
 def use_kv_buckets(monkeypatch) -> None:
-    """Make the per-sequence kernels use the KV buckets rather than a page range."""
+    """Make metadata builders use the KV buckets rather than a page range."""
+    from spyre_inference.v1.attention.backends import spyre_attn
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
     monkeypatch.setattr(
-        "spyre_inference.v1.attention.spyre_attn_bucketer._declared_page_range",
-        lambda max_pages: None,
+        spyre_attn, "SpyreAttnBucketer", lambda vllm_config, **_: SpyreAttnBucketer(vllm_config)
     )

@@ -143,13 +143,15 @@ def sliding_window_builder(default_vllm_config):
     )
 
 
-def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
+def make_bucketer(
+    max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8, declare_pages=False
+):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
-    return SpyreAttnBucketer(config)
+    return SpyreAttnBucketer(config, declare_pages=declare_pages)
 
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
@@ -160,6 +162,7 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
 def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
     from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -194,7 +197,11 @@ def test_mask_mirror_normalizes_singleton_strides_and_keeps_its_cached_copy(shap
         shape, tuple(1 if size == 1 else stride for size, stride in zip(shape, stack.stride()))
     )
     metadata = SimpleNamespace(
-        attention_mask_stacks=[stack], attention_mask_stacks_device=None, num_seqs=1
+        attention_mask_stacks=[stack],
+        attention_mask_stacks_device=None,
+        num_seqs=1,
+        page_range=None,
+        seq_page_range=lambda seq_idx: None,
     )
     mirrored = _mirror_mask_stack(metadata, 0, torch.device("cpu"))
     torch.testing.assert_close(mirrored, stack, rtol=0, atol=0)
@@ -445,7 +452,9 @@ class TestRecordGraphs:
     ):
         """Without a window every bucket must realize onto itself; drift is a bug."""
         builder._attn_bucketer = make_bucketer()
-        monkeypatch.setattr(builder, "_pad_num_blocks", lambda n: min(n * 2, NUM_PAGES) if n else 0)
+        monkeypatch.setattr(
+            builder, "_pad_num_blocks", lambda n, prefill=False: min(n * 2, NUM_PAGES) if n else 0
+        )
 
         with caplog.at_level(logging.WARNING):
             _record(impl, kv_cache, builder)
@@ -460,6 +469,30 @@ class TestRecordGraphs:
         with caplog.at_level(logging.WARNING):
             _record(impl, kv_cache, sliding_window_builder)
 
+        assert "diverged" not in caplog.text
+
+    def test_prefill_rounding_onto_its_page_granularity_is_quiet(self, impl, builder, caplog):
+        """With a page range build() rounds a prefill page count up to the prefill
+        granularity, which is not drift."""
+        from torch_spyre._inductor import config as ts_config
+
+        # Not monkeypatch: its undo deletes a config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=2, max_buckets=32):
+            # 20 pages, which prefill rounds up to 24.
+            builder._attn_bucketer = make_bucketer(
+                max_model_len=20 * BLOCK_SIZE, max_num_batched_tokens=16, declare_pages=True
+            )
+            assert builder.attn_bucketer.prefill_page_range["max"] == 24
+            shape = (24, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
+            kv_cache = SpyrePagedKVCache(
+                k_pages=torch.zeros(shape, dtype=torch.float16),
+                v_pages=torch.zeros(shape, dtype=torch.float16),
+            )
+
+            with caplog.at_level(logging.WARNING):
+                recorded = _record(impl, kv_cache, builder)
+
+        assert recorded == len(builder.attn_bucketer.variants())
         assert "diverged" not in caplog.text
 
     def test_skips_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
@@ -541,6 +574,7 @@ class TestRecordGraphs:
         """
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+        monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
         cfg = get_current_vllm_config()
         monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
 

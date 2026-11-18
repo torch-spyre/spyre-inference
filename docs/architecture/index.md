@@ -410,7 +410,7 @@ materialized contiguously first.
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
+| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets (the per-sequence kernels usually keep each sequence's own block count instead, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
 | 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter, one per KV head, through a row view of the paged cache (fused into one kernel); only the row-index vectors are computed host-side and copied over |
 | 3. Page attention | Spyre | Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 4. Write-back | Spyre | Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy |
@@ -436,7 +436,12 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
 per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
 block counts that fit its smallest real query length; variants exceeding the allocated
-page count are skipped. Failed recordings are logged and compile on first use instead.
+page count are skipped. When the per-sequence page count is dynamic (copied to the device
+with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
+bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
+it. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
+traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
+compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and

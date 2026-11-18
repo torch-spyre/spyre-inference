@@ -19,17 +19,6 @@ from spyre_inference import envs
 from spyre_inference.v1.worker import compile_guard
 
 
-def pytest_configure(config):
-    # Registered here rather than in pyproject.toml's markers list: that file
-    # is a protected environment file, and a docs-only marker line should not
-    # need the /confirm-environment-changes acknowledgment on every PR.
-    config.addinivalue_line(
-        "markers",
-        "convert: spyre_convert op and convert/place_row_gathered helper tests"
-        " (tests/custom_ops/test_convert_utils.py)",
-    )
-
-
 def pytest_collection_modifyitems(items):
     """Stamp each item's JUnit tags at collection, not in a fixture: pytest skips a
     function-scoped autouse fixture entirely for a marked skip, a true skipif,

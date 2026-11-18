@@ -27,7 +27,6 @@ import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
-@pytest.mark.convert
 def test_convert_noop_returns_same_tensor():
     """A tensor already on the target device and dtype is returned as-is (the
     short-circuit keeps a same-device spyre_convert out of Inductor graphs),
@@ -41,7 +40,6 @@ def test_convert_noop_returns_same_tensor():
     assert convert(None, device="cpu", dtype=torch.float32) is None
 
 
-@pytest.mark.convert
 def test_convert_dtype_change_on_cpu(default_vllm_config):
     """A dtype-only conversion routes through the opaque spyre_convert op
     (registered by the fixture) and keeps the values."""
@@ -53,7 +51,6 @@ def test_convert_dtype_change_on_cpu(default_vllm_config):
     torch.testing.assert_close(out, t.float())
 
 
-@pytest.mark.convert
 def test_convert_op_rejects_same_device_and_dtype(default_vllm_config):
     """The op body treats a true no-op as a bug (the Python boundary is
     responsible for short-circuiting it) and must say so."""
@@ -62,7 +59,6 @@ def test_convert_op_rejects_same_device_and_dtype(default_vllm_config):
         torch.ops.vllm.spyre_convert(t, None, None)
 
 
-@pytest.mark.convert
 def test_convert_tensor_tree_walks_and_filters(default_vllm_config):
     """The tree walk converts every tensor in a nested structure, passes
     non-tensors and None through untouched, and the predicate excludes
@@ -85,7 +81,6 @@ def test_convert_tensor_tree_walks_and_filters(default_vllm_config):
     assert out["b"][0] is fp32  # excluded by the predicate
 
 
-@pytest.mark.convert
 @pytest.mark.parametrize(
     "shape,expected_size,expected_strides",
     [
@@ -108,7 +103,6 @@ def test_row_outermost_layout_describes_gather_source(shape, expected_size, expe
         assert valid == {(0,): shape[0], (1,): shape[1], (2, 3): shape[2]}
 
 
-@pytest.mark.convert
 @pytest.mark.parametrize("shape", [(2, 32), (2, 96)])
 def test_row_outermost_layout_rejects_partial_sticks(shape):
     """A last dim that is not a whole number of sticks has no exact padded
@@ -118,7 +112,6 @@ def test_row_outermost_layout_rejects_partial_sticks(shape):
     assert row_outermost_layout(shape, torch.float16) is None
 
 
-@pytest.mark.convert
 def test_place_row_gathered_off_device_fn_uses_plain_path():
     """A fn whose probe lands off Spyre needs no layout: the source goes
     through fn unchanged, with exactly one call."""
@@ -136,7 +129,6 @@ def test_place_row_gathered_off_device_fn_uses_plain_path():
     torch.testing.assert_close(out, src * 2)
 
 
-@pytest.mark.convert
 def test_convert_moves_cpu_to_spyre_and_back():
     """cpu->spyre and spyre->cpu transfers round-trip the values (within fp16
     ULPs: the device transfer is not bit-exact)."""
@@ -154,7 +146,6 @@ def test_convert_moves_cpu_to_spyre_and_back():
     torch.testing.assert_close(back, t, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.convert
 def test_convert_spyre_dtype_change_detours_through_cpu():
     """Spyre cannot change dtype on device, so a dtype change from a Spyre
     tensor hops via the host before landing on the target device."""
@@ -168,7 +159,6 @@ def test_convert_spyre_dtype_change_detours_through_cpu():
     torch.testing.assert_close(out, t.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.convert
 def test_place_row_gathered_puts_rows_outermost_on_spyre():
     """A stick-aligned 2D source is placed on the device with its rows
     outermost (probe learns the destination from fn) and survives the move."""
@@ -191,7 +181,6 @@ def test_place_row_gathered_puts_rows_outermost_on_spyre():
     torch.testing.assert_close(out.cpu(), src, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.convert
 def test_place_row_gathered_narrow_rows_keep_default_layout():
     """A row width that is not a whole stick cannot be laid out row-outermost,
     so the source falls back to the plain fn path (still correct values)."""

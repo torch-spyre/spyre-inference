@@ -2501,6 +2501,16 @@ are missing.</p>
 <td>Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); <code>greedy_argmax</code> matches <code>torch.argmax</code> on NaN; inputs are checked. Port performance and correctness changes, never the table.</td>
 </tr>
 <tr>
+<td><code>csrc/cpu/topk_topp_sampler.cpp</code></td>
+<td>vLLM CPU top-k/top-p, AVX512 and AVX2 from vllm#43452, VSX and VXE from vllm#62440. Not a same-path file on current vLLM main.</td>
+<td>Tie-inclusive top-k; upstream keeps exactly k. Top-k plus top-p is an exact softmax cut on the survivors. Top-p alone, and a top-p-only row in a mixed batch, stays the approximate upstream kernel. Re-sync those two PRs, not only the files in the diff below.</td>
+</tr>
+<tr>
+<td><code>csrc/cpu/cpu_fast_exp.hpp</code></td>
+<td>No upstream file. The polynomial is the unmerged <code>DEFINE_FAST_EXP</code> from vllm#62440 (AVX512) and vllm#43452 (AVX2); vLLM did not merge it, Intel preferred Triton.</td>
+<td>AVX2 FMA is a function attribute on <code>fast_exp</code> and the two top-p row functions that inline it. The rest of <code>_C_AVX2</code> is built with <code>-mno-fma</code>, because leaving <code>-mfma</code> off does not clear FMA when GCC defaults to x86-64-v3. s390x evaluates it on VXE lanes; Power calls <code>FP32Vec16::exp()</code>. Kept out of <code>cpu_types_*.hpp</code>, which stay line-unchanged copies. Nothing to diff for it on a vLLM bump.</td>
+</tr>
+<tr>
 <td><code>csrc/core/registration.h</code>, <code>cmake/utils.cmake</code>, <code>cmake/cpu_extension.cmake</code></td>
 <td>same paths</td>
 <td>Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of <code>-march=native</code>, so wheels are portable.</td>
@@ -2508,7 +2518,7 @@ are missing.</p>
 <tr>
 <td><code>SpyreTopKTopPSampler.forward_native</code> (<code>spyre_inference/v1/sample/topk_topp_sampler.py</code>)</td>
 <td><code>TopKTopPSampler.forward_native</code> (<code>vllm/v1/sample/ops/topk_topp_sampler.py</code>)</td>
-<td>Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors.</td>
+<td>Reimplements the upstream tail (kernel top-k/top-p when the ops are in the loaded extension, otherwise sort-free top-k, plus the kernel draw); its comment names the vLLM version it mirrors.</td>
 </tr>
 <tr>
 <td><code>spyre_inference/v1/spec_decode/xpress_head.py</code>, <code>SpyreQwen3XPressForCausalLM</code> (<code>spyre_inference/models/qwen3_dflash.py</code>)</td>

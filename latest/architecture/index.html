@@ -3112,7 +3112,7 @@ materialized contiguously first.</p>
 <tr>
 <td>1. Build metadata &amp; masks</td>
 <td>CPU → Spyre</td>
-<td>The metadata builder reads <code>query_start_loc</code>/<code>seq_lens</code>, pads each <code>query_len</code> and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device</td>
+<td>The metadata builder reads <code>query_start_loc</code>/<code>seq_lens</code>, pads each <code>query_len</code> and KV block count onto their buckets (the per-sequence kernels usually keep each sequence's own block count instead, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device</td>
 </tr>
 <tr>
 <td>2. Write new K/V to cache</td>
@@ -3149,7 +3149,12 @@ leaving the retained config's specs, and so its <code>page_size_bytes</code>, ph
 rather than lazily on first use: by default (<code>SPYRE_ATTN_RECORD=1</code>) warmup records
 per-sequence variants from <code>SpyreAttnBucketer.variants()</code>. A query bucket pairs only with
 block counts that fit its smallest real query length; variants exceeding the allocated
-page count are skipped. Failed recordings are logged and compile on first use instead.
+page count are skipped. When the per-sequence page count is dynamic (copied to the device
+with <code>tensor.to(dynamic=...)</code>), warmup instead records one per-sequence variant per query
+bucket, at the page count of <code>max_model_len</code>, and that kernel runs every page count up to
+it. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
+traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
+compile on first use instead.
 When the batched-decode kernel is enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default) warmup
 enumerates its variants, the product of the KV-length (<code>num_blocks</code>) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
@@ -3409,16 +3414,27 @@ same way. That brings back the CPU kernels and drops the full-vocabulary sort:</
   vectorized max followed by a first-match scan, so ties break like <code>torch.argmax</code>. A
   single row falls back to <code>torch.argmax</code>, where OpenMP fork/join would cost more than the
   scan.</li>
-<li><strong>Top-k + top-p</strong> — <code>apply_top_k_top_p_sort_free</code> takes a <code>topk</code> window of <code>2 × max_k</code>
-  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
-  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
-  exact tie count when ties run past it. Top-p without top-k still sorts.</li>
+<li><strong>Top-k / top-p</strong> — with the filter ops loaded, <code>apply_top_k_top_p_kernels</code> masks in
+  place. Top-k keeps every tie with the k-th value and does not sort. Top-k together
+  with top-p sorts those survivors and cuts top-p exactly on them, so a k near the
+  vocabulary size is close to a full sort. Top-p alone, including a row whose k is disabled in a
+  mixed batch, uses vLLM's approximate CPU kernel: the kept set can differ from a full
+  sort by a few boundary tokens, and it does not drop below the requested probability
+  mass. Without those ops, top-k uses <code>topk</code>, top-k with top-p uses
+  <code>apply_top_k_top_p_sort_free</code>, and top-p alone sorts. Speculative decoding's
+  <code>apply_sampling_constraints</code> is separate from that sampler: it still calls vLLM's
+  <code>apply_top_k_top_p</code> and sorts. The shared <code>Sampler</code> only covers the token draw.</li>
 </ul>
-<p>The kernels live in <code>csrc/cpu/sampling_kernels.cpp</code> and are built with CMake from
+<p>The kernels live in <code>csrc/cpu/sampling_kernels.cpp</code> and <code>csrc/cpu/topk_topp_sampler.cpp</code>,
+with the vector exp in <code>csrc/cpu/cpu_fast_exp.hpp</code>. They are built with CMake from
 <code>setup.py</code>, over the <code>cpu_types_{x86,vsx,vxe}.hpp</code> SIMD headers copied unchanged from vLLM,
 so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (<code>_C</code>) and an
-AVX2 fallback (<code>_C_AVX2</code>), and <code>v1/sample/sampling_kernels.py</code> imports whichever the host
-supports, as vLLM's CPU backend does. The ops register under the fixed <code>_spyre_C</code>
+AVX2 fallback (<code>_C_AVX2</code>). <code>v1/sample/sampling_kernels.py</code> loads <code>_C</code> when
+<code>torch.cpu.get_capabilities()</code> reports <code>avx512_f</code>, <code>avx512_vl</code>, <code>avx512_bw</code> and
+<code>avx512_dq</code>, and <code>_C_AVX2</code> when it reports <code>avx2</code> and <code>fma3</code> but not that set.
+AVX512F alone is not enough: the build also uses VL, BW and DQ. The check ignores
+<code>ATEN_CPU_CAPABILITY</code>, so pinning ATen's dispatch level keeps the extension.
+The ops register under the fixed <code>_spyre_C</code>
 namespace rather than <code>TORCH_EXTENSION_NAME</code>, so the two builds share one op name and
 cannot collide with a vLLM <code>_C</code> in the same environment. If the extension
 is missing or fails to import (a failed build, or a dev checkout that never built it), the

@@ -1124,6 +1124,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#one-per-sequence-kernel-for-every-page-count" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One per-sequence kernel for every page count
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1894,6 +1905,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#one-per-sequence-kernel-for-every-page-count" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One per-sequence kernel for every page count
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2357,6 +2379,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#one-per-sequence-kernel-for-every-page-count" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One per-sequence kernel for every page count
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2721,6 +2754,28 @@ less warmup.</p>
 records eligible KV-length × num-sequences combinations.
 <code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code> (default: powers of two from 1 to <code>--max-num-seqs</code>) is the
 extra lever there, and the same keep-it-short advice applies.</p>
+<h4 id="one-per-sequence-kernel-for-every-page-count">One per-sequence kernel for every page count<a class="headerlink" href="#one-per-sequence-kernel-for-every-page-count" title="Permanent link">&para;</a></h4>
+<p>The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
+use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+sequence length up to <code>--max-model-len</code>. Each kernel call covers at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.</p>
+<p>Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
+prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
+their own page count.</p>
+<p>The page tables and mask stacks are copied to the device with torch-spyre's
+<code>tensor.to("spyre", dynamic=...)</code>. For this, the plugin sets two torch-spyre limits unless you
+export them yourself: <code>MIN_RESERVED_DIM_SIZE</code> to 2, and <code>MAX_BUCKETS</code> to at least
+<code>--max-model-len / block_size</code> rounded up to a multiple of 8. If an exported <code>MAX_BUCKETS</code> is
+below that rounded value, prefill reads one page per loop step instead.</p>
+<p>The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
+bucket pair, when any of these holds:</p>
+<ul>
+<li><code>--max-model-len / block_size</code> is not above <code>MIN_RESERVED_DIM_SIZE</code>, or is above an exported
+  <code>MAX_BUCKETS</code>; startup logs a warning;</li>
+<li><code>SPYRE_ATTN_FOR_EACH_TILE=0</code> is set;</li>
+<li>the layer uses sliding-window attention.</li>
+</ul>
+<p>The batched decode kernel always uses the KV buckets.</p>
 <h2 id="kv-cache-size">KV cache size<a class="headerlink" href="#kv-cache-size" title="Permanent link">&para;</a></h2>
 <p>The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
 card's free memory (<code>torch.accelerator.get_memory_info</code>) and gives the KV cache what is

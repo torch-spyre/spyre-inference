@@ -73,6 +73,19 @@ if [[ -z "$ARTIFACTORY_LOCATION" ]] ; then
     ARTIFACTORY_LOCATION="${ARTIFACTORY_BASE_URL}/artifactory/${ARTIFACTORY_RPM_PATH}"
 fi
 
+# Refuse to attach the bearer token to anything but https: a fat-fingered http://
+# base URL would otherwise send the token in the clear. curl's --proto/--proto-redir
+# below is the second layer, covering a redirect the server returns at request time
+# rather than the base URL set here. Same guard as .github/scripts/fetch_bench_datasets.py
+# (PR #1569) and .github/scripts/resolve_rpms.py (#1567).
+case "$ARTIFACTORY_LOCATION" in
+    https:*) ;;
+    *)
+        echo "ARTIFACTORY_LOCATION must use https, refusing to send the token: ${ARTIFACTORY_LOCATION}" >&2
+        exit 1
+        ;;
+esac
+
 RPMS_DOWNLOAD_DIR="${RPMS_DOWNLOAD_DIR:-rpms}"
 
 mkdir -p "$RPMS_DOWNLOAD_DIR" || exit 1
@@ -87,8 +100,13 @@ for rpm_name in $RPM_NAMES; do
     echo "  ${url}"
     # The token goes to curl on stdin as a config file (-K -), never in argv:
     # argv is world-readable through /proc/<pid>/cmdline on a shared runner.
+    # --proto and --proto-redir pin the initial request and every redirect hop
+    # to https, so a redirect to http:// can never carry the Authorization
+    # header in cleartext.
     # This matches .github/scripts/fetch_bench_datasets.py.
     curl -fSL \
+        --proto '=https' \
+        --proto-redir '=https' \
         -o "${RPMS_DOWNLOAD_DIR}/${filename}" \
         -K - \
         "${url}" <<CURL_CONFIG || exit 1

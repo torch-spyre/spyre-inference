@@ -31,7 +31,7 @@ import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
-from vllm.config import CompilationMode, get_current_vllm_config
+from vllm.config import get_current_vllm_config
 from vllm.logger import _print_warning_once
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
@@ -73,10 +73,7 @@ def impl(default_vllm_config, monkeypatch):
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
-    # The fixture's bare CompilationConfig leaves mode unset, which resolves to
-    # eager. __init__ reads the mode to pick its kernel, so set it before building.
-    get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
-    # __init__ also reads the block size, which the decode kernel's page reshape bakes in.
+    # __init__ reads the block size, which the decode kernel's page reshape bakes in.
     get_current_vllm_config().cache_config.block_size = BLOCK_SIZE
     return SpyreAttentionImpl(
         num_heads=NUM_HEADS,

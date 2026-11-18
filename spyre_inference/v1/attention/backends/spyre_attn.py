@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypeVar
 
 import torch
-from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
@@ -1408,13 +1408,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
-        # `== STOCK`, not `!= NONE`: a CompilationConfig that never went through the
-        # platform hook leaves mode unset (Python None), which `!= NONE` would wrongly
-        # treat as compiled. The platform resolves compiled runs to STOCK, which is also
-        # what the `default_vllm_config` test fixture ends up with.
-        _mode = get_current_vllm_config().compilation_config.mode
-        self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
-
         # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
@@ -1458,7 +1451,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(reshape_and_cache_kernel, dynamic=False)
-        # Only reached compiled: _batched_decode_supported declines it otherwise.
         self._decode_fn = _batched_decode_compiled
 
         self._kv_slots: SpyrePagedKVCache | None = None

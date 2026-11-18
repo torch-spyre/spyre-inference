@@ -3165,14 +3165,10 @@ sequence is padded to its own query bucket (decodes use the length-1 bucket) bef
 dispatch. <code>SPYRE_ATTN_RECORD=0</code> restores lazy per-variant compilation.</p>
 <p>Under <code>dynamic=False</code> the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
-with KV length. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> walks that axis with torch-spyre's
-<code>for_each_tile</code> instead, leaving one body plus a tile spec, and the same applies to the
-batched-decode kernel's walk over block chunks. The kernels carry the online softmax as
-a <code>(tile_max, tile_sum, tile_output)</code> triple either way. <code>walk_tiles</code> selects the walk;
-the same flag also controls <code>fullgraph</code> and the batched-decode page-index upload.
-<code>SPYRE_ATTN_FOR_EACH_TILE=1</code> is the default; setting it to <code>0</code> uses Python loops as a
-rollback path. The flag is read once at import, so set it before importing
-<code>spyre_inference</code>.</p>
+with KV length. The kernels therefore walk that axis with torch-spyre's <code>for_each_tile</code>,
+leaving one body plus a tile spec, and the same applies to the batched-decode kernel's
+walk over block chunks. The kernels carry the online softmax as a
+<code>(tile_max, tile_sum, tile_output)</code> triple.</p>
 <h3 id="lx-resident-pages">LX-resident pages<a class="headerlink" href="#lx-resident-pages" title="Permanent link">&para;</a></h3>
 <p>The per-sequence decode kernel (<code>page_attn_decode</code>, one query row) keeps a
 gathered page in the LX scratchpad from its gather to its last use instead of

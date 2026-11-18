@@ -2772,7 +2772,6 @@ bucket pair, when any of these holds:</p>
 <ul>
 <li><code>--max-model-len / block_size</code> is not above <code>MIN_RESERVED_DIM_SIZE</code>, or is above an exported
   <code>MAX_BUCKETS</code>; startup logs a warning;</li>
-<li><code>SPYRE_ATTN_FOR_EACH_TILE=0</code> is set;</li>
 <li>the layer uses sliding-window attention.</li>
 </ul>
 <p>The batched decode kernel always uses the KV buckets.</p>

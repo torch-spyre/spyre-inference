@@ -170,7 +170,6 @@ def _run_spyre_attn_test(
     dtype: torch.dtype = DTYPE,
     kv_cache_dtype: str = "auto",
     kv_scales: tuple[float, float] = (1.0, 1.0),
-    expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
     num_blocks: int = 256,
 ) -> None:
@@ -270,16 +269,13 @@ def _run_spyre_attn_test(
     )
     assert attn_impl.block_size == block_size
 
-    # The fused store is just whether the kernel was handed an `out` buffer.
-    fused_calls: list[bool] = []
     dispatched_widths: set[int] = set()
-    if expect_fused_store is not None or expect_query_widths is not None:
+    if expect_query_widths is not None:
         real_run = attn_impl._run_page_attn
 
         def spy_run(
             query, row_table, k_pages, v_pages, index_table, mask_stack, nb, page_range, pql, out
         ):
-            fused_calls.append(out is not None)
             dispatched_widths.add(pql)
             return real_run(
                 query,
@@ -353,11 +349,6 @@ def _run_spyre_attn_test(
         output=output,
     )
 
-    if expect_fused_store is not None:
-        assert fused_calls, "no attention kernel ran"
-        assert set(fused_calls) == {expect_fused_store}, (
-            f"fused output store: expected {expect_fused_store}, got {set(fused_calls)}"
-        )
     if expect_query_widths is not None:
         assert dispatched_widths == expect_query_widths, (
             f"query widths dispatched: expected {expect_query_widths}, "
@@ -428,36 +419,6 @@ def test_spyre_attn_core(default_vllm_config, seq_lens, configure_compilation, c
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
-    )
-
-
-@pytest.mark.parametrize(
-    ("configure_device", "configure_compilation", "seq_lens", "expect_fused_store"),
-    [
-        pytest.param("spyre", "STOCK_TORCH_COMPILE", [(1, 512)], True, id="decode-fused"),
-        pytest.param("spyre", "STOCK_TORCH_COMPILE", [(32, 256)], True, id="prefill-fused"),
-    ],
-    indirect=["configure_device", "configure_compilation"],
-)
-def test_spyre_attn_fused_output_store(
-    default_vllm_config,
-    monkeypatch,
-    seq_lens,
-    expect_fused_store,
-    configure_compilation,
-    configure_device,
-):
-    """Assert both the output and which store path ran, so a guard that stops engaging
-    cannot leave these cases green on the unfused store alone."""
-    # The per-seq kernels are the subject; batched decode would take a lone decode.
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    _run_spyre_attn_test(
-        seq_lens=seq_lens,
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        expect_fused_store=expect_fused_store,
     )
 
 

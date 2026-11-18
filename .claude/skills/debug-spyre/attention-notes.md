@@ -138,7 +138,7 @@ Look for **periodic patterns**: if every Nth head is huge and the rest are sane 
 
 ## Attention-specific gotcha: which mode the impl compiles in
 
-`SpyreAttentionImpl` compiles its kernels whatever `compilation_config.mode` says (torch-spyre#4334): there is no eager decoder-attention path. `SpyreEncoderAttentionImpl` still follows the mode it samples at construction, so for an encoder bug match the mode the failing test used, or you may be comparing apples to oranges.
+Decoder attention (`SpyreAttentionImpl`) always runs compiled, even under `--enforce-eager`, because its page gather fails in eager mode (torch-spyre#4334). Encoder attention (`SpyreEncoderAttentionImpl`) compiles only when `compilation_config.mode` is `STOCK_TORCH_COMPILE` at the time it is built. So to reproduce an encoder bug, use the same compilation mode as the failing test.
 
 ## CPU-vs-Spyre standalone repro (attention-flavored)
 

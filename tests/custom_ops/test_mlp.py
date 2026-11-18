@@ -284,11 +284,73 @@ def test_replicated_matches_reference(tp_group, num_tokens, input_size, output_s
 
 
 @pytest.mark.mlp
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,num_experts",
+    [
+        (1, 128, 8),
+        (1, 512, 32),
+        (7, 256, 64),
+        (64, 512, 128),
+        (7, 2816, 32),  # gemma-4-26B-A4B router
+    ],
+)
+def test_gate_linear_matches_reference(tp_group, num_tokens, hidden_size, num_experts):
+    """The MoE router gate on Spyre matches upstream F.linear, in the weight dtype.
+
+    gemma-4 asks for fp32 router logits (`out_dtype=torch.float32`); Spyre cannot
+    restickify fp32, so the OOT layer clears `out_dtype` — for positional callers
+    too — and the routing reduction is promoted in `moe` instead.
+    """
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    from spyre_inference.custom_ops.gate_linear import SpyreGateLinear
+
+    dtype = torch.float16
+    torch.manual_seed(0)
+    layer = GateLinear(
+        hidden_size,
+        num_experts,
+        bias=False,
+        params_dtype=dtype,
+        out_dtype=torch.float32,
+        quant_config=None,
+        prefix="gate",
+    )
+    assert isinstance(layer, SpyreGateLinear)
+    assert layer.out_dtype is None
+
+    positional = GateLinear(64, 8, False, torch.float32)
+    assert positional.out_dtype is None
+
+    # torch.empty() leaves memory uninitialised (may contain NaN in float16);
+    # fill with small random values so the comparison is meaningful.
+    layer.weight.data.normal_(std=0.02)
+
+    torch.manual_seed(1)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    expected = F.linear(x, layer.weight)
+
+    # Store the transposed weight, as the loader would, before moving to device.
+    layer.quant_method.process_weights_after_loading(layer)
+
+    layer = layer.to("spyre")
+    logits, bias = layer(x.to("spyre"))
+    assert bias is None
+    assert logits.shape == (num_tokens, num_experts)
+    assert logits.dtype == dtype
+
+    # The gemma-4 router shape's 2816-wide reduction accumulates enough fp16
+    # rounding error to miss the default atol by a hair.
+    torch.testing.assert_close(logits.cpu().float(), expected.float(), atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.mlp
 def test_linear_oot_registration(tp_group):
     """Each unquantized parallel-linear class is swapped for its Spyre OOT
     subclass, all sharing the transposed-weight method. QKV additionally
     asserts the gather_output=False invariant.
     """
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         MergedColumnParallelLinear,
@@ -297,6 +359,7 @@ def test_linear_oot_registration(tp_group):
         RowParallelLinear,
     )
 
+    from spyre_inference.custom_ops.gate_linear import SpyreGateLinear
     from spyre_inference.custom_ops.linear import (
         SpyreColumnParallelLinear,
         SpyreMergedColumnParallelLinear,
@@ -363,5 +426,16 @@ def test_linear_oot_registration(tp_group):
     )
     assert isinstance(score, SpyreReplicatedLinear)
 
-    for layer in (qkv, gate_up, down, col, score):
+    # The MoE router gate is a ReplicatedLinear subclass with no disable_tp.
+    gate = GateLinear(
+        64,
+        8,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=None,
+        prefix="gate",
+    )
+    assert isinstance(gate, SpyreGateLinear)
+
+    for layer in (qkv, gate_up, down, col, score, gate):
         assert isinstance(layer.quant_method, SpyreUnquantizedLinearMethod)

@@ -471,7 +471,7 @@ jobs:
           retention-days: 1
 
   test:
-    name: 'build and run tests (${{ matrix.cfg }})'
+    name: '${{ matrix.cfg }}'
     needs: [resolve_durations, build_kernels]
     if: ${{ inputs.test_type != 'perf' }}
     strategy:

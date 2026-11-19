@@ -116,8 +116,9 @@ env:
   RUNNER_LABELS: ${{ format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label) }}
 
 jobs:
+  # The run page lists a called workflow's jobs by their own names, so each carries the cfg.
   attempt:
-    name: run
+    name: build and run tests (${{ inputs.cfg }})
     runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
     continue-on-error: true
     timeout-minutes: 720
@@ -207,7 +208,7 @@ jobs:
 
   # Fresh runner pod, no changed-files gate; failing again here is a genuine failure.
   retry:
-    name: pod-level retry
+    name: build and run tests (${{ inputs.cfg }}) (pod-level retry)
     needs: attempt
     if: ${{ !cancelled() && needs.attempt.outputs.passed != 'true' }}
     runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}

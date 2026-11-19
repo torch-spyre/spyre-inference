@@ -41,3 +41,8 @@ def test_retry_gates_only_on_the_missing_passed_output():
     assert "needs.attempt.outputs.passed != 'true'" in gate
     assert ".result" not in gate
     assert "failure" not in gate
+
+
+def test_job_names_carry_the_cfg():
+    for job in _jobs().values():
+        assert "${{ inputs.cfg }}" in job["name"]

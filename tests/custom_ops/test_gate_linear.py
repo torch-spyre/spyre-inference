@@ -114,7 +114,7 @@ def test_gate_linear_matches_reference_on_spyre(tp_group, num_tokens, hidden, co
     gate.quant_method.process_weights_after_loading(gate)
     gate = gate.to("spyre")
     if compiled:
-        gate = torch.compile(gate, fullgraph=True, dynamic=False)
+        gate = torch.compile(gate, fullgraph=True, dynamic=False, backend="inductor")
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", FallbackWarning)
@@ -124,4 +124,5 @@ def test_gate_linear_matches_reference_on_spyre(tp_group, num_tokens, hidden, co
 
     assert returned_bias is None
     assert out.dtype == torch.float16
-    torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+    # Same atol as the other 2816-wide fp16 reductions (test_mlp.py).
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)

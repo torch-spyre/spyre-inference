@@ -985,8 +985,14 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
-        if runner == "v1":
-            # The hybrid KV cache manager runs on the V2 runner only; V1 keeps one group.
+        # The hybrid KV cache manager is off unless asked for (None is vLLM's unset
+        # default, resolved after this hook); only the V2 runner can run it.
+        if scheduler_config.disable_hybrid_kv_cache_manager is False and runner == "v1":
+            raise ValueError(
+                "The hybrid KV cache manager needs SPYRE_MODEL_RUNNER=v2 on Spyre; drop "
+                "--no-disable-hybrid-kv-cache-manager or switch the model runner."
+            )
+        if scheduler_config.disable_hybrid_kv_cache_manager is None:
             scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,

@@ -30,10 +30,7 @@ from vllm.v1.core.kv_cache_planning import (
     _pool_bytes_per_block_from_builder,
     get_kv_cache_groups_from_builder,
 )
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheSpec,
-)
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.worker_base import CompilationTimes
@@ -44,7 +41,6 @@ from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.kv_cache_setup import layer_spec
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -80,17 +76,13 @@ def _kv_block_layout(
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
     # Offsets scale with the block count, which num_gpu_blocks_override may set.
     placement = builder.get_kv_cache_config_from_groups(vllm_config, groups, 1)
-    group_of = {name: group for group in groups for name in group.layer_names}
-    pages: dict[int, tuple[int, bool]] = {}
+    pages: dict[int, int] = {}
     for tensor in placement.kv_cache_tensors:
-        for index, name in enumerate(tensor.layers):
+        for index in range(len(tensor.layers)):
             start = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
-            is_attention = isinstance(layer_spec(group_of[name], name), AttentionSpec)
-            pages.setdefault(start, (tensor.block_stride, is_attention))
-    tensors: list[int] = []
-    for page, is_attention in pages.values():
-        # An attention page holds K and V, which allocate_pages allocates apart.
-        tensors += [page // 2] * 2 if is_attention else [page]
+            pages.setdefault(start, tensor.block_stride)
+    # An attention page holds K and V, which allocate_pages allocates apart.
+    tensors = [page // 2 for page in pages.values() for _ in range(2)]
     per_request = _max_memory_usage_bytes_from_groups(builder, vllm_config, groups) // pool_bytes
     return pool_bytes, tensors, per_request
 

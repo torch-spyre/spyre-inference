@@ -24,8 +24,6 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup
@@ -111,17 +109,18 @@ def allocate_spyre_kv_caches(
     regions, so each byte range is its own allocation rather than one backing buffer.
     """
     group_of = {
-        layer_name: group_id
+        layer_name: (group_id, group.kv_cache_spec)
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         for layer_name in group.layer_names
     }
     num_blocks = kv_cache_config.num_blocks
-    ranges: dict[int, tuple[int, SpyrePagedKVCache]] = {}
+    ranges: dict[int, SpyrePagedKVCache] = {}
     kv_caches: dict[str, SpyrePagedKVCache] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         for index, layer_name in enumerate(kv_cache_tensor.layers):
-            group_id = group_of[layer_name]
-            spec = layer_spec(kv_cache_config.kv_cache_groups[group_id], layer_name)
+            group_id, spec = group_of[layer_name]
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[layer_name]
             if not isinstance(spec, AttentionSpec):
                 raise NotImplementedError(
                     f"{layer_name}: Spyre allocates attention KV pages only, not "
@@ -142,26 +141,13 @@ def allocate_spyre_kv_caches(
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
             start = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
-            if start not in ranges:
-                pages = impl_cls.allocate_pages(num_blocks * pages_per_block, kernel_spec, device)
-                ranges[start] = (spec.page_size_bytes, pages)
+            num_pages = num_blocks * pages_per_block
+            if start in ranges:
+                kv_caches[layer_name] = impl_cls.view_pages(ranges[start], num_pages, kernel_spec)
             else:
-                page_bytes, base = ranges[start]
-                if page_bytes != spec.page_size_bytes:
-                    raise ValueError(
-                        f"{layer_name}'s {spec.page_size_bytes}-byte page overlays a "
-                        f"{page_bytes}-byte one at byte {start}."
-                    )
-                pages = impl_cls.view_pages(base, num_blocks * pages_per_block, kernel_spec)
-            kv_caches[layer_name] = pages
+                ranges[start] = impl_cls.allocate_pages(num_pages, kernel_spec, device)
+                kv_caches[layer_name] = ranges[start]
 
     for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]
     return kv_caches
-
-
-def layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
-    spec = group.kv_cache_spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return spec.kv_cache_specs[layer_name]
-    return spec

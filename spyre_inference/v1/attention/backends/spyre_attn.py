@@ -75,6 +75,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
     batched_decode_chunking,
+    sliding_window_page_bound,
 )
 from spyre_inference.v1.worker import compile_guard
 
@@ -584,11 +585,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.
-        # Sliding window layers pad each sequence to a bound taken from its KV bucket, so
-        # they keep the buckets.
         self._attn_bucketer = SpyreAttnBucketer(
             vllm_config,
-            declare_pages=self.sliding_window is None and not self._encoder_only,
+            declare_pages=not self._encoder_only,
+            sliding_window=self.sliding_window,
         )
 
         self._init_reorder_batch_threshold(
@@ -650,11 +650,23 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # A fully-masked padded tile would divide by a zero softmax denominator.
             return 0
         assert self.sliding_window is not None
-        block_size = self.block_size
-        span = self.sliding_window + aligned_query_len - 1
-        bound = min(num_blocks, (span + block_size - 1) // block_size + 1)
+        bound = sliding_window_page_bound(
+            num_blocks, aligned_query_len, self.sliding_window, self.block_size
+        )
         assert bound >= 1
         return bound
+
+    def _declared_window_pages(self, bound: int, prefill: bool) -> int:
+        """Page count a sliding-window sequence padded to ``bound`` runs at with a page
+        range: ``bound`` raised to the range's minimum and granularity."""
+        bucketer = self._attn_bucketer
+        pages = bucketer.find_declared_pages(bound, prefill)
+        page_range = bucketer.prefill_page_range if prefill else bucketer.page_range
+        assert page_range is not None
+        assert pages <= page_range["max"], (
+            f"{pages} pages exceed the declared maximum {page_range['max']}"
+        )
+        return pages
 
     def _get_masked_tile(self, aligned_query_len: int) -> torch.Tensor:
         """Shared fully-masked tile for padded blocks, read-only like _get_zero_tile.
@@ -1022,11 +1034,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # Sliding window: arithmetic block-skip. Blocks entirely outside
             # every query's window are dropped; interior blocks share a
             # zero mask tile; only boundary blocks get real per-query cutoffs.
-            # The count is padded up to _max_active_blocks so it stops sliding with
-            # the context, which would compile a new kernel inside the request. Not
-            # rounded onto the num_blocks ladder: that inflates the exact per-bucket
-            # bound several-fold. padded_num_blocks stays None so forward() keeps
-            # gathering through active_block_indices.
+            # The count is padded up to _max_active_blocks of its KV bucket so it stops
+            # sliding with the context, which would compile a new kernel inside the
+            # request, and so batched decode keeps its buckets. Not rounded onto the
+            # num_blocks ladder: that inflates the exact per-bucket bound several-fold.
+            # With a page range, the per-sequence kernels run every such bound, raised
+            # to the range's minimum and granularity. padded_num_blocks stays None so
+            # forward() keeps gathering through active_block_indices.
             active_block_indices = []
             query_lens_list = query_lens.tolist()
             seq_lens_list = seq_lens.tolist()
@@ -1049,10 +1063,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     # fault. Its tile is fully masked, so the duplicate contributes
                     # exp(finfo.min - max) == 0. Keyed on the bucket's block count,
                     # not the sequence's, so one shape serves the whole bucket.
-                    max_active_s = self._max_active_blocks(
-                        self._pad_num_blocks((kv_len_s + block_size - 1) // block_size),
-                        aligned_query_lens[s],
+                    kv_bucket_s = self._attn_bucketer.find_blocks_bucket(
+                        (kv_len_s + block_size - 1) // block_size
                     )
+                    assert kv_bucket_s is not None, f"no KV bucket for kv_len={kv_len_s}"
+                    max_active_s = self._max_active_blocks(kv_bucket_s, aligned_query_lens[s])
+                    if self._attn_bucketer.page_range is not None:
+                        max_active_s = self._declared_window_pages(
+                            max_active_s, aligned_query_lens[s] > 1
+                        )
                     # A bound below the real count would silently leave the count
                     # sliding, i.e. the bug this padding fixes, with no signal.
                     assert len(active_bs) <= max_active_s, (

@@ -288,12 +288,14 @@ export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at leas
 `--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
 below that rounded value, prefill reads one page per loop step instead.
 
-The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
-bucket pair, when any of these holds:
+A sliding-window layer reads only the pages its window reaches, at most
+`ceil((window + query bucket - 1) / block_size) + 1`, so its page range stops at the largest of
+these bounds instead of `--max-model-len / block_size`. Each sequence keeps the bound of its KV
+bucket as its page count, as the batched decode kernel needs.
 
-- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
-  `MAX_BUCKETS`; startup logs a warning;
-- the layer uses sliding-window attention.
+The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
+bucket pair, when the largest page count is not above `MIN_RESERVED_DIM_SIZE`, or is above an
+exported `MAX_BUCKETS`; startup logs a warning.
 
 The batched decode kernel always uses the KV buckets.
 

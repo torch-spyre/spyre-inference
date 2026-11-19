@@ -1727,6 +1727,32 @@ def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm
     assert open_positions == list(range(kv_len - window, kv_len))
 
 
+def test_sliding_window_page_counts_fit_the_declared_range(default_vllm_config):
+    """With a page range, each sequence runs its KV bucket's window bound, raised to the
+    range's minimum and, for prefill, its granularity."""
+    torch.set_default_device("cpu")
+    block_size, window = 64, 128
+    seq_lens = [(1, 64), (1, 512), (100, 512)]
+    metadata = _padded_mask_metadata(
+        seq_lens,
+        block_size=block_size,
+        sliding_window=window,
+        max_num_blocks=_num_blocks_buckets()[-1],
+    )
+    assert metadata.page_range is not None
+    for s, (query_len, kv_len) in enumerate(seq_lens):
+        page_range = metadata.seq_page_range(s)
+        assert page_range is not None
+        aligned = metadata.aligned_query_lens[s]
+        bucket = min(b for b in _num_blocks_buckets() if b * block_size >= kv_len)
+        bound = min(bucket, (window + aligned - 1 + block_size - 1) // block_size + 1)
+        g = page_range["granularity"]
+        expected = max(-(-bound // g) * g, page_range["min"])
+        num_pages = metadata.attention_mask_stacks[s].shape[0]
+        assert num_pages == expected <= page_range["max"]
+        assert metadata.page_index_tables_cpu[s].shape[0] == num_pages
+
+
 def _num_blocks_buckets(block_size: int = 64) -> list[int]:
     """The recorder's num_blocks buckets for the fixture's config."""
     from vllm.config import get_current_vllm_config

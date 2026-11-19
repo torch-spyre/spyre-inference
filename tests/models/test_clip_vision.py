@@ -315,13 +315,28 @@ def test_class_layout_gives_each_image_one_token_and_a_fixed_slot(tp_group):
     assert values["positions"].reshape(3, 128)[0, :65].tolist() == list(range(65))
 
 
+def test_an_image_of_another_size_is_rejected(tp_group):
+    """Upstream's input schema enforced the configured size; the mixin path bypasses it."""
+    model = _spyre_model(_tower_config(num_layers=1), "LAST")
+    with pytest.raises(ValueError, match="images, got"):
+        model.vision_inputs({"pixel_values": [torch.randn(3, IMAGE, IMAGE // 2)]})
+
+
 @pytest.mark.parametrize(
-    ("pooling_type", "expected"), [("LAST", (1, 8)), ("MEAN", (64, 576))], ids=["class", "full"]
+    ("pooling_type", "items", "expected"),
+    [
+        ("LAST", 8, (1, 8)),
+        ("MEAN", 8, (64, 576)),
+        ("LAST", 100, (1, SEGMENT_ITEMS)),
+        ("MEAN", 100, (64, 4096)),
+    ],
+    ids=["class", "full", "class-capped", "full-capped"],
 )
-def test_budget_range_covers_a_whole_step(tp_group, pooling_type, expected):
-    """Eight images per step: eight 1-token images, or eight 65-token ones on 64-row sticks."""
+def test_budget_range_covers_a_whole_step(tp_group, pooling_type, items, expected):
+    """Eight images per step: eight 1-token images, or eight 65-token ones on 64-row sticks.
+    A larger step stops at the 63 items one call holds, as no budget past that is filled."""
     model = _spyre_model(_tower_config(num_layers=1), pooling_type)
-    model.max_items_per_step = 8
+    model.max_items_per_step = items
     assert model.get_encoder_cudagraph_budget_range(None) == expected
     assert model.vision_items_limited_by_tokens
     assert model.vision_max_items_per_call == SEGMENT_ITEMS
@@ -405,30 +420,10 @@ def _padded_device_inputs(model, images, token_budget):
 
 
 @pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
-def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group, pooling_type):
-    """The same padded device buffers through the uncompiled and the compiled pipeline."""
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    images = _pixels(2)
-    model = _spyre_model(_tower_config(), pooling_type).to("spyre")
-    tokens = sum(model.vision_item_tokens({"pixel_values": images}))
-    step = model.vision_patch_multiple // model.patches_per_token
-    inputs = _padded_device_inputs(model, images, token_budget=-(-2 * tokens // step) * step)
-
-    with torch.inference_mode():
-        eager = model.encoder_cudagraph_forward(inputs)[:tokens]
-        model.compile_vision_graphs()
-        compiled = model.encoder_cudagraph_forward(inputs)[:tokens]
-
-    assert _cosine(compiled, eager) > 0.9999
-    torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
 def test_compiled_pipeline_matches_upstream_at_every_budget_on_spyre(tp_group, pooling_type):
     """The compiled graphs at each budget of an eight-image step, fed the way the manager
-    feeds them."""
+    feeds them; at the smallest one, also against the uncompiled pipeline on the same
+    device buffers."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
@@ -440,13 +435,22 @@ def test_compiled_pipeline_matches_upstream_at_every_budget_on_spyre(tp_group, p
     images = _pixels(3)
     model = _spyre_model(config, pooling_type).to("spyre")
     model.max_items_per_step = 8
-    model.compile_vision_graphs()
+    tokens = sum(model.vision_item_tokens({"pixel_values": images}))
     budgets = EncoderCudaGraphManager._generate_budgets(
         *model.get_encoder_cudagraph_budget_range(None)
     )
-    tokens = sum(model.vision_item_tokens({"pixel_values": images}))
+    budgets = [b for b in budgets if b >= tokens]
     expected = _reference(config, pooling_type, images).flatten(0, 1)
-    for budget in (b for b in budgets if b >= tokens):
+
+    with torch.inference_mode():
+        eager = model.encoder_cudagraph_forward(_padded_device_inputs(model, images, budgets[0]))
+    eager = convert(eager, device="cpu")[:tokens]
+    model.compile_vision_graphs()
+    for budget in budgets:
         with torch.inference_mode():
             out = model.encoder_cudagraph_forward(_padded_device_inputs(model, images, budget))
-        assert _cosine(convert(out, device="cpu")[:tokens], expected) > 0.995, budget
+        out = convert(out, device="cpu")[:tokens]
+        assert _cosine(out, expected) > 0.995, budget
+        if budget == budgets[0]:
+            assert _cosine(out, eager) > 0.9999
+            torch.testing.assert_close(out.float(), eager.float(), atol=2e-2, rtol=2e-2)

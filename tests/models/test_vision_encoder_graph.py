@@ -575,6 +575,39 @@ def test_mrv2_encoder_runner_serves_through_the_captured_budgets(monkeypatch):
     assert not manager.is_captured()
 
 
+@pytest.mark.parametrize("mixin", [True, False], ids=["mixin", "marked"])
+def test_compiled_pooling_warmup_runs_a_mixin_tower_per_budget_only(monkeypatch, mixin):
+    """A compiled pooling model (CLIP) records a mixin tower's graphs after the attention
+    kernels and skips the per-width tower warmup; any other tower keeps it."""
+    import contextlib
+
+    from spyre_inference.v1.worker import spyre_model_runner
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    monkeypatch.setattr(spyre_model_runner, "allocate_staging_buffers", lambda *a: None)
+    monkeypatch.setattr(
+        spyre_model_runner, "_set_spyre_compilation_settings", lambda cfg: contextlib.nullcontext()
+    )
+    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+    runner.model_config = SimpleNamespace(runner_type="pooling", enforce_eager=False)
+    runner.vllm_config = SimpleNamespace(model_config=runner.model_config)
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner._spyre_device = torch.device("cpu")
+    runner._encoder_groups_by_rows, runner._encoder_budget, runner._encoder_rectangles = {}, 16, []
+    runner.spyre_shape_bucketer = None
+    runner._spyre_kv_caches = [torch.zeros(1)]
+    calls = []
+    runner._record_attention_graphs = lambda: calls.append("attention")
+    runner._warmup_multimodal_encoder = lambda: calls.append("per-width")
+    runner._record_vision_graphs = lambda: calls.append("budgets")
+    runner._compiled_vision_model = lambda: object() if mixin else None
+
+    runner.warming_up_model()
+
+    expected = ["attention", "budgets"] if mixin else ["attention", "per-width", "budgets"]
+    assert calls == expected
+
+
 def _prompt(mask_rows: list[int], num_tokens: int = 12):
     is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
     is_multimodal[mask_rows] = True

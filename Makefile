@@ -120,7 +120,7 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
+.PHONY: help test tests run-one aiu-setup perf-tests perf-legs coverage print-test-type \
         test-smoke test-smoke-shard test-smoke-unit-shard test-quality test-quality-shard \
         test-e2e-smoke test-e2e-smoke-shard test-e2e-smoke-dist-shard tests-integration \
         test-probes test-probes-shard \
@@ -487,7 +487,7 @@ else
 BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them. Set JUNIT_XML=<file> to write one JUnit testcase per benchmark.
 	mkdir -p "$(RESULTS_DIR)"
 	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \
@@ -495,6 +495,15 @@ perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
 	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir "$(BENCH_CONFIGS_DIR)" \
 		--results-dir "$(RESULTS_DIR)" \
+		--models "$(MODELS)" \
+		--tps "$(TPS)" \
+		--bench-types "$(BENCH_TYPES)" \
+		--suite "$(BENCH_SUITE)" \
+		--junit-xml "$(JUNIT_XML)"
+
+perf-legs: ## Print the CI perf legs (one per selected model and TP, with the cards it needs) as JSON. Same filters as perf-tests.
+	@python3 .github/scripts/run_vllm_benchmarks.py --list-legs \
+		--configs-dir "$(BENCH_CONFIGS_DIR)" \
 		--models "$(MODELS)" \
 		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)" \

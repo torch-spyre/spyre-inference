@@ -109,7 +109,7 @@ def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
 
 
 # Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
-_MASK_MIN = torch.finfo(torch.float16).min / 2
+MASK_MIN = torch.finfo(torch.float16).min / 2
 # Most items per call with `segment_buffer`: the one-hot is a stick wide, its last column padding.
 SEGMENT_ITEMS = STICK - 1
 
@@ -127,7 +127,7 @@ def segment_mask(segments: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Additive `[1, 1, P, P]` mask keeping each patch to its own item."""
     # A matmul: Spyre cannot lay out a column-minus-row broadcast.
     segments = segments.to(dtype)
-    return ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
+    return ((1.0 - torch.matmul(segments, segments.t())) * MASK_MIN)[None, None]
 
 
 class SpyreVisionEncoderMixin:
@@ -204,6 +204,9 @@ class SpyreVisionEncoderMixin:
     vision_taps: ClassVar[tuple[int, ...]] = ()
     # Most items one encoder call can carry, when the layout bounds it (e.g. a one-hot width).
     vision_max_items_per_call: ClassVar[int | None] = None
+    # Limit items per call by budget tokens and vision_max_items_per_call (then required)
+    # instead of upstream's smallest budget, e.g. for a tower with one token per image.
+    vision_items_limited_by_tokens: ClassVar[bool] = False
 
     @property
     def vision_pad_groups(self) -> int:
@@ -244,6 +247,12 @@ class SpyreVisionEncoderMixin:
         deepstack features).
         """
         return torch.where(mask, image, text)
+
+    def vision_embed_text(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The prompt's ``[T, H]`` text embedding: upstream's, with no image tokens."""
+        return super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
 
     # --- 3. Used by the runner ---
 
@@ -287,8 +296,12 @@ class SpyreVisionEncoderMixin:
 
         Overridable: a model whose processor does not count in image tokens out of the encoder
         (e.g. it adds newline tokens) returns its largest item's encoder tokens as the maximum.
+
+        Capped at ``max_model_len``: an item's encoder tokens are among its prompt's, so a
+        larger item is rejected before it reaches the encoder and its budgets are unreachable.
         """
-        return self.vision_patch_multiple // self.patches_per_token, self.max_tokens_per_item
+        largest = min(self.max_tokens_per_item, vllm_config.model_config.max_model_len)
+        return self.vision_patch_multiple // self.patches_per_token, largest
 
     @property
     def vision_pack_tokens(self) -> int | None:
@@ -430,7 +443,7 @@ class SpyreVisionEncoderMixin:
         image tokens arrive on the host: they are placed there at the bucketed ``[T, H]``, so
         the card sees one shape per token bucket whatever the image token count.
         """
-        text = super().embed_input_ids(input_ids, (), is_multimodal=is_multimodal)
+        text = self.vision_embed_text(input_ids, is_multimodal)
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return text
         assert is_multimodal is not None, "image tokens need is_multimodal"

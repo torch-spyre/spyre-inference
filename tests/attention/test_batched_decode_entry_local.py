@@ -18,9 +18,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from spyre_testing_plugin.attn_helpers import split_by_chunk, use_python_for_each_tile
 
 from spyre_inference.v1.attention.ops import batched_decode as bdhm
-from spyre_inference.v1.attention.ops import tile_loop
 
 BLOCK, HEAD, SCALE = 4, 8, 0.3
 
@@ -62,6 +62,12 @@ def _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, cap, 
 
 
 def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None):
+    """Run the kernel on #876 metadata, split per chunk as the upload does."""
+    page_ids, mask = split_by_chunk(page_ids, mask, bpc)
+    return _kernel(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap, sinks)
+
+
+def _kernel(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None):
     return bdhm.batched_decode_kernel(
         query=query,
         rep_row_ids=rep,
@@ -89,10 +95,8 @@ def _meta(b, bpc, kv, q):
 
 @pytest.fixture(autouse=True)
 def python_walk(monkeypatch):
-    # The body math is under test; drive the Python walk (carry=None).
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    # The kernel captures the walk mode separately at import time.
-    monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", False)
+    # The body math is under test, not the tiled op.
+    use_python_for_each_tile(monkeypatch)
 
 
 @pytest.mark.parametrize(("c", "kv", "q"), [(1, 1, 1), (2, 1, 1), (2, 2, 4)])
@@ -221,13 +225,12 @@ def test_body_matches_reference_with_init_state():
 
 
 @pytest.mark.parametrize("c", [1, 3])
-@pytest.mark.parametrize("split_index", [False, True])
-def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
+def test_uploaded_metadata_matches_kernel(monkeypatch, c):
     """Feed the production upload's metadata to the whole kernel on CPU.
 
     Only the device transfer is replaced. The Python walk emulates chunk
-    boundaries, including the split-index shape branch; this does not test
-    compiled for_each_tile execution or the device's physical index layout.
+    boundaries; this does not test compiled for_each_tile execution or the
+    device's physical index layout.
     """
     from spyre_inference.v1.attention.backends import spyre_attn as backend
 
@@ -236,9 +239,8 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
     k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
     mask[0, 0, 0, 0, 2:] = float("-inf")
     mask[::bpc, 1] = float("-inf")
-    if split_index:
-        # The tiled walk's builder materializes the KV-head axis.
-        mask = mask.expand(-1, -1, kv, -1, -1).contiguous()
+    # The builder materializes the KV-head axis.
+    mask = mask.expand(-1, -1, kv, -1, -1).contiguous()
     original_ids, original_mask = page_ids.clone(), mask.clone()
     metadata = SimpleNamespace(
         padded_num_seqs=b,
@@ -256,14 +258,11 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", cpu_transfer)
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", split_index)
-    monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", split_index)
     impl = object.__new__(backend.SpyreAttentionImpl)
     impl._mirror_batched_decode_indices(metadata, torch.device("cpu"))
-    assert len(layouts) == int(split_index)
-    if split_index:
-        assert list(layouts[0].device_size) == [c, 1, bpc * b, 32]
-    got = _call(
+    assert len(layouts) == 1
+    assert list(layouts[0].device_size) == [c, 1, bpc * b, 32]
+    got = _kernel(
         query,
         metadata.rep_row_ids_dev,
         k_pages,
@@ -293,4 +292,4 @@ def test_temp_split_layout_fields():
 
     layout = temporary_chunk_major_page_index_layout(3, 8)
     assert list(layout.device_size) == [3, 1, 8, 32]
-    assert list(layout.stride_map) == [8, -1, 1, -1]
+    assert list(layout.stride_map) == [8, 0, 1, 0]

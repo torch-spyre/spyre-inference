@@ -26,6 +26,9 @@ breaks these invariants fails here.
 """
 
 import importlib.util
+import json
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -33,6 +36,9 @@ import yaml
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / ".github" / "scripts" / "run_vllm_benchmarks.py"
+# The runner imports its sibling resource_sampler, which loading by path does not resolve.
+sys.path.insert(0, str(_SCRIPT.parent))
+resource_sampler = importlib.import_module("resource_sampler")
 _spec = importlib.util.spec_from_file_location("run_vllm_benchmarks", _SCRIPT)
 runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(runner)
@@ -142,6 +148,27 @@ def test_bare_list_still_loads(tmp_path):
 @pytest.mark.parametrize("raw", [{"defaults": {}}, {"tests": {}}, "scalar"])
 def test_malformed_file_returns_none(tmp_path, raw):
     assert runner._load_configs(_write(tmp_path, raw)) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../escape", "a/b", "a\\b", "..", ".", ".hidden", "", None],
+)
+def test_unsafe_test_name_fails_to_load(tmp_path, name):
+    """test_name is joined into the results dir for .json/.cmd/.log files, so
+    anything but a single path-safe segment must fail the whole file."""
+    config = {"test_name": name, "parameters": {"model": "m", "tensor_parallel_size": 1}}
+    assert runner._load_configs(_write(tmp_path, [config])) is None
+
+
+def test_safe_test_name_still_loads(tmp_path):
+    (config,) = runner._load_configs(
+        _write(
+            tmp_path,
+            [{"test_name": "serve_granite41-8b_tp1", "parameters": {"model": "m"}}],
+        )
+    )
+    assert config["test_name"] == "serve_granite41-8b_tp1"
 
 
 # ── derived values ──
@@ -255,6 +282,23 @@ def test_missing_dataset_aborts_the_run(monkeypatch, tmp_path):
     assert excinfo.value.code == 2
 
 
+def test_unset_dataset_var_falls_back_to_the_archive(monkeypatch, tmp_path):
+    """The vision var has a fetch-cache default now, so unset resolves and an
+    absent file is fatal like any other trace, not a skip."""
+    monkeypatch.delenv("SPYRE_VISION_DATASET", raising=False)
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
+    config = _serve_config("${SPYRE_VISION_DATASET}")
+    runner._resolve_dataset_path(config)
+
+    expected = tmp_path / "spyre-inference/datasets/vision/oracle_invoices_2026.11.10/dataset.jsonl"
+    assert config["parameters"]["dataset-path"] == str(expected)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner._select_configs([config], set(), set())
+
+    assert excinfo.value.code == 2
+
+
 def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path):
     """Filtering runs first, so an absent trace only matters for a selected test."""
     monkeypatch.setenv("SPYRE_CICS_DATASET", str(tmp_path / "absent.jsonl"))
@@ -263,6 +307,84 @@ def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path
 
     assert runner._select_configs([config], {"other-model"}, set()) == []
     assert runner._select_configs([config], set(), {4}) == []
+
+
+# ── vision dataset: server_parameters expansion and archive defaults ──
+
+
+def test_server_parameters_expand_env(monkeypatch, tmp_path):
+    """allowed-local-media-path must not reach vllm serve as a literal ${VAR}."""
+    media = tmp_path / "media"
+    media.mkdir()
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    monkeypatch.setenv("SPYRE_VISION_IMAGES_DATASET", str(media))
+    monkeypatch.setenv("SPYRE_CICS_DATASET", str(trace))
+    config = _serve_config("${SPYRE_CICS_DATASET}")
+    config["server_parameters"]["allowed-local-media-path"] = "${SPYRE_VISION_IMAGES_DATASET}"
+    runner._derive_config(config)
+
+    (selected,) = runner._select_configs([config], set(), set())
+
+    assert selected["server_parameters"]["allowed-local-media-path"] == str(media)
+
+
+def test_missing_media_dir_aborts_the_run(monkeypatch, tmp_path):
+    """A dataset whose image dir is absent cannot run, like an absent trace."""
+    trace = tmp_path / "trace.jsonl"
+    trace.touch()
+    config = _serve_config(str(trace))
+    config["server_parameters"]["allowed-local-media-path"] = str(tmp_path / "absent")
+    runner._derive_config(config)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner._select_configs([config], set(), set())
+
+    assert excinfo.value.code == 2
+
+
+def test_archive_defaults_point_into_the_cache(tmp_path):
+    """Unset vision vars fall back to the extracted archive's cache location."""
+    monkeypatch = pytest.MonkeyPatch()
+    with monkeypatch.context() as mp:
+        mp.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path))
+        mp.delenv("SPYRE_VISION_DATASET", raising=False)
+        mp.delenv("SPYRE_VISION_IMAGES_DATASET", raising=False)
+        env = runner._dataset_path_defaults()
+
+    out = tmp_path / "spyre-inference/datasets/vision/oracle_invoices_2026.11.10"
+    assert env["SPYRE_VISION_DATASET"] == str(out / "dataset.jsonl")
+    assert env["SPYRE_VISION_IMAGES_DATASET"] == str(out)
+
+
+def test_materialize_rewrites_image_paths_absolute(tmp_path, monkeypatch):
+    """The archive ships relative image paths; the cache copy must be absolute."""
+    import tarfile
+
+    images = tmp_path / "img"
+    images.mkdir()
+    (images / "a.jpg").write_bytes(b"not-really-a-jpeg")
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text('{"prompt": "p", "image_files": ["img/a.jpg"]}\n')
+    archive = tmp_path / "ds.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(prompts, arcname="prompts.jsonl")
+        tar.add(images, arcname="img")
+
+    spec = {"path": "ds.tar.gz", "sha256": "0" * 64, "media_var": "SPYRE_VISION_IMAGES_DATASET"}
+    monkeypatch.setenv("SPYRE_BENCH_DATA_DIR", str(tmp_path / "cache"))
+    out = tmp_path / "cache" / "ds"
+    # The archive sits where the fetch step would have put it.
+    (tmp_path / "cache").mkdir()
+    archive.rename(tmp_path / "cache" / "ds.tar.gz")
+
+    dataset, media = runner.fetch_bench_datasets.materialize(tmp_path / "cache" / "ds.tar.gz", spec)
+
+    assert media == out
+    assert dataset == out / "dataset.jsonl"
+    row = json.loads(dataset.read_text().splitlines()[0])
+    assert row["image_files"] == [str(out / "img" / "a.jpg")]
+    assert Path(row["image_files"][0]).is_file()
 
 
 def test_config_without_tp_aborts_the_run():
@@ -329,6 +451,178 @@ def test_matrix_skips_dev_configs(tmp_path):
     result = matrix.generate_benchmark_matrix(str(tmp_path), [])
 
     assert result["include"] == [{"models": "ci-model"}]
+
+
+# ── CI legs ──
+
+
+def _offline(model: str, tp: int) -> dict:
+    return {"test_name": f"t_{tp}", "parameters": {"model": model, "tensor_parallel_size": tp}}
+
+
+def _legs_files(tmp_path) -> list:
+    latency = tmp_path / "latency-tests.yaml"
+    latency.write_text(yaml.safe_dump([_offline("Org/A", 1), _offline("org/a", 4)]))
+    serve = _write(
+        tmp_path,
+        {
+            "tests": [
+                _serve_config("x", server_parameters={"model": "Org/A", "tensor-parallel-size": 1}),
+                _serve_config("x", server_parameters={"model": "org/b", "tensor-parallel-size": 2}),
+            ]
+        },
+    )
+    return [("latency", latency), ("serve", serve), ("serve", tmp_path / "absent.yaml")]
+
+
+def test_legs_split_by_model_and_tp_on_enough_cards(tmp_path):
+    legs = runner.list_legs(_legs_files(tmp_path), set(), set())
+
+    assert legs == [
+        {"model": "Org/A", "tp": 1, "cards": 1, "key": "org-a-tp1"},
+        {"model": "org/a", "tp": 4, "cards": 4, "key": "org-a-tp4"},
+        {"model": "org/b", "tp": 2, "cards": 2, "key": "org-b-tp2"},
+    ]
+
+
+def test_legs_follow_the_model_and_tp_filters(tmp_path):
+    legs = runner.list_legs(_legs_files(tmp_path), {"org/a"}, {4})
+
+    assert [(leg["model"], leg["tp"]) for leg in legs] == [("org/a", 4)]
+
+
+def test_tp_beyond_the_largest_runner_aborts_the_listing(tmp_path):
+    latency = tmp_path / "latency-tests.yaml"
+    latency.write_text(yaml.safe_dump([_offline("m", 8)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner.list_legs([("latency", latency)], set(), set())
+    assert excinfo.value.code == 2
+
+
+def test_every_ci_config_lands_on_a_leg_with_enough_cards():
+    legs = runner.list_legs(
+        [("latency", LATENCY_TESTS), ("throughput", THROUGHPUT_TESTS), ("serve", SERVE_TESTS)],
+        set(),
+        set(),
+    )
+    cards = {(leg["model"].lower(), leg["tp"]): leg["cards"] for leg in legs}
+    assert len({leg["key"] for leg in legs}) == len(legs)
+
+    for config_file in (LATENCY_TESTS, THROUGHPUT_TESTS, SERVE_TESTS):
+        for config in runner._load_configs(config_file):
+            tp = runner._config_tp(config)
+            assert cards[(runner._config_model(config).lower(), tp)] >= tp, config["test_name"]
+
+
+# ── pinned revisions ──
+
+
+def test_cache_config_pins_are_read():
+    pins = runner._pinned_revisions()
+
+    assert pins["google/gemma-4-26b-a4b"] == "24548b62aa021d562695c04aaf7758a1ea47990b"
+    assert "ibm-ai-platform/micro-g3.3-8b-instruct-1b" not in pins
+
+
+def test_pinned_serve_model_runs_at_its_cached_revision(monkeypatch):
+    monkeypatch.setattr(runner, "_local_snapshot", lambda model, rev: f"/snap/{model}/{rev}")
+    config = _serve_config("x", server_parameters={"model": "Org/M", "tensor-parallel-size": 1})
+    runner._derive_config(config)
+
+    runner._pin_revision(config, {"org/m": "abc"})
+
+    assert config["server_parameters"]["revision"] == "abc"
+    # bench serve has no revision flag, so its tokenizer is the local snapshot.
+    assert config["parameters"]["tokenizer"] == "/snap/Org/M/abc"
+
+
+def test_pinned_offline_model_keeps_an_explicit_revision(monkeypatch):
+    monkeypatch.setattr(runner, "_local_snapshot", lambda model, rev: f"/snap/{rev}")
+    config = _offline("org/m", 1)
+    config["parameters"]["revision"] = "mine"
+
+    runner._pin_revision(config, {"org/m": "abc"})
+
+    assert config["parameters"]["revision"] == "mine"
+    assert config["parameters"]["tokenizer"] == "/snap/mine"
+
+
+def test_unpinned_or_uncached_model_is_left_alone(monkeypatch):
+    monkeypatch.setattr(runner, "_local_snapshot", lambda model, rev: None)
+    unpinned, uncached = _offline("org/x", 1), _offline("org/m", 1)
+
+    runner._pin_revision(unpinned, {"org/m": "abc"})
+    runner._pin_revision(uncached, {"org/m": "abc"})
+
+    assert unpinned["parameters"] == _offline("org/x", 1)["parameters"]
+    assert uncached["parameters"]["revision"] == "abc"
+    assert "tokenizer" not in uncached["parameters"]
+
+
+# ── JUnit ──
+
+
+def test_junit_holds_one_case_per_benchmark(tmp_path):
+    import xml.etree.ElementTree as ET
+
+    path = tmp_path / "out" / "junit.xml"
+    runner.write_junit(
+        path,
+        [
+            runner.BenchResult("latency", "lat_a", "org/a", 1.5),
+            runner.BenchResult("serve", "srv_b", "", 2.0, "exit code 1\n\x1b[31mboom\x1b[0m"),
+        ],
+    )
+
+    suite = ET.parse(path).getroot().find("testsuite")
+    assert (suite.get("tests"), suite.get("failures")) == ("2", "1")
+    passed, failed = suite.findall("testcase")
+    assert (passed.get("classname"), passed.get("name")) == ("vllm_bench.latency", "lat_a")
+    assert passed.find("failure") is None
+    tags = [p.get("value") for p in passed.iter("property")]
+    assert "testtype__perf" in tags and "model__org/a" in tags
+    failure = failed.find("failure")
+    assert failure.get("message") == "exit code 1"
+    assert failure.text == "exit code 1\n[31mboom[0m"
+
+
+def test_main_writes_junit_and_fails_on_a_failed_benchmark(monkeypatch, tmp_path):
+    import xml.etree.ElementTree as ET
+
+    (tmp_path / "latency-tests.yaml").write_text(
+        yaml.safe_dump(
+            [{**_offline("m", 1), "test_name": "ok"}, {**_offline("m", 1), "test_name": "bad"}]
+        )
+    )
+    monkeypatch.setattr(
+        runner, "run_benchmark", lambda **kw: "exit code 1" if kw["test_name"] == "bad" else None
+    )
+    junit = tmp_path / "junit.xml"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_vllm_benchmarks.py",
+            "--configs-dir",
+            str(tmp_path),
+            "--results-dir",
+            str(tmp_path / "results"),
+            "--bench-types",
+            "latency",
+            "--junit-xml",
+            str(junit),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        runner.main()
+
+    assert exc.value.code == 1
+    cases = ET.parse(junit).getroot().iter("testcase")
+    assert {c.get("name"): c.find("failure") is not None for c in cases} == {
+        "ok": False,
+        "bad": True,
+    }
 
 
 # ── the checked-in config ──
@@ -427,3 +721,179 @@ def test_offline_tests_yaml_derives_consistently(config_file):
             continue
         half = parameters["max-model-len"] // 2
         assert parameters[input_key] == parameters[output_key] == half, name
+
+
+def _sampler(monkeypatch, cpu=(), mem=()):
+    """A ContainerSampler with canned samples, so no cgroup is read."""
+    monkeypatch.setattr(resource_sampler, "_read_cgroup_cpu_usec", lambda root: 0)
+    sampler = resource_sampler.ContainerSampler(interval=1.0)
+    sampler._cpu_samples = list(cpu)
+    sampler._mem_samples = list(mem)
+    return sampler
+
+
+def test_runner_imports_the_resource_sampler():
+    assert runner.write_resource_metrics is resource_sampler.write_resource_metrics
+    assert runner.ContainerSampler is resource_sampler.ContainerSampler
+
+
+def test_sampler_summary_is_mean_peak_p99(monkeypatch):
+    sampler = _sampler(monkeypatch, cpu=[10.0, 20.0, 30.0], mem=[100.0, 200.0, 300.0])
+    assert sampler.summary() == {
+        "host_cpu_pct_total": {"mean": 20.0, "peak": 30.0, "p99": 30.0},
+        "host_mem_mb": {"mean": 200.0, "peak": 300.0, "p99": 300.0},
+    }
+
+
+def test_sampler_summary_prefixes_the_phase(monkeypatch):
+    summary = _sampler(monkeypatch, cpu=[1.0], mem=[2.0]).summary(phase="compile")
+    assert set(summary) == {"compile_host_cpu_pct_total", "compile_host_mem_mb"}
+
+
+def test_sampler_summary_is_empty_without_samples(monkeypatch):
+    assert _sampler(monkeypatch).summary() == {}
+
+
+def test_write_resource_metrics_writes_one_flat_record_per_stat(tmp_path):
+    summary = {"host_cpu_pct_total": {"mean": 20.0, "peak": 30.0}}
+    resource_sampler.write_resource_metrics("serve_m_tp1", tmp_path, summary, model="org/m")
+    # Named by test, with the suffix the ingest's host-resource pass reads.
+    lines = (tmp_path / "serve_m_tp1.host_resources.json").read_text().splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {
+            "test_name": "serve_m_tp1",
+            "metric": "host_cpu_pct_total_mean",
+            "value": 20.0,
+            "model": "org/m",
+        },
+        {
+            "test_name": "serve_m_tp1",
+            "metric": "host_cpu_pct_total_peak",
+            "value": 30.0,
+            "model": "org/m",
+        },
+    ]
+
+
+def test_write_resource_metrics_omits_an_empty_model(tmp_path):
+    resource_sampler.write_resource_metrics("t", tmp_path, {"host_mem_mb": {"mean": 1.5}})
+    (record,) = [
+        json.loads(line) for line in (tmp_path / "t.host_resources.json").read_text().splitlines()
+    ]
+    assert "model" not in record
+
+
+def test_write_resource_metrics_writes_nothing_for_an_empty_summary(tmp_path):
+    resource_sampler.write_resource_metrics("t", tmp_path, {})
+    assert list(tmp_path.iterdir()) == []
+
+
+_MOUNT = "49 47 0:30 {root} /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw,nsdelegate\n"
+
+
+@pytest.mark.parametrize(
+    "mount_root, own, expected",
+    [
+        # Host or shared cgroupns: the mount is the whole tree, the process sits below it.
+        ("/", "/kubepods/pod1/ctr", "/sys/fs/cgroup/kubepods/pod1/ctr"),
+        # Private cgroupns: the process is its namespace's root.
+        ("/", "/", "/sys/fs/cgroup"),
+        # A bind-mounted subtree: the 0:: path is below the mount root, not under the mountpoint.
+        ("/kubepods/pod1/ctr", "/kubepods/pod1/ctr", "/sys/fs/cgroup"),
+        ("/kubepods/pod1", "/kubepods/pod1/ctr", "/sys/fs/cgroup/ctr"),
+        # A process outside the mounted subtree sees only the mount's top.
+        ("/kubepods/pod1/ctr", "/other", "/sys/fs/cgroup"),
+    ],
+)
+def test_resolve_cgroup_finds_the_processes_own_directory(mount_root, own, expected):
+    resolved = resource_sampler._resolve_cgroup(f"0::{own}\n", _MOUNT.format(root=mount_root))
+    assert resolved == Path(expected)
+
+
+def test_resolve_cgroup_on_a_spyre_perf_pod():
+    """Private cgroupns, as read on a pod: /sys/fs/cgroup is already the pod's cgroup."""
+    mountinfo = (
+        "1457 1454 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime"
+        " - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot\n"
+    )
+    assert resource_sampler._resolve_cgroup("0::/\n", mountinfo) == Path("/sys/fs/cgroup")
+
+
+def test_resolve_cgroup_ignores_v1_lines_and_other_mounts():
+    proc_cgroup = "12:memory:/legacy\n0::/pod/ctr\n"
+    mountinfo = "30 25 0:27 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n" + _MOUNT.format(
+        root="/"
+    )
+    assert resource_sampler._resolve_cgroup(proc_cgroup, mountinfo) == Path(
+        "/sys/fs/cgroup/pod/ctr"
+    )
+
+
+@pytest.mark.parametrize(
+    "proc_cgroup, mountinfo",
+    [
+        ("12:memory:/legacy\n", _MOUNT.format(root="/")),  # cgroup v1 only: no 0:: line
+        ("0::/pod\n", "30 25 0:27 / /sys/fs/cgroup rw - cgroup cgroup rw,memory\n"),  # no cgroup2
+        ("", ""),
+    ],
+)
+def test_resolve_cgroup_returns_none_when_it_cannot_tell(proc_cgroup, mountinfo):
+    assert resource_sampler._resolve_cgroup(proc_cgroup, mountinfo) is None
+
+
+def test_cgroup_root_falls_back_to_the_mountpoint_when_unreadable(monkeypatch):
+    def unreadable(self, *args, **kwargs):
+        raise OSError("no /proc")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert resource_sampler._cgroup_root() == Path("/sys/fs/cgroup")
+
+
+def test_cgroup_root_of_this_process_has_the_files_the_sampler_reads():
+    root = resource_sampler._cgroup_root()
+    if not (root / "cpu.stat").exists():
+        pytest.skip("no cgroup v2 accounting on this host")
+    assert (root / "memory.current").exists()
+    resource_sampler._read_cgroup_cpu_usec(root)
+    resource_sampler._read_cgroup_mem_mb(root)
+
+
+def test_make_sampler_degrades_to_a_noop_without_cgroup_metrics(monkeypatch):
+    def unavailable():
+        raise OSError("no cgroup")
+
+    monkeypatch.setattr(runner, "ContainerSampler", unavailable)
+    sampler = runner._make_sampler()
+    sampler.stop()
+    assert sampler.summary(phase="compile") == {}
+
+
+def test_make_sampler_degrades_to_a_noop_on_a_malformed_interval(monkeypatch):
+    """A ValueError from the env parse must not escape: the server is already running."""
+    monkeypatch.setenv("RESOURCE_SAMPLER_INTERVAL", "1s")
+    sampler = runner._make_sampler()
+    assert isinstance(sampler, runner._Noop)
+    sampler.stop()
+    assert sampler.summary() == {}
+
+
+def test_sampler_thread_survives_an_unparsable_sample(monkeypatch):
+    """A ValueError (e.g. an unexpected cpu.stat line) skips one sample, not the thread."""
+    monkeypatch.setattr(resource_sampler, "_read_cgroup_cpu_usec", lambda root: 0)
+    sampler = resource_sampler.ContainerSampler(interval=0.01)
+    calls = []
+
+    def collect():
+        calls.append(None)
+        if len(calls) == 1:
+            raise ValueError("invalid literal for int()")
+        return 1.0, 2.0
+
+    monkeypatch.setattr(sampler, "_collect", collect)
+    sampler.start()
+    deadline = time.monotonic() + 5
+    while not sampler._cpu_samples and time.monotonic() < deadline:
+        time.sleep(0.01)
+    sampler.stop()
+
+    assert sampler._cpu_samples and sampler._mem_samples == [2.0] * len(sampler._cpu_samples)

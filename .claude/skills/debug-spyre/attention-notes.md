@@ -6,9 +6,9 @@ Companion to `SKILL.md`. Read this when the failing surface is the Spyre attenti
 
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — the decoder backend: `SpyreAttentionImpl` (head-major allocation, per-head KV-write index, kernels), `SpyreAttentionMetadataBuilder` (shared with the encoder backend), and the per-sequence / batched-decode dispatch.
 - `spyre_inference/v1/attention/backends/spyre_encoder_attn.py` — encoder-only (no KV cache) attention.
-- `spyre_inference/v1/attention/ops/` — the kernel source code (`page_attn*.py`, `batched_decode*.py`, `reshape_and_cache*.py`), the cache device layouts (`layout.py`) and the tiled-walk driver (`tile_loop.py`). Kernel docstrings and inline comments name the torch-spyre limitation each shape choice routes around.
+- `spyre_inference/v1/attention/ops/` — the kernel source code (`page_attn*.py`, `batched_decode*.py`, `reshape_and_cache*.py`) and the cache device layouts (`layout.py`). Kernel docstrings and inline comments name the torch-spyre limitation each shape choice routes around.
 - `spyre_inference/v1/attention/attn_layer.py` — the traced KV write and query staging that replace `Attention.forward`.
-- `tests/attention/test_spyre_attn.py` — builds real metadata via `SpyreAttentionMetadataBuilder`, seeds the cache through the impl's own store, calls `SpyreAttentionImpl.forward` (compiled on Spyre, eager on CPU), compares against a CPU reference (`ref_attn`) with `assert_close_outliers` (base `atol=0.3, rtol=0.2` when a query is 32+ rows, `atol=0.2, rtol=0.2` otherwise; up to 5 outliers at twice the resulting tolerances) — if mismatch ratios are near 100 % with differences > 1.0, suspect a **structural** bug, not fp16 noise.
+- `tests/attention/test_spyre_attn.py` — builds real metadata via `SpyreAttentionMetadataBuilder`, seeds the cache through the impl's own store, calls `SpyreAttentionImpl.forward` (always compiled, on Spyre), compares against a CPU reference (`ref_attn`) with `assert_close_outliers` (base `atol=0.3, rtol=0.2` when a query is 32+ rows, `atol=0.2, rtol=0.2` otherwise; up to 5 outliers at twice the resulting tolerances) — if mismatch ratios are near 100 % with differences > 1.0, suspect a **structural** bug, not fp16 noise.
 
 ## Attention-specific limitations
 
@@ -19,7 +19,7 @@ In addition to the generic table in `SKILL.md`:
 | KV alignment to bucketed length | `SpyreAttnBucketer` kv buckets: powers of two from `block_size` to `max_model_len`, consumed as a padded block count, so the same compiled kernel is reused as KV grows |
 | Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1] + multiples of min(512, max_num_batched_tokens)`; each sequence's query is padded up to its own bucket |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
-| The page gather is a 2-D subscript (`aten.index`), which fails eager on Spyre (torch-spyre#4334) | Attention always compiles on Spyre, even under `--enforce-eager`; off Spyre an eager run calls the kernels uncompiled. Batched decode still requires `STOCK_TORCH_COMPILE` mode |
+| The page gather is a 2-D subscript (`aten.index`), which fails eager on Spyre (torch-spyre#4334) | Attention always compiles, even under `--enforce-eager` |
 
 MHA and MQA (`test_spyre_attn_head_configs`), GQA, sliding window and soft-capping all have committed parametrizations.
 
@@ -28,7 +28,7 @@ MHA and MQA (`test_spyre_attn_head_configs`), GQA, sliding window and soft-cappi
 These appear in current parametrize IDs. They're for reading collected node IDs; `-k` will not parse the parens/equals/commas.
 
 - `decode_single` / `decode_batch` / `prefill_single` / `prefill_batch` / `mixed_batch` / `kv_padded_prefill`
-- `device_cpu-eager` / `device_spyre-compiled`, or `device_spyre` with `compiled`
+- `device_spyre-compiled`, or `device_spyre` with `compiled`
 
 ## Reading LX residency: read the allocation, not the `lx_pinning:` log
 
@@ -109,7 +109,7 @@ When the failing surface is attention, in addition to the generic starter set, a
 - **Attention mask off-by-one / wrong padded shape / wrong causal boundary.** `_build_attention_mask` (no sliding window) and `_build_single_tile` (sliding window) build per-block tiles padded to `aligned_query_len × block_size`. Off-by-one in causal/padding masking produces near-100 % mismatches that look like "random output." Print the mask stack for a small case and verify masked positions are `finfo(fp16).min` (-65504), unmasked are `0`, and the causal boundary matches `context_lens + q_pos`.
 - **Page index table wrong.** `page_index_tables_cpu[s][i, 0]` must be the physical page of sequence `s`'s `i`-th *active* block (a position within `active_block_indices` under a window, not an absolute block index). A wrong order leaves the mask tiles misaligned with the pages they mask — silent disaster.
 - **Batched vs per-sequence path.** Even one decode sequence can take the batched kernel when it is supported (compiled and sufficient page capacity); set `SPYRE_BATCHED_DECODE=0` to force the per-sequence loop and see whether the failure follows the path.
-- **Tiled vs Python walk.** `SPYRE_ATTN_FOR_EACH_TILE=0` runs the identical kernel bodies under a Python loop; a failure that disappears there is a `for_each_tile` / torch-spyre pin problem. The flag is read at import.
+- **Tiled vs Python walk.** CPU tests swap `for_each_tile` for a Python loop (`use_python_for_each_tile` in `spyre_testing_plugin.attn_helpers`) that runs the identical kernel bodies. A failure those CPU tests don't reproduce points at the `for_each_tile` lowering or the torch-spyre pin.
 - **A shape that escapes the `SpyreAttnBucketer` kv/query buckets** dispatches to an unrecorded kernel (correctness, not just recompilation cost).
 
 ## Pipeline bisection for `forward()`
@@ -138,8 +138,8 @@ Look for **periodic patterns**: if every Nth head is huge and the rest are sane 
 
 ## Attention-specific gotcha: which mode the impl compiles in
 
-`SpyreAttentionImpl` samples `get_current_vllm_config().compilation_config.mode` at construction and compiles its kernels when it equals `STOCK_TORCH_COMPILE`, and on a Spyre device regardless of mode (torch-spyre#4334). The `default_vllm_config` fixture resolves to `STOCK_TORCH_COMPILE` (the platform hook sets it), so an impl built under it compiles unless the test's `configure_compilation` fixture sets `NONE`; only an eager CPU run calls the kernels uncompiled. If you're reproducing a kernel-looking bug in a plain script, match the mode the failing test used, or you may be comparing apples to oranges.
+Decoder attention (`SpyreAttentionImpl`) always runs compiled, even under `--enforce-eager`, because its page gather fails in eager mode (torch-spyre#4334). Encoder attention (`SpyreEncoderAttentionImpl`) compiles only when `compilation_config.mode` is `STOCK_TORCH_COMPILE` at the time it is built. So to reproduce an encoder bug, use the same compilation mode as the failing test.
 
 ## CPU-vs-Spyre standalone repro (attention-flavored)
 
-If the failing test has a `device_cpu-eager` parametrization, rerun that node id in place of `device_spyre-compiled`. Some attention tests parametrize only Spyre, and compiled CPU attention variants are skipped. Otherwise, for a standalone repro under `logs/<slug>/repro_cpu.py`, copy the setup `_run_spyre_attn_test` does — plain CPU head-major page tensors written through the impl's store, metadata from `SpyreAttentionMetadataBuilder.build`, an impl under a `set_current_vllm_config` context — and call the kernel from `v1/attention/ops/` directly. (`allocate_pages` needs a Spyre device: its layouts come from `torch_spyre._C`.) If the CPU variant passes, the bug is in torch-spyre's realization of the operation; if it still fails on CPU, the bug is in our own logic. Note that a compiled attention kernel does not run on CPU (Inductor's C++ codegen rejects it), so compare against the eager kernel.
+The decoder attention tests run on Spyre only; `SpyreAttentionImpl` takes no CPU KV cache. For a standalone repro under `logs/<slug>/repro_cpu.py`, build the metadata with `SpyreAttentionMetadataBuilder.build` as `_run_spyre_attn_test` does, fill plain CPU head-major page tensors by indexing (`k_pages[block, :, offset] = key[t]`, as `test_spyre_attn_scatter` builds its expected pages), and call the kernel from `v1/attention/ops/` directly on CPU tensors. (`allocate_pages` needs a Spyre device: its layouts come from `torch_spyre._C`.) If the CPU kernel passes, the bug is in torch-spyre's realization of the operation; if it still fails on CPU, the bug is in our own logic. A compiled attention kernel does not run on CPU (Inductor's C++ codegen rejects it), so compare against the eager kernel.

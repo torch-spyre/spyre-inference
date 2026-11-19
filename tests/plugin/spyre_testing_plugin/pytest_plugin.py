@@ -651,7 +651,7 @@ def _find_allow_entry(test_name: str, allow_list: tuple[AllowEntry, ...]) -> All
     return None
 
 
-# Architecture-specific model family exclusions for upstream tests
+# Architecture-specific model family exclusions
 _UNSUPPORTED_ARCH_MODELS: dict[str, tuple[str, ...]] = {
     "ppc64le": ("qwen",),
 }
@@ -664,7 +664,8 @@ def _is_unsupported_on_current_platform(item: pytest.Item) -> bool:
     if not patterns:
         return False
     path_str = str(item.fspath).lower()
-    if any(pat in path_str for pat in patterns):
+    nodeid = item.nodeid.lower()
+    if any(pat in path_str or pat in nodeid for pat in patterns):
         return True
     params = getattr(getattr(item, "callspec", None), "params", {})
     # Deliberately sweep all param values, not just a "model" key. The GSM8K gate
@@ -705,6 +706,17 @@ def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Apply YAML-based filtering to upstream tests and reorder tests."""
+    arch_deselected: list[pytest.Item] = []
+    kept: list[pytest.Item] = []
+    for item in items:
+        if _is_unsupported_on_current_platform(item):
+            arch_deselected.append(item)
+        else:
+            kept.append(item)
+    if arch_deselected:
+        items[:] = kept
+        config.hook.pytest_deselected(items=arch_deselected)
+
     upstream_tests_base = getattr(config, "_upstream_tests_base", None)
     if upstream_tests_base:
         upstream_tests_base = Path(upstream_tests_base).resolve()
@@ -714,20 +726,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         }
 
         upstream_marker = pytest.mark.upstream
-        kept: list[pytest.Item] = []
-        deselected: list[pytest.Item] = []
 
         for item in items:
             test_path = Path(item.fspath).resolve()
             if not test_path.is_relative_to(upstream_tests_base):
-                kept.append(item)
                 continue
 
-            if _is_unsupported_on_current_platform(item):
-                deselected.append(item)
-                continue
-
-            kept.append(item)
             item.add_marker(upstream_marker)
 
             # Tag upstream items before the skip/xfail branches so tags land
@@ -775,10 +779,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             # Inject fixtures for tests that have fixture_names defined
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
-
-        items[:] = kept
-        if deselected:
-            config.hook.pytest_deselected(items=deselected)
 
     _signal_timeout_for_subprocess_tests(items)
     _reorder_tests_by_name(items)
@@ -1293,21 +1293,9 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(SpyreAttentionImpl, "do_kv_cache_update", do_kv_cache_update)
 
-    # The test runs on CPU, where a Spyre device layout (the batched decode index's stick
-    # layout) cannot be built; the plain transfer carries the same values.
-    orig_to = torch.Tensor.to
+    from spyre_testing_plugin.attn_helpers import drop_cpu_device_layouts
 
-    def to(tensor, *args, device_layout=None, **kwargs):
-        if device_layout is None:
-            return orig_to(tensor, *args, **kwargs)
-        target = kwargs.get("device", args[0] if args else None)
-        if not isinstance(target, (str, torch.device)):
-            target = tensor.device
-        if torch.device(target).type != "spyre":
-            return orig_to(tensor, *args, **kwargs)
-        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", to)
+    drop_cpu_device_layouts(monkeypatch)
 
     yield
 

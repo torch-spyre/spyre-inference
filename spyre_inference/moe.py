@@ -21,7 +21,11 @@ adapters opt a layer in with a ``SpyreMoERecipe``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import contextvars
+import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -127,7 +131,9 @@ class SpyreMoERecipe:
 
     activation: Literal["gelu_tanh", "silu", "swigluoai"]
     routing: Literal["full_softmax", "topk_softmax"]
-    prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # Called per chunk of experts while the down stack streams to the card: ``stack`` is
+    # ``w2[experts]``, so the whole transformed stack is never built on the host.
+    prepare_down_weight: Callable[[torch.Tensor, slice], torch.Tensor] | None = None
 
 
 # vLLM's swigluoai_and_mul constants. Its MoEActivation.SWIGLUOAI also defines the w13 layout:
@@ -512,7 +518,9 @@ def _moe_persistent_in_graph(
             tile_size=1,
             init=init,
         )
-    return result.squeeze(0)
+    # Sum, not squeeze: an in-graph all_reduce of a view of a for_each_tile result can leave
+    # each rank with its own partial (torch-spyre#6062).
+    return result.sum(dim=0)
 
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
@@ -629,25 +637,68 @@ def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
     return SpyreTensorLayout(list(weight.shape), list(weight.stride()), weight.dtype, [1, 0, 2])
 
 
-def _to_spyre_expert_weight(
-    weight: torch.Tensor, pad: tuple[int, ...], *, kernel_order: bool = False
-) -> torch.Tensor:
-    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device."""
-    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+# Host bytes a chunk of an expert stack stages: the copy is host-bound, and a chunk's
+# transpose stays in cache where a whole stack's does not.
+_EXPERT_CHUNK_BYTES = 32 << 20
 
-    if any(pad):
-        weight = F.pad(weight, pad)
-    if not kernel_order:
-        moved = dma_moe_expert_weight_to_spyre(weight)
-        assert moved is not None
-        return moved
+
+def _gather_layout(weight: torch.Tensor) -> SpyreTensorLayout | None:
+    """The ``[E, C, F]`` gather layout of the ``dma_*`` helpers; None off whole sticks."""
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    experts, contract, free = weight.shape
+    eps = SpyreTensorLayout(list(weight.shape), weight.dtype).elems_per_stick()
+    if free % eps:
+        return None
+    return SpyreTensorLayout(
+        [experts, contract, free // eps, eps],
+        [contract * free, free, eps, 1],
+        get_device_dtype(weight.dtype),
+        {(0,): experts, (1,): contract, (2, 3): free},
+    )
+
+
+def _to_spyre_expert_weight(
+    weight: torch.Tensor,
+    pad: tuple[int, ...],
+    *,
+    kernel_order: bool = False,
+    prepare: Callable[[torch.Tensor, slice], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device
+    in chunks of experts, each transformed by ``prepare(chunk, experts)`` when given."""
+    from torch_spyre._C import copy_tensor
+    from torch_spyre.model_utils import spyre_empty_with_layout
+
     if not torch.spyre.is_initialized():
         torch.empty(0, dtype=weight.dtype, device="spyre")
-    weight = weight.contiguous()
-    layout = _expert_kernel_layout(weight)
-    assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
+    assert len(pad) <= 4, "pad never touches the expert axis, so chunks pad like the stack"
+    padded = torch.empty(weight.shape, dtype=weight.dtype, device="meta")
+    if any(pad):
+        padded = F.pad(padded, pad)
+    layout = _expert_kernel_layout(padded) if kernel_order else _gather_layout(padded)
+    assert layout is not None, "the free dim must span whole sticks"
     # Lands on the current Spyre device, as the ``dma_*`` helpers do.
-    return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
+    dst = spyre_empty_with_layout(padded.size(), padded.stride(), weight.dtype, layout, device=None)
+    experts = weight.shape[0]
+    per_expert = padded[0].numel() * weight.element_size()
+    chunk = max(1, min(experts, _EXPERT_CHUNK_BYTES // max(1, per_expert)))
+    for start in range(0, experts, chunk):
+        part = weight[start : start + chunk]
+        if prepare is not None:
+            part = prepare(part, slice(start, min(start + chunk, experts)))
+        part = F.pad(part, pad) if any(pad) else part.contiguous()
+        copy_tensor(part, dst[start : start + chunk], non_blocking=False)
+    return dst
+
+
+def _chunked_down_transform(
+    transform: Callable[[torch.Tensor, slice], torch.Tensor],
+) -> Callable[[torch.Tensor, slice], torch.Tensor]:
+    def prepare(part: torch.Tensor, experts: slice) -> torch.Tensor:
+        return transform(part.transpose(1, 2), experts).transpose(1, 2)
+
+    return prepare
 
 
 def _chunk_entry_constants(chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -684,17 +735,11 @@ def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     experts, contract, free = pool.shape
     if contract % chunks:
         raise ValueError(f"gate/up contract dim {contract} must divide into {chunks} chunks")
-    eps = SpyreTensorLayout([experts, contract, free], pool.dtype).elems_per_stick()
+    expected = _gather_layout(pool)
+    assert expected is not None, "a gather pool spans whole sticks"
+    _check_pool_layout(pool, expected)
+    eps = expected.elems_per_stick()
     device_dtype = get_device_dtype(pool.dtype)
-    _check_pool_layout(
-        pool,
-        SpyreTensorLayout(
-            [experts, contract, free // eps, eps],
-            [contract * free, free, eps, 1],
-            device_dtype,
-            {(0,): experts, (1,): contract, (2, 3): free},
-        ),
-    )
     c4 = contract // chunks
     layout = SpyreTensorLayout(
         [experts * chunks, c4, free // eps, eps],
@@ -765,6 +810,108 @@ def _prepare_biases(
     return biases
 
 
+# Routed-expert layers prepared on threads while a model loads. The pool belongs to one
+# ``prepare_moe_layers_on_threads`` context: leaving it waits, re-raises the first failure
+# and joins the threads, also when the load raises.
+
+_DEFAULT_PREP_THREADS = 8
+_MAX_PREP_THREADS = 16
+
+_prep_thread = threading.local()
+
+
+def _prep_thread_count() -> int:
+    """``SPYRE_MOE_PREP_THREADS``, else min(8, torch's threads, this rank's CPU share); 1 to 16."""
+    threads = envs.SPYRE_MOE_PREP_THREADS
+    if threads < 0:
+        raise ValueError(f"SPYRE_MOE_PREP_THREADS must be 0 or more, got {threads}")
+    if threads == 0:
+        threads = min(_DEFAULT_PREP_THREADS, torch.get_num_threads())
+    return max(1, min(threads, _MAX_PREP_THREADS))
+
+
+def _start_prep_thread(device_index: int) -> None:
+    torch.spyre.set_device(device_index)
+    _prep_thread.stream = torch.spyre.Stream()
+
+
+class _MoePrep:
+    def __init__(self) -> None:
+        self._threads: int | None = None
+        self._pool: ThreadPoolExecutor | None = None
+        self._futures: list[Future[None]] = []
+        self._started = False
+
+    def prepare(self, layer: RoutedExperts) -> None:
+        if self._threads is None:
+            self._threads = _prep_thread_count()
+        if self._threads <= 1 or not self._started:
+            # The first layer runs here, which also starts the runtime the threads share.
+            _prepare_layer(layer)
+            self._started = True
+            return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._threads,
+                thread_name_prefix="spyre-moe-prep",
+                initializer=_start_prep_thread,
+                initargs=(torch.spyre.current_device(),),
+            )
+            logger.info(
+                "Spyre MoE: preparing routed-expert layers on %d threads, each staging "
+                "%d MiB of host copies at a time.",
+                self._threads,
+                _EXPERT_CHUNK_BYTES >> 20,
+            )
+        self._futures.append(self._pool.submit(self._prepare_on_thread, layer))
+
+    @staticmethod
+    def _prepare_on_thread(layer: RoutedExperts) -> None:
+        with torch.spyre.stream(_prep_thread.stream):
+            _prepare_layer(layer)
+
+    def wait(self) -> None:
+        futures, self._futures = self._futures, []
+        for future in futures:
+            future.result()
+
+    def shutdown(self) -> None:
+        self._futures.clear()
+        if self._pool is not None:
+            self._pool.shutdown(cancel_futures=True)
+            self._pool = None
+
+
+_active_prep: contextvars.ContextVar[_MoePrep | None] = contextvars.ContextVar(
+    "spyre_moe_prep", default=None
+)
+
+
+@contextmanager
+def prepare_moe_layers_on_threads() -> Iterator[None]:
+    """Prepare the MoE layers of the model loaded inside on ``SPYRE_MOE_PREP_THREADS`` threads.
+
+    The first layer runs on the caller, which starts the runtime; leaving the context waits
+    for the rest and re-raises the first failure. Outside it, layers run on the caller.
+    """
+    prep = _MoePrep()
+    token = _active_prep.set(prep)
+    try:
+        yield
+        prep.wait()
+    finally:
+        _active_prep.reset(token)
+        prep.shutdown()
+
+
+def _prepare_layer_soon(layer: RoutedExperts) -> None:
+    prep = _active_prep.get()
+    if prep is None:
+        _prepare_layer(layer)
+    else:
+        prep.prepare(layer)
+
+
 def _prepare_layer(layer: RoutedExperts) -> None:
     from torch_spyre._C import get_elem_in_stick
 
@@ -806,21 +953,23 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # too, and its padded activation lanes still meet those zero rows.
     pad = -inter % stick
     if layer.spyre_moe_recipe.activation == "swigluoai":
-        w13 = deinterleave_gate_up(w13)
+        # gate on the even rows, up on the odd ones (deinterleave_gate_up), as views.
+        gate, up = w13[:, 0::2, :], w13[:, 1::2, :]
+    else:
+        gate, up = w13[:, :inter, :], w13[:, inter:, :]
     # Share gate/up allocations between persistent and gathered chunk views.
-    layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
-    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
+    layer.spyre_moe_gate = _to_spyre_expert_weight(gate.transpose(1, 2), (0, pad))
+    layer.spyre_moe_up = _to_spyre_expert_weight(up.transpose(1, 2), (0, pad))
     layer.spyre_moe_chunks = chunks
     layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
     layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
-    del layer.w13_weight, w13
+    del layer.w13_weight, w13, gate, up  # gate and up are views of w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
-    if transform_down is not None:
-        w2 = transform_down(w2)
+    prepare = _chunked_down_transform(transform_down) if transform_down is not None else None
     # Keep the complete stack for persistent compute and expose a view for gathered decode.
     layer.spyre_moe_down = _to_spyre_expert_weight(
-        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
+        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True, prepare=prepare
     )
     layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
     layer.spyre_moe_chunk_scale, layer.spyre_moe_chunk_offsets = _chunk_entry_constants(chunks)
@@ -895,7 +1044,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "Spyre MoE backend requires an explicit model-specific recipe; "
                 "this architecture has not opted in."
             )
-        _prepare_layer(cast("RoutedExperts", layer))
+        _prepare_layer_soon(cast("RoutedExperts", layer))
         # MoERunner._forward_impl initializes this lazily. Traced, that check becomes a guard
         # which warmup's first call flips, so the first real request would re-trace the block.
         layer._ensure_moe_quant_config_init()

@@ -143,6 +143,8 @@ else
 fi
 
 # Idempotent, so it runs every time to also fix trees unpacked before it existed.
+# The previous run's env.sh would be rewritten too, and is regenerated below anyway.
+rm -f "${PREFIX}/env.sh"
 RELOCATE="${REPO_ROOT}/.github/scripts/relocate_spyre_libs.py"
 ALIAS="$(python3 -I "$RELOCATE" "$PREFIX")"
 ALIAS_LINK="$(dirname "$ALIAS")"

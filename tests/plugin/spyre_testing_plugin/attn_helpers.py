@@ -345,3 +345,70 @@ def _padded_mask_metadata(
         slot_mapping=slot_mapping,
         sliding_window=sliding_window,
     )
+
+
+def python_for_each_tile(body, operands, *, dims, tile_size, init):
+    """`for_each_tile`'s reduction form as a plain Python loop over the same tiles.
+
+    Outside a compile the real op still traces its body through Dynamo into a `scan`,
+    which adds graphs to the compile counters and hides per-trip calls from tests.
+    """
+    (extent,) = {o.shape[d] for o, d in zip(operands, dims, strict=True) if d is not None}
+    assert extent % tile_size == 0, f"extent {extent} is not a multiple of {tile_size}"
+    carry = init
+    for start in range(0, extent, tile_size):
+        tiles = tuple(
+            o if d is None else o.narrow(d, start, tile_size)
+            for o, d in zip(operands, dims, strict=True)
+        )
+        carry, _ = body(carry, tiles)
+    return carry, None
+
+
+def use_python_for_each_tile(monkeypatch) -> None:
+    """Run the attention kernels' tile walks as `python_for_each_tile` for one test."""
+    from torch_spyre._inductor import wsr
+
+    monkeypatch.setattr(wsr, "for_each_tile", python_for_each_tile)
+
+
+def split_by_chunk(chunk_page_ids, mask_by_chunk, blocks_per_chunk):
+    """The builder's [C*J, B] batched-decode metadata in the kernel's per-chunk layout.
+
+    The reshape `_mirror_batched_decode_indices` uploads, without the device layout.
+    """
+    num_chunks, num_seqs = chunk_page_ids.shape[0] // blocks_per_chunk, chunk_page_ids.shape[1]
+    return (
+        chunk_page_ids.reshape(num_chunks, blocks_per_chunk * num_seqs, 1),
+        mask_by_chunk.reshape(num_chunks, blocks_per_chunk, *mask_by_chunk.shape[1:]),
+    )
+
+
+def drop_cpu_device_layouts(monkeypatch) -> None:
+    """Transfer to CPU without the Spyre device layout, which only Spyre can build.
+
+    The batched decode index upload places one; the plain transfer carries the same values.
+    """
+    orig_to = torch.Tensor.to
+
+    def to(tensor, *args, device_layout=None, **kwargs):
+        if device_layout is None:
+            return orig_to(tensor, *args, **kwargs)
+        target = kwargs.get("device", args[0] if args else None)
+        if not isinstance(target, (str, torch.device)):
+            target = tensor.device
+        if torch.device(target).type != "spyre":
+            return orig_to(tensor, *args, **kwargs)
+        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
+
+
+def use_kv_buckets(monkeypatch) -> None:
+    """Make metadata builders use the KV buckets rather than a page range."""
+    from spyre_inference.v1.attention.backends import spyre_attn
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
+    monkeypatch.setattr(
+        spyre_attn, "SpyreAttnBucketer", lambda vllm_config, **_: SpyreAttnBucketer(vllm_config)
+    )

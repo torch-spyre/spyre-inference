@@ -161,6 +161,14 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
+# A copy takes dynamic= together with device_layout= only from torch-spyre#6327 on.
+@functools.cache
+def _reservation_takes_a_layout() -> bool:
+    from torch_spyre import _C
+
+    return hasattr(_C, "spyre_empty_reserved_with_layout")
+
+
 def _to_device_with_page_range(
     host: torch.Tensor, page_range: dict[str, int], device: torch.device
 ) -> torch.Tensor:
@@ -204,7 +212,7 @@ def _mirror_mask_stack(
         page_range = attn_metadata.seq_page_range(seq_idx)
         layout = (
             row_outermost_layout((page_range["max"], query_rows, block_size), stack_cpu.dtype)
-            if page_range is not None and device.type == "spyre"
+            if page_range is not None and device.type == "spyre" and _reservation_takes_a_layout()
             else None
         )
         if page_range is not None and layout is not None:

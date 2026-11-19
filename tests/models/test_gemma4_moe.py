@@ -204,19 +204,24 @@ def moe_weights(request):
 _TOPK_MARGIN = 2.0**-5
 
 
+def _with_topk_margin(logits, top_k):
+    # A common lift of a close row's top k keeps the selected set and its routing weights.
+    order = torch.sort(logits.float(), dim=-1, descending=True, stable=True).indices
+    ranked = logits.float().gather(-1, order)
+    close = (ranked[:, top_k - 1] - ranked[:, top_k]) < _TOPK_MARGIN
+    lift = torch.zeros_like(logits).scatter_(-1, order[:, :top_k], _TOPK_MARGIN)
+    logits = torch.where(close.unsqueeze(-1), logits + lift, logits)
+    ranked = torch.sort(logits.float(), dim=-1, descending=True).values
+    assert (ranked[:, top_k - 1] - ranked[:, top_k] > _TOPK_MARGIN / 2).all()
+    return logits
+
+
 def _inputs(num_tokens, routing_margin=True):
     gen = torch.Generator().manual_seed(num_tokens)
     x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
     logits = torch.randn(num_tokens, EXPERTS, dtype=torch.float16, generator=gen)
     if routing_margin:
-        # A common lift of a close row's top k keeps the selected set and its routing weights.
-        order = torch.sort(logits.float(), dim=-1, descending=True, stable=True).indices
-        ranked = logits.float().gather(-1, order)
-        close = (ranked[:, TOP_K - 1] - ranked[:, TOP_K]) < _TOPK_MARGIN
-        lift = torch.zeros_like(logits).scatter_(-1, order[:, :TOP_K], _TOPK_MARGIN)
-        logits = torch.where(close.unsqueeze(-1), logits + lift, logits)
-        ranked = torch.sort(logits.float(), dim=-1, descending=True).values
-        assert (ranked[:, TOP_K - 1] - ranked[:, TOP_K] > _TOPK_MARGIN / 2).all()
+        logits = _with_topk_margin(logits, TOP_K)
     return x, logits
 
 
@@ -379,6 +384,7 @@ def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
         "sp_size": 1,
         "is_lora_enabled": False,
         "has_bias": False,
+        "in_dtype": torch.float16,
     } | (moe_config or {})
     fields = {
         "custom_routing_function": None,
@@ -651,12 +657,90 @@ def test_traced_dispatch_inlines_the_persistent_form_without_compiled_regions(
         )
     monkeypatch.setattr(moe_module, "_experts", lambda *args: pytest.fail("ran the region form"))
     for name in ("_route_selected", "_moe_persistent_in_graph"):
-        monkeypatch.setattr(moe_module, name, lambda *args, _name=name: calls.append((_name,)))
+        monkeypatch.setattr(
+            moe_module, name, lambda *args, _name=name, **kwargs: calls.append((_name,))
+        )
 
     _apply(_dispatch_layer(routing), tokens=64)
     assert [call[0] for call in calls] == expected
     if expected[0] == "_probs":
         assert calls[0][1] == torch.float32, "routing must stay in the logits' dtype in-graph"
+
+
+@pytest.mark.parametrize(
+    ("group", "token_range", "expected"),
+    [(1, None, [1, 1, 1, 1]), (4, (256, 512), [1, 4, 4, 1]), (4, (64, 1024), [4, 4, 4, 4])],
+)
+def test_the_recipe_sets_the_experts_per_trip_of_each_traced_batch(
+    monkeypatch, group, token_range, expected
+):
+    """The recipe's group applies to traced batches in its token range; others run one."""
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer()
+    recipe = SpyreMoERecipe(*_STANDARD, expert_group=group, expert_group_tokens=token_range)
+    with spyre_config.patch({"sencores": 32}):
+        configure_spyre_moe_layer(layer, recipe)
+    assert layer.spyre_moe_recipe == recipe
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    seen = []
+    monkeypatch.setattr(moe_module, "_topk_probs", lambda *args: None)
+    monkeypatch.setattr(moe_module, "_route_selected", lambda *args: None)
+    monkeypatch.setattr(
+        moe_module, "_moe_persistent_in_graph", lambda *args, group: seen.append(group)
+    )
+    dispatch = _dispatch_layer("topk_softmax")
+    # The configured layer's own recipe, so the loop sees exactly what configure stored.
+    dispatch.spyre_moe_recipe = layer.spyre_moe_recipe
+    for tokens in (1024, 512, 256, 64):
+        _apply(dispatch, tokens=tokens)
+    assert seen == expected
+
+
+@pytest.mark.parametrize(
+    ("group", "token_range"),
+    [(4, None), (4, (0, 512)), (4, (512, 256)), (0, (256, 512)), (-1, (256, 512))],
+)
+def test_a_grouping_recipe_needs_a_positive_group_and_a_token_range(group, token_range):
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    recipe = SpyreMoERecipe(*_STANDARD, expert_group=group, expert_group_tokens=token_range)
+    with pytest.raises(ValueError, match="expert_group="):
+        configure_spyre_moe_layer(_generic_layer(), recipe)
+
+
+@pytest.mark.parametrize(("group", "cores"), [(3, 32), (64, 32), (16, 24), (8, 24), (4, 2)])
+def test_a_recipe_group_that_does_not_fit_runs_one_expert_per_trip(group, cores):
+    """The cores belong to the deployment, so the group yields: 3 does not divide the 16
+    experts, 64 and 4 are more than the cores, and on 24 cores 16 breaks the cores and 8 the
+    64-token stick."""
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer()
+    recipe = SpyreMoERecipe(*_STANDARD, expert_group=group, expert_group_tokens=(256, 512))
+    with spyre_config.patch({"sencores": cores}):
+        configure_spyre_moe_layer(layer, recipe)
+    assert layer.spyre_moe_recipe.expert_group == 1
+
+
+def test_the_expert_group_leaves_unsupported_layers_rejected():
+    """Grouping changes no admission rule."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    recipe = SpyreMoERecipe(*_STANDARD, expert_group=4, expert_group_tokens=(256, 512))
+    for overrides, match in (
+        ({"quant_method": object()}, "quantized experts"),
+        ({"moe_config": {"ep_size": 2}}, "local experts"),
+        ({"moe_config": {"is_lora_enabled": True}}, "LoRA experts"),
+    ):
+        with pytest.raises(NotImplementedError, match=match):
+            configure_spyre_moe_layer(_generic_layer(**overrides), recipe)
 
 
 def test_moe_runner_traces_only_stick_aligned_batches():
@@ -959,6 +1043,21 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
+def _record_expert_loops(monkeypatch):
+    # Each expert loop's (experts per trip, accumulators).
+    from torch_spyre._inductor import wsr
+
+    loops = []
+    real = wsr.for_each_tile
+
+    def recording(body, operands, *, dims, tile_size, init=None, **kwargs):
+        loops.append((tile_size, init.shape[0]))
+        return real(body, operands, dims=dims, tile_size=tile_size, init=init, **kwargs)
+
+    monkeypatch.setattr(wsr, "for_each_tile", recording)
+    return loops
+
+
 def test_traced_persistent_dispatch_matches_dense_reference():
     """Traced into one graph, as a compiled block does for a stick-aligned token bucket.
 
@@ -1026,6 +1125,79 @@ def test_traced_persistent_dispatch_matches_dense_reference():
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("sticks", [2, 8])
+def test_traced_grouped_dispatch_matches_dense_reference(monkeypatch, sticks):
+    """The same traced path for a 128- and a 512-token chunk, four experts per trip on 32 cores.
+
+    Over these rows some top-8 margins fall below fp16 rounding, so the logits get a margin;
+    one stick of unmodified logits is covered by the test above.
+    """
+    from spyre_testing_plugin.pytest_plugin import spyre_available
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    from spyre_inference.moe import (
+        SpyreMoERecipe,
+        SpyreUnquantizedFusedMoEMethod,
+        _to_spyre_expert_weight,
+    )
+
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    top_k, group = 8, 4
+    torch.manual_seed(0)
+    host = {
+        "gate": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "up": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "down": torch.randn(GEMMA4_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
+    }
+    device = {k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in host.items()}
+    stick = get_elem_in_stick(torch.float16)
+    tokens = sticks * stick
+    layer = SimpleNamespace(
+        spyre_moe_recipe=SpyreMoERecipe(
+            "gelu_tanh", "full_softmax", expert_group=group, expert_group_tokens=(tokens, tokens)
+        ),
+        spyre_moe_gate=device["gate"],
+        spyre_moe_up=device["up"],
+        spyre_moe_down=device["down"],
+        spyre_moe_stick=stick,
+        spyre_moe_route_identity=torch.eye(stick, dtype=torch.float16).to("spyre"),
+        spyre_moe_biases=None,
+        top_k=top_k,
+    )
+    gen = torch.Generator().manual_seed(stick)
+    x = torch.randn(tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
+    logits = torch.randn(tokens, GEMMA4_EXPERTS, dtype=torch.float16, generator=gen)
+    logits = _with_topk_margin(logits, top_k)
+
+    def block(x, logits):
+        return SpyreUnquantizedFusedMoEMethod.apply_monolithic(None, layer, x * 1.0, logits * 1.0)
+
+    loops = _record_expert_loops(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught, spyre_config.patch({"sencores": 32}):
+        warnings.simplefilter("always", FallbackWarning)
+        compiled = torch.compile(block, backend="inductor", fullgraph=True, dynamic=False)
+        actual = compiled(x.to("spyre"), logits.to("spyre"))
+
+    assert loops == [(group, group)], loops
+    fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not fallbacks, f"the traced dispatch fell back to CPU: {fallbacks}"
+    expected = _dense_reference(
+        x,
+        torch.softmax(logits, dim=-1),
+        host["gate"],
+        host["up"],
+        host["down"],
+        torch.ones(GEMMA4_EXPERTS),
+        top_k,
+    )
+    assert actual.shape == x.shape
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
+
+
 def test_persistent_expert_loop_matches_dense_on_host():
     from spyre_inference.moe import _moe_persistent
 
@@ -1043,6 +1215,41 @@ def test_persistent_expert_loop_matches_dense_on_host():
 
     actual = _moe_persistent(x, route, gate, up, down, "gelu_tanh")
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("group", [2, 4])
+@pytest.mark.parametrize("biased", [False, True])
+def test_grouped_in_graph_expert_loop_matches_one_expert_per_trip_on_host(
+    monkeypatch, group, biased
+):
+    """Grouping experts per trip only regroups the sum over experts."""
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference.moe import _ExpertBiases, _moe_persistent_in_graph
+
+    torch.manual_seed(0)
+    tokens, experts, hidden, inter = 256, 8, 16, 24
+    x = torch.randn(tokens, hidden, dtype=torch.float64)
+    gate = torch.randn(experts, hidden, inter, dtype=torch.float64)
+    up = torch.randn(experts, hidden, inter, dtype=torch.float64)
+    down = torch.randn(experts, inter, hidden, dtype=torch.float64)
+    route = torch.rand(tokens, experts, 1, dtype=torch.float64)
+    biases = None
+    if biased:
+        b = {
+            name: torch.randn(experts, 1, width, dtype=torch.float64)
+            for name, width in (("gate", inter), ("up", inter), ("down", hidden))
+        }
+        biases = _ExpertBiases(gate=b["gate"], up=b["up"], down=b["down"], down_chunks=b["down"])
+
+    loops = _record_expert_loops(monkeypatch)
+    expected = _moe_persistent_in_graph(x, route, gate, up, down, "gelu_tanh", biases)
+    with spyre_config.patch({"sencores": 32}):
+        actual = _moe_persistent_in_graph(
+            x, route, gate, up, down, "gelu_tanh", biases, group=group
+        )
+    assert loops == [(1, 1), (group, group)], loops
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
 
 
 class _RoutedExperts(torch.nn.Module):

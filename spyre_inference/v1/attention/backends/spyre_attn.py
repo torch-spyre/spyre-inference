@@ -657,8 +657,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return bound
 
     def _declared_window_pages(self, bound: int, prefill: bool) -> int:
-        """Page count a sliding-window sequence padded to ``bound`` runs at with a page
-        range: ``bound`` raised to the range's minimum and granularity."""
         bucketer = self._attn_bucketer
         pages = bucketer.find_declared_pages(bound, prefill)
         page_range = bucketer.prefill_page_range if prefill else bucketer.page_range
@@ -1038,9 +1036,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # sliding with the context, which would compile a new kernel inside the
             # request, and so batched decode keeps its buckets. Not rounded onto the
             # num_blocks ladder: that inflates the exact per-bucket bound several-fold.
-            # With a page range, the per-sequence kernels run every such bound, raised
-            # to the range's minimum and granularity. padded_num_blocks stays None so
-            # forward() keeps gathering through active_block_indices.
+            # padded_num_blocks stays None so forward() keeps gathering through
+            # active_block_indices.
             active_block_indices = []
             query_lens_list = query_lens.tolist()
             seq_lens_list = seq_lens.tolist()

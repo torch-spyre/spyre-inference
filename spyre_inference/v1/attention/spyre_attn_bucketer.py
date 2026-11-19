@@ -254,11 +254,8 @@ def _declared_page_range(max_pages: int) -> dict[str, int] | None:
 def sliding_window_page_bound(
     num_blocks: int, aligned_query_len: int, sliding_window: int, block_size: int
 ) -> int:
-    """Most pages a sliding-window sequence in the ``num_blocks`` bucket can attend to.
-
-    The window and the query together span ``sliding_window + aligned_query_len - 1``
-    tokens, which can cross one more page than they fill.
-    """
+    """Most pages a sliding-window sequence in the ``num_blocks`` bucket can attend to."""
+    # The window and query span can cross one more page than they fill.
     span = sliding_window + aligned_query_len - 1
     return min(num_blocks, (span + block_size - 1) // block_size + 1)
 
@@ -413,7 +410,6 @@ class SpyreAttnBucketer:
         if declare_pages:
             max_pages = self._num_blocks_buckets[-1]
             if sliding_window is not None:
-                # A sliding-window sequence keeps only the pages its window reaches.
                 max_pages = max(
                     sliding_window_page_bound(max_pages, q, sliding_window, block_size)
                     for q in self._query_buckets

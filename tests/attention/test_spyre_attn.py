@@ -1728,8 +1728,6 @@ def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm
 
 
 def test_sliding_window_page_counts_fit_the_declared_range(default_vllm_config):
-    """With a page range, each sequence runs its KV bucket's window bound, raised to the
-    range's minimum and, for prefill, its granularity."""
     torch.set_default_device("cpu")
     block_size, window = 64, 128
     seq_lens = [(1, 64), (1, 512), (100, 512)]

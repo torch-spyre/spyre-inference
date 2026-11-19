@@ -808,8 +808,7 @@ class TestDeclaredPages:
         assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
 
     def test_a_sliding_window_declares_only_the_pages_its_window_reaches(self):
-        # A 512-token window with query buckets 1 and 512: decode reaches 9 pages and a
-        # 512-token prefill 17, far below the 32 pages of max_model_len.
+        # Decode reaches 9 pages and a 512-token prefill 17, below max_model_len's 32.
         b = SpyreAttnBucketer(
             make_config(max_model_len=2048, max_num_batched_tokens=512),
             declare_pages=True,

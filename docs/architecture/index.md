@@ -5,6 +5,9 @@ IBM's Spyre AI accelerator. It integrates with vLLM's plugin system to replace k
 compute layers with Spyre-optimized implementations while preserving the rest of the
 vLLM execution pipeline.
 
+For the optional converted-weight cache, see
+[Native cache placement metadata](native-cache-host-state.md).
+
 ## System Overview
 
 The diagram below shows how `spyre-inference` fits into vLLM's process architecture.

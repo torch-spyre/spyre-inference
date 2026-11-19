@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     SPYRE_DEVICES: str | None = None
     SPYRE_MODEL_RUNNER: str = "v1"
     SPYRE_MRV2_KERNELS: str = "host"
+    SPYRE_NATIVE_CACHE_DIR: str | None = None
+    SPYRE_NATIVE_HOST_ALL_LOCAL: bool = False
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
@@ -58,6 +60,11 @@ _cache: dict[str, Any] = {}
 
 # --8<-- [start:env-vars-definition]
 environment_variables: dict[str, Callable[[], Any]] = {
+    "SPYRE_NATIVE_CACHE_DIR": lambda: os.getenv("SPYRE_NATIVE_CACHE_DIR"),
+    # Source-checkpoint CPU reads for spyre_native: "0" (default) shares file reads
+    # across ranks and broadcasts tensors; "1" makes every rank read independently.
+    # Set identically on all ranks. Does not affect rank-local native-cache restore.
+    "SPYRE_NATIVE_HOST_ALL_LOCAL": lambda: bool(int(os.getenv("SPYRE_NATIVE_HOST_ALL_LOCAL", "0"))),
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),

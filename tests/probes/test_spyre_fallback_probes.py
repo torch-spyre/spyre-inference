@@ -1148,10 +1148,11 @@ def test_spyre_scalar_pow_cube(spyre_device, exponent):
 # 10. FP32 reduce then D2H (MEAN destagger)
 # ---------------------------------------------------------------------------
 #
-# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
-# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
-# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
-# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
+# Device fp32 is staggered inside sticks (torch-spyre#2971). A reduction over a
+# non-stick dim drops that element arrangement from its output (torch-spyre#5553),
+# and since torch-spyre#5484 the copy to host trusts the arrangement, so both reads
+# below come back permuted. SpyreMeanPool sums its rectangle lanes on the host until
+# torch-spyre#5598 lands; both probes then XPASS.
 
 
 def _fp32_mean_reduction(spyre_device):
@@ -1183,6 +1184,15 @@ def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
     torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "The fp32 sum is tagged STANDARD (torch-spyre#5553), so its fp16 cast is "
+        "tagged staggered and the copy to host permutes it. SpyreMeanPool sums "
+        "rectangle lanes on the host. When this XPASS-es (torch-spyre#5598), it can "
+        "reduce on device again."
+    ),
+)
 def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
     """to(fp16) before convert un-staggers a device fp32 sum."""
     acc, ref = _fp32_mean_reduction(spyre_device)

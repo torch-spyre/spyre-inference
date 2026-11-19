@@ -23,7 +23,6 @@ from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
-from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,
     SpyreClassifierLinear,
@@ -32,8 +31,6 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreRobertaClassificationHead,
     SpyreTokenPooler,
     _iter_modules,
-    _mean_pool_grid_reduce,
-    _mean_pool_row_mask_mul,
     select_rows,
 )
 
@@ -95,9 +92,8 @@ def warm_pooler_row_widths(
     to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
 
     ``SpyreSequencePooler`` trims only after the classifier/embed head, so the head
-    sees these same bucket widths and is warmed at each. ``SpyreMeanPool``'s
-    rectangle reduce specializes on ``(extent, rows)`` and is warmed per declared
-    rectangle.
+    sees these same bucket widths and is warmed at each, as well as at the lane
+    counts ``SpyreMeanPool`` hands it on a declared rectangle.
     """
     rows = hidden_states.shape[0]
     # poolers_by_task is a plain dict; nn.Module.modules() doesn't descend into it.
@@ -133,13 +129,6 @@ def warm_pooler_row_widths(
             embeddings = head.projector(pooled) if head.projector is not None else pooled
             if head.activation is not None:
                 head.activation(embeddings)
-    if grid_shapes:
-        device = hidden_states.device
-        mask = convert(torch.zeros(rows, 1, dtype=torch.float16), device)
-        prod = _mean_pool_row_mask_mul(hidden_states, mask).clone()
-        for extent, lanes in grid_shapes:
-            lens = convert(torch.ones(lanes, 1, dtype=torch.float32), device)
-            _mean_pool_grid_reduce(prod, lens, extent)
     for token_pooler in token_poolers:
         warm_token_pool_widths(token_pooler, hidden_states)
 

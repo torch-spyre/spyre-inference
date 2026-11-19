@@ -32,9 +32,7 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    KVCacheGroupSpec,
     KVCacheSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
@@ -46,6 +44,7 @@ from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.kv_cache_setup import layer_spec
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -62,19 +61,14 @@ def _kv_block_layout(
     """``(pool bytes per block, bytes per block of each Spyre KV tensor, blocks per full
     request)``, or None without a KV cache.
 
-    With ``disable_hybrid_kv_cache_manager`` every layer lands in one group and the pool
-    bytes match the tensors' sum. They differ for a Mamba hybrid, which keeps the hybrid
-    manager: upstream overlays its groups on one buffer and needs ``pool bytes`` per block, while
-    Spyre allocates every layer's own page per block, unpadded where upstream pads (a
-    Mamba state). The per-request count is upstream's grouping, so a Mamba group holds
-    one block and a sliding-window group its window.
+    The tensors are one K and one V per byte range of upstream's placement, as
+    ``allocate_spyre_kv_caches`` allocates them.
     """
     if not kv_cache_spec:
         return None
     builder = get_kv_cache_config_builder(vllm_config)
     # The engine groups the same specs in get_global_kv_cache_groups and logs from there;
-    # this replay would repeat its warnings (a hybrid model's disabled hybrid manager) on
-    # every worker.
+    # this replay would repeat its warnings on every worker.
     grouping_logger = logging.getLogger(get_kv_cache_groups_from_builder.__module__)
     was_disabled, grouping_logger.disabled = grouping_logger.disabled, True
     try:
@@ -84,23 +78,21 @@ def _kv_block_layout(
     if not groups:
         return None
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
-    # Attention and Mamba specs pad their page to a shared size; Spyre's pages do not.
+    # Offsets scale with the block count, which num_gpu_blocks_override may set.
+    placement = builder.get_kv_cache_config_from_groups(vllm_config, groups, 1)
+    group_of = {name: group for group in groups for name in group.layer_names}
+    pages: dict[int, tuple[int, bool]] = {}
+    for tensor in placement.kv_cache_tensors:
+        for index, name in enumerate(tensor.layers):
+            start = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
+            is_attention = isinstance(layer_spec(group_of[name], name), AttentionSpec)
+            pages.setdefault(start, (tensor.block_stride, is_attention))
     tensors: list[int] = []
-    for group in groups:
-        for name in group.layer_names:
-            spec = _layer_spec(group, name)
-            page = getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
-            # An attention page holds K and V, which allocate_pages allocates apart.
-            tensors += [page // 2] * 2 if isinstance(spec, AttentionSpec) else [page]
+    for page, is_attention in pages.values():
+        # An attention page holds K and V, which allocate_pages allocates apart.
+        tensors += [page // 2] * 2 if is_attention else [page]
     per_request = _max_memory_usage_bytes_from_groups(builder, vllm_config, groups) // pool_bytes
     return pool_bytes, tensors, per_request
-
-
-def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
-    spec = group.kv_cache_spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return spec.kv_cache_specs[layer_name]
-    return spec
 
 
 def _get_spyre_pcie_address(local_rank: int) -> str:
@@ -243,11 +235,8 @@ class TorchSpyreWorker(Worker):
         consumed; a forward's activations come out of the 1 - gpu_memory_utilization
         headroom.
 
-        Upstream turns the returned bytes into blocks by its pool's bytes per block,
-        while Spyre gives every layer its own page per block (``allocate_spyre_kv_caches``),
-        which costs more wherever groups would share a page. So the measured device bytes
-        are converted into blocks at Spyre's cost per block and handed back in upstream's
-        units.
+        The allocator never splits a tensor across its regions, so the block count is
+        capped where the KV tensors still fit.
         """
         available = super().determine_available_memory()
         layout = _kv_block_layout(self.vllm_config, self.model_runner.get_kv_cache_spec())

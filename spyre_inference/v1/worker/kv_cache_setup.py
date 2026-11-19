@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attention-group window split and per-layer KV page allocation, shared by both
-model runners."""
+"""Attention-group window split and KV page allocation, shared by both model runners."""
 
 from copy import copy
 from dataclasses import replace
@@ -22,8 +21,11 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup
@@ -100,33 +102,66 @@ def allocate_spyre_kv_caches(
     static_ctx: dict[str, Any],
     shared_layers: dict[str, str],
     device: torch.device,
+    kernel_block_sizes: list[int] | None = None,
 ) -> dict[str, SpyrePagedKVCache]:
-    """One SpyrePagedKVCache per layer, in the layout its attention impl allocates."""
-    # One spec per layer. disable_hybrid_kv_cache_manager (set in the platform)
-    # collapses hybrid models into a single group; when the layers' head shapes differ
-    # its spec is a UniformTypeKVCacheSpecs, which unwraps to the real per-layer specs
-    # so each layer keeps its own num_kv_heads/head_size. A merged spec is direct.
-    spec_by_layer = {}
-    for group in kv_cache_config.kv_cache_groups:
-        per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
-        if per_layer is not None:
-            spec_by_layer.update(per_layer)
-        else:
-            spec_by_layer.update({ln: group.kv_cache_spec for ln in group.layer_names})
+    """SpyrePagedKVCache pages per layer, at upstream's KVCacheTensor placement.
 
-    kv_caches: dict[str, SpyrePagedKVCache] = {}
-    # A KVCacheTensor lists several layers; sharing one page buffer among them
-    # would let each layer's KV write clobber the others'.
+    Layers placed on the same bytes (layer ``l`` of every cache group) share one K/V pair,
+    each viewing it in its own page shape. A Spyre tensor never spans the allocator's
+    regions, so each byte range is its own allocation rather than one backing buffer.
+    """
+    group_of = {
+        layer_name: group_id
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        for layer_name in group.layer_names
+    }
     num_blocks = kv_cache_config.num_blocks
+    ranges: dict[int, tuple[int, SpyrePagedKVCache]] = {}
+    kv_caches: dict[str, SpyrePagedKVCache] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        for layer_name in kv_cache_tensor.layers:
-            spec = spec_by_layer[layer_name]
-            # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the default decoder layout.
+        for index, layer_name in enumerate(kv_cache_tensor.layers):
+            group_id = group_of[layer_name]
+            spec = layer_spec(kv_cache_config.kv_cache_groups[group_id], layer_name)
+            if not isinstance(spec, AttentionSpec):
+                raise NotImplementedError(
+                    f"{layer_name}: Spyre allocates attention KV pages only, not "
+                    f"{type(spec).__name__}."
+                )
+            if kv_cache_tensor.block_stride != spec.page_size_bytes:
+                raise NotImplementedError(
+                    f"{layer_name}: Spyre KV pages are unpadded and layer-outermost, but its "
+                    f"KVCacheTensor strides blocks by {kv_cache_tensor.block_stride} bytes "
+                    f"for a {spec.page_size_bytes}-byte page."
+                )
+            kernel_block_size = spec.block_size
+            if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
+                kernel_block_size = kernel_block_sizes[group_id]
+            pages_per_block = spec.block_size // kernel_block_size
+            kernel_spec = replace(spec, block_size=kernel_block_size)
+            # A layer without an impl (fixture stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)
+            start = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
+            if start not in ranges:
+                pages = impl_cls.allocate_pages(num_blocks * pages_per_block, kernel_spec, device)
+                ranges[start] = (spec.page_size_bytes, pages)
+            else:
+                page_bytes, base = ranges[start]
+                if page_bytes != spec.page_size_bytes:
+                    raise ValueError(
+                        f"{layer_name}'s {spec.page_size_bytes}-byte page overlays a "
+                        f"{page_bytes}-byte one at byte {start}."
+                    )
+                pages = impl_cls.view_pages(base, num_blocks * pages_per_block, kernel_spec)
+            kv_caches[layer_name] = pages
 
     for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]
     return kv_caches
+
+
+def layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.kv_cache_specs[layer_name]
+    return spec

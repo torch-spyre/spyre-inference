@@ -985,12 +985,6 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
-        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
-        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
-        # KV-cache manager gives every layer its own buffer; SWA is still computed, per
-        # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
-        scheduler_config.disable_hybrid_kv_cache_manager = True
-
         # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,
         # overriding the flag; a size would also skip the measurement and hand out a
         # fixed budget whatever the card has free.

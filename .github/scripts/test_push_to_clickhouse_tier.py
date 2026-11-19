@@ -45,7 +45,7 @@ def _tier_script() -> str:
         ("trunk", "trunk", "trunk"),
         ("integration-tests (integration)", "integration-tests (integration)", "integration"),
         ("integration-tests (perf)", "integration-tests (perf)", "perf"),
-        ("test_each_commit", "regression", "regression"),
+        ("test_each_commit", "trunk", "trunk"),
         ("integration-tests", "", ""),
     ],
 )

@@ -79,7 +79,8 @@ pytest --upstream -m "attention"
 ```
 
 `e2e_smoke` and `attention_smoke` are the opt-in subsets that carry e2e and attention
-coverage into the `integration` tier. Adding a test to either is an admission decision; see
+coverage into the `integration` tier, and `regression_extra` is what `regression` adds on
+top. Adding a test to any of them is an admission decision; see
 [The Integration Tier](integration-tier.md).
 
 #### Model Output Quality Gate

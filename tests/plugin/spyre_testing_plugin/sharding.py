@@ -14,7 +14,8 @@
 
 """Duration-weighted test sharding for CI fan-out.
 
-Each suite (attn/smoke/smoke-unit/e2e-smoke/e2e-smoke-dist/upstream/dist/probe/quality)
+Each suite (attn/smoke/smoke-unit/e2e-smoke/e2e-smoke-dist/regression-extra/upstream/dist/
+probe/quality)
 is split across N parallel jobs; a job keeps only its shard's slice. Every shard job
 computes the same weighted greedy longest-processing-time partition, so no cross-job
 coordination is needed and the union of all shards is the full selection exactly once
@@ -66,6 +67,7 @@ def add_shard_options(parser) -> None:
         "smoke-unit",
         "e2e-smoke",
         "e2e-smoke-dist",
+        "regression-extra",
         "upstream",
         "dist",
         "probe",
@@ -102,6 +104,7 @@ def apply_shards(config: pytest.Config, items: list[pytest.Item]) -> None:
     _apply_smoke_shard(config, items)
     _apply_smoke_unit_shard(config, items)
     _apply_e2e_smoke_shard(config, items)
+    _apply_regression_extra_shard(config, items)
     _apply_upstream_shard(config, items)
     _apply_distributed_shard(config, items)
     _apply_probe_shard(config, items)
@@ -332,6 +335,19 @@ def _apply_e2e_smoke_shard(config: pytest.Config, items: list[pytest.Item]) -> N
             label=label,
             durations=_load_durations(config),
         )
+
+
+def _apply_regression_extra_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    _apply_shard(
+        config,
+        items,
+        num_shards=config.getoption("--regression-extra-shards"),
+        shard_id=config.getoption("--regression-extra-shard-id"),
+        select=lambda item: bool(item.get_closest_marker("regression_extra")),
+        weight=lambda item: 1,
+        label="regression-extra",
+        durations=_load_durations(config),
+    )
 
 
 def _apply_upstream_shard(config: pytest.Config, items: list[pytest.Item]) -> None:

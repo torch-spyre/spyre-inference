@@ -271,6 +271,32 @@ records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+#### One per-sequence kernel for every page count
+
+The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
+use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.
+
+Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
+prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
+their own page count.
+
+The page tables and mask stacks are copied to the device with torch-spyre's
+`tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+`--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
+below that rounded value, prefill reads one page per loop step instead.
+
+The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
+bucket pair, when any of these holds:
+
+- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
+  `MAX_BUCKETS`; startup logs a warning;
+- the layer uses sliding-window attention.
+
+The batched decode kernel always uses the KV buckets.
+
 ## KV cache size
 
 The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the

@@ -1266,21 +1266,9 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(SpyreAttentionImpl, "do_kv_cache_update", do_kv_cache_update)
 
-    # The test runs on CPU, where a Spyre device layout (the batched decode index's stick
-    # layout) cannot be built; the plain transfer carries the same values.
-    orig_to = torch.Tensor.to
+    from spyre_testing_plugin.attn_helpers import drop_cpu_device_layouts
 
-    def to(tensor, *args, device_layout=None, **kwargs):
-        if device_layout is None:
-            return orig_to(tensor, *args, **kwargs)
-        target = kwargs.get("device", args[0] if args else None)
-        if not isinstance(target, (str, torch.device)):
-            target = tensor.device
-        if torch.device(target).type != "spyre":
-            return orig_to(tensor, *args, **kwargs)
-        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", to)
+    drop_cpu_device_layouts(monkeypatch)
 
     yield
 

@@ -52,9 +52,8 @@ def _launch_sites() -> set[str]:
     root = Path(importlib.util.find_spec("vllm.v1.worker").origin).parent  # ty: ignore
     files = [*(root / "gpu").rglob("*.py"), *(root / f"{m}.py" for m in _OUTSIDE_GPU)]
     sources = {".".join(p.relative_to(root).with_suffix("").parts): p.read_text() for p in files}
-    # Parsing and walking dominate the runtime (the source_walk mark exempts this
-    # from the tests/mrv2 budget: the walk is wall-clock sensitive under host load),
-    # so each module is parsed at most once and walked only if its text has a launch.
+    # Parsing and walking dominate the runtime (the tests/mrv2 budget is 1s), so each module
+    # is parsed at most once and walked only if its text has a launch.
     trees = {module: ast.parse(source) for module, source in sources.items() if "jit" in source}
     # Only a module-level kernel is a global kernels.bind() can replace.
     jitted = {
@@ -82,7 +81,6 @@ def _launch_sites() -> set[str]:
     }
 
 
-@pytest.mark.source_walk
 def test_every_launch_site_is_bound() -> None:
     bound = set(kernels.HOST_KERNELS) | set(kernels.UNSUPPORTED_KERNELS)
     sites = _launch_sites()

@@ -14,9 +14,9 @@
 
 """Guards for tests/mrv2: an autouse fixture makes vllm.LLM.__init__() raise,
 and a time budget (1s/test summed across setup+call+teardown, ~20s/directory,
-exempting tests marked ``triton_cpu``, ``subprocess_isolated``,
-``spyre_device`` or ``source_walk``) fails the run if exceeded. The budget
-alone catches an accidental real torch.compile() too (its fixed tracing/codegen overhead alone
+exempting tests marked ``triton_cpu``, ``subprocess_isolated`` or
+``spyre_device``) fails the run if exceeded. The budget alone catches an
+accidental real torch.compile() too (its fixed tracing/codegen overhead alone
 exceeds the per-test budget), without a dedicated torch.compile guard:
 monkeypatching it doesn't un-bake what a module-scope ``@torch.compile``
 decorator already returned into whatever module first got imported during a
@@ -59,12 +59,6 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "spyre_device: allocates on a Spyre card, whose first use takes seconds; "
         "exempt from the budget",
-    )
-    config.addinivalue_line(
-        "markers",
-        "source_walk: reads and parses the vLLM source tree, so its runtime "
-        "scales with the tree size and host load, not with anything the budget "
-        "guards; exempt from the budget",
     )
 
 
@@ -113,7 +107,7 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
     session_setup, _session_fixture_s = _session_fixture_s, 0.0
     if not _is_mrv2_item(item):
         return
-    if {"triton_cpu", "subprocess_isolated", "spyre_device", "source_walk"} & set(item.keywords):
+    if {"triton_cpu", "subprocess_isolated", "spyre_device"} & set(item.keywords):
         return
 
     duration = report.duration - session_setup if report.when == "setup" else report.duration

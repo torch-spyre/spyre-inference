@@ -454,7 +454,7 @@ def test_spyre_indirect_page_gather_2d_index(spyre_device, mode):
     """`k_pages[kv_rows]` with a [KV, 1] int32 index, the page gather of page_attn_decode.
 
     This is why SpyreAttentionImpl compiles attention on Spyre even under --enforce-eager.
-    When the eager case XPASSes, `SpyreAttentionImpl._attn_compiled` can honor eager there.
+    When the eager case XPASSes, attention can honor --enforce-eager on Spyre.
     """
     num_kv_heads, block_size, head_size, num_pages = 8, 64, 128, 16
     page = 5

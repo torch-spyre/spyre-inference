@@ -479,8 +479,7 @@ Two things follow from those choices. The gather is a 2-D subscript, which lower
 `aten.index` and fails eager on Spyre by upcasting its int32 index (torch-spyre#4334,
 tracked by `test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is
 always compiled on Spyre, even under `--enforce-eager` — attention compiles in its own
-domain, so the rest of the model still runs eager. Off Spyre an eager run calls the same
-kernels uncompiled, which is how the CPU-reference tests exercise them. Because the bmm's
+domain, so the rest of the model still runs eager. Because the bmm's
 output axes (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling
 them would mean K-splitting a reduction a gather cannot mirror, the attention compile alone
 is capped at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's

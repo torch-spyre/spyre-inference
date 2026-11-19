@@ -172,7 +172,6 @@ def _run_spyre_attn_test(
     dtype: torch.dtype = DTYPE,
     kv_cache_dtype: str = "auto",
     kv_scales: tuple[float, float] = (1.0, 1.0),
-    expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
     num_blocks: int = 256,
 ) -> None:
@@ -181,12 +180,6 @@ def _run_spyre_attn_test(
     Seeds the cache entirely through the impl's store, history included: the device
     layout cannot be reproduced by a host-populated transfer.
     """
-    # The compiled attention kernel targets the Spyre device. On CPU it routes through
-    # Inductor's C++ backend, whose codegen for the kernels' indirect gathers is broken.
-    # CPU is only the eager reference here, so skip the compiled+CPU combo.
-    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "cpu":
-        pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
-
     from vllm.config import get_current_vllm_config
 
     # SpyreAttentionImpl and the metadata builder both read the dtype off the VllmConfig.
@@ -278,16 +271,13 @@ def _run_spyre_attn_test(
     )
     assert attn_impl.block_size == block_size
 
-    # The fused store is just whether the kernel was handed an `out` buffer.
-    fused_calls: list[bool] = []
     dispatched_widths: set[int] = set()
-    if expect_fused_store is not None or expect_query_widths is not None:
+    if expect_query_widths is not None:
         real_run = attn_impl._run_page_attn
 
         def spy_run(
             query, row_table, k_pages, v_pages, index_table, mask_stack, nb, page_range, pql, out
         ):
-            fused_calls.append(out is not None)
             dispatched_widths.add(pql)
             return real_run(
                 query,
@@ -361,11 +351,6 @@ def _run_spyre_attn_test(
         output=output,
     )
 
-    if expect_fused_store is not None:
-        assert fused_calls, "no attention kernel ran"
-        assert set(fused_calls) == {expect_fused_store}, (
-            f"fused output store: expected {expect_fused_store}, got {set(fused_calls)}"
-        )
     if expect_query_widths is not None:
         assert dispatched_widths == expect_query_widths, (
             f"query widths dispatched: expected {expect_query_widths}, "
@@ -421,12 +406,7 @@ _SHAPES = [
     pytest.param([(32, 65)], id="kv_padded_prefill"),
 ]
 
-# Spyre always compiles attention, even eager (torch-spyre#4334); CPU runs the same kernels
-# uncompiled, which is what keeps the kernels checked on a card-free host.
-_DEVICE_MODES = [
-    pytest.param("cpu", "NONE", id="device_cpu-eager"),
-    pytest.param("spyre", "STOCK_TORCH_COMPILE", id="device_spyre-compiled"),
-]
+_DEVICE_MODES = [pytest.param("spyre", "STOCK_TORCH_COMPILE", id="device_spyre-compiled")]
 
 
 # Residency is a property of the layout plan rather than a result, so it is not asserted.
@@ -441,37 +421,6 @@ def test_spyre_attn_core(default_vllm_config, seq_lens, configure_compilation, c
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
-    )
-
-
-@pytest.mark.parametrize(
-    ("configure_device", "configure_compilation", "seq_lens", "expect_fused_store"),
-    [
-        pytest.param("spyre", "STOCK_TORCH_COMPILE", [(1, 512)], True, id="decode-fused"),
-        pytest.param("spyre", "STOCK_TORCH_COMPILE", [(32, 256)], True, id="prefill-fused"),
-        pytest.param("cpu", "NONE", [(1, 512)], False, id="cpu_eager-decode"),
-    ],
-    indirect=["configure_device", "configure_compilation"],
-)
-def test_spyre_attn_fused_output_store(
-    default_vllm_config,
-    monkeypatch,
-    seq_lens,
-    expect_fused_store,
-    configure_compilation,
-    configure_device,
-):
-    """Assert both the output and which store path ran, so a guard that stops engaging
-    cannot leave these cases green on the unfused store alone."""
-    # The per-seq kernels are the subject; batched decode would take a lone decode.
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    _run_spyre_attn_test(
-        seq_lens=seq_lens,
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        expect_fused_store=expect_fused_store,
     )
 
 
@@ -1471,32 +1420,6 @@ def test_bucketed_block_ids_match_scalar_fill(
             assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
 
 
-@pytest.mark.parametrize(
-    ("mode", "device", "compiled"),
-    [
-        ("STOCK_TORCH_COMPILE", "cpu", True),
-        ("NONE", "cpu", False),
-        # torch-spyre#4334: the eager page gather fails, so Spyre compiles regardless.
-        ("NONE", "spyre", True),
-    ],
-)
-def test_attn_compiled_gates_every_compiled_path(
-    default_vllm_config, monkeypatch, mode, device, compiled
-):
-    """Recording, batched decode and the fused store follow the kernels' compile choice."""
-    from vllm.config import CompilationMode, get_current_vllm_config
-
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    get_current_vllm_config().compilation_config.mode = getattr(CompilationMode, mode)
-    impl = SpyreAttentionImpl(num_heads=8, head_size=64, scale=0.125, num_kv_heads=2)
-    dev = torch.device(device)
-
-    assert impl._attn_compiled(dev) is compiled
-    assert impl._batched_decode_supported(dev) is compiled
-    prefill_fn, _ = impl._page_attn_fns(dev)
-    assert (prefill_fn is spyre_attn._page_attn_prefill_compiled) is compiled
-
-
 @pytest.mark.parametrize("batched_decode", ["0", "1"])
 def test_batched_decode_metadata_follows_env(
     default_vllm_config, monkeypatch, batched_decode: str
@@ -2220,10 +2143,7 @@ _SLOT_CASES = [
 
 @pytest.mark.parametrize(
     "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
+    [pytest.param("spyre", id="device_spyre")],
     indirect=True,
 )
 @pytest.mark.parametrize(
@@ -2290,9 +2210,8 @@ def test_spyre_attn_scatter(
     torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
 
-    if configure_device == "spyre":
-        del k_actual, v_actual, kv_cache
-        gc.collect()
+    del k_actual, v_actual, kv_cache
+    gc.collect()
 
 
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
@@ -2988,7 +2907,7 @@ def test_spyre_attn_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     )
 
     pages = torch.empty(1 + num_seqs * blocks_per_seq)
-    assert impl._batched_decode_supported(pages.device)
+    assert impl._batched_decode_supported()
     assert impl._batched_decode_preconditions_met(attn_metadata, pages), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
     )
@@ -3179,7 +3098,7 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
         num_kv_heads=num_kv_heads,
     )
     device = torch.device(configure_device)
-    assert impl._batched_decode_supported(device)
+    assert impl._batched_decode_supported()
 
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
     blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)

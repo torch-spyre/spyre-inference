@@ -155,6 +155,14 @@ def test_encoder_data_parallel_is_rejected():
         _manager(_FakeVisionModel(), tp_mode="data")
 
 
+def test_capture_without_a_graph_pool_counts_as_captured():
+    """MRV2's EncoderRunner runs the uncompiled encoder unless is_captured() holds."""
+    manager = _manager(_FakeVisionModel(max_tokens=300))
+    assert not manager.is_captured()
+    manager.capture(graph_pool=None)
+    assert manager.is_captured()
+
+
 def test_execute_packs_pads_per_block_and_splits_per_item():
     model = _FakeVisionModel(max_tokens=300)
     manager = _manager(model)

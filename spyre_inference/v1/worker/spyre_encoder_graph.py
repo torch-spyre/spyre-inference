@@ -144,6 +144,11 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             self.path_token_budgets = budgets
         return [outputs[i] for i in range(len(tokens))]
 
+    def is_captured(self) -> bool:
+        """Upstream's checks for a CUDA graph pool, which Spyre never has; MRV2's
+        EncoderRunner only dispatches to a captured manager."""
+        return bool(getattr(self, "_staging", None))
+
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()
     ) -> None:

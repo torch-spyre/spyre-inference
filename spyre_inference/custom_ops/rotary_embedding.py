@@ -49,7 +49,7 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
 
-from .utils import place_row_gathered
+from .utils import place_row_gathered, warm_up_host_cos
 
 # One Spyre stick of fp16 elements.
 _STICK = 64
@@ -140,9 +140,7 @@ class _SpyreRotaryMixin:
         )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
-        # A process's first multi-threaded host cos (MKL vector math) can differ in the last
-        # bits from run to run; a one-element call first makes the cache reproducible.
-        torch.zeros(1).cos()
+        warm_up_host_cos()
         return super()._compute_cos_sin_cache()
 
     def _apply(self, fn, recurse=True):

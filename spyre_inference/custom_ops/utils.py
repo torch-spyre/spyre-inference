@@ -207,3 +207,9 @@ def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
             valid_elements={(0,): num_rows, (1, 2): row_width},
         ),
     )
+
+
+def warm_up_host_cos() -> None:
+    """Run before building a host cos table: a process's first multi-threaded host cos (MKL
+    vector math) can differ in the last bits from run to run."""
+    torch.zeros(1).cos()

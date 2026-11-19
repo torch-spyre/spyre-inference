@@ -541,6 +541,57 @@ def _apply(layer, tokens):
     return method.apply_monolithic(layer, torch.zeros(tokens, HIDDEN), torch.zeros(tokens, EXPERTS))
 
 
+def _opaque_warm_model(monkeypatch, stick):
+    """A model with one MoE layer whose ``apply_monolithic`` records the token counts it saw."""
+    import sys
+
+    from spyre_inference import moe as moe_module
+
+    calls = []
+    layer = torch.nn.Module()
+    layer.spyre_moe_regions = {}
+    layer.spyre_moe_gate = torch.zeros(1, dtype=torch.float16)
+    layer.hidden_size, layer.global_num_experts = HIDDEN, EXPERTS
+    layer.quant_method = SimpleNamespace(
+        apply_monolithic=lambda layer, x, logits: calls.append((x.shape, logits.shape))
+    )
+    model = torch.nn.Module()
+    model.dense = torch.nn.Module()
+    model.experts = layer
+    monkeypatch.setitem(sys.modules, "torch_spyre", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules, "torch_spyre._C", SimpleNamespace(get_elem_in_stick=lambda dtype: stick)
+    )
+    compiled = []
+    monkeypatch.setattr(
+        moe_module.torch, "compile", lambda fn, **kwargs: compiled.append(kwargs) or fn
+    )
+    return model, calls, compiled
+
+
+def test_warming_the_opaque_regions_runs_the_experts_for_the_off_stick_sizes(monkeypatch):
+    """Sizes that are a multiple of the stick trace into the block graph and need nothing."""
+    from spyre_inference.moe import warm_opaque_regions
+
+    model, calls, compiled = _opaque_warm_model(monkeypatch, stick=16)
+    warm_opaque_regions(model, [1, 4, 16, 512], torch.device("cpu"))
+
+    assert calls == [((1, HIDDEN), (1, EXPERTS)), ((4, HIDDEN), (4, EXPERTS))]
+    # Both inputs pass through one compiled identity, so they carry a compiled layout.
+    assert compiled == [{"backend": "inductor", "fullgraph": True, "dynamic": False}]
+
+
+def test_warming_the_opaque_regions_is_a_no_op_without_them(monkeypatch):
+    from spyre_inference.moe import warm_opaque_regions
+
+    model, calls, compiled = _opaque_warm_model(monkeypatch, stick=1)
+    warm_opaque_regions(model, [1, 4, 16], torch.device("cpu"))
+    assert calls == [] and compiled == []  # every size is stick-aligned
+
+    warm_opaque_regions(torch.nn.Module(), [1, 4, 16], torch.device("cpu"))
+    assert calls == []  # a dense model has no MoE layer
+
+
 def test_single_token_dispatches_to_the_gathered_form(monkeypatch):
     """One token takes the gathered region, whose combine is the only legal layout there."""
     calls, resets = _dispatch_recorder(monkeypatch)

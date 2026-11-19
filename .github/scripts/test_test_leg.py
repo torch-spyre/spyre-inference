@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""_test_leg.yaml retries unless the attempt proved it passed, so a dead runner is retried (#1454)."""
+"""_test_leg.yaml retries unless the attempt proved it passed, so a dead runner retries (#1454)."""
 
 from __future__ import annotations
 

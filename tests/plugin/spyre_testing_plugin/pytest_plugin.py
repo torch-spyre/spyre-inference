@@ -1314,6 +1314,8 @@ def pytest_runtest_makereport(item, call):
         item._spyre_reap_card = True
 
 
+# tryfirst: the skip / fail must land before the parity module's fixture starts its subprocess.
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
     if item.get_closest_marker(_TRITON_CPU_MARKER) is None:
         return

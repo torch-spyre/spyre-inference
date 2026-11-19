@@ -40,7 +40,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import TransformersForCausalLM
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
-from spyre_inference.custom_ops.utils import warm_up_host_cos
+from spyre_inference.custom_ops.utils import init_host_cos
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -63,7 +63,7 @@ def _build_rotation_cache(
     """
     rope_half = inv_freq.shape[0]
     freqs = torch.outer(torch.arange(max_position, dtype=torch.float32), inv_freq)
-    warm_up_host_cos()
+    init_host_cos()
     cos, sin = torch.cos(freqs) * scaling, torch.sin(freqs) * scaling
     rot = torch.stack([cos, -sin, sin, cos], dim=1).view(max_position, 2, 2, rope_half)
 

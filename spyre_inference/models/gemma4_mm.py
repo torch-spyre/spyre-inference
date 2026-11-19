@@ -31,7 +31,7 @@ from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG
 
 from spyre_inference.custom_ops.head_pad import pad_input_end, pad_output_end
-from spyre_inference.custom_ops.utils import convert, warm_up_host_cos
+from spyre_inference.custom_ops.utils import convert, init_host_cos
 from spyre_inference.models._vision_encoder import (
     SEGMENT_ITEMS,
     GatherTable,
@@ -377,7 +377,7 @@ def gemma4_rope_tables(
     `attention_scaling` (stock applies it to the whole table) scales the real lanes only.
     """
     angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
-    warm_up_host_cos()
+    init_host_cos()
     c = angles.cos() * attention_scaling
     s = angles.sin() * attention_scaling
     z = torch.zeros_like(c)

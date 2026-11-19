@@ -209,7 +209,7 @@ def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
     )
 
 
-def warm_up_host_cos() -> None:
-    """Run before building a host cos table: a process's first multi-threaded host cos (MKL
-    vector math) can differ in the last bits from run to run."""
+def init_host_cos() -> None:
+    """Initialize host cos (MKL vector math) on one thread before building a cos table: a
+    process's first multi-threaded host cos can differ in the last bits from run to run."""
     torch.zeros(1).cos()

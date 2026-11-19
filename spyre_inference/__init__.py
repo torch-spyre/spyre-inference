@@ -48,6 +48,11 @@ def register():
     if os.environ.get("FLEX_DEVICE") == "PF":
         for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
             os.environ.setdefault(name, "1")
+    # A process's first multi-threaded host MKL vector-math call (cos, exp, sqrt, tanh, ...)
+    # can differ in the last bits from run to run; a one-element call first avoids it.
+    import torch
+
+    torch.zeros(1).cos()
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 

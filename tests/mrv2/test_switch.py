@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SPYRE_MODEL_RUNNER picks the worker and turns on vLLM's V2 runner flag."""
+"""SPYRE_MODEL_RUNNER picks the worker, turns on vLLM's V2 runner flag, and leaves the
+hybrid KV cache manager on for V2 only."""
 
 import copy
 import os
@@ -56,11 +57,11 @@ def _set_runner(monkeypatch: pytest.MonkeyPatch, runner: str | None) -> None:
 
 
 @pytest.mark.parametrize(
-    ("runner", "worker_cls", "use_v2"),
+    ("runner", "worker_cls", "use_v2", "hybrid_kv_cache_manager"),
     [
-        (None, "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0"),
-        ("v1", "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0"),
-        ("v2", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2", "1"),
+        (None, "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0", False),
+        ("v1", "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0", False),
+        ("v2", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2", "1", True),
     ],
 )
 def test_runner_switch(
@@ -69,13 +70,17 @@ def test_runner_switch(
     runner: str | None,
     worker_cls: str,
     use_v2: str,
+    hybrid_kv_cache_manager: bool,
 ) -> None:
     _set_runner(monkeypatch, runner)
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.parallel_config.worker_cls == worker_cls
     assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == use_v2
+    disabled = vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+    assert disabled is not hybrid_kv_cache_manager
 
 
 @pytest.mark.parametrize(

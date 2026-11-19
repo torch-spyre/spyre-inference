@@ -985,6 +985,10 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
+        if runner == "v1":
+            # The hybrid KV cache manager runs on the V2 runner only; V1 keeps one group.
+            scheduler_config.disable_hybrid_kv_cache_manager = True
+
         # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,
         # overriding the flag; a size would also skip the measurement and hand out a
         # fixed budget whatever the card has free.

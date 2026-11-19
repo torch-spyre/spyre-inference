@@ -39,8 +39,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
     Inherited from upstream: budget selection and user overrides, packing items into budgets,
     replay padding, and the per-item output split. Overridden: capture compiles the model's
-    graphs at that budget's static shape, and replay copies the inputs into host staging
-    buffers, uploads them once and runs those graphs.
+    graphs at that budget's static shape, replay copies the inputs into host staging
+    buffers, uploads them once and runs those graphs, and the manager counts as captured
+    while those buffers are staged.
     """
 
     def __init__(
@@ -187,11 +188,12 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         return output
 
     def is_captured(self) -> bool:
-        # Upstream keys this on a CUDA graph pool, which Spyre never has; MRV2's
-        # EncoderRunner gates on it and would otherwise compile every image mid-request.
+        # Captured once a budget is staged; upstream's check reads the CUDA graph pool,
+        # which Spyre leaves None.
         return bool(self._staging)
 
     def clear(self) -> None:
+        # The compiled graphs live on the model; only the staging buffers are dropped.
         super().clear()
         self._staging.clear()
 

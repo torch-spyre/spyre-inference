@@ -14,12 +14,12 @@
 
 """Tests for the attention graph recorder.
 
-CPU-only: these check that recording compiles a graph for every variant the
-bucketer enumerates, and that a subsequent dispatch compiles nothing more. The
-count comes from Dynamo's own ``unique_graphs`` counter, since Dynamo is what
-decides whether a dispatch reuses a graph. The kernels run on CPU here (no
-Spyre), which is enough to exercise the metadata the recorder builds and the
-guards it trips.
+These check that recording compiles a graph for every variant the bucketer
+enumerates, and that a subsequent dispatch compiles nothing more. The count comes
+from Dynamo's own ``unique_graphs`` counter, since Dynamo is what decides whether a
+dispatch reuses a graph. The tests that record run on Spyre pages, so the guards
+are the ones serving trips. Tests that only check what gets recorded stub out
+``forward`` and compile nothing.
 """
 
 import logging
@@ -29,8 +29,10 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from spyre_testing_plugin.attn_helpers import use_kv_buckets, use_python_for_each_tile
+from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
-from vllm.config import CompilationMode, get_current_vllm_config
+from vllm.config import get_current_vllm_config
 from vllm.logger import _print_warning_once
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
@@ -39,11 +41,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
-    SpyrePagedKVCache,
     _build_query_row_tables,
     _mirror_mask_stack,
 )
-from spyre_inference.v1.attention.ops import batched_decode, tile_loop
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
 )
@@ -70,17 +70,12 @@ def compiles() -> int:
 
 @pytest.fixture()
 def impl(default_vllm_config, monkeypatch):
-    # CPU graph-reuse tests use the Python walk; Spyre e2e tests cover tiled lowering.
-    # The batched kernel reads its own copy of the flag.
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(batched_decode, "USE_FOR_EACH_TILE", False)
+    # These tests check the KV buckets, which a page range would replace.
+    use_kv_buckets(monkeypatch)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
-    # The fixture's bare CompilationConfig leaves mode unset, which resolves to
-    # eager. __init__ reads the mode to pick its kernel, so set it before building.
-    get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
-    # __init__ also reads the block size, which the decode kernel's page reshape bakes in.
+    # __init__ reads the block size, which the decode kernel's page reshape bakes in.
     get_current_vllm_config().cache_config.block_size = BLOCK_SIZE
     return SpyreAttentionImpl(
         num_heads=NUM_HEADS,
@@ -91,13 +86,27 @@ def impl(default_vllm_config, monkeypatch):
     )
 
 
+SPEC = AttentionSpec(
+    block_size=BLOCK_SIZE, num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE, dtype=torch.float16
+)
+
+
 @pytest.fixture()
-def kv_cache():
-    shape = (NUM_PAGES, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
-    return SpyrePagedKVCache(
-        k_pages=torch.zeros(shape, dtype=torch.float16),
-        v_pages=torch.zeros(shape, dtype=torch.float16),
-    )
+def spyre_device():
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    return torch.device("spyre")
+
+
+@pytest.fixture()
+def stub_forward(impl, monkeypatch):
+    """Record without tracing: what gets recorded comes from build()'s metadata alone."""
+    monkeypatch.setattr(impl, "forward", MagicMock())
+
+
+@pytest.fixture()
+def kv_cache(spyre_device):
+    return SpyreAttentionImpl.allocate_pages(NUM_PAGES, SPEC, spyre_device)
 
 
 def _make_builder(kv_cache_spec, backend=SpyreAttentionBackend) -> SpyreAttentionMetadataBuilder:
@@ -162,7 +171,7 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
 def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
     from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    use_kv_buckets(monkeypatch)
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -245,7 +254,7 @@ def test_non_causal_draft_variant_keeps_future_block_tokens_visible(
     assert mask[0, 0, -1] == torch.finfo(mask.dtype).min
 
     # Exercise the kernel bodies on CPU without the Spyre tiled-loop lowering.
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    use_python_for_each_tile(monkeypatch)
     shape = backend.get_kv_cache_shape(1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
     k_pages, v_pages = (torch.zeros(shape, dtype=torch.float16) for _ in range(2))
     v_pages[0, :, -1] = 1
@@ -310,7 +319,7 @@ def test_recorder_passes_explicit_causality_to_metadata(
     builder._attn_bucketer = make_bucketer()
     forward = MagicMock()
     monkeypatch.setattr(impl, "forward", forward)
-    monkeypatch.setattr(impl, "_batched_decode_supported", lambda device: False)
+    monkeypatch.setattr(impl, "_batched_decode_supported", lambda: False)
     impl.record_graphs(SimpleNamespace(), kv_cache, builder, causal=causal)
     assert forward.call_count > 0
     assert all(call.args[5].causal is causal for call in forward.call_args_list)
@@ -348,6 +357,7 @@ class TestRecordGraphs:
         yield
         envs.clear_env_cache()
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_records_every_enumerated_variant(self, impl, kv_cache, builder):
         bucketer = builder._attn_bucketer = make_bucketer()
 
@@ -400,7 +410,7 @@ class TestRecordGraphs:
             scale=impl.scale,
             num_kv_heads=NUM_KV_HEADS,
         )
-        other_cache = SpyrePagedKVCache(*(torch.zeros_like(t) for t in kv_cache))
+        other_cache = SpyreAttentionImpl.allocate_pages(NUM_PAGES, SPEC, kv_cache[0].device)
         assert other.graph_key() == impl.graph_key()
 
         snapshot = compiles()
@@ -447,6 +457,7 @@ class TestRecordGraphs:
             )
         assert compiles() == snapshot
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_collapsing_without_a_sliding_window_warns(
         self, impl, kv_cache, builder, caplog, monkeypatch
     ):
@@ -461,6 +472,7 @@ class TestRecordGraphs:
 
         assert "bucketer and build() have diverged" in caplog.text
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_collapsing_with_a_sliding_window_is_quiet(
         self, impl, kv_cache, sliding_window_builder, caplog
     ):
@@ -471,7 +483,10 @@ class TestRecordGraphs:
 
         assert "diverged" not in caplog.text
 
-    def test_prefill_rounding_onto_its_page_granularity_is_quiet(self, impl, builder, caplog):
+    @pytest.mark.usefixtures("stub_forward")
+    def test_prefill_rounding_onto_its_page_granularity_is_quiet(
+        self, impl, builder, caplog, spyre_device
+    ):
         """With a page range build() rounds a prefill page count up to the prefill
         granularity, which is not drift."""
         from torch_spyre._inductor import config as ts_config
@@ -483,11 +498,7 @@ class TestRecordGraphs:
                 max_model_len=20 * BLOCK_SIZE, max_num_batched_tokens=16, declare_pages=True
             )
             assert builder.attn_bucketer.prefill_page_range["max"] == 24
-            shape = (24, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
-            kv_cache = SpyrePagedKVCache(
-                k_pages=torch.zeros(shape, dtype=torch.float16),
-                v_pages=torch.zeros(shape, dtype=torch.float16),
-            )
+            kv_cache = SpyreAttentionImpl.allocate_pages(24, SPEC, spyre_device)
 
             with caplog.at_level(logging.WARNING):
                 recorded = _record(impl, kv_cache, builder)
@@ -495,6 +506,7 @@ class TestRecordGraphs:
         assert recorded == len(builder.attn_bucketer.variants())
         assert "diverged" not in caplog.text
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_skips_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """Buckets sized from max_model_len can outrun a small KV cache."""
         bucketer = builder._attn_bucketer = make_bucketer(max_model_len=4096)
@@ -574,7 +586,7 @@ class TestRecordGraphs:
         """
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-        monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+        use_kv_buckets(monkeypatch)
         cfg = get_current_vllm_config()
         monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
 
@@ -653,20 +665,14 @@ class TestRecordGraphs:
         assert aligned[0] > 1 and aligned[1] == 1, "not a mixed batch"
 
         # The buffers attn_layer hands forward() in production.
-        q_staging, out_staging = impl._staging_buffers(torch.device("cpu"))
+        q_staging, out_staging = impl._staging_buffers(kv_cache[0].device)
 
         snapshot = compiles()
         impl.forward(MagicMock(), q_staging, q_staging, q_staging, kv_cache, metadata, out_staging)
 
         assert compiles() == snapshot
 
-    def test_eager_records_nothing(self, impl, kv_cache, builder):
-        impl._compile_attn = False
-        builder._attn_bucketer = make_bucketer()
-        snapshot = compiles()
-        assert _record(impl, kv_cache, builder) == 0
-        assert compiles() == snapshot
-
+    @pytest.mark.usefixtures("stub_forward")
     def test_a_failing_variant_does_not_abort_the_pass(self, impl, kv_cache, builder, monkeypatch):
         """One bad variant must not take down engine startup."""
         bucketer = builder._attn_bucketer = make_bucketer()
@@ -713,6 +719,7 @@ def test_one_token_variant_records_the_per_seq_kernel(builder, monkeypatch, num_
 
 
 class TestRecompileLimit:
+    @pytest.mark.usefixtures("stub_forward")
     def test_limit_is_raised_during_recording_and_restored(self, impl, kv_cache, builder):
         """Dynamo's accumulated limit is global, so more buckets than it allows would
         otherwise stop compiling partway through and fall back to eager."""
@@ -761,12 +768,8 @@ class TestRecordBatchedDecode:
         envs.clear_env_cache()
 
     @pytest.fixture()
-    def wide_cache(self):
-        shape = (self.PAGES, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
-        return SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=torch.float16),
-            v_pages=torch.zeros(shape, dtype=torch.float16),
-        )
+    def wide_cache(self, spyre_device):
+        return SpyreAttentionImpl.allocate_pages(self.PAGES, SPEC, spyre_device)
 
     @classmethod
     def _recordable_batched(cls, bucketer, pages: int | None = None) -> list:
@@ -778,6 +781,7 @@ class TestRecordBatchedDecode:
     def _expected(self, bucketer, batched: int) -> int:
         return len(_recordable(bucketer, self.PAGES)) + batched
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_records_every_enumerated_batched_variant(self, impl, wide_cache, builder):
         bucketer = builder._attn_bucketer = make_bucketer()
 
@@ -789,6 +793,7 @@ class TestRecordBatchedDecode:
         )
         assert recorded == self._expected(bucketer, len(batched))
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_records_nothing_batched_when_the_flag_is_off(
         self, impl, wide_cache, builder, monkeypatch
     ):
@@ -798,6 +803,7 @@ class TestRecordBatchedDecode:
 
         assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
 
+    @pytest.mark.usefixtures("stub_forward")
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """The gather's entry axis, not the block count, is what a small cache bounds."""
         bucketer = builder._attn_bucketer = make_bucketer()
@@ -809,7 +815,7 @@ class TestRecordBatchedDecode:
         assert recorded == len(_recordable(bucketer)) + len(batched)
 
     def test_window_variants_over_the_requested_budget_still_record(
-        self, impl, sliding_window_builder
+        self, impl, sliding_window_builder, spyre_device
     ):
         """A window moves the realized entry axis, so the skip must key on that.
 
@@ -822,11 +828,7 @@ class TestRecordBatchedDecode:
         # ask for. NUM_PAGES no longer straddles any variant once padding lifts the
         # realized axis back to the bucket maximum.
         pages = 12
-        shape = (pages, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
-        cache = SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=torch.float16),
-            v_pages=torch.zeros(shape, dtype=torch.float16),
-        )
+        cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
         # Whether the realized gather fits is a question about build()'s output.
         reachable = []
         for v in bucketer.batched_decode_variants():

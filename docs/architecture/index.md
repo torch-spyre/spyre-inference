@@ -453,14 +453,10 @@ dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
-with KV length. `SPYRE_ATTN_FOR_EACH_TILE=1` walks that axis with torch-spyre's
-`for_each_tile` instead, leaving one body plus a tile spec, and the same applies to the
-batched-decode kernel's walk over block chunks. The kernels carry the online softmax as
-a `(tile_max, tile_sum, tile_output)` triple either way. `walk_tiles` selects the walk;
-the same flag also controls `fullgraph` and the batched-decode page-index upload.
-`SPYRE_ATTN_FOR_EACH_TILE=1` is the default; setting it to `0` uses Python loops as a
-rollback path. The flag is read once at import, so set it before importing
-`spyre_inference`.
+with KV length. The kernels therefore walk that axis with torch-spyre's `for_each_tile`,
+leaving one body plus a tile spec, and the same applies to the batched-decode kernel's
+walk over block chunks. The kernels carry the online softmax as a
+`(tile_max, tile_sum, tile_output)` triple.
 
 ### LX-resident pages
 
@@ -483,8 +479,7 @@ Two things follow from those choices. The gather is a 2-D subscript, which lower
 `aten.index` and fails eager on Spyre by upcasting its int32 index (torch-spyre#4334,
 tracked by `test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is
 always compiled on Spyre, even under `--enforce-eager` — attention compiles in its own
-domain, so the rest of the model still runs eager. Off Spyre an eager run calls the same
-kernels uncompiled, which is how the CPU-reference tests exercise them. Because the bmm's
+domain, so the rest of the model still runs eager. Because the bmm's
 output axes (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling
 them would mean K-splitting a reduction a gather cannot mirror, the attention compile alone
 is capped at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's

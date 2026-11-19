@@ -136,7 +136,7 @@ def test_nothing_outside_the_package_imports_it(path: pathlib.Path) -> None:
     if _imports_spyre_package(tree, _containing_package(path)):
         assert path in _ALLOWED_IMPORTERS, (
             f"{path.relative_to(_REPO_ROOT)} imports spyre_inference.v1.worker.spyre, "
-            "but nothing outside the package may import it until V2 is the default."
+            "but nothing outside the package may import it until V1 is removed (#1245)."
         )
 
 

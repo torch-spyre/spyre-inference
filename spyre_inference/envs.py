@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     # Declarations so type checkers and IDEs resolve the lazily-provided
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
-    SPYRE_MODEL_RUNNER: str = "v1"
+    SPYRE_MODEL_RUNNER: str = "v2"
     SPYRE_MRV2_KERNELS: str = "host"
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
@@ -62,9 +62,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
     # Which model runner the worker uses:
-    #  - "v1": the V1 runner (default)
-    #  - "v2": the Model Runner V2 port (#906), in bring-up
-    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v1",
+    #  - "v2": vLLM's Model Runner V2 (default)
+    #  - "v1": the V1 runner, a best-effort fallback until it is removed (#1245)
+    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v2",
     # What runs MRV2's Triton kernels under SPYRE_MODEL_RUNNER=v2:
     #  - "host": the csrc/ host ops kernels.bind() puts in their place; vLLM never
     #    sees Triton (default, every arch)

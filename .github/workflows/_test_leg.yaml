@@ -1,0 +1,263 @@
+name: Test matrix leg (reusable)
+
+# One _test_matrix.yaml `test` leg plus its pod-level retry. A separate workflow because a
+# job can only `needs:` a whole matrix, so a retry there waits for the slowest leg.
+on:
+  workflow_call:
+    inputs:
+      cfg:
+        description: Display name of this matrix config (matrix.cfg)
+        required: true
+        type: string
+      test_target:
+        description: Makefile target to run (matrix.test_target)
+        required: true
+        type: string
+      test_types:
+        description: Tiers this leg belongs to, whitespace-separated (matrix.test_types)
+        required: true
+        type: string
+      runs_on:
+        description: JSON array of the leg's runner labels (toJSON(matrix.runs_on))
+        required: true
+        type: string
+      runs_on_pr:
+        description: >-
+          JSON array of runner labels for PR runs (toJSON(matrix.runs_on_pr)), used unless
+          runner_label is set or the event is merge_group; empty = always runs_on
+        required: false
+        type: string
+        default: ''
+      leg_arch:
+        description: Arch the leg's tests run on (matrix.runs_on[0]), hashed into run_id by the ingest
+        required: true
+        type: string
+      image_label:
+        description: Standing runner image label (matrix.image_label)
+        required: true
+        type: string
+      job_index:
+        description: The caller's strategy.job-index, which scopes cache dirs and artifact names
+        required: true
+        type: string
+      durations_run_id:
+        description: Run id whose test-durations artifact weights the shard partition
+        required: false
+        type: string
+        default: ''
+      run_tests:
+        description: >-
+          The caller's change-detection result: false skips the leg unless
+          skip_if_no_changes is false.
+        required: true
+        type: boolean
+      skip_if_no_changes:
+        required: true
+        type: boolean
+      use_prebaked_image:
+        required: true
+        type: boolean
+      image_rpms:
+        required: false
+        type: boolean
+        default: false
+      extra_groups:
+        description: Dependency groups to sync on top of dev (matrix.extra_groups)
+        required: false
+        type: string
+        default: ''
+      torch_spyre_ref:
+        required: false
+        type: string
+        default: ''
+      rpm_location:
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        required: false
+        type: string
+        default: ''
+      ref:
+        required: false
+        type: string
+        default: ''
+      repository:
+        required: false
+        type: string
+        default: ''
+      runner_label:
+        required: false
+        type: string
+        default: ''
+      test_type:
+        required: false
+        type: string
+        default: regression
+    secrets:
+      ARTIFACTORY_USER:
+        required: false
+      ARTIFACTORY_TOKEN:
+        required: false
+      ARTIFACTORY_BASE_URL:
+        required: false
+      ARTIFACTORY_RPM_PATH:
+        required: false
+      HF_TOKEN:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # GitHub sets CI=true, which makes the pytest inductor tests fail with an
+  # AssertionError from a mix of fallbacks and decompositions.
+  CI: ''
+  STORAGE_1_DIR: /storage-1/spyre-inference
+  HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+  # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
+  # against a gated repo 401s even when the model is on the PVC.
+  HF_HUB_OFFLINE: '1'
+  # inputs.runner_label replaces the standing image label (per-PR dispatch flow);
+  # on merge_group the standing label gains the `_mq` suffix to select the merge-queue set.
+  RUNNER_LABELS: ${{ format('["{0}","{1}"]', join(fromJSON((inputs.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && inputs.runs_on_pr || inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label) }}
+
+jobs:
+  # The run page lists a called workflow's jobs by their own names, so each carries the cfg.
+  attempt:
+    name: build and run tests (${{ inputs.cfg }})
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON((inputs.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && inputs.runs_on_pr || inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
+    continue-on-error: true
+    timeout-minutes: 720
+    outputs:
+      passed: ${{ steps.done.outputs.passed }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # Cross-repo Test-With: companion fork/branch (empty = base repo / dispatched ref).
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      # Single run/skip decision for the build+test step below. A leg runs
+      # only when BOTH hold:
+      #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
+      #      flow passes only when source files changed;
+      #   2. this config's test_types set contains the requested test_type
+      #      (so test_type selects a subset of the matrix; regression = every
+      #      config).
+      - name: Decide whether to run
+        id: gate
+        env:
+          RAW_TEST_TYPE: ${{ inputs.test_type }}
+        run: |
+          # `make print-test-type` is the single source of truth for TEST_TYPE
+          # resolution (empty -> regression) and rejects an unknown type: this
+          # workflow_call path accepts any string, and an unknown value would
+          # match no config and silently skip every leg -> a green run that
+          # tested nothing.
+          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
+          if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
+             || "${{ inputs.run_tests }}" == "true" ]]; then
+            changed=true
+          else
+            changed=false
+          fi
+          # perf is not a matrix config (the perf job in _test_matrix.yaml runs it),
+          # so every leg skips when test_type=perf.
+          case " ${{ inputs.test_types }} " in
+            *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
+            *) selected=false ;;
+          esac
+          if [[ "${{ inputs.use_prebaked_image }}" == "true" && -n "${{ inputs.extra_groups }}" ]]; then
+            selected=false
+          fi
+          if [[ "$changed" == "true" && "$selected" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run matrix config
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        # Bounds the whole composite. Warm legs run 27-38min; a cold compile cache (any
+        # lockfile change) pushes the gemma-4 vision shard to ~90min, so 150 leaves headroom.
+        # NOTE: the runner's Linux kill is single-process, so this ends the job but does not
+        # reap a double-forked leftover; the pod is torn down by ARC, which releases the card.
+        timeout-minutes: 150
+        uses: ./.github/actions/run-matrix-config
+        with:
+          cfg: ${{ inputs.cfg }}
+          test_target: ${{ inputs.test_target }}
+          durations_run_id: ${{ inputs.durations_run_id }}
+          test_type: ${{ inputs.test_type }}
+          # The declared membership set, not the invoked tier: one testtype__ tag per member,
+          # so a later run of another tier reuses this coverage instead of re-running it.
+          test_types: ${{ inputs.test_types }}
+          leg_arch: ${{ inputs.leg_arch }}
+          runner_labels: ${{ env.RUNNER_LABELS }}
+          job_slot: ${{ inputs.job_index }}
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          extra_groups: ${{ inputs.extra_groups }}
+          image_rpms: ${{ inputs.image_rpms }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+
+      # Only a fully successful attempt reaches this, and the retry runs unless it is set: a runner
+      # that died (#1454) sends no failure signal, and needs.attempt.result reads success under
+      # continue-on-error.
+      - name: Mark attempt passed
+        id: done
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  # Fresh runner pod, no changed-files gate; failing again here is a genuine failure.
+  retry:
+    name: build and run tests (${{ inputs.cfg }}) (pod-level retry)
+    needs: attempt
+    if: ${{ !cancelled() && needs.attempt.outputs.passed != 'true' }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON((inputs.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && inputs.runs_on_pr || inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Run matrix config (pod-level retry)
+        timeout-minutes: 150
+        uses: ./.github/actions/run-matrix-config
+        with:
+          cfg: ${{ inputs.cfg }}
+          test_target: ${{ inputs.test_target }}
+          durations_run_id: ${{ inputs.durations_run_id }}
+          test_type: ${{ inputs.test_type }}
+          test_types: ${{ inputs.test_types }}
+          leg_arch: ${{ inputs.leg_arch }}
+          runner_labels: ${{ env.RUNNER_LABELS }}
+          job_slot: retry-${{ inputs.job_index }}
+          retry: 'true'
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          extra_groups: ${{ inputs.extra_groups }}
+          image_rpms: ${{ inputs.image_rpms }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+          hf_token: ${{ secrets.HF_TOKEN }}

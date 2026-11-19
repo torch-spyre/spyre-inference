@@ -471,7 +471,7 @@ jobs:
           retention-days: 1
 
   test:
-    name: 'build and run tests (${{ matrix.cfg }})'
+    name: '${{ matrix.cfg }}'
     needs: [resolve_durations, build_kernels]
     if: ${{ inputs.test_type != 'perf' }}
     strategy:
@@ -952,215 +952,36 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
-    # Compose runner labels from matrix.runs_on and the image label.
-    # When inputs.runner_label is set (per-PR dispatch flow), it replaces
-    # the standing image label with the per-PR image label; on merge_group the
-    # standing label gains the `_mq` suffix to select the merge-queue set.
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join((matrix.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && matrix.runs_on_pr || matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label)) }}
-    # Don't let one failed config fail this job outright -- test_result decides pass/fail after test_retry gets a shot on a fresh pod.
-    continue-on-error: true
-    timeout-minutes: 720
-    env:
-      # The CI env var is very important.
-      # GitHub actions automatically sets CI=true
-      # which causes the pytest inductor tests to fail with AssertionError
-      # due to a mix of fallbacks and decompositions.
-      # Here we set it to an empty string (or we could also unset it).
-      CI: ''
-      STORAGE_1_DIR: /storage-1/spyre-inference
-      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
-      # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
-      # against a gated repo 401s even when the model is on the PVC.
-      HF_HUB_OFFLINE: '1'
+    uses: ./.github/workflows/_test_leg.yaml
+    secrets: inherit
+    with:
+      cfg: ${{ matrix.cfg }}
+      test_target: ${{ matrix.test_target }}
+      test_types: ${{ matrix.test_types }}
+      runs_on: ${{ toJSON(matrix.runs_on) }}
+      runs_on_pr: ${{ matrix.runs_on_pr && toJSON(matrix.runs_on_pr) || '' }}
+      # First runs_on label is the arch; the ingest is pinned to x86_64 and cannot read it.
+      leg_arch: ${{ matrix.runs_on[0] }}
+      image_label: ${{ matrix.image_label }}
+      job_index: ${{ strategy.job-index }}
+      durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
+      run_tests: ${{ needs.build_kernels.outputs.src_changed == 'true' }}
+      skip_if_no_changes: ${{ inputs.skip_if_no_changes }}
+      use_prebaked_image: ${{ inputs.use_prebaked_image }}
+      extra_groups: ${{ matrix.extra_groups || '' }}
+      image_rpms: ${{ inputs.image_rpms }}
+      torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+      rpm_location: ${{ inputs.rpm_location }}
+      rpm_names: ${{ inputs.rpm_names }}
+      ref: ${{ inputs.ref }}
+      repository: ${{ inputs.repository }}
+      runner_label: ${{ inputs.runner_label }}
+      test_type: ${{ inputs.test_type }}
 
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          # Cross-repo Test-With: companion fork/branch (empty = base repo / dispatched ref).
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || github.ref }}
-
-      # Single run/skip decision for every build+test step below. A job runs
-      # only when BOTH hold:
-      #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
-      #      flow passes only when source files changed;
-      #   2. this config's test_types set contains the requested test_type
-      #      (so test_type selects a subset of the matrix; regression = every
-      #      config).
-      - name: Decide whether to run
-        id: gate
-        env:
-          RAW_TEST_TYPE: ${{ inputs.test_type }}
-        run: |
-          # Apply the shared default (empty -> regression) and validate via
-          # `make print-test-type` -- the Makefile is the single source of
-          # truth for TEST_TYPE resolution, the single choke point every
-          # caller (Jenkins, config.yaml) passes through. It also rejects an
-          # unknown type (non-zero exit with an ::error:: line): type: choice
-          # guards the workflow_dispatch entrypoint, but this reusable
-          # workflow_call path accepts any string, and an unknown value would
-          # match no config and silently skip every job -> a green run that
-          # tested nothing.
-          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
-          # Expose the resolved type so the perf job (which is NOT one of the
-          # matrix.cfg entries) can gate itself on it -- same pattern as the
-          # sibling torch-spyre workflow's generate_matrix.resolved_test_type.
-          echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
-          if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
-             || "${{ needs.build_kernels.outputs.src_changed }}" == "true" ]]; then
-            changed=true
-          else
-            changed=false
-          fi
-          # perf is NOT part of the pytest matrix: it runs in the dedicated perf
-          # job below, not as any matrix.cfg. So every matrix config skips when
-          # test_type=perf (selected=false for all), and only the perf job runs.
-          case " ${{ matrix.test_types }} " in
-            *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
-            *) selected=false ;;
-          esac
-          if [[ "${{ inputs.use_prebaked_image }}" == "true" && -n "${{ matrix.extra_groups }}" ]]; then
-            selected=false
-          fi
-          if [[ "$changed" == "true" && "$selected" == "true" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Runs the actual build+test for this leg via the shared composite action, so test_retry below can reuse the exact same steps for a fresh-pod retry instead of duplicating them.
-      - name: Run matrix config
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        # Bounds the whole composite. Warm legs run 27-38min; a cold compile cache (any
-        # lockfile change) pushes the gemma-4 vision shard to ~90min, so 150 leaves headroom.
-        # NOTE: the runner's Linux kill is single-process, so this ends the job but does not
-        # reap a double-forked leftover; the pod is torn down by ARC, which releases the card.
-        timeout-minutes: 150
-        uses: ./.github/actions/run-matrix-config
-        with:
-          cfg: ${{ matrix.cfg }}
-          test_target: ${{ matrix.test_target }}
-          durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
-          test_type: ${{ inputs.test_type }}
-          # The declared membership set, not the invoked tier: one testtype__ tag per member,
-          # so a later run of another tier reuses this coverage instead of re-running it.
-          test_types: ${{ matrix.test_types }}
-          # First runs_on label is the arch; the ingest is pinned to x86_64 and cannot read it.
-          leg_arch: ${{ matrix.runs_on[0] }}
-          # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
-          runner_labels: ${{ format('["{0}","{1}"]', join((matrix.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && matrix.runs_on_pr || matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
-          job_slot: ${{ strategy.job-index }}
-          use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          extra_groups: ${{ matrix.extra_groups }}
-          image_rpms: ${{ inputs.image_rpms }}
-          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
-          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
-          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
-          rpm_names: ${{ inputs.rpm_names }}
-          rpm_location: ${{ inputs.rpm_location }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-          hf_token: ${{ secrets.HF_TOKEN }}
-
-      # Records this leg's matrix entry as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
-      - name: Save suite descriptor for pod-level retry
-        if: failure()
-        run: |
-          mkdir -p "${RUNNER_TEMP}/failed_suite"
-          cat > "${RUNNER_TEMP}/failed_suite/suite.json" <<'JSONEOF'
-          ${{ toJSON(matrix) }}
-          JSONEOF
-
-      # github.run_attempt in the name: the artifacts REST API is run-scoped not attempt-scoped, so a re-run's descriptors from a prior attempt would otherwise retry a suite that already passed.
-      - name: Upload failed-suite descriptor
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: failed-suite-${{ github.run_attempt }}-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/failed_suite/suite.json
-          if-no-files-found: error
-          retention-days: 1
-
-  # Collect suites that need a pod-level retry: reads the failed-suite-* artifacts uploaded above and rebuilds a retry matrix for test_retry below to consume via fromJSON.
-  collect_failed_suites:
-    name: Collect suites for pod-level retry
-    needs: test
-    if: ${{ always() && inputs.test_type != 'perf' }}
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.collect.outputs.matrix }}
-      has_failed: ${{ steps.collect.outputs.has_failed }}
-    steps:
-      - name: Checkout scripts
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          sparse-checkout: .github/scripts
-          sparse-checkout-cone-mode: false
-
-      - name: Download failed-suite descriptors and build retry matrix
-        id: collect
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/collect_failed_suites.py
-
-  # Pod-level retry: re-runs, on a brand-new runner pod, exactly the configs collect_failed_suites found failed (no changed-files gate, since these are already known to need running); a config that fails again here is a genuine failure.
-  test_retry:
-    name: 'build and run tests (${{ matrix.cfg }}) (pod-level retry)'
-    needs: [collect_failed_suites, resolve_durations]
-    if: ${{ !cancelled() && needs.collect_failed_suites.outputs.has_failed == 'true' }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.collect_failed_suites.outputs.matrix) }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join((matrix.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && matrix.runs_on_pr || matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label)) }}
-    timeout-minutes: 720
-    env:
-      CI: ''
-      STORAGE_1_DIR: /storage-1/spyre-inference
-      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
-      HF_HUB_OFFLINE: '1'
-
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || github.ref }}
-
-      # Same composite action the `test` job uses -- a pod-level retry runs the exact same steps, just on a fresh pod, so there is no separate copy to keep in sync here.
-      - name: Run matrix config (pod-level retry)
-        timeout-minutes: 150
-        uses: ./.github/actions/run-matrix-config
-        with:
-          cfg: ${{ matrix.cfg }}
-          test_target: ${{ matrix.test_target }}
-          durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
-          test_type: ${{ inputs.test_type }}
-          # Survives the retry hop: the failed-suite descriptor is toJSON(matrix), so the whole
-          # entry -- test_types and runs_on included -- is rebuilt by collect_failed_suites.
-          test_types: ${{ matrix.test_types }}
-          leg_arch: ${{ matrix.runs_on[0] }}
-          runner_labels: ${{ format('["{0}","{1}"]', join((matrix.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && matrix.runs_on_pr || matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
-          job_slot: retry-${{ strategy.job-index }}
-          retry: 'true'
-          use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          extra_groups: ${{ matrix.extra_groups }}
-          image_rpms: ${{ inputs.image_rpms }}
-          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
-          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
-          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
-          rpm_names: ${{ inputs.rpm_names }}
-          rpm_location: ${{ inputs.rpm_location }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-          hf_token: ${{ secrets.HF_TOKEN }}
-
-  # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself) by inspecting the pod-level retry outcome; this job's own result is what determines the reusable workflow's overall conclusion.
+  # A leg fails only when its pod-level retry fails too (_test_leg.yaml).
   test_result:
     name: Test matrix result
-    needs: [build_kernels, collect_failed_suites, test_retry]
+    needs: [build_kernels, test]
     if: ${{ always() && inputs.test_type != 'perf' }}
     runs-on: ubuntu-latest
     steps:
@@ -1171,11 +992,8 @@ jobs:
             echo "::error::Building the csrc/ sampling kernels failed (result: ${{ needs.build_kernels.result }})."
             exit 1
           fi
-          echo "Suites retried: ${{ needs.collect_failed_suites.outputs.has_failed }}"
-          echo "test_retry result: ${{ needs.test_retry.result }}"
-          if [[ "${{ needs.collect_failed_suites.outputs.has_failed }}" == "true" && \
-                "${{ needs.test_retry.result }}" != "success" ]]; then
-            echo "::error::One or more configs still failed after pod-level retry."
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "::error::One or more configs still failed after pod-level retry (result: ${{ needs.test.result }})."
             exit 1
           fi
           echo "All configs passed (directly or after pod-level retry)."
@@ -1188,7 +1006,7 @@ jobs:
   # ---------------------------------------------------------------------------
   coverage:
     name: Aggregate coverage
-    needs: [test, test_retry]
+    needs: [test]
     if: ${{ always() && inputs.test_type != 'perf' }}
     # Informational -- must never fail the reusable workflow (and thus the
     # callers' required-check gate).
@@ -1265,7 +1083,7 @@ jobs:
   # ---------------------------------------------------------------------------
   durations:
     name: Aggregate test durations
-    needs: [test, test_retry]
+    needs: [test]
     if: ${{ always() && inputs.test_type != 'perf' }}
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -1319,7 +1137,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-report:
     name: Aggregate test report
-    needs: [test, test_retry, perf]
+    needs: [test, perf]
     if: always()
     continue-on-error: true
     runs-on: ubuntu-latest

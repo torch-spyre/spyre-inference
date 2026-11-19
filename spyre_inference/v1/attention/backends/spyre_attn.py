@@ -1437,7 +1437,7 @@ class SpyreAttentionBackend(AttentionBackend):
         # Kernels, buckets and warmup run at cache_config.block_size; larger blocks are split.
         config = get_current_vllm_config_or_none()
         base = config.cache_config.block_size if config is not None else None
-        if kv_cache_spec is not None and base and kv_cache_spec.block_size != base:
+        if kv_cache_spec is not None and base and kv_cache_spec.block_size > base:
             return [base]
         return [MultipleOf(64)]
 

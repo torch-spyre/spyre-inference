@@ -305,12 +305,15 @@ left of `--gpu-memory-utilization` (default 0.92) × total. The cache keeps ever
 that memory pays for, usually far more than `--max-num-seqs` requests at `--max-model-len`
 need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.
 
-Each Spyre layer allocates its own page per block, so the budget is converted into blocks
-at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
-groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
-one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
-regions, so a model with few layers gets fewer blocks than its budget: they must still pack
-into the regions. When memory runs out before a full batch fits, a warning names the knobs,
+On the V2 model runner (`SPYRE_MODEL_RUNNER=v2`) vLLM's hybrid KV cache manager is on: a
+model that mixes sliding-window and full-attention layers (Gemma-3, Gemma-4) gets one KV
+cache group per kind, and sliding-window groups return blocks that fall out of the window.
+The groups overlay one another as upstream lays them out, each layer reading the shared
+pages in its own shape, so a block costs what vLLM's pool counts. `--disable-hybrid-kv-cache-manager`
+gives every layer its own page per block instead, as the V1 runner always does. The K and V
+pages of each allocation are one tensor each, and the Spyre allocator never splits a tensor
+across its 16 GiB memory regions, so a model with few layers gets fewer blocks than its
+budget: they must still pack into the regions. When memory runs out before a full batch fits, a warning names the knobs,
 and requests wait for pages instead of all running at full length.
 
 The profile run is skipped, as the first forward on Spyre would trace the model before

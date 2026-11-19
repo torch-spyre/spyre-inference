@@ -578,6 +578,21 @@ def test_kernel_block_sizes_accept_the_layer_spec():
         assert [s.base for s in sizes if isinstance(s, MultipleOf)] == [64]
 
 
+def test_a_block_the_hybrid_manager_grew_is_read_as_cache_block_size_kernel_blocks():
+    """Page-size unification gives gemma-4's global group 256-token blocks; the kernels,
+    buckets and warmup run at cache_config.block_size, so upstream splits them."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+
+    vllm_config = VllmConfig()
+    vllm_config.cache_config.block_size = 128
+    grown = FullAttentionSpec(block_size=256, num_kv_heads=2, head_size=512, dtype=torch.float16)
+    with set_current_vllm_config(vllm_config):
+        assert SpyreAttentionBackend.get_supported_kernel_block_sizes(grown) == [128]
+
+
 def test_block_size_validation():
     """Test that SpyreAttentionMetadataBuilder validates block_size alignment.
 

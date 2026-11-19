@@ -186,6 +186,15 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         self.graph_hits += num_items
         return output
 
+    def is_captured(self) -> bool:
+        # Upstream keys this on a CUDA graph pool, which Spyre never has; MRV2's
+        # EncoderRunner gates on it and would otherwise compile every image mid-request.
+        return bool(self._staging)
+
+    def clear(self) -> None:
+        super().clear()
+        self._staging.clear()
+
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Copy host buffers to the encoder's device."""
         return {key: convert(value, device=self.device) for key, value in values.items()}

@@ -654,94 +654,6 @@ def test_block_size_validation():
         assert builder.block_size == block_size
 
 
-def test_each_layer_in_one_kv_cache_tensor_gets_its_own_pages(monkeypatch):
-    """A KVCacheTensor packs *every* attention layer into one allocation.
-
-    One shared page buffer per tensor would alias all those layers onto the same block,
-    so a later layer's KV write clobbers an earlier layer's. Prefill still looks right --
-    each layer reads back its own fresh write -- and only decode is corrupted, which is
-    why this needs an allocation-level guard rather than an output check.
-
-    Card-free on purpose: `allocate_pages` is stubbed with per-call sentinels, so the
-    card-less CI shards run this instead of skipping past it.
-    """
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
-    from vllm.config.compilation import CompilationConfig
-    from vllm.v1.kv_cache_interface import (
-        AttentionSpec,
-        KVCacheConfig,
-        KVCacheGroupSpec,
-        KVCacheTensor,
-    )
-
-    from spyre_inference.v1.attention.backends import spyre_attn as spyre_attn_mod
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
-    layer_names = [f"layers.{i}.self_attn" for i in range(4)]
-
-    vllm_config = VllmConfig(
-        model_config=ModelConfig(
-            model="Qwen/Qwen3-0.6B",
-            max_model_len=1,
-            dtype=torch.float16,
-            trust_remote_code=True,
-        ),
-        cache_config=CacheConfig(block_size=block_size),
-        compilation_config=CompilationConfig(custom_ops=["all"]),
-    )
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
-
-    spec = AttentionSpec(
-        block_size=block_size,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        dtype=torch.float16,
-    )
-    # The shape under test: all four layers in a single KVCacheTensor, as vLLM packs them.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=spec.page_size_bytes * num_blocks * len(layer_names),
-                layers=layer_names,
-                layer_stride=spec.page_size_bytes * num_blocks,
-                block_stride=spec.page_size_bytes,
-            )
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
-    )
-
-    for layer_name in layer_names:
-        fake_layer = Mock()
-        fake_layer.kv_cache = None
-        runner.compilation_config.static_forward_context[layer_name] = fake_layer
-
-    calls = []
-
-    def _fake_allocate_pages(cls, blocks, allocate_spec, device):
-        calls.append((blocks, allocate_spec, device))
-        return Mock(name=f"pages-{len(calls)}")
-
-    monkeypatch.setattr(
-        spyre_attn_mod.SpyreAttentionImpl,
-        "allocate_pages",
-        classmethod(_fake_allocate_pages),
-    )
-
-    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
-
-    assert set(caches) == set(layer_names)
-    # The bug this guards against: one buffer handed to every layer.
-    assert len({id(caches[name]) for name in layer_names}) == len(layer_names), (
-        "layers packed into one KVCacheTensor must not share a page buffer"
-    )
-    # One allocation per layer, each sized for the full per-layer block count -- not one
-    # allocation carved up by layer_stride.
-    assert len(calls) == len(layer_names)
-    assert all(blocks == num_blocks for blocks, _, _ in calls)
-
-
 def test_supported_dtypes_includes_bfloat16():
     """Nothing selects bf16 by default, but `--dtype bfloat16` has to reach the kernels
     rather than be rejected during backend selection."""
@@ -1913,13 +1825,13 @@ def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch
     import contextlib
     from types import SimpleNamespace
 
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     from spyre_inference.v1.worker import compile_guard
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+    from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
     layer = _fp8_layer(0.25, 0.5)
-    runner = object.__new__(TorchSpyreModelRunner)
+    runner = object.__new__(SpyreModelRunnerV2)
     monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=[layer])))
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     _resolve([layer])
@@ -2629,77 +2541,6 @@ def test_spyre_attn_head_configs(
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
     )
-
-
-def test_kv_cache_shape_matches_runner_allocation():
-    """The advertised shape, the runner's allocation and the kernels share one layout.
-
-    If get_kv_cache_shape drifts, vLLM code that allocates from the contract (KV
-    transfer, future tests) allocates a transposed cache."""
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
-    from vllm.config.compilation import CompilationConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
-
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
-    vllm_config = VllmConfig(
-        model_config=ModelConfig(
-            model="Qwen/Qwen3-0.6B", max_model_len=1, dtype=torch.float16, trust_remote_code=True
-        ),
-        cache_config=CacheConfig(block_size=block_size),
-        compilation_config=CompilationConfig(custom_ops=["all"]),
-    )
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
-    spec = AttentionSpec(
-        block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=spec.page_size_bytes * num_blocks,
-                layers=["layers.0.self_attn"],
-                layer_stride=spec.page_size_bytes * num_blocks,
-                block_stride=spec.page_size_bytes,
-            )
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0.self_attn"], kv_cache_spec=spec)],
-    )
-
-    from vllm.config import set_current_vllm_config
-
-    with set_current_vllm_config(vllm_config):
-        impl = SpyreAttentionImpl(
-            num_heads=32, head_size=head_size, scale=head_size**-0.5, num_kv_heads=num_kv_heads
-        )
-    fake_layer = Mock()
-    fake_layer.kv_cache = None
-    fake_layer.impl = impl
-    runner.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
-
-    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
-    k_pages = caches["layers.0.self_attn"].k_pages
-    v_pages = caches["layers.0.self_attn"].v_pages
-
-    expected = SpyreAttentionBackend.get_kv_cache_shape(
-        num_blocks, block_size, num_kv_heads, head_size
-    )
-    assert k_pages.shape == expected == (num_blocks, num_kv_heads, block_size, head_size)
-    assert v_pages.shape == expected
-
-    # The kernel gathers a (page, kv_head) row, which has to stay whole at device
-    # position 0 (torch-spyre#3705) or the gather costs the whole cache, not one page.
-    for pages in (k_pages, v_pages):
-        device_size = pages.device_tensor_layout().device_size
-        assert device_size[0] == num_blocks * num_kv_heads
-        assert device_size[1] == block_size
-
-    del caches, k_pages, v_pages
-    gc.collect()
 
 
 def test_page_attn_decode_matches_fp32_reference():

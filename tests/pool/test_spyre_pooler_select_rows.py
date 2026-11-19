@@ -58,7 +58,7 @@ def test_select_rows_on_spyre_from_full_prefix_slice(num_scheduled_tokens):
     sliced = buffer[:num_scheduled_tokens]
     # Sanity: really is a view sharing storage, not a fresh tensor. Can't assert
     # `sliced._base is not None` here: real vLLM forward passes run under
-    # `@torch.inference_mode()` (spyre_model_runner.py, gpu_model_runner.py), and
+    # `@torch.inference_mode()` (MRV2's execute_model), and
     # this suite's session fixture does the same -- inference mode skips the
     # autograd view-tracking that populates `_base`, even though the storage is
     # genuinely shared.

@@ -14,9 +14,9 @@
 
 """MRV2: the per-step encoder plan, moved off the runner onto the model state.
 
-V1 keeps this on TorchSpyreModelRunner (_encoder_grid); MRV2 expects per-step
-state on the model state instead. Built by encoder_only.py, which publishes it as
-``SpyreEncoderOnlyModelState.encoder_plan`` for pooling to read. Warmup forces a
+MRV2 expects per-step state on the model state, not the runner. Built by
+encoder_only.py, which publishes it as ``SpyreEncoderOnlyModelState.encoder_plan``
+for pooling to read. Warmup forces a
 plan through ``SpyreEncoderOnlyModelState.forced_plan()``, not here.
 """
 
@@ -43,8 +43,8 @@ class EncoderPlan:
     def grid(self) -> tuple[int, int, list[int]] | None:
         """``(extent, width, query_lens)`` on the rectangular path; None on the ragged one.
 
-        Real rows are ``encoder_dense_row_indices(query_lens, extent)``, the layout V1
-        unpads with too; the ragged body is already packed.
+        Real rows are ``encoder_dense_row_indices(query_lens, extent)``, the layout
+        ``unpad_encoder_grid`` unpads; the ragged body is already packed.
         """
         plan = self.attn_plan
         if not isinstance(plan, EncoderRectPlan):

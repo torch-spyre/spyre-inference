@@ -34,14 +34,14 @@ def register():
     # vLLM's plugin probe swallows exceptions here and falls back to another platform,
     # so errors are only logged; check_and_update_config rejects the resulting state.
     try:
-        if triton_gate.wants_triton(envs.SPYRE_MODEL_RUNNER, envs.SPYRE_MRV2_KERNELS):
+        if triton_gate.wants_triton(envs.SPYRE_MRV2_KERNELS):
             triton_gate.open()
         else:
             triton_gate.close()
     except Exception:
         init_logger(__name__).exception("Spyre Triton gate could not be applied")
     # VllmConfig.__post_init__ reads use_v2_model_runner before the platform hook.
-    pin_model_runner(envs.SPYRE_MODEL_RUNNER)
+    pin_model_runner()
     # flex and torch-spyre read these once, when the device runtime starts on the first
     # device op in each worker, which is after this runs; an explicit value still wins.
     # Preferred on a PF device only, not on a VF.
@@ -51,25 +51,18 @@ def register():
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 
-def pin_model_runner(runner: str) -> None:
-    """Point VLLM_USE_V2_MODEL_RUNNER at SPYRE_MODEL_RUNNER's choice.
-
-    Pinned for v1 too: use_v2_model_runner returns an explicit value before its
-    HAS_TRITON fallback, and vLLM's own heuristics can otherwise still pick V2.
-    """
-    want = "1" if runner == "v2" else "0"
+def pin_model_runner() -> None:
+    """Pin VLLM_USE_V2_MODEL_RUNNER=1: Spyre only has Model Runner V2, and vLLM 0.33
+    still defaults to V1 without it."""
     current = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
-    if current not in (None, "", want):
+    if current not in (None, "", "1"):
         from vllm.logger import init_logger
 
         init_logger(__name__).warning(
-            "SPYRE_MODEL_RUNNER=%s picks the model runner; overriding "
-            "VLLM_USE_V2_MODEL_RUNNER=%s to %s.",
-            runner,
+            "Spyre only supports Model Runner V2; overriding VLLM_USE_V2_MODEL_RUNNER=%s to 1.",
             current,
-            want,
         )
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = want
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
 
 @contextlib.contextmanager

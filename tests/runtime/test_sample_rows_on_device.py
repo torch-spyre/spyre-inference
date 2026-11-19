@@ -19,7 +19,6 @@ import types
 import pytest
 import torch
 
-from spyre_inference.v1.worker import spyre_model_runner as v1_runner
 from spyre_inference.v1.worker.spyre import model_wrapper as mr
 
 ROWS, HIDDEN = 16, 8
@@ -148,7 +147,10 @@ def test_warmup_skips_hidden_states_left_on_the_host(monkeypatch):
     assert projected == []
 
 
-def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
+def test_cpu_fallback_pooling_keeps_the_host_output_contract(monkeypatch):
+    """A pooling model whose pooler stays on the host gets plain host hidden states,
+    not the generative row-gathering subclass."""
+
     class DeviceTensor(torch.Tensor):
         @property
         def device(self):
@@ -163,21 +165,10 @@ def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
         return plain
 
     monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", convert)
-    monkeypatch.setattr(v1_runner.attn_layer, "publish_null_slots", lambda _: None)
     model = lambda **kwargs: device_hidden
     wrapper = mr._SpyreModelWrapper(model, torch.device("spyre"), model_dtype=torch.float16)
 
-    def dummy_run(self, *args, **kwargs):
-        assert kwargs["force_attention"]
-        hidden = self.model()
-        return hidden, hidden[:1]
-
-    monkeypatch.setattr(v1_runner.GPUModelRunner, "_dummy_run", dummy_run)
-    runner = object.__new__(v1_runner.TorchSpyreModelRunner)
-    runner.model = wrapper
-    runner.model_config = types.SimpleNamespace(runner_type="pooling")
-
-    hidden, _ = runner._dummy_run(4)
+    hidden = wrapper()
 
     assert copies == ["cpu"]
     assert type(hidden) is torch.Tensor

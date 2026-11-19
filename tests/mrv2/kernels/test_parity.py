@@ -50,7 +50,6 @@ def parity_report(request: pytest.FixtureRequest) -> dict[str, list[str]]:
         text=True,
         env={
             **os.environ,
-            "SPYRE_MODEL_RUNNER": "v2",
             "SPYRE_MRV2_KERNELS": "triton",
             # Not via `tests`: a PEP 420 namespace that upstream vLLM's tests package shadows.
             "PYTHONPATH": os.pathsep.join(

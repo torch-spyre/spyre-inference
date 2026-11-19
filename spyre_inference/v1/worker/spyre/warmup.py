@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: V2 warmup driver (vllm/v1/worker/gpu_worker.py:Worker.compile_or_warm_up_model,
-TorchSpyreModelRunner.warming_up_model).
+"""MRV2: V2 warmup driver (vllm/v1/worker/gpu_worker.py:Worker.compile_or_warm_up_model).
 
 Decoder dummies skip attention and publish null KV slots; pooling dummies keep
 attention on; a separate pass then records attention over attn_groups and runs the
@@ -161,8 +160,7 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
-    """The input embedding at every body size, and the encoder at every batch width
-    (V1's _warmup_input_embedding / _warmup_multimodal_encoder).
+    """The input embedding at every body size, and the encoder at every batch width.
 
     A dummy run hands the model the staging buffer instead of producing it through
     embed_input_ids, and no dummy run reaches the encoder. A generative model's tower is
@@ -195,7 +193,7 @@ def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
 
 def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
     """A SpyreVisionEncoderMixin tower compiles per token budget, then serves through the
-    encoder runner's graph manager (V1's _record_vision_graphs / _warmup_vision_merge).
+    encoder runner's graph manager.
 
     Not keyed on cudagraph_mm_encoder, which also gates GPU-only memory profiling.
     """
@@ -325,6 +323,8 @@ def run(runner: "SpyreModelRunnerV2") -> None:
                     # Wider than any sampled batch: the prompt-logprobs chunk, which
                     # only goes through compute_logits, never the sampler.
                     wrapper.compute_logits(widest.new_zeros(rows, widest.shape[1]))
+        # The bench tooling (vllm-bench-serve's collect.py) parses this line.
+        logger.info("Warmup complete in %.3fs for %d buckets.", time.time() - t0, len(calls))
         if runner.spyre_kv_caches:
             _record_attention(runner)
         if not runner.model_config.enforce_eager:

@@ -15,7 +15,7 @@
 """MRV2: pooling (vllm/v1/worker/gpu/pool/pooling_runner.py:PoolingRunner).
 
 Host cursor instead of a device one, no dim-0 slice of the hidden states, and the
-encoder grid handled through the shared encoder_grid helpers V1 uses. The grid comes
+encoder grid handled through the shared encoder_grid helpers. The grid comes
 from the encoder model state's EncoderPlan, read through ``encoder_plan_source``;
 load.py sets that, ``pooling_on_spyre`` and ``spyre_device`` once both the state and
 the wrapper exist.
@@ -78,7 +78,7 @@ class SpyrePoolingRunner(PoolingRunner):
         pooling_metadata.build_pooling_cursor(
             input_batch.num_scheduled_tokens, seq_lens_cpu, device=_HOST
         )
-        # As V1's _pool: a no-op on Spyre, and the Spyre heads need a Spyre input.
+        # A no-op on Spyre, and the Spyre heads need a Spyre input.
         hidden_states = convert(hidden_states, self.spyre_device)
         hidden_states = pool_rows_for(hidden_states, self.model.pooler, pooling_metadata, grid)
         pooler_output = self.model.pooler(hidden_states, pooling_metadata)

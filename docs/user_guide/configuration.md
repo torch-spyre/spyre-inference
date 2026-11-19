@@ -345,16 +345,13 @@ compiles them once, as an fp16 cache does.
 
 ## Model runner
 
-The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
-host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so no Triton install is
-needed on any architecture.
+The plugin runs vLLM's Model Runner V2 (MRV2), its only model runner: the V1 runner was
+removed (#1245), and `SPYRE_MODEL_RUNNER=v1` is refused at startup. MRV2's Triton
+kernels are replaced by host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so
+no Triton install is needed on any architecture. The plugin pins
+`VLLM_USE_V2_MODEL_RUNNER=1`, so don't set it yourself.
 
-Set `SPYRE_MODEL_RUNNER=v1` to fall back to the V1 model runner. The fallback is
-best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
-the V1 runner (#1245). The plugin sets `VLLM_USE_V2_MODEL_RUNNER` from
-`SPYRE_MODEL_RUNNER`, so don't set it yourself.
-
-Differences on V2:
+Differences from the removed V1 runner:
 
 - Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.

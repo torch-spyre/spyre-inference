@@ -109,5 +109,8 @@ class SpyreModelRunnerV2(GPUModelRunner):
         warmup.run(self)
 
     def profile_run(self, randomize_inputs: bool = False) -> None:
-        # No forward, only the staging buffers, as TorchSpyreModelRunner.profile_run.
+        # No forward, only the staging buffers: on Spyre the first forward is the trace, and
+        # without KV pages it would trace no KV write, so warmup would retrace every block.
+        # Allocated here, Worker.determine_available_memory counts them before the KV
+        # cache takes the measured memory.
         allocate_staging_buffers(self.compilation_config.static_forward_context, self.spyre_device)

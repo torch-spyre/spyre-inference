@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: set vllm.triton_utils.HAS_TRITON per runner by patching the two names
+"""MRV2: set vllm.triton_utils.HAS_TRITON per kernel source by patching the two names
 vllm/triton_utils/importing.py reads. register() can run inside that import (it
 resolves the platform), so each patch is also applied to the half-executed module.
 """
@@ -60,8 +60,8 @@ def _from_importing() -> bool:
 
 
 def open() -> None:
-    """V2: report a CPU build to importing.py only, so it takes vLLM's own
-    triton-cpu branch while the platform probes still see the real build."""
+    """SPYRE_MRV2_KERNELS=triton: report a CPU build to importing.py only, so it takes
+    vLLM's own triton-cpu branch while the platform probes still see the real build."""
 
     def wrap(matches: Callable[[str], bool]) -> Callable[[str], bool]:
         def cpu_for_importing(substr: str) -> bool:
@@ -73,8 +73,8 @@ def open() -> None:
 
 
 def close() -> None:
-    """V1: hide triton from importing.py only; torch has already imported it, and
-    triton-cpu's CPU driver would otherwise pass vLLM's check."""
+    """Host kernels: hide triton from importing.py only; torch has already imported it,
+    and triton-cpu's CPU driver would otherwise pass vLLM's check."""
 
     def wrap(find_spec: Callable[..., Any]) -> Callable[..., Any]:
         def hidden(name: str, package: str | None = None) -> Any:
@@ -96,19 +96,19 @@ def has_triton_cpu() -> bool:
         return False
 
 
-def wants_triton(runner: str, mrv2_kernels: str) -> bool:
-    """Only V2 on SPYRE_MRV2_KERNELS=triton runs Triton, and only on triton-cpu."""
-    return runner == "v2" and mrv2_kernels == "triton"
+def wants_triton(mrv2_kernels: str) -> bool:
+    """Only SPYRE_MRV2_KERNELS=triton runs Triton, and only on triton-cpu."""
+    return mrv2_kernels == "triton"
 
 
-def check(runner: str, mrv2_kernels: str) -> None:
-    """Raise unless vLLM's HAS_TRITON matches the runner and kernel source."""
+def check(mrv2_kernels: str) -> None:
+    """Raise unless vLLM's HAS_TRITON matches the kernel source."""
     from vllm.triton_utils import HAS_TRITON
 
     # importing.py has bound HAS_TRITON, so the patches have done their job.
     _unpatch(importlib.util, "find_spec")
     _unpatch(vllm.platforms, "vllm_version_matches_substr")
-    triton = wants_triton(runner, mrv2_kernels)
+    triton = wants_triton(mrv2_kernels)
     if triton and not has_triton_cpu():
         raise ValueError(
             "SPYRE_MRV2_KERNELS=triton needs triton-cpu, an x86-only dev dependency "
@@ -116,7 +116,7 @@ def check(runner: str, mrv2_kernels: str) -> None:
         )
     if triton != HAS_TRITON:
         raise ValueError(
-            f"SPYRE_MODEL_RUNNER={runner} SPYRE_MRV2_KERNELS={mrv2_kernels} needs "
+            f"SPYRE_MRV2_KERNELS={mrv2_kernels} needs "
             f"HAS_TRITON={triton}, but vLLM resolved {HAS_TRITON}: set both before vLLM "
             "is imported, and the same in every process."
         )

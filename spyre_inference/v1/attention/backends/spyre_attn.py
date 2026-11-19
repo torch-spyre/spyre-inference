@@ -202,7 +202,18 @@ def _mirror_mask_stack(
             stack_cpu.shape, (query_rows * block_size, block_size, 1)
         )
         page_range = attn_metadata.seq_page_range(seq_idx)
-        if page_range is not None:
+        layout = (
+            row_outermost_layout((page_range["max"], query_rows, block_size), stack_cpu.dtype)
+            if page_range is not None and device.type == "spyre"
+            else None
+        )
+        if page_range is not None and layout is not None:
+            # Pages outermost make the real pages a prefix of the reservation, so only they
+            # are copied; the default layout scatters them (torch-spyre#6026).
+            stack_device = stack_cpu.to(  # ty: ignore[no-matching-overload]
+                device, dynamic={0: page_range}, device_layout=layout
+            )
+        elif page_range is not None:
             stack_device = _to_device_with_page_range(stack_cpu, page_range, device)
         else:
             # `convert` copies, so even a nonzero-offset host view arrives contiguous at

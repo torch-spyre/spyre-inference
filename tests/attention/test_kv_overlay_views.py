@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
 
-pytestmark = pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
+pytestmark = pytest.mark.attention
 
 NUM_BLOCKS = 6
 SLIDING = SlidingWindowSpec(
@@ -40,6 +40,10 @@ def _values(*shape: int) -> torch.Tensor:
 @pytest.fixture
 def overlay() -> tuple[torch.Tensor, torch.Tensor]:
     """The K pages of a sliding layer and of a global layer viewing them."""
+    # At test time, not collection: opening the card at import would hold it for the
+    # whole session, before the subprocess-engine tests the plugin runs first.
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
     device = torch.device("spyre")
     torch.zeros(64, dtype=torch.float16, device=device)
     base = SpyreAttentionImpl.allocate_pages(NUM_BLOCKS, SLIDING, device)

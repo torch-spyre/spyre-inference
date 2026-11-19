@@ -161,14 +161,6 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
-# A copy takes dynamic= together with device_layout= only from torch-spyre#6327 on.
-@functools.cache
-def _reservation_takes_a_layout() -> bool:
-    from torch_spyre import _C
-
-    return hasattr(_C, "spyre_empty_reserved_with_layout")
-
-
 def _to_device_with_page_range(
     host: torch.Tensor, page_range: dict[str, int], device: torch.device
 ) -> torch.Tensor:
@@ -210,19 +202,15 @@ def _mirror_mask_stack(
             stack_cpu.shape, (query_rows * block_size, block_size, 1)
         )
         page_range = attn_metadata.seq_page_range(seq_idx)
-        layout = (
-            row_outermost_layout((page_range["max"], query_rows, block_size), stack_cpu.dtype)
-            if page_range is not None and device.type == "spyre" and _reservation_takes_a_layout()
-            else None
-        )
-        if page_range is not None and layout is not None:
+        if page_range is not None and device.type == "spyre":
             # Pages outermost make the real pages a prefix of the reservation, so only they
             # are copied; the default layout scatters them (torch-spyre#6026).
+            layout = row_outermost_layout(
+                (page_range["max"], query_rows, block_size), stack_cpu.dtype
+            )
             stack_device = stack_cpu.to(  # ty: ignore[no-matching-overload]
                 device, dynamic={0: page_range}, device_layout=layout
             )
-        elif page_range is not None:
-            stack_device = _to_device_with_page_range(stack_cpu, page_range, device)
         else:
             # `convert` copies, so even a nonzero-offset host view arrives contiguous at
             # offset 0, ready for an in-graph dim-0 slice.

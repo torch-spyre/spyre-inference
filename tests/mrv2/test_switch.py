@@ -104,6 +104,26 @@ def test_hybrid_kv_cache_manager_is_opt_in_on_v2(
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is disabled
 
 
+@pytest.mark.usefixtures("vllm_config")
+@pytest.mark.parametrize(("requested", "disabled"), [(None, True), (False, False)])
+def test_v2_hybrid_kv_cache_manager_setting_survives_config_init(
+    monkeypatch: pytest.MonkeyPatch, requested: bool | None, disabled: bool
+) -> None:
+    """Through VllmConfig.__post_init__: the default-off rule relies on vLLM resolving its
+    unset default after the platform hook."""
+    from vllm.config import SchedulerConfig
+    from vllm.platforms import current_platform
+
+    assert isinstance(current_platform, TorchSpyrePlatform)
+    _set_runner(monkeypatch, "v2")
+
+    config = VllmConfig(
+        scheduler_config=SchedulerConfig.default_factory(disable_hybrid_kv_cache_manager=requested)
+    )
+
+    assert config.scheduler_config.disable_hybrid_kv_cache_manager is disabled
+
+
 def test_hybrid_kv_cache_manager_is_rejected_on_v1(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:

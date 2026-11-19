@@ -920,11 +920,8 @@ class TestRecordBatchedDecode:
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
 
 
-@pytest.mark.parametrize("narrow_chunks", [False, True], ids=["full_width", "narrow"])
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
-def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(
-    builder, monkeypatch, num_seqs, narrow_chunks
-):
+def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
     """With a chunk range, every decode batch realizes a recorded kernel: a single-chunk one
     within one full-width chunk, the dynamic one past it at a chunk count in its range."""
     from torch_spyre._inductor import config as ts_config
@@ -933,7 +930,6 @@ def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(
     from spyre_inference.v1.attention import spyre_attn_bucketer
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_ATTN_NARROW_CHUNKS", str(int(narrow_chunks)))
     envs.clear_env_cache()
     monkeypatch.setattr(spyre_attn_bucketer, "_chunk_index_takes_a_range", lambda: True)
     max_model_len = 2048

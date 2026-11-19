@@ -304,11 +304,6 @@ compiles two batched kernels per num-sequences bucket. A num-sequences bucket wh
 copy a tensor with both `dynamic=` and `device_layout=` (torch-spyre#6327); with an older
 one, batched decode keeps its KV buckets and startup logs why.
 
-`SPYRE_ATTN_NARROW_CHUNKS=1` gives a batch that fits in one chunk the kernel of its own KV
-bucket instead, as narrow as that bucket. Short contexts then decode faster (a full chunk
-measured up to a third slower on 4 sequences of one block), at the cost of one more warmup
-compile per KV bucket that fits in a chunk.
-
 ## KV cache size
 
 The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the

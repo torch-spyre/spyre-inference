@@ -856,19 +856,6 @@ class TestDynamicChunks:
             for nb in range(1, width + 1):
                 assert b.batched_decode_shape(num_seqs, nb) == (width, width, 1, None)
 
-    def test_narrow_chunks_keep_a_kernel_per_bucket_within_one_chunk(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ATTN_NARROW_CHUNKS", "1")
-        envs.clear_env_cache()
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
-        for num_seqs in b.num_seqs_buckets:
-            width = 32 // num_seqs
-            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
-            narrow = [nb for nb in b.num_blocks_buckets if nb <= width]
-            assert sorted(v.blocks_per_chunk for v in variants if not v.dynamic_chunks) == narrow
-            shape = b.batched_decode_shape(num_seqs, 1)
-            assert shape is not None
-            assert (shape.blocks_per_chunk, shape.num_chunks) == (narrow[0], 1)
-
     def test_a_batch_size_whose_context_fits_two_chunks_keeps_the_buckets(self):
         # 32 pages: one full chunk at one sequence, two at two sequences.
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)

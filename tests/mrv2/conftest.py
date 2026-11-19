@@ -47,11 +47,6 @@ def pytest_configure(config: pytest.Config) -> None:
     config.pluginmanager.register(_SessionFixtureTimer(), "mrv2-session-fixture-timer")
     config.addinivalue_line(
         "markers",
-        "triton_cpu: JIT-compiles Triton on a cold cache (seconds per kernel); "
-        "exempt from the tests/mrv2 time budget",
-    )
-    config.addinivalue_line(
-        "markers",
         "subprocess_isolated: spawns a fresh interpreter so a before/after check "
         "isn't vacuous from an already-warm module cache; exempt from the budget",
     )

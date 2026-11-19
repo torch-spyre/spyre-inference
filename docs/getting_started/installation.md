@@ -41,6 +41,22 @@ This command will:
 3. Install or reuse the torch-spyre wheel for the pinned source revision (RPMs are provisioned separately)
 4. Install PyTorch 2.14.1 from the CPU-specific index
 
+## MRV2 kernel parity tests (x86 only)
+
+The Model Runner V2 host kernels are checked against upstream's Triton kernels on
+triton-cpu. triton is never a runtime dependency; it lives in the opt-in `triton-cpu`
+dependency group, which installs nothing off x86:
+
+```bash
+uv sync --frozen --group dev --group triton-cpu
+uv run --group triton-cpu pytest -m triton_cpu
+```
+
+The `triton_cpu` tests are collected only when `-m` names the marker. A later plain
+`uv sync` removes triton again (a plain `uv run` leaves it). Every other test expects a
+triton-free environment, as on Power and Z: `test_triton_is_not_installed` fails while
+the group is installed.
+
 ## Verification
 
 After installation, verify the plugin is correctly installed:

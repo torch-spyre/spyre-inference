@@ -804,6 +804,18 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-smoke
+          # The only job that installs triton: the MRV2 host kernels' parity tests against
+          # triton-cpu. Every other job runs triton-free, like Power and Z in production.
+          # Skipped on prebaked runs, which can't add a dependency group.
+          - cfg: MRV2 triton-cpu parity
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-triton-cpu
+            extra_groups: triton-cpu
           # Distributed (TP=2) suite, sharded across parallel 2-card jobs. Each
           # case spawns a TP=2 subprocess pair, so the model-run cases dominate;
           # the plugin's weighted partition balances by recorded runtime.
@@ -1003,6 +1015,9 @@ jobs:
             *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
             *) selected=false ;;
           esac
+          if [[ "${{ inputs.use_prebaked_image }}" == "true" && -n "${{ matrix.extra_groups }}" ]]; then
+            selected=false
+          fi
           if [[ "$changed" == "true" && "$selected" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -1032,6 +1047,7 @@ jobs:
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          extra_groups: ${{ matrix.extra_groups }}
           image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
@@ -1124,6 +1140,7 @@ jobs:
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          extra_groups: ${{ matrix.extra_groups }}
           image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile

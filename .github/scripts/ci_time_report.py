@@ -220,13 +220,10 @@ def leg_delta(head: dict[str, int], base: dict[str, int]) -> dict[str, int]:
     }
 
 
-def slot_suites(legs: list[dict], failed_suite_names: list[str]) -> dict[str, str]:
-    # retry-<i> indexes collect_failed_suites' retry matrix, built in sorted descriptor order.
+def slot_suites(legs: list[dict]) -> dict[str, str]:
+    # A leg's pod-level retry uses slot retry-<i>, i being the leg's own matrix index.
     out = {str(i): suite_name(leg["cfg"]) for i, leg in enumerate(legs)}
-    for i, name in enumerate(sorted(failed_suite_names)):
-        idx = name.rsplit("-", 1)[-1]
-        if idx.isdigit() and int(idx) < len(legs):
-            out[f"retry-{i}"] = suite_name(legs[int(idx)]["cfg"])
+    out |= {f"retry-{i}": name for i, name in list(out.items())}
     return out
 
 
@@ -633,8 +630,7 @@ def build_report(repo: str, run: dict, pr: dict) -> Report | str:
         head_legs = matrix_legs(file_at(repo, MATRIX_PATH, run["head_sha"]))
         fork_legs = matrix_legs(file_at(repo, MATRIX_PATH, cmp["merge_base_commit"]["sha"]))
         legs = leg_delta(tier_leg_counts(head_legs), tier_leg_counts(fork_legs))
-    failed = list(newest_by_name(artifacts, f"failed-suite-{run.get('run_attempt', 1)}-"))
-    suites = slot_suites(run_legs, failed)
+    suites = slot_suites(run_legs)
 
     junit_meta = newest_by_name(artifacts, "junit-")
     # A green run can still miss legs (e.g. a runner that never came up, which the

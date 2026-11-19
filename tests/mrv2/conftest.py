@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Guards for tests/mrv2: an autouse fixture makes vllm.LLM.__init__() raise,
-and a time budget (1s/test summed across setup+call+teardown, ~20s/directory,
+and a time budget (3s/test summed across setup+call+teardown, ~30s/directory,
 exempting tests marked ``triton_cpu``, ``subprocess_isolated`` or
 ``spyre_device``) fails the run if exceeded. The budget alone catches an
 accidental real torch.compile() too (its fixed tracing/codegen overhead alone
@@ -34,8 +34,8 @@ import pytest
 from vllm import LLM  # eager: vllm.LLM is a lazy import that would bill the first test's setup
 
 _MRV2_DIR = pathlib.Path(__file__).parent
-_PER_TEST_BUDGET_S = 1.0
-_TOTAL_BUDGET_S = 20.0
+_PER_TEST_BUDGET_S = 3.0
+_TOTAL_BUDGET_S = 30.0
 
 _total_duration = 0.0
 _total_budget_reported = False

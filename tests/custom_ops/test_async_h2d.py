@@ -66,9 +66,20 @@ def test_layout_convert_falls_back_to_tensor_to(source, device, dtype, monkeypat
     assert layouts == [sentinel]
 
 
-@pytest.mark.parametrize("layout", [False, True], ids=["convert", "layout"])
-def test_upload_ignores_source_rewrite_after_enqueue(layout):
-    """A caller rewriting its int32 buffer while the upload is queued must not reach the card."""
+@pytest.mark.parametrize(
+    "layout,dtype",
+    [
+        (False, torch.int32),
+        (False, torch.float32),
+        # Passed through uncloned: these fail if torch-spyre stops staging them.
+        (False, torch.int64),
+        (False, torch.float16),
+        (True, torch.int32),
+    ],
+    ids=["convert-int32", "convert-fp32", "convert-int64", "convert-fp16", "layout-int32"],
+)
+def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
+    """A caller rewriting its buffer while the upload is queued must not reach the card."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops import utils
@@ -82,8 +93,9 @@ def test_upload_ignores_source_rewrite_after_enqueue(layout):
     torch.spyre.synchronize()
 
     for _ in range(20):
-        # 64 int32 = two whole sticks, so torch-spyre uploads it without staging.
-        src = torch.arange(8 if layout else 64, dtype=torch.int32) + 40
+        # Two whole sticks: a same-format upload of this size skips torch-spyre's staging.
+        n = 8 if layout else 128 // dtype.itemsize * 2
+        src = torch.arange(n, dtype=dtype) + 40
         want = src.clone()
         for _ in range(40):
             mm(a)

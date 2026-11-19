@@ -156,7 +156,8 @@ Three adaptations worth knowing:
   accumulators stay in LX only on a torch-spyre that gives the sum after the loop a relayout
   copy of the loop's carry; without it the values are the same and the accumulators live in
   HBM. Batches outside the range, batches that are not whole sticks of tokens (the usual decode
-  sizes) and the eager forms are unchanged. A grouped loop has device tests at TP 1 only.
+  sizes) and the eager forms are unchanged. The gemma-4 recipe runs G = 4 for 128 to 512
+  tokens. Device tests cover a grouped loop at TP 1, and at TP 2 on the nano checkpoint.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` stacks those forms contract on (see
   [MoE expert weights](#moe-expert-weights)), freeing each source stack as it goes,

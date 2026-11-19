@@ -173,6 +173,9 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
                     _fold_gemma4_expert_scale,
                     scale=cast(Gemma4Router, decoder.router).per_expert_scale,
                 ),
+                # At 1,024 tokens four experts per trip are slower than one (TP 4 shapes).
+                expert_group=4,
+                expert_group_tokens=(128, 512),
             ),
         )
         configured += 1

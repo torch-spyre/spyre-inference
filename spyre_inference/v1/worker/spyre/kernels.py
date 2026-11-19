@@ -250,7 +250,8 @@ def apply_top_k_top_p_kernels(
     return logits
 
 
-# Logits are already on the host, so the sort-free top-k/top-p replaces MRV2's full sort.
+# Logits are already on the host, so the csrc/ filters (or, on an extension that predates
+# them, the sort-free top-k/top-p) replace MRV2's full sort.
 _TOP_K_TOP_P_SITES = ("gpu.sample.sampler", "gpu.sample.states")
 
 
@@ -260,7 +261,12 @@ def spyre_apply_top_k_top_p(
     p: torch.Tensor | None,
     has_topp_only_rows: bool = True,
 ) -> torch.Tensor:
-    """apply_top_k_top_p without the full-vocab sort whenever top-k bounds it."""
+    """apply_top_k_top_p on the csrc/ filters, else without the full-vocab sort whenever
+    top-k bounds it."""
+    from spyre_inference.v1.sample.sampling_kernels import has_topk_topp_kernels
+
+    if has_topk_topp_kernels():
+        return apply_top_k_top_p_kernels(logits, k, p)
     if k is None:
         return logits if p is None else apply_top_k_top_p_pytorch(logits, k, p)
     if p is None:

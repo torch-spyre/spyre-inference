@@ -148,14 +148,17 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
 
 
 # 1024, not 512: the masked value changes often enough to surface as pass-to-pass
-# divergence only at the larger bucket.
+# divergence only at the larger context.
 _PAD_MAX_MODEL_LEN = 1024
 _BLOCK_SIZE = 128
-_PAD_PROMPT_LEN = 700
+_PAD_PROMPT_LEN = 100
 
 
 def _block_counts() -> tuple[int, int]:
-    """``(real, padded)`` block counts for ``_PAD_PROMPT_LEN``, from the bucketer itself."""
+    """``(real, padded)`` block counts for ``_PAD_PROMPT_LEN``, from the bucketer itself.
+
+    A prompt within one page still walks two: the page range's minimum.
+    """
     from unittest.mock import MagicMock
 
     from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
@@ -166,8 +169,7 @@ def _block_counts() -> tuple[int, int]:
     config.scheduler_config.max_num_batched_tokens = _PAD_MAX_MODEL_LEN
     config.scheduler_config.max_num_seqs = 1
     real = (_PAD_PROMPT_LEN + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-    padded = SpyreAttnBucketer(config).find_blocks_bucket(real)
-    assert padded is not None, f"real={real} blocks is above every bucket"
+    padded = SpyreAttnBucketer(config, declare_pages=True).find_pages(real, prefill=True)
     return real, padded
 
 
@@ -178,7 +180,7 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
     real, padded = _block_counts()
     assert padded > real, (
         f"_PAD_PROMPT_LEN={_PAD_PROMPT_LEN} gives real=={real}==padded blocks, so this "
-        f"test no longer exercises a padded block; pick a length off the bucket lattice."
+        f"test no longer exercises a padded block; pick a length that pads."
     )
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")

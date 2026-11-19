@@ -689,16 +689,14 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
     declared_blocks = [(s + block_size - 1) // block_size for s in seq_lens]
     declared_query = [max(1, q) for q in query_lens]
     if builder is not None and builder.sliding_window is not None:
-        # A window drops out-of-window blocks and pads back to its bucket maximum,
-        # so the identity does not hold; only the per-sequence bound is meaningful.
-        # The bound comes from the builder rather than being restated here, so the
-        # check cannot drift from the padding it verifies. It is asked for the same
-        # bucket build() used -- the padded block count, not the sequence's own.
-        for s, (realized, aligned) in enumerate(zip(realized_blocks, realized_query)):
-            bound = builder._max_active_blocks(builder._pad_num_blocks(declared_blocks[s]), aligned)
+        # A window drops out-of-window blocks, so the identity does not hold; only the
+        # per-sequence bound is meaningful. The bound comes from the builder rather than
+        # being restated here, so the check cannot drift from the padding it verifies.
+        bound = builder.attn_bucketer.max_pages
+        for s, realized in enumerate(realized_blocks):
             if realized > bound:
                 row["error"] = (
-                    f"windowed active blocks {realized} exceed the bucket bound {bound} "
+                    f"windowed active blocks {realized} exceed the window bound {bound} "
                     f"for sequence {s}"
                 )
                 print(f"    -> {row['error']}", flush=True)
@@ -707,6 +705,12 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
             row["error"] = f"query padding is not the identity: {declared_query}->{realized_query}"
             print(f"    -> {row['error']}", flush=True)
         return
+    # A page count only rounds onto the page range: up to its minimum, and for a prefill
+    # to its granularity.
+    if builder is not None:
+        declared_blocks = [
+            builder._pad_num_blocks(n, q > 1) for n, q in zip(declared_blocks, declared_query)
+        ]
     if realized_blocks != declared_blocks or realized_query != declared_query:
         row["error"] = (
             f"padding is not the identity: blocks {declared_blocks}->{realized_blocks}, "
@@ -1071,10 +1075,10 @@ def _infer_type(query_lens):
 def derive_lattice(entries, max_batched_tokens):
     """The bucket lattice that makes the builder's padding the identity.
 
-    One bucket per declared length, so ``find_*_bucket`` returns it unchanged. The kv
-    ladder stays in tokens rather than block-aligned: ``num_blocks_buckets`` derives
-    from it through the builder's own ``ceil(len / block_size)``, so one lattice holds
-    for a whole ``block_sizes`` sweep, which ``envs`` caching on first read requires.
+    One bucket per declared length, so ``find_*_bucket`` returns it unchanged. Page counts
+    are not bucketed: each sequence walks its own, and ``max_model_len`` is the longest
+    declared one, so one lattice holds for a whole ``block_sizes`` sweep, which ``envs``
+    caching on first read requires.
     """
     kv = sorted({s for e in entries for s in e["seq_lens"]})
     # max_num_batched_tokens is pinned, not derived: staging_rows is it plus one and
@@ -1088,7 +1092,6 @@ def derive_lattice(entries, max_batched_tokens):
         "max_model_len": kv[-1],
         "max_num_batched_tokens": max_batched_tokens,
         "max_num_seqs": num_seqs[-1],
-        "SPYRE_ATTN_KV_BUCKETS": ",".join(map(str, kv)),
         "SPYRE_ATTN_QUERY_BUCKETS": ",".join(map(str, query)),
         "SPYRE_ATTN_NUM_SEQS_BUCKETS": ",".join(map(str, num_seqs)),
     }
@@ -1271,7 +1274,6 @@ def main():
     print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
-    print(f"  kv buckets : {limits['SPYRE_ATTN_KV_BUCKETS']}")
     print(f"  q buckets  : {limits['SPYRE_ATTN_QUERY_BUCKETS']}")
     print(f"  seq buckets: {limits['SPYRE_ATTN_NUM_SEQS_BUCKETS']}")
     print(f"  iterations : {cfg.get('iterations', 10)} (warmup {cfg.get('warmup', 2)})")

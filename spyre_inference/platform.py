@@ -1023,11 +1023,6 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
-        # Validate the ladder settings now; the bucketer only reads them in the worker.
-        from spyre_inference.v1.attention.spyre_attn_bucketer import validate_kv_ladder_env
-
-        validate_kv_ladder_env()
-
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
         from spyre_inference.threading_config import configure_threading

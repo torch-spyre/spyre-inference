@@ -785,11 +785,11 @@ def test_encoder_build_skips_kv_cache_fields(default_vllm_config) -> None:
 def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_config) -> None:
     """A pooling model whose max_model_len is under the top body bucket still builds.
 
-    The two ladders are keyed on different quantities: the num_blocks buckets come
-    from max_model_len, while the body buckets a pooling model warms come from
+    The two limits are keyed on different quantities: the page count comes from
+    max_model_len, while the body buckets a pooling model warms come from
     max_num_batched_tokens. all-MiniLM-L6-v2 and all-roberta-large-v1 derive
     max_model_len=256 and get a 512-token top body bucket, so warmup profiled 4
-    blocks against a 2-block ladder and the engine died at init.
+    blocks against a 2-page limit and the engine died at init.
     """
     meta = _profile_metadata(
         EncoderOnlyAttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1
@@ -797,8 +797,8 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
     assert meta.padded_num_blocks is None
 
     # Same input on the paged builder still raises: the guard is what makes the
-    # encoder case work, not a widened ladder.
-    with pytest.raises(AssertionError, match="exceeds the largest recorded bucket"):
+    # encoder case work, not a widened page limit.
+    with pytest.raises(AssertionError, match="pages a sequence can span"):
         _profile_metadata(AttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1)
 
 

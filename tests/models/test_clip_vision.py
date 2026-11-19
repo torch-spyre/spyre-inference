@@ -283,7 +283,9 @@ def test_budget_padding_does_not_leak_into_images(tp_group, pooling_type):
     images = _pixels(2)
     values = model.prepare_encoder_cudagraph_replay_buffers({"pixel_values": images}, 0, 0).values
     padding = model.get_encoder_cudagraph_config().padding_logics
-    patches = next(iter(values.values())).shape[0]
+    # The smallest budget the manager builds: "full" packs 2 x 65 = 130 rows, never a budget.
+    step = model.vision_patch_multiple
+    patches = -(-next(iter(values.values())).shape[0] // step) * step
 
     def run(num_patches):
         bufs = model._vision_empty(num_patches)

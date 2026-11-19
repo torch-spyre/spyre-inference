@@ -49,7 +49,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, subclass_attention_backend
 from vllm.v1.attention.selector import get_attn_backend
 
-from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm, _layer_norm_kernel
+from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
     SEGMENT_ITEMS,
@@ -105,6 +105,25 @@ def has_text_tokens(multimodal_embeddings, is_multimodal: torch.Tensor | None) -
     if not has_mm or is_multimodal is None:
         return not has_mm
     return bool((~convert(is_multimodal, device="cpu")).any())
+
+
+def _vision_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
+    """A boundary norm inside a vision graph: fp32 statistics, since CLIP's boundary norms
+    see activations past fp16's range, and the full-size arithmetic in ``x``'s dtype.
+
+    Only the ``[rows, 1]`` statistics come back from fp32. A full tensor cast from fp32
+    keeps a staggered element order, which Spyre cannot combine with a full fp16 operand
+    such as the weight ("Multi-arg pointwise with mixed EA"); a broadcast one it can.
+    """
+    xf = x.float()
+    mean = xf.mean(dim=-1, keepdim=True)
+    var = (xf - mean).pow(2).mean(dim=-1, keepdim=True)
+    out = (x - mean.to(x.dtype)) * torch.rsqrt(var + norm.eps).to(x.dtype)
+    if norm.weight is not None:
+        out = out * norm.weight
+    if norm.bias is not None:
+        out = out + norm.bias
+    return out
 
 
 def merge_text_and_vision(
@@ -364,10 +383,7 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
         patch_weight_t = cast(torch.Tensor, tower.embeddings.patch_embedding.weight)
         x = torch.matmul(values["patches"], patch_weight_t)
         x = x + self.spyre_position_table.gather(values["positions"])
-        # The fp32 statistics of SpyreLayerNorm, in-graph: CLIP's boundary norms see
-        # activations past fp16's range.
-        norm = tower.pre_layrnorm
-        x = _layer_norm_kernel(x, norm.weight, norm.bias, norm.eps).unsqueeze(0)
+        x = _vision_layer_norm(x, tower.pre_layrnorm).unsqueeze(0)
         return x, {"mask": segment_mask(values["segments"], x.dtype)}
 
     def vision_blocks(self) -> nn.ModuleList:
@@ -379,7 +395,7 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
             x = (x.reshape(-1, self._slot, x.shape[-1]) * self._class_pick).sum(dim=1)
         norm = self.vision_model.post_layernorm
         if norm is not None:
-            x = _layer_norm_kernel(x, norm.weight, norm.bias, norm.eps)
+            x = _vision_layer_norm(x, norm)
         return self.visual_projection(x)
 
     # --- the merge ---

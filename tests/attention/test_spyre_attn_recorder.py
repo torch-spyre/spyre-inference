@@ -920,6 +920,82 @@ class TestRecordBatchedDecode:
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
 
 
+@pytest.mark.parametrize("narrow_chunks", [False, True], ids=["full_width", "narrow"])
+@pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
+def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(
+    builder, monkeypatch, num_seqs, narrow_chunks
+):
+    """With a chunk range, every decode batch realizes a recorded kernel: a single-chunk one
+    within one full-width chunk, the dynamic one past it at a chunk count in its range."""
+    from torch_spyre._inductor import config as ts_config
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    from spyre_inference.v1.attention import spyre_attn_bucketer
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_ATTN_NARROW_CHUNKS", str(int(narrow_chunks)))
+    envs.clear_env_cache()
+    monkeypatch.setattr(spyre_attn_bucketer, "_chunk_index_takes_a_range", lambda: True)
+    max_model_len = 2048
+    max_blocks = max_model_len // BLOCK_SIZE
+    # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+        bucketer = builder._attn_bucketer = make_bucketer(
+            max_model_len=max_model_len, declare_pages=True
+        )
+        variants = bucketer.batched_decode_variants()
+        for v in variants:
+            md = builder.build_for_batched_decode_variant(v)
+            realized = (
+                md.blocks_per_chunk,
+                md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
+                md.chunk_range is not None,
+            )
+            assert realized == (v.blocks_per_chunk, v.num_chunks, v.dynamic_chunks), v
+        bucketed = {
+            (v.num_seqs, v.blocks_per_chunk, v.num_chunks) for v in variants if not v.dynamic_chunks
+        }
+        dynamic = {
+            (v.num_seqs, v.blocks_per_chunk): v.num_chunks for v in variants if v.dynamic_chunks
+        }
+
+        for kv_len in range(65, max_model_len + 1, 97):
+            seq_lens = torch.tensor(
+                [max(1, kv_len - 50 * i) for i in range(num_seqs)], dtype=torch.int32
+            )
+            md = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=CommonAttentionMetadata(
+                    query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
+                    query_start_loc_cpu=torch.arange(num_seqs + 1, dtype=torch.int32),
+                    seq_lens=seq_lens,
+                    num_reqs=num_seqs,
+                    num_actual_tokens=num_seqs,
+                    max_query_len=1,
+                    max_seq_len=int(seq_lens.max()),
+                    block_table_tensor=torch.arange(
+                        num_seqs * max_blocks, dtype=torch.int32
+                    ).reshape(num_seqs, max_blocks),
+                    slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+                    causal=True,
+                    is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+                ),
+            )
+            assert md.padded_num_seqs is not None, "builder declined the batched path"
+            num_chunks = md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk
+            if md.chunk_range is None:
+                key = (md.padded_num_seqs, md.blocks_per_chunk, num_chunks)
+                assert key in bucketed, f"{kv_len=} realized {key}"
+                continue
+            key = (md.padded_num_seqs, md.blocks_per_chunk)
+            assert key in dynamic, f"{kv_len=} realized {key}"
+            assert md.chunk_range["min"] <= num_chunks <= dynamic[key]
+            # Only the chunks the longest sequence needs, past the range minimum.
+            needed = -(-int(seq_lens.max()) // (BLOCK_SIZE * md.blocks_per_chunk))
+            assert num_chunks == max(needed, md.chunk_range["min"]), f"{kv_len=}"
+
+
 def test_large_batch_ladder_variants_build_onto_their_own_kernel(builder, monkeypatch):
     """Warmup builds a large-batch bucket below the base bucket build() pads each sequence onto."""
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")

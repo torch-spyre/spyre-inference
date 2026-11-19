@@ -25,7 +25,8 @@ query_len buckets).
 
 The batched decode kernel specializes on its own key,
 ``(num_seqs, blocks_per_chunk, num_chunks)``, hence a second bucket type and
-enumerator.
+enumerator. With a dynamic chunk count, ``num_chunks`` drops out of the key past one
+full-width chunk.
 
 Vocabulary: a *bucket* is one padded size a runtime length rounds up onto; the
 sorted list of them for one axis is that axis's *buckets*; the spacing between
@@ -38,6 +39,7 @@ import bisect
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -56,6 +58,12 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 _SPYRE_CORE_COUNT = 32
 
 
+def _full_chunk_width(b_seqs: int) -> int:
+    """The blocks per chunk at which a chunk's ``b_seqs * blocks_per_chunk`` entries fill
+    the cores."""
+    return max(1, _SPYRE_CORE_COUNT // b_seqs)
+
+
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
@@ -63,7 +71,7 @@ def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     them, more than one stick's worth hits a backend axis-merge limit. The block
     axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
-    blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    blocks_per_chunk = min(_full_chunk_width(b_seqs), b_blocks)
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
     return blocks_per_chunk, num_chunks
 
@@ -85,7 +93,8 @@ class SpyreAttnBatchedDecodeBucket:
     """One recordable batched decode kernel variant.
 
     The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
-    ``num_chunks`` (derived from the logical block-axis tensor extent).
+    ``num_chunks`` (derived from the logical block-axis tensor extent), unless
+    ``dynamic_chunks``: then ``num_chunks`` is the count it is recorded at.
     ``num_blocks`` is the bucket they were derived from, kept so the recorder can
     skip a bucket that outruns the KV allocation.
     """
@@ -94,6 +103,23 @@ class SpyreAttnBatchedDecodeBucket:
     num_blocks: int
     blocks_per_chunk: int
     num_chunks: int
+    # The one kernel that runs every chunk count of this num_seqs bucket's chunk range.
+    dynamic_chunks: bool = False
+
+
+class BatchedDecodeShape(NamedTuple):
+    """How ``build()`` lays out one batched decode call.
+
+    ``num_blocks`` is the block count the call covers: a bucket's, or with a
+    ``chunk_range`` the batch's own. ``chunk_range`` is the ``min``, ``max`` and
+    ``granularity`` of the chunk count the call's kernel runs, or None when the kernel is
+    compiled for ``num_chunks`` alone.
+    """
+
+    num_blocks: int
+    blocks_per_chunk: int
+    num_chunks: int
+    chunk_range: dict[str, int] | None
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -275,6 +301,38 @@ def _prefill_page_range(page_range: dict[str, int]) -> dict[str, int]:
     return {"min": min_pages, "max": max_pages, "granularity": g}
 
 
+def _chunk_index_takes_a_range() -> bool:
+    """Whether torch-spyre can copy a tensor with both an explicit device layout and a
+    dynamic size (torch-spyre#6327), as the batched decode chunk index needs."""
+    from torch_spyre import _C
+
+    return hasattr(_C, "spyre_empty_reserved_with_layout")
+
+
+def _declared_chunk_ranges(
+    page_range: dict[str, int], num_seqs_buckets: list[int]
+) -> dict[int, dict[str, int]]:
+    """Per num_seqs bucket, the range of chunk counts one batched decode kernel is compiled
+    for, at the chunk width that fills the cores.
+
+    A bucket whose chunk count past one chunk can only be ``page_range["min"]`` is left
+    out, since a size with min == max fails to trace. Empty, and logged, when torch-spyre
+    cannot copy the chunk index with a dynamic size.
+    """
+    if not _chunk_index_takes_a_range():
+        logger.info_once(
+            "This torch-spyre cannot copy the batched decode chunk index with a dynamic size "
+            "(torch-spyre#6327), so batched decode compiles one variant per KV bucket."
+        )
+        return {}
+    ranges = {}
+    for num_seqs in num_seqs_buckets:
+        max_chunks = -(-page_range["max"] // _full_chunk_width(num_seqs))
+        if page_range["min"] < max_chunks:
+            ranges[num_seqs] = {"min": page_range["min"], "max": max_chunks, "granularity": 1}
+    return ranges
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -397,6 +455,13 @@ class SpyreAttnBucketer:
         if self._page_range is not None:
             self._prefill_page_range = _prefill_page_range(self._page_range)
 
+        # Batched decode takes its chunk count at run time instead, once a batch needs more
+        # than one full-width chunk.
+        self._chunk_ranges: dict[int, dict[str, int]] = {}
+        if self._page_range is not None:
+            self._chunk_ranges = _declared_chunk_ranges(self._page_range, self._num_seqs_buckets)
+        self._narrow_chunks = envs.SPYRE_ATTN_NARROW_CHUNKS
+
         validate_kv_ladder_env()
 
         # Batched decode only: below the threshold the dense buckets cost warmup without a
@@ -504,6 +569,38 @@ class SpyreAttnBucketer:
     def find_batched_blocks_bucket(self, num_blocks: int, num_seqs_bucket: int) -> int | None:
         return self._round_up(num_blocks, self.batched_blocks_buckets(num_seqs_bucket))
 
+    def batched_decode_shape(
+        self, num_seqs_bucket: int, num_blocks: int
+    ) -> BatchedDecodeShape | None:
+        """The layout of a batched decode call whose longest sequence has ``num_blocks``
+        blocks, or None if no bucket holds it.
+
+        Without a chunk range for ``num_seqs_bucket`` the call keeps its bucket. With one, a
+        longer call takes full-width chunks and only as many as ``num_blocks`` needs, so one
+        kernel runs every chunk count in the range. A call that fits in one chunk runs one
+        full-width chunk, or with ``SPYRE_ATTN_NARROW_CHUNKS`` the chunk of its own bucket.
+        """
+        b_blocks = self.find_batched_blocks_bucket(num_blocks, num_seqs_bucket)
+        if b_blocks is None:
+            return None
+        chunk_range = self._chunk_ranges.get(num_seqs_bucket)
+        width = _full_chunk_width(num_seqs_bucket)
+        # Not where the full width is below the smallest bucket, which one KV head raises to
+        # 2 blocks: there every call takes the dynamic kernel.
+        if (
+            chunk_range is not None
+            and not self._narrow_chunks
+            and num_blocks <= width
+            and self._num_blocks_buckets[0] <= width
+        ):
+            return BatchedDecodeShape(width, width, 1, None)
+        if chunk_range is None or b_blocks <= width:
+            return BatchedDecodeShape(
+                b_blocks, *batched_decode_chunking(num_seqs_bucket, b_blocks), None
+            )
+        num_chunks = max(-(-num_blocks // width), chunk_range["min"])
+        return BatchedDecodeShape(num_blocks, width, num_chunks, chunk_range)
+
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
         idx = bisect.bisect_left(self._query_buckets, padded_query_len)
@@ -547,23 +644,33 @@ class SpyreAttnBucketer:
 
         Each num_seqs bucket against its own ``batched_blocks_buckets``: unlike
         ``variants()`` there is no inter-axis bound to exploit, since a decode
-        batch of any size can sit at any context length.
+        batch of any size can sit at any context length. With a chunk range, the buckets
+        past one full-width chunk give way to one kernel, recorded at max_model_len, and
+        unless ``SPYRE_ATTN_NARROW_CHUNKS`` the ones within it to one full-width chunk.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
+        pairs = []
+        for num_seqs in self._num_seqs_buckets:
+            blocks_buckets = self.batched_blocks_buckets(num_seqs)
+            if num_seqs in self._chunk_ranges:
+                width = _full_chunk_width(num_seqs)
+                blocks_buckets = [nb for nb in blocks_buckets if nb <= width]
+                if blocks_buckets and not self._narrow_chunks:
+                    blocks_buckets = [width]
+                blocks_buckets.append(self._num_blocks_buckets[-1])
+            pairs.extend((nb, num_seqs) for nb in blocks_buckets)
         out: list[SpyreAttnBatchedDecodeBucket] = []
-        pairs = sorted(
-            ((nb, ns) for ns in self._num_seqs_buckets for nb in self.batched_blocks_buckets(ns)),
-            reverse=True,
-        )
-        for num_blocks, num_seqs in pairs:
-            blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+        for num_blocks, num_seqs in sorted(pairs, reverse=True):
+            shape = self.batched_decode_shape(num_seqs, num_blocks)
+            assert shape is not None
             out.append(
                 SpyreAttnBatchedDecodeBucket(
                     num_seqs=num_seqs,
-                    num_blocks=num_blocks,
-                    blocks_per_chunk=blocks_per_chunk,
-                    num_chunks=num_chunks,
+                    num_blocks=shape.num_blocks,
+                    blocks_per_chunk=shape.blocks_per_chunk,
+                    num_chunks=shape.num_chunks,
+                    dynamic_chunks=shape.chunk_range is not None,
                 )
             )
         return out

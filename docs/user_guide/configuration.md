@@ -295,7 +295,19 @@ bucket pair, when any of these holds:
   `MAX_BUCKETS`; startup logs a warning;
 - the layer uses sliding-window attention.
 
-The batched decode kernel always uses the KV buckets.
+The batched decode kernel takes its chunk count at run time in the same way, and under the
+same conditions. A chunk is `32 / num_seqs` blocks of each sequence, enough to fill the cores.
+A decode batch longer than one chunk walks only the chunks its longest sequence needs, up to
+`--max-model-len`. A batch that fits in one chunk runs as one full chunk. Warmup then
+compiles two batched kernels per num-sequences bucket. A num-sequences bucket whose
+`--max-model-len` fits in two chunks keeps its KV buckets. This needs a torch-spyre that can
+copy a tensor with both `dynamic=` and `device_layout=` (torch-spyre#6327); with an older
+one, batched decode keeps its KV buckets and startup logs why.
+
+`SPYRE_ATTN_NARROW_CHUNKS=1` gives a batch that fits in one chunk the kernel of its own KV
+bucket instead, as narrow as that bucket. Short contexts then decode faster (a full chunk
+measured up to a third slower on 4 sequences of one block), at the cost of one more warmup
+compile per KV bucket that fits in a chunk.
 
 ## KV cache size
 

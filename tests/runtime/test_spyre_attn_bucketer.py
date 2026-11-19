@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from spyre_inference import envs
+from spyre_inference.v1.attention import spyre_attn_bucketer
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     _parse_buckets,
@@ -810,3 +811,78 @@ class TestDeclaredPages:
     def test_without_declare_pages_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048))
         assert b.page_range is None
+
+
+class TestDynamicChunks:
+    """Batched decode takes a chunk range instead of the KV buckets past one full chunk."""
+
+    @pytest.fixture(autouse=True)
+    def _declarable(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        monkeypatch.setattr(spyre_attn_bucketer, "_chunk_index_takes_a_range", lambda: True)
+        # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+        # config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+            yield
+
+    def test_one_variant_past_one_full_chunk_covers_every_longer_context(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        max_pages = 8192 // BLOCK_SIZE
+        for num_seqs in b.num_seqs_buckets:
+            width = 32 // num_seqs
+            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
+            (dynamic,) = [v for v in variants if v.dynamic_chunks]
+            assert (dynamic.blocks_per_chunk, dynamic.num_chunks) == (width, max_pages // width)
+            assert all(v.num_blocks <= width for v in variants if not v.dynamic_chunks)
+            for nb in (width + 1, 3 * width - 1, max_pages):
+                shape = b.batched_decode_shape(num_seqs, nb)
+                assert shape is not None
+                assert shape.chunk_range == {"min": 2, "max": max_pages // width, "granularity": 1}
+                assert shape.blocks_per_chunk == width
+                assert (shape.num_chunks - 1) * width < nb <= shape.num_chunks * width
+            shape = b.batched_decode_shape(num_seqs, width)
+            assert shape is not None
+            assert (shape.chunk_range, shape.num_chunks) == (None, 1)
+
+    def test_one_full_width_chunk_serves_every_call_within_one_chunk(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        for num_seqs in b.num_seqs_buckets:
+            width = 32 // num_seqs
+            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
+            assert [
+                (v.blocks_per_chunk, v.num_chunks) for v in variants if not v.dynamic_chunks
+            ] == [(width, 1)]
+            for nb in range(1, width + 1):
+                assert b.batched_decode_shape(num_seqs, nb) == (width, width, 1, None)
+
+    def test_narrow_chunks_keep_a_kernel_per_bucket_within_one_chunk(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_NARROW_CHUNKS", "1")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        for num_seqs in b.num_seqs_buckets:
+            width = 32 // num_seqs
+            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
+            narrow = [nb for nb in b.num_blocks_buckets if nb <= width]
+            assert sorted(v.blocks_per_chunk for v in variants if not v.dynamic_chunks) == narrow
+            shape = b.batched_decode_shape(num_seqs, 1)
+            assert shape is not None
+            assert (shape.blocks_per_chunk, shape.num_chunks) == (narrow[0], 1)
+
+    def test_a_batch_size_whose_context_fits_two_chunks_keeps_the_buckets(self):
+        # 32 pages: one full chunk at one sequence, two at two sequences.
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        for num_seqs in (1, 2):
+            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
+            assert not any(v.dynamic_chunks for v in variants)
+            assert {v.num_blocks for v in variants} == set(b.num_blocks_buckets)
+        assert any(v.dynamic_chunks for v in b.batched_decode_variants() if v.num_seqs == 4)
+
+    @pytest.mark.parametrize("declarable", [False, True], ids=["old_torch_spyre", "no_pages"])
+    def test_without_a_chunk_range_batched_decode_keeps_the_buckets(self, monkeypatch, declarable):
+        monkeypatch.setattr(spyre_attn_bucketer, "_chunk_index_takes_a_range", lambda: declarable)
+        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=not declarable)
+        assert (b.page_range is not None) == (not declarable)
+        assert not any(v.dynamic_chunks for v in b.batched_decode_variants())
+        shape = b.batched_decode_shape(4, 100)
+        assert shape is not None and shape.chunk_range is None

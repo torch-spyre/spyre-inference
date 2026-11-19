@@ -767,13 +767,16 @@ def test_raise_dynamo_recompile_limits_survives_a_clobber():
         ) = saved
 
 
-def test_worker_reasserts_recompile_limits_after_autoload():
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_worker_reasserts_recompile_limits_after_autoload(runner):
     """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
     import inspect
 
-    from spyre_inference.v1.worker import spyre_worker
+    from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
+    from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
-    src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
+    worker = TorchSpyreWorker if runner == "v1" else SpyreWorkerV2
+    src = inspect.getsource(worker.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
 
 

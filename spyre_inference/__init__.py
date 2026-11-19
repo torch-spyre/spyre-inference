@@ -52,7 +52,7 @@ def register():
     # can differ in the last bits from run to run; a one-element call first avoids it.
     import torch
 
-    torch.zeros(1).cos()
+    torch.zeros(1, dtype=torch.float32, device="cpu").cos()
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 

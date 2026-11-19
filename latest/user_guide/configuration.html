@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.2">
     
     
       
@@ -1168,6 +1168,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#model-runner" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model runner
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#offline-engine-in-the-calling-process" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1949,6 +1960,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#model-runner" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model runner
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#offline-engine-in-the-calling-process" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2423,6 +2445,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#model-runner" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model runner
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#offline-engine-in-the-calling-process" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2811,6 +2844,21 @@ relying on it.</p>
 different KV scales therefore compiles the transformer block and each recorded attention
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.</p>
+<h2 id="model-runner">Model runner<a class="headerlink" href="#model-runner" title="Permanent link">&para;</a></h2>
+<p>The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
+host kernels built into the plugin (<code>SPYRE_MRV2_KERNELS=host</code>), so no Triton install is
+needed on any architecture.</p>
+<p>Set <code>SPYRE_MODEL_RUNNER=v1</code> to fall back to the V1 model runner. The fallback is
+best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
+the V1 runner (#1245). The plugin sets <code>VLLM_USE_V2_MODEL_RUNNER</code> from
+<code>SPYRE_MODEL_RUNNER</code>, so don't set it yourself.</p>
+<p>Differences on V2:</p>
+<ul>
+<li>Seeded sampling draws a different token sequence for the same seed, because MRV2
+  seeds each position rather than one generator per request. Greedy output is unchanged.</li>
+<li>These are refused at startup: speculative decoding other than DFlash/XPress,
+  batch-sharded sampling, <code>cudagraph_mm_encoder</code>, and prefill context parallelism.</li>
+</ul>
 <h2 id="offline-engine-in-the-calling-process">Offline engine in the calling process<a class="headerlink" href="#offline-engine-in-the-calling-process" title="Permanent link">&para;</a></h2>
 <p>At <code>tensor_parallel_size=1</code>, set <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> to run the offline
 <code>LLM</code> engine in the calling process instead of a spawned EngineCore, which skips the

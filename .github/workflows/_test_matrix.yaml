@@ -45,6 +45,13 @@ on:
         required: false
         type: boolean
         default: false
+      image_rpms:
+        description: >-
+          When true, skip the baseline RPM install and use the runner image's Spyre RPMs, while still building
+          spyre-inference and torch-spyre (torch_spyre_ref) from source. Not combinable with rpm_names.
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -175,7 +182,7 @@ jobs:
     outputs:
       resolved_test_type: ${{ steps.resolve.outputs.resolved_test_type }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
@@ -227,7 +234,7 @@ jobs:
       durations_run_id: ${{ steps.resolve.outputs.durations_run_id }}
     steps:
       - name: Checkout scripts
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
@@ -251,7 +258,7 @@ jobs:
     runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x0","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
@@ -260,7 +267,7 @@ jobs:
 
       # At torch-spyre main, the same ref the v2 ingest action runs, so both use one id formula.
       - name: Checkout the identity library
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: torch-spyre/torch-spyre
           ref: main
@@ -276,13 +283,18 @@ jobs:
         id: delta
         env:
           PREBAKED: ${{ inputs.use_prebaked_image }}
+          IMAGE_RPMS: ${{ inputs.image_rpms }}
           RPM_NAMES: ${{ inputs.rpm_names }}
           TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
         run: |
           SHA="$(git rev-parse HEAD)"
           TOKENS="spyre-inference@${SHA:0:12}"
           if [[ "${PREBAKED}" != "true" ]]; then
-            TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            if [[ "${IMAGE_RPMS}" == "true" ]]; then
+              TOKENS="${TOKENS} image-rpms"
+            else
+              TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            fi
             if [[ -n "${TORCH_SPYRE_REF}" ]]; then
               TOKENS="${TOKENS} torch-spyre@${TORCH_SPYRE_REF}"
             fi
@@ -317,14 +329,14 @@ jobs:
     outputs:
       src_changed: ${{ steps.changed-src-files.outputs.any_changed }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Get changed source files
         id: changed-src-files
-        uses: tj-actions/changed-files@ed68ef82c095e0d48ec87eccea555d944a631a4c # v46.0.5
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
         with:
           # Avoid using single or double quotes for multiline patterns.
           files: |
@@ -939,6 +951,7 @@ jobs:
       run_tests: ${{ needs.build_kernels.outputs.src_changed == 'true' }}
       skip_if_no_changes: ${{ inputs.skip_if_no_changes }}
       use_prebaked_image: ${{ inputs.use_prebaked_image }}
+      image_rpms: ${{ inputs.image_rpms }}
       torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
       rpm_location: ${{ inputs.rpm_location }}
       rpm_names: ${{ inputs.rpm_names }}
@@ -982,12 +995,12 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
 
@@ -1057,12 +1070,12 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
 
@@ -1111,7 +1124,7 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
@@ -1155,12 +1168,12 @@ jobs:
     outputs:
       legs: ${{ steps.legs.outputs.legs }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
 
@@ -1204,7 +1217,7 @@ jobs:
       ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
       ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
@@ -1213,7 +1226,7 @@ jobs:
       # use_prebaked_image is true, so the run uses the image's Spyre stack
       # as-is. See issue #543.
       - name: Install Spyre RPMs
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/spyre-rpm-install
 
       # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
@@ -1225,10 +1238,16 @@ jobs:
 
       # Restore now; the post step ships it back at job end (writers only). Prebaked runs build nothing.
       - name: uv cache (NFS)
-        if: ${{ !inputs.use_prebaked_image }}
+        if: ${{ !inputs.use_prebaked_image && !inputs.image_rpms }}
         uses: ./.github/actions/uv-nfs-cache
         with:
           storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+
+      - name: Reject image_rpms with override RPMs
+        if: ${{ inputs.image_rpms && inputs.rpm_names != '' }}
+        run: |
+          echo "::error::image_rpms cannot be combined with rpm_names: override RPMs layer onto the baseline install, which image_rpms skips."
+          exit 1
 
       - name: Install override Spyre RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -1254,9 +1273,14 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+          IMAGE_RPMS: "${{ inputs.image_rpms }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+          # uv keys a git-built wheel on the rev alone, so a wheel built against other RPMs would be reused; force a rebuild against the image's.
+          if [[ "$IMAGE_RPMS" == "true" ]]; then
+            uv cache clean torch-spyre
+          fi
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
             # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
             # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
@@ -1363,8 +1387,9 @@ jobs:
           v2-run-id: ${{ inputs.run_id }}
           state: ${{ steps.bench.outcome == 'success' && 'passed' || 'failed' }}
           leg-key: ${{ matrix.leg.key }}
-          rpm-lock: ${{ !inputs.use_prebaked_image && 'spyre-rpms.lock' || '' }}
+          rpm-lock: ${{ !inputs.use_prebaked_image && !inputs.image_rpms && 'spyre-rpms.lock' || '' }}
           installed: >-
+            ${{ inputs.image_rpms && 'image-rpms' || '' }}
             ${{ inputs.rpm_names }}
             ${{ inputs.torch_spyre_ref && format('torch-spyre@{0}', inputs.torch_spyre_ref) || '' }}
           job-id: '0'

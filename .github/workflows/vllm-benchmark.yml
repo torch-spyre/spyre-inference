@@ -72,9 +72,9 @@ jobs:
       benchmark_matrix: ${{ steps.set-parameters.outputs.benchmark_matrix }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
 
@@ -128,7 +128,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Install Spyre RPMs
         id: spyre-rpms
@@ -138,7 +138,7 @@ jobs:
       # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
       # steps below. See .github/scripts/nfs_uv_cache.py.
       - name: Set up uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: false
 
@@ -226,14 +226,15 @@ jobs:
 
           # Count the native results: vLLM writes no .pytorch.json for pooling models
           # (embedding, reranker), and extract_rows reads their metrics from the native file.
+          # The host resource sampler's *.host_resources.json is not a benchmark result.
           # -maxdepth 1 matches the top-level glob extract_rows reads.
-          JSON_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" 2>/dev/null | wc -l)
+          JSON_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" ! -name "*.host_resources.json" 2>/dev/null | wc -l)
           echo "Benchmark JSON result files found: ${JSON_COUNT}"
 
           # Latency and throughput results must have a .pytorch.json sibling: without it,
           # extract_rows keys their rows by test name with native metric names.
           MISSING=$(for f in benchmark-results/{latency,throughput}_*.json; do
-            [[ -e "$f" && "$f" != *.pytorch.json && ! -e "${f%.json}.pytorch.json" ]] && echo "$f"
+            [[ -e "$f" && "$f" != *.pytorch.json && "$f" != *.host_resources.json && ! -e "${f%.json}.pytorch.json" ]] && echo "$f"
           done || true)
           if [[ -n "${MISSING}" ]]; then
             echo "Benchmark results without a .pytorch.json: ${MISSING}"
@@ -270,7 +271,7 @@ jobs:
           MATRIX_MODELS: ${{ matrix.models }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          RESULT_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" 2>/dev/null | wc -l)
+          RESULT_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" ! -name "*.host_resources.json" 2>/dev/null | wc -l)
 
           {
             echo "### Benchmark Results"

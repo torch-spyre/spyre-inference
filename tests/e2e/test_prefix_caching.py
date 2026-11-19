@@ -15,6 +15,7 @@
 """Prefix-caching (APC) end-to-end tests for the Spyre backend."""
 
 import pytest
+from spyre_testing_plugin.greedy_checks import assert_greedy_runs_agree, logprob_trace
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import AttentionConfig
@@ -48,13 +49,9 @@ _QUESTIONS = [
     "What is the capital of Germany?",
 ]
 
-# On-device fp16 greedy decode: cache-served and freshly-recomputed attention
-# accumulate rounding errors in different orders, which can flip a near-tie at
-# the logit level.  Empirically the outputs agree on the first ~12 tokens and
-# diverge only in the tail of a 16-token sequence.  We therefore compare only
-# the first _STABLE_TOKENS tokens rather than demanding bit-exact equality
-# across the full sequence.
-_STABLE_TOKENS = 12
+# Cached and recomputed attention round differently in fp16, so compare by logprob.
+_NUM_LOGPROBS = 5
+_LOGPROB_TOLERANCE = 0.1
 
 
 def _build_prefix(tokenizer: AutoTokenizer) -> str:
@@ -122,12 +119,10 @@ def test_prefix_caching(enforce_eager: bool, shared_prefix: str) -> None:
     2. A non-APC baseline engine.
 
     Asserts that both cold and warm APC outputs agree with the non-APC baseline
-    for the first ``_STABLE_TOKENS`` tokens. Full-sequence bit-exact equality is
-    too strict on fp16 Spyre hardware, where cache-served vs recomputed
-    attention paths accumulate rounding differences in later tail tokens.
+    up to a near-tie flip (``assert_greedy_runs_agree``).
     """
     prompts = [shared_prefix + q for q in _QUESTIONS]
-    sp = SamplingParams(temperature=0.0, max_tokens=16)
+    sp = SamplingParams(temperature=0.0, max_tokens=16, logprobs=_NUM_LOGPROBS)
 
     llm_apc = _make_llm(enable_prefix_caching=True, enforce_eager=enforce_eager)
     cold_outputs = llm_apc.generate(prompts, sp, use_tqdm=False)
@@ -145,19 +140,8 @@ def test_prefix_caching(enforce_eager: bool, shared_prefix: str) -> None:
     del llm_plain
 
     assert len(cold_outputs) == len(warm_outputs) == len(plain_outputs) == len(prompts)
-    for i, (cold, warm, plain) in enumerate(zip(cold_outputs, warm_outputs, plain_outputs)):
-        cold_ids = list(cold.outputs[0].token_ids)[:_STABLE_TOKENS]
-        warm_ids = list(warm.outputs[0].token_ids)[:_STABLE_TOKENS]
-        plain_ids = list(plain.outputs[0].token_ids)[:_STABLE_TOKENS]
-        assert cold_ids == plain_ids, (
-            f"Prompt {i}: cold APC output does not match non-APC baseline "
-            f"(first {_STABLE_TOKENS} tokens).\n"
-            f"  cold APC : {cold_ids}\n"
-            f"  plain    : {plain_ids}"
-        )
-        assert warm_ids == plain_ids, (
-            f"Prompt {i}: warm APC output does not match non-APC baseline "
-            f"(first {_STABLE_TOKENS} tokens).\n"
-            f"  warm APC : {warm_ids}\n"
-            f"  plain    : {plain_ids}"
+    plain = logprob_trace(plain_outputs)
+    for name, outputs in (("cold APC", cold_outputs), ("warm APC", warm_outputs)):
+        assert_greedy_runs_agree(
+            plain, logprob_trace(outputs), _LOGPROB_TOLERANCE, names=("plain", name)
         )

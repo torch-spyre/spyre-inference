@@ -20,6 +20,7 @@ import gc
 import os
 
 import pytest
+from spyre_testing_plugin.greedy_checks import Trace, assert_greedy_runs_agree, logprob_trace
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 from spyre_testing_plugin.tags import record_serving_capability
 from spyre_testing_plugin.vfio_reaper import wait_until_card_free
@@ -29,9 +30,8 @@ from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 MAX_MODEL_LEN = 128
 MAX_NUM_SEQS = 2
 NUM_LOGPROBS = 5
-# Max logprob gap (nats) per token while TP=1 and TP=2 share a prefix; the 6-layer nano runs wider.
-LOGPROB_TOLERANCE = {"joerunde/gemma-4-moe-nano": 0.7}
-DEFAULT_LOGPROB_TOLERANCE = 0.1
+# Max logprob gap (nats) of a picked token while the two runs share a prefix.
+LOGPROB_TOLERANCE = 0.1
 
 
 def _generate(
@@ -41,7 +41,7 @@ def _generate(
     compilation_config: dict | None = None,
     hf_overrides=None,
     kv_cache_dtype: str = "auto",
-) -> tuple[list[list[int]], list[list[dict[int, float]]]]:
+) -> Trace:
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -57,14 +57,12 @@ def _generate(
     )
     try:
         outs = llm.generate(
-            ["Hello, world!", "Count to ten: one, two, three"],
+            ["Call me Ishmael.", "Call me Ishmael. Some years ago"]
+            if model == "joerunde/gemma-4-moe-nano"
+            else ["1, 2, 3, 4, 5, 6,", "Count to ten: one, two, three"],
             SamplingParams(max_tokens=8, temperature=0.0, logprobs=NUM_LOGPROBS, ignore_eos=True),
         )
-        tokens = [list(o.outputs[0].token_ids) for o in outs]
-        logprobs = [
-            [{tid: lp.logprob for tid, lp in step.items()} for step in o.outputs[0].logprobs]
-            for o in outs
-        ]
+        trace = logprob_trace(outs)
     finally:
         llm.llm_engine.engine_core.shutdown(timeout=60)
         del llm
@@ -72,7 +70,7 @@ def _generate(
         freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
     # Outside the finally, where a generate failure would mask this check's own.
     assert freed, "Spyre devices were not released after LLM shutdown"
-    return tokens, logprobs
+    return trace
 
 
 def _assert_matches_tp1(
@@ -98,58 +96,8 @@ def _assert_matches_tp1(
         )
 
 
-def _assert_top_logprobs_close(
-    where: str, ref: dict[int, float], lp: dict[int, float], tolerance: float
-) -> None:
-    """Every token in either top-k agrees within the tolerance.
-
-    A token outside one run's top-k sits at or below that run's k-th logprob, so it
-    fails only when its other logprob clears that bound by more than the tolerance.
-    """
-    for a, b, names in ((ref, lp, ("tp1", "tp2")), (lp, ref, ("tp2", "tp1"))):
-        floor = min(b.values())
-        for tid, value in a.items():
-            gap = abs(value - b[tid]) if tid in b else value - floor
-            assert gap <= tolerance, (
-                f"{where}: token {tid} logprob {names[0]} {value:.3f} vs {names[1]} "
-                f"{b.get(tid, f'<= {floor:.3f}')} (gap {gap:.3f} > {tolerance})"
-            )
-
-
-def _assert_logprobs_match_tp1(
-    model: str,
-    tp1: tuple[list[list[int]], list[list[dict[int, float]]]],
-    tp2: tuple[list[list[int]], list[list[dict[int, float]]]],
-) -> None:
-    """Up to the first divergence, both runs' top tokens agree within the tolerance.
-
-    A divergence must be a near tie: each run's winner is in the other's top tokens and
-    beats it by no more than the tolerance in both runs.
-    """
-    tolerance = LOGPROB_TOLERANCE.get(model, DEFAULT_LOGPROB_TOLERANCE)
-    for name, (tokens, logprobs) in (("tp1", tp1), ("tp2", tp2)):
-        for i, (seq, steps) in enumerate(zip(tokens, logprobs, strict=True)):
-            assert len(seq) == len(steps), (
-                f"prompt {i}: {name} has {len(seq)} tokens but {len(steps)} logprob rows"
-            )
-    for i, (ref_tokens, tokens, ref_steps, steps) in enumerate(
-        zip(tp1[0], tp2[0], tp1[1], tp2[1], strict=True)
-    ):
-        for step, (ref_pick, pick, ref_lp, lp) in enumerate(
-            zip(ref_tokens, tokens, ref_steps, steps)
-        ):
-            where = f"prompt {i} step {step}"
-            assert ref_pick in lp, f"{where}: tp1 token {ref_pick} not in tp2 top {lp}"
-            assert pick in ref_lp, f"{where}: tp2 token {pick} not in tp1 top {ref_lp}"
-            _assert_top_logprobs_close(where, ref_lp, lp, tolerance)
-            if pick != ref_pick:
-                margins = (ref_lp[ref_pick] - ref_lp[pick], lp[pick] - lp[ref_pick])
-                assert max(margins) <= tolerance, (
-                    f"{where}: tp1 picked {ref_pick}, tp2 picked {pick}; not a near tie "
-                    f"(margins tp1 {margins[0]:.3f}, tp2 {margins[1]:.3f} > {tolerance})"
-                )
-                # Past a flip the two runs condition on different tokens.
-                break
+def _assert_logprobs_match_tp1(model: str, tp1: Trace, tp2: Trace) -> None:
+    assert_greedy_runs_agree(tp1, tp2, LOGPROB_TOLERANCE, names=("tp1", "tp2"))
 
 
 @pytest.mark.e2e_smoke
@@ -232,6 +180,8 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
 
 
 MULTIMODAL_MODEL = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
+# Per-tensor FP8 sibling: quant_method "fp8", static activations.
+MULTIMODAL_FP8_MODEL = "mistralai/Ministral-3-14B-Instruct-2512"
 # Short enough to keep both warmups (TP=1, then TP=2) inside one test's budget: the 176x176
 # image and the prompt fit, and attention records only the buckets up to it.
 MULTIMODAL_MAX_MODEL_LEN = 256
@@ -263,22 +213,29 @@ def _image_conversation():
     ]
 
 
-def _generate_image(tp: int) -> list[list[int]]:
+def _generate_ministral(tp: int, model: str = MULTIMODAL_MODEL, images: int = 1) -> list[list[int]]:
+    """Greedy tokens for a text prompt, then the image prompt when ``images`` is set.
+
+    ``images=0`` builds the tower as a placeholder, skipping its weights and warmup.
+    """
     from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model=MULTIMODAL_MODEL,
+        model=model,
         config_format="mistral",
         tensor_parallel_size=tp,
         dtype="float16",
         max_model_len=MULTIMODAL_MAX_MODEL_LEN,
         max_num_seqs=1,
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={"image": images},
         # One decoding sequence, and a prefill of the whole prompt.
         compilation_config={"compile_sizes": [1, MULTIMODAL_MAX_MODEL_LEN]},
     )
+    conversations = [[{"role": "user", "content": "Count to ten: one, two, three"}]]
+    if images:
+        conversations.append(_image_conversation())
     try:
-        outs = llm.chat([_image_conversation()], SamplingParams(max_tokens=8, temperature=0.0))
+        outs = llm.chat(conversations, SamplingParams(max_tokens=8, temperature=0.0))
         result = [list(o.outputs[0].token_ids) for o in outs]
     finally:
         llm.llm_engine.engine_core.shutdown(timeout=60)
@@ -292,18 +249,27 @@ def _generate_image(tp: int) -> list[list[int]]:
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.multimodal
+@pytest.mark.fp8
 @pytest.mark.skipif(
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 @pytest.mark.timeout(3600)
 def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
-    """TP=1 vs TP=2 greedy prefix match on one image prompt, compiled: the vision blocks
-    and projection run their TP all_reduces inside the compiled graphs, and serving must
-    not compile anything."""
+    """TP=1 vs TP=2 greedy prefix match on a text and an image prompt, compiled: the vision
+    blocks and projection run their TP all_reduces inside the compiled graphs, and serving
+    must not compile anything.
+
+    The FP8 checkpoint, loaded through ``SpyreFp8Config``, must then track the BF16 TP=2
+    run on the text prompt. It runs text only: FP8 changes the decoder's linears alone.
+    """
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    _assert_matches_tp1(_generate_image(tp=1), _generate_image(tp=2))
+    tp1 = _generate_ministral(tp=1)
+    bf16 = _generate_ministral(tp=2)
+    _assert_matches_tp1(tp1, bf16)
+    fp8 = _generate_ministral(tp=2, model=MULTIMODAL_FP8_MODEL, images=0)
+    _assert_matches_tp1(bf16[:1], fp8, names=("bf16", "fp8"))
 
 
 @pytest.mark.e2e_smoke
@@ -321,8 +287,6 @@ def test_tp2_fp8_kv_cache_matches_fp16_cache() -> None:
     """
     model = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
     _cc = {"compile_sizes": [1, 2, 16]}
-    fp16, _ = _generate(model, tp=2, enforce_eager=False, compilation_config=_cc)
-    fp8, _ = _generate(
-        model, tp=2, enforce_eager=False, compilation_config=_cc, kv_cache_dtype="fp8"
-    )
-    _assert_matches_tp1(fp16, fp8, names=("fp16 cache", "fp8 cache"))
+    fp16 = _generate(model, tp=2, enforce_eager=False, compilation_config=_cc)
+    fp8 = _generate(model, tp=2, enforce_eager=False, compilation_config=_cc, kv_cache_dtype="fp8")
+    assert_greedy_runs_agree(fp16, fp8, LOGPROB_TOLERANCE, names=("fp16 cache", "fp8 cache"))

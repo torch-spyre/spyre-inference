@@ -50,6 +50,10 @@ on:
       use_prebaked_image:
         required: true
         type: boolean
+      image_rpms:
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         required: false
         type: string
@@ -120,7 +124,7 @@ jobs:
     outputs:
       failed: ${{ steps.flag.outputs.failed }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           # Cross-repo Test-With: companion fork/branch (empty = base repo / dispatched ref).
           repository: ${{ inputs.repository || github.repository }}
@@ -182,6 +186,7 @@ jobs:
           runner_labels: ${{ env.RUNNER_LABELS }}
           job_slot: ${{ inputs.job_index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
@@ -207,7 +212,7 @@ jobs:
     runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
     timeout-minutes: 720
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
@@ -226,6 +231,7 @@ jobs:
           job_slot: retry-${{ inputs.job_index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}

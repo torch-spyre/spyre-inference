@@ -122,7 +122,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 720
     outputs:
-      failed: ${{ steps.flag.outputs.failed }}
+      passed: ${{ steps.done.outputs.passed }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -198,17 +198,18 @@ jobs:
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
           hf_token: ${{ secrets.HF_TOKEN }}
 
-      # needs.attempt.result is unreliable under continue-on-error, so the retry gates on this output.
-      - name: Flag for pod-level retry
-        id: flag
-        if: failure()
-        run: echo "failed=true" >> "$GITHUB_OUTPUT"
+      # Only a fully successful attempt reaches this, and the retry runs unless it is set: a runner
+      # that died (#1454) sends no failure signal, and needs.attempt.result reads success under
+      # continue-on-error.
+      - name: Mark attempt passed
+        id: done
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   # Fresh runner pod, no changed-files gate; failing again here is a genuine failure.
   retry:
     name: pod-level retry
     needs: attempt
-    if: ${{ !cancelled() && (needs.attempt.outputs.failed == 'true' || needs.attempt.result == 'failure') }}
+    if: ${{ !cancelled() && needs.attempt.outputs.passed != 'true' }}
     runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
     timeout-minutes: 720
     steps:

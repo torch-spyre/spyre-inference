@@ -49,7 +49,7 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
 
-from .utils import init_host_cos, place_row_gathered
+from .utils import place_row_gathered
 
 # One Spyre stick of fp16 elements.
 _STICK = 64
@@ -138,10 +138,6 @@ class _SpyreRotaryMixin:
             if self._padded_inner % _STICK != 0
             else None
         )
-
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        init_host_cos()
-        return super()._compute_cos_sin_cache()
 
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module

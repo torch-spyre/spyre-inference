@@ -221,8 +221,15 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "2")
     from vllm import SamplingParams
 
+    def encoder_graph_manager(worker):
+        runner = worker.model_runner
+        if hasattr(runner, "encoder_cudagraph_manager"):
+            return runner.encoder_cudagraph_manager
+        # The V2 runner keeps it on the model state's encoder runner.
+        return runner.model_state.encoder_runner.cudagraph_manager
+
     def record_encoder_calls(worker):
-        manager = worker.model_runner.encoder_cudagraph_manager
+        manager = encoder_graph_manager(worker)
         manager.calls = []
         execute = manager._execute_local
 
@@ -234,7 +241,7 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
         return manager.graph_hits, manager.graph_misses
 
     def encoder_calls(worker):
-        manager = worker.model_runner.encoder_cudagraph_manager
+        manager = encoder_graph_manager(worker)
         return manager.calls, manager._pack_tokens, manager.graph_hits, manager.graph_misses
 
     llm = _llm(

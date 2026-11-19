@@ -602,11 +602,13 @@ def test_only_tensor_parallelism_is_accepted(field):
 
 @pytest.mark.parametrize("requested", ["1", "true", "0", None])
 def test_v1_model_runner_is_pinned(monkeypatch, requested):
-    """TorchSpyreWorker only builds the V1 runner, so the resolved config must agree
-    whatever the user asked for. An explicit VLLM_USE_V2_MODEL_RUNNER=1 short-circuits
-    upstream's HAS_TRITON fallback, so the override is what prevents V2 here."""
+    """With SPYRE_MODEL_RUNNER=v1, TorchSpyreWorker only builds the V1 runner, so the
+    resolved config must agree whatever the user asked for. An explicit
+    VLLM_USE_V2_MODEL_RUNNER=1 short-circuits upstream's HAS_TRITON fallback, so the
+    override is what prevents V2 here."""
     from spyre_inference.platform import TorchSpyrePlatform
 
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
     # After construction: register() pins the env var before VllmConfig reads it.
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
     if requested is None:
@@ -625,9 +627,11 @@ def test_v2_only_features_are_rejected(monkeypatch, feature):
     """hisparse and watermarking outrank VLLM_USE_V2_MODEL_RUNNER inside
     use_v2_model_runner: hisparse raises an error blaming the env var *we* set, and
     watermarking silently returns V2. AuxOutput never flips the runner, so the tripwire
-    cannot catch it, and it would be accepted and never produced. Reject all three here."""
+    cannot catch it, and it would be accepted and never produced. Reject all three on
+    SPYRE_MODEL_RUNNER=v1."""
     from spyre_inference.platform import TorchSpyrePlatform
 
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
     if feature == "hisparse":

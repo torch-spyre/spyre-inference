@@ -275,7 +275,8 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
         assert pooling_type is not None
         self._class_layout = _get_vision_feature_select_strategy(pooling_type) == "class"
         self._patch_size: int = vision.patch_size
-        grid = cast(int, vision.image_size) // self._patch_size
+        self._image_size = cast(int, vision.image_size)
+        grid = self._image_size // self._patch_size
         self._image_rows = grid * grid + 1
         self._slot = align_up(self._image_rows) if self._class_layout else self._image_rows
         self._tokens_per_image = 1 if self._class_layout else self._image_rows
@@ -339,9 +340,11 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
     def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
         # The default maximum is the largest item, which is one token for "class", so every
         # budget would hold one image; and for "full" the default minimum (64) exceeds an
-        # item (50 for ViT-B/32), which upstream rejects. Cover a whole step instead.
+        # item (50 for ViT-B/32), which upstream rejects. Cover a whole step instead, up to
+        # the items one call can hold: a larger budget is compiled but never filled.
         low = self.vision_patch_multiple // self.patches_per_token
-        high = align_up(self.max_items_per_step * self._tokens_per_image, low)
+        items = min(self.max_items_per_step, self.vision_max_items_per_call)
+        high = align_up(items * self._tokens_per_image, low)
         return low, max(high, low)
 
     # Every image pads as a whole unit at the budget's tail: there is no merge to keep a view.
@@ -362,8 +365,12 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
         flat_patches, seg, pos = [], [], []
         for i, img in enumerate(_pixel_values(mm_kwargs)):
             c, h, w = img.shape
+            # Upstream's input schema checked this; the mixin's embed_multimodal bypasses it.
+            if (h, w) != (self._image_size, self._image_size):
+                raise ValueError(
+                    f"expected {self._image_size}x{self._image_size} images, got {h}x{w}"
+                )
             hp, wp = h // p, w // p
-            assert hp * wp + 1 == self._image_rows, f"{h}x{w} is not the configured image size"
             patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
             patches = patches.reshape(hp * wp, -1).to(torch.float16)
             row = patches.new_zeros(1, patches.shape[1])

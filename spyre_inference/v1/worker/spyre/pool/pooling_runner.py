@@ -36,7 +36,7 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.encoder_grid import pool_rows_for, unpad_encoder_grid
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata
 from spyre_inference.v1.worker.spyre.model_states.encoder_plan import EncoderPlan
-from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
+from spyre_inference.v1.worker.spyre.model_wrapper import unwrap_model
 
 _HOST = torch.device("cpu")
 

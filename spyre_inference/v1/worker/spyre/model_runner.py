@@ -37,10 +37,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.spec_decode.config import validate_dflash_config
 from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
+from spyre_inference.v1.worker.spyre.model_wrapper import unwrap_model
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
-from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
 class SpyreModelRunnerV2(GPUModelRunner):

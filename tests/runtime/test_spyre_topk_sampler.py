@@ -21,10 +21,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.sampler import Sampler
 
-from spyre_inference.v1.sample.topk_topp_sampler import (
-    SpyreTopKTopPSampler,
-    apply_top_k_top_p_sort_free,
-)
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+from spyre_inference.v1.worker.spyre.kernels import apply_top_k_top_p_sort_free
 
 
 def _meta(rows: int, k: int | None = None, p: float | None = None) -> SamplingMetadata:

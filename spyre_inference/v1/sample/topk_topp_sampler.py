@@ -22,65 +22,10 @@ from spyre_inference.v1.sample.sampling_kernels import (
     has_sampling_kernels,
     has_topk_topp_kernels,
 )
-
-
-def apply_top_k_top_p_sort_free(
-    logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor
-) -> torch.Tensor:
-    """``apply_top_k_top_p_pytorch`` without the full-vocab sort.
-
-    Top-p only ever keeps top-k survivors, so it runs on a ``topk`` window.
-    vllm keeps every token tied with a row's k-th value, and fp16 logits tie
-    there often, so the window carries slack and widens to the exact tie count
-    when ties run past it.
-
-    The logits tensor is updated in-place."""
-    max_k = int(k.max())
-    vocab = logits.shape[1]
-    if max_k >= vocab:
-        return apply_top_k_top_p_pytorch(logits, k, p)
-    vals, idx = logits.topk(min(2 * max_k, vocab), dim=-1)
-    kth = vals.gather(1, k.long().unsqueeze(1) - 1)
-    if (vals[:, -1:] == kth).any():
-        vals, idx = logits.topk(int((logits >= kth).sum(dim=-1).max()), dim=-1)
-    vals.masked_fill_(vals < kth, -float("inf"))
-    vals, idx = vals.flip(-1), idx.flip(-1)
-    probs_sum = vals.softmax(dim=-1).cumsum_(dim=-1)
-    top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
-    top_p_mask[:, -1] = False
-    vals.masked_fill_(top_p_mask, -float("inf"))
-    return logits.fill_(-float("inf")).scatter_(1, idx, vals)
-
-
-def apply_top_k_top_p_kernels(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-) -> torch.Tensor:
-    """``apply_top_k_top_p_pytorch`` on the csrc/ kernels.
-
-    Top-k alone matches the PyTorch filter with no sort, ties with the k-th
-    value included. Top-p alone is vLLM's CPU kernel, whose cut can differ from a
-    full sort by a few boundary tokens. Top-k together with top-p sorts the k
-    survivors and cuts those exactly, so a large k is close to a full-vocab sort.
-
-    The op masks logits in place, so a tensor that is not float32 and contiguous
-    is copied here. A copy made inside the op would not be the caller's tensor.
-    Serving already passes float32 logits, and then this cast is a no-op. vLLM's
-    ``InputBatch.top_k`` is int32; int64 is accepted too. Only a non-contiguous
-    k is copied."""
-    if k is None and p is None:
-        return logits
-    logits = logits.to(torch.float32).contiguous()
-    if k is not None:
-        k = k.contiguous()
-    if p is not None:
-        p = p.to(torch.float32).contiguous()
-    if p is None:
-        torch.ops._spyre_C.cpu_topk_sampling(logits, k)  # ty: ignore[invalid-argument-type]
-    elif k is None:
-        torch.ops._spyre_C.cpu_topp_sampling(logits, p)  # ty: ignore[invalid-argument-type]
-    else:
-        torch.ops._spyre_C.cpu_topk_topp_sampling(logits, k, p)  # ty: ignore[invalid-argument-type]
-    return logits
+from spyre_inference.v1.worker.spyre.kernels import (
+    apply_top_k_top_p_kernels,
+    apply_top_k_top_p_sort_free,
+)
 
 
 class SpyreTopKTopPSampler(TopKTopPSampler):

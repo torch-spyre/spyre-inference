@@ -51,11 +51,8 @@ from spyre_inference.v1.worker.model_load import (
     resolve_kv_scales,
 )
 from spyre_inference.v1.worker.spyre.model_states import resolve_spyre_model_state
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper, model_dtype
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
-from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
-    _SpyreModelWrapper,
-    model_dtype,
-)
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_len_ladder,

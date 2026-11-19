@@ -19,7 +19,8 @@ import types
 import pytest
 import torch
 
-from spyre_inference.v1.worker import spyre_model_runner as mr
+from spyre_inference.v1.worker import spyre_model_runner as v1_runner
+from spyre_inference.v1.worker.spyre import model_wrapper as mr
 
 ROWS, HIDDEN = 16, 8
 
@@ -116,7 +117,7 @@ def test_warmup_compiles_every_row_bucket_a_body_bucket_holds(monkeypatch):
     _, hidden, widths = _hidden(monkeypatch, [1, 2, 4, 16, 32])
     runner, projected = _runner()
 
-    mr.TorchSpyreModelRunner._warm_sample_row_gathers(runner, hidden, [1, 2, 4, 16, 32])
+    mr.warm_sample_row_gathers(runner.model, hidden, [1, 2, 4, 16, 32])
 
     assert widths == [1, 2, 4, 16]
     assert projected == [1, 2, 4, 16, 16]
@@ -128,7 +129,7 @@ def test_warmup_covers_one_row_padded_to_a_two_token_body(monkeypatch):
     hidden = mr._SpyreHiddenStates.wrap(plain[:2], [2, 4])
     runner, _ = _runner()
 
-    mr.TorchSpyreModelRunner._warm_sample_row_gathers(runner, hidden, [2, 4])
+    mr.warm_sample_row_gathers(runner.model, hidden, [2, 4])
     warmed = set(widths)
     widths.clear()
     hidden[torch.tensor([1])]
@@ -141,9 +142,7 @@ def test_warmup_skips_hidden_states_left_on_the_host(monkeypatch):
     _, _, widths = _hidden(monkeypatch, [1, 2])
     runner, projected = _runner()
 
-    mr.TorchSpyreModelRunner._warm_sample_row_gathers(
-        runner, torch.zeros(ROWS, HIDDEN, dtype=torch.float16), [1, 2]
-    )
+    mr.warm_sample_row_gathers(runner.model, torch.zeros(ROWS, HIDDEN, dtype=torch.float16), [1, 2])
 
     assert widths == []
     assert projected == []
@@ -164,7 +163,7 @@ def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
         return plain
 
     monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", convert)
-    monkeypatch.setattr(mr.attn_layer, "publish_null_slots", lambda _: None)
+    monkeypatch.setattr(v1_runner.attn_layer, "publish_null_slots", lambda _: None)
     model = lambda **kwargs: device_hidden
     wrapper = mr._SpyreModelWrapper(model, torch.device("spyre"), model_dtype=torch.float16)
 
@@ -173,8 +172,8 @@ def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
         hidden = self.model()
         return hidden, hidden[:1]
 
-    monkeypatch.setattr(mr.GPUModelRunner, "_dummy_run", dummy_run)
-    runner = object.__new__(mr.TorchSpyreModelRunner)
+    monkeypatch.setattr(v1_runner.GPUModelRunner, "_dummy_run", dummy_run)
+    runner = object.__new__(v1_runner.TorchSpyreModelRunner)
     runner.model = wrapper
     runner.model_config = types.SimpleNamespace(runner_type="pooling")
 

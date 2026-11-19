@@ -25,8 +25,8 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
-from spyre_inference.v1.sample.topk_topp_sampler import (
-    SpyreTopKTopPSampler,
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+from spyre_inference.v1.worker.spyre.kernels import (
     apply_top_k_top_p_kernels,
     apply_top_k_top_p_sort_free,
 )
@@ -358,7 +358,7 @@ def test_avx2_build_filters_match_pytorch() -> None:
         "assert 'spyre_inference._C_AVX2' in sys.modules\n"
         "assert 'spyre_inference._C' not in sys.modules\n"
         "from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch\n"
-        "from spyre_inference.v1.sample.topk_topp_sampler import apply_top_k_top_p_kernels\n"
+        "from spyre_inference.v1.worker.spyre.kernels import apply_top_k_top_p_kernels\n"
         "def kept(t):\n"
         "    return t > float('-inf')\n"
         "x = torch.randn(4, 32003)\n"

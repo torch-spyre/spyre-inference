@@ -25,7 +25,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from spyre_inference.v1.worker import spyre_model_runner as mr
+from spyre_inference.v1.worker import spyre_model_runner as v1_runner
+from spyre_inference.v1.worker.spyre import model_wrapper as mr
 
 
 def test_wrapper_converts_ints_to_int64(monkeypatch):
@@ -64,16 +65,16 @@ def test_kv_sharing_layer_gets_its_target_spec_for_attention_only(monkeypatch):
     assert uniform is not None
     group = KVCacheGroupSpec(layer_names=[owner, sharing], kv_cache_spec=uniform)
     config = KVCacheConfig(num_blocks=2, kv_cache_tensors=[], kv_cache_groups=[group])
-    runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)
+    runner = v1_runner.TorchSpyreModelRunner.__new__(v1_runner.TorchSpyreModelRunner)
     runner.attn_groups = []
     runner.vllm_config = None
     seen = []
     monkeypatch.setattr(
-        mr.GPUModelRunner,
+        v1_runner.GPUModelRunner,
         "initialize_attn_backend",
         lambda _self, cfg, is_profiling=False: seen.append(cfg),
     )
-    monkeypatch.setattr(mr, "split_attn_groups_by_window", lambda *_: None)
+    monkeypatch.setattr(v1_runner, "split_attn_groups_by_window", lambda *_: None)
     monkeypatch.setattr("vllm.config.get_layers_from_vllm_config", lambda *_: {})
 
     runner.shared_kv_cache_layers = {}

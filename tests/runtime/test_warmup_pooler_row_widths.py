@@ -130,10 +130,14 @@ def test_the_token_pooler_behind_the_dispatch_dict_is_swept(monkeypatch):
     assert lengths == [1, 2, 8]  # the plain one-row sweep, then the ladder
 
 
-@pytest.mark.skipif(not spyre_available(), reason="needs a Spyre card")
 def test_token_pool_sweep_gathers_real_rows_on_spyre(monkeypatch):
     """The sweep's gathers run for real on the card and pick the rows the bucketed
     forward will ask for: the first ``length`` rows of the body."""
+    # Lazily, not in a skipif: the condition evaluates at import time there,
+    # claiming the card during collection, before the subprocess-first test
+    # ordering can run the engine tests.
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
     hidden = (torch.arange(ROWS * 64) % 512).reshape(ROWS, 64).to(torch.float16)
     real_select_rows = warmup.select_rows
     chunks: list[torch.Tensor] = []

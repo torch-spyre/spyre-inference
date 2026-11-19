@@ -145,6 +145,17 @@ def _maybe_uniproc(parallel_config, requested_backend) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
+# Hosts where `--load-format spyre` is the default. Everywhere else it is opt-in.
+_SPYRE_LOADER_DEFAULT_MACHINES = frozenset({"ppc64le", "ppc64"})
+
+
+def _host_machine() -> str:
+    """CPU architecture of the host (``uname -m``). A function so tests can patch it.
+
+    os.uname() rather than the ``platform`` module: this file is itself named platform.py."""
+    return os.uname().machine
+
+
 # Expert-count attributes used across HF model families (Mixtral, Qwen MoE, Gemma 4,
 # DeepSeek, etc.).
 _MOE_EXPERT_ATTRS = ("num_experts", "num_local_experts", "n_routed_experts")
@@ -494,12 +505,17 @@ class TorchSpyrePlatform(CpuPlatform):
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
 
+        # On POWER hosts the direct-to-device loader is the default; elsewhere a user opts in
+        # with --load-format spyre.
         load_config = getattr(vllm_config, "load_config", None)
-        if load_config is not None and load_config.load_format == "auto":
-            # Padding is normally applied in check_and_update_config, after this
-            # hook, so the loader gate would not see it. Both passes are
-            # idempotent: run them first, after the head_dim repair that precedes
-            # them there, so the gate can keep padded models on the stock loader.
+        if (
+            load_config is not None
+            and load_config.load_format == "auto"
+            and _host_machine() in _SPYRE_LOADER_DEFAULT_MACHINES
+        ):
+            # Padding is normally applied in check_and_update_config, after this hook, so the
+            # gate would not see it. The passes are idempotent: run them first so padded
+            # models stay on the stock loader.
             from spyre_inference.models.gemma4 import repair_head_dim_access
 
             repair_head_dim_access(vllm_config.model_config.hf_config)
@@ -975,9 +991,9 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.cache_config.kv_sharing_fast_prefill:
             raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
 
-        # Reject an explicitly-requested --load-format spyre for configs the loader
-        # doesn't support. apply_config_platform_defaults only runs for load_format="auto";
-        # a user who passes --load-format spyre directly bypasses that gate.
+        # Reject --load-format spyre (explicit, or the POWER default) for configs the loader
+        # doesn't support, instead of failing later inside the loader. The head_dim /
+        # intermediate_size padding above has already run, so it is visible here.
         load_config = getattr(vllm_config, "load_config", None)
         if (
             load_config is not None

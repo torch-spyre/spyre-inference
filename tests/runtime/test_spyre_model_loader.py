@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.utils import WeightsMapper
 
+import spyre_inference.platform as plat_mod
 from spyre_inference.model_loader import (
     SpyreModelLoader,
     _check_all_weights_loaded,
@@ -77,20 +78,40 @@ def _make_vllm_config(
     )
 
 
-def test_platform_defaults_load_format_to_spyre():
-    """Positive control: a plain TP=1 text-generation config flips auto → spyre."""
+@pytest.fixture
+def on_power(monkeypatch):
+    """Pretend the host is POWER, where `auto` resolves to the spyre loader.
+
+    Set before the VllmConfig is built: construction already runs the platform hook.
+    """
+    monkeypatch.setattr(plat_mod, "_host_machine", lambda: "ppc64le")
+
+
+@pytest.mark.parametrize("machine", ["ppc64le", "ppc64"])
+def test_platform_defaults_load_format_to_spyre_on_power(monkeypatch, machine):
+    """Positive control: a plain TP=1 text-generation config flips auto → spyre on POWER."""
+    monkeypatch.setattr(plat_mod, "_host_machine", lambda: machine)
     vllm_config = _make_vllm_config()
     assert vllm_config.load_config.load_format == "spyre"
 
 
-def test_platform_defaults_load_format_to_spyre_tp2():
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64", "s390x"])
+def test_platform_keeps_auto_load_format_off_power(monkeypatch, machine):
+    """spyre is opt-in on every other architecture: a supported config stays on 'auto'."""
+    monkeypatch.setattr(plat_mod, "_host_machine", lambda: machine)
+    vllm_config = _make_vllm_config()
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.load_config.load_format == "auto"
+
+
+def test_platform_defaults_load_format_to_spyre_tp2(on_power):
     """TP>1 is supported: auto resolves to spyre (linear weights shard on read)."""
     vllm_config = _make_vllm_config(tp_size=2)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.load_config.load_format == "spyre"
 
 
-def test_platform_defaults_load_format_to_spyre_multimodal():
+def test_platform_defaults_load_format_to_spyre_multimodal(on_power):
     """Multimodal models are supported: auto resolves to spyre."""
     vllm_config = _make_vllm_config()
     vllm_config.model_config.multimodal_config = object()
@@ -107,8 +128,8 @@ def test_platform_defaults_load_format_to_spyre_multimodal():
     ],
     ids=["quantized", "pooling"],
 )
-def test_platform_load_format_stays_auto(kwargs):
-    """load_format stays 'auto' for configs SpyreModelLoader doesn't support."""
+def test_platform_load_format_stays_auto(kwargs, on_power):
+    """Even on POWER, load_format stays 'auto' for configs SpyreModelLoader doesn't support."""
     vllm_config = _make_vllm_config(**kwargs)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.load_config.load_format == "auto"
@@ -171,12 +192,12 @@ def test_spyre_loader_supported_rejects_unsupported(kwargs, description):
     assert not _spyre_loader_supported(_make_ns(**kwargs)), description
 
 
-def test_platform_load_format_stays_auto_transformers_backend():
+def test_platform_load_format_stays_auto_transformers_backend(on_power):
     """load_format stays 'auto' for the transformers backend."""
     assert _make_vllm_config(transformers_backend=True).load_config.load_format == "auto"
 
 
-def test_platform_load_format_stays_auto_moe():
+def test_platform_load_format_stays_auto_moe(on_power):
     """load_format stays 'auto' for MoE models."""
     assert _make_vllm_config(moe=True).load_config.load_format == "auto"
 
@@ -190,8 +211,6 @@ def test_explicit_spyre_load_format_rejected_for_unsupported_config():
     _spyre_loader_supported is mocked to False to simulate an unsupported config.
     """
     import unittest.mock as mock
-
-    import spyre_inference.platform as plat_mod
 
     vllm_config = _make_vllm_config()
     vllm_config.load_config.load_format = "spyre"
@@ -248,7 +267,7 @@ def test_spyre_loader_supported_accepts_unpadded_text_config():
     assert _spyre_loader_supported(ns)
 
 
-def test_gate_sees_padding_applied_by_the_hook(monkeypatch):
+def test_gate_sees_padding_applied_by_the_hook(monkeypatch, on_power):
     """The hook must pad before gating, since check_and_update_config runs later."""
     vllm_config = _make_vllm_config()
     vllm_config.load_config.load_format = "auto"

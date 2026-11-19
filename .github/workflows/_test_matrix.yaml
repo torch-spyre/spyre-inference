@@ -804,9 +804,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-smoke
-          # The only job that installs triton: the MRV2 host kernels' parity tests against
-          # triton-cpu. Every other job runs triton-free, like Power and Z in production.
-          # Skipped on prebaked runs, which can't add a dependency group.
+          # The only job that installs triton; every other job runs triton-free, like Power and Z.
           - cfg: MRV2 triton-cpu parity
             test_types: unit regression trunk
             runs_on:

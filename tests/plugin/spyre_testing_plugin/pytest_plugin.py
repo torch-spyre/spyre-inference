@@ -484,8 +484,6 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
 # ---------------------------------------------------------------------------
 
 _UPSTREAM_MARKER = "upstream"
-# Opt-in like upstream: the parity tests against triton-cpu, which only the job that installs
-# the triton-cpu dependency group runs.
 _TRITON_CPU_MARKER = "triton_cpu"
 # Satisfiability is brute-forced over the other markers (2**N evaluations); past this, fail open.
 _MAX_FREE_MARKERS = 12

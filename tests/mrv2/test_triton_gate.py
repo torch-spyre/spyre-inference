@@ -58,8 +58,7 @@ def test_x86_has_triton_cpu() -> None:
     reason="a prebaked image holds whatever its build installed, triton included",
 )
 def test_triton_is_not_installed() -> None:
-    """Every job but the triton-cpu parity one runs triton-free, like Power and Z, so the
-    gate tests below and the on-card V2 tests run the gate for real."""
+    """Only the parity job installs triton, so every other job runs the gate as Power and Z do."""
     try:
         import triton  # noqa: F401
     except ModuleNotFoundError:

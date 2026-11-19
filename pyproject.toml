@@ -440,6 +440,5 @@ dev = [
     # pandas 3.1.0 fails to build from source on s390x (pandas-dev/pandas#71548)
     "pandas!=3.1.0; platform_machine == 's390x'",
 ]
-# Opt-in, x86 only: SPYRE_MRV2_KERNELS=triton, the parity reference for the MRV2 host kernels.
-# Kept out of default-groups so every other environment runs triton-free, like Power and Z.
+# Opt-in, x86 only: the MRV2 host kernels' parity reference. Not a default group.
 triton-cpu = ["triton; platform_machine == 'x86_64'"]

@@ -317,8 +317,7 @@ test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 test-attention-smoke: ## Run the small attention smoke subset (integration-tier attention coverage). Needs 1 card.
 	$(MAKE) run-one MARK_OVERRIDE='attention_smoke and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
-# The only suite that needs triton (the triton-cpu dependency group); every other one runs
-# triton-free, like Power and Z. CPU-only, x86-only.
+# The only suite that needs triton (the triton-cpu group). CPU-only, x86-only.
 test-triton-cpu: ## Run the MRV2 host-kernel parity tests against triton-cpu. Needs `uv sync --group dev --group triton-cpu`.
 	$(MAKE) run-one MARK_OVERRIDE='triton_cpu' JUNIT_XML=$(JUNIT_XML)
 

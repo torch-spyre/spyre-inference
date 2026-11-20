@@ -40,8 +40,6 @@ def register():
             triton_gate.close()
     except Exception:
         init_logger(__name__).exception("Spyre Triton gate could not be applied")
-    # VllmConfig.__post_init__ reads use_v2_model_runner before the platform hook.
-    pin_model_runner()
     # flex and torch-spyre read these once, when the device runtime starts on the first
     # device op in each worker, which is after this runs; an explicit value still wins.
     # Preferred on a PF device only, not on a VF.
@@ -49,20 +47,6 @@ def register():
         for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
             os.environ.setdefault(name, "1")
     return "spyre_inference.platform.TorchSpyrePlatform"
-
-
-def pin_model_runner() -> None:
-    """Pin VLLM_USE_V2_MODEL_RUNNER=1: Spyre only has Model Runner V2, and vLLM 0.33
-    still defaults to V1 without it."""
-    current = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
-    if current not in (None, "", "1"):
-        from vllm.logger import init_logger
-
-        init_logger(__name__).warning(
-            "Spyre only supports Model Runner V2; overriding VLLM_USE_V2_MODEL_RUNNER=%s to 1.",
-            current,
-        )
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
 
 @contextlib.contextmanager

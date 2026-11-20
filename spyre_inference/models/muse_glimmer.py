@@ -86,7 +86,7 @@ def _spyre_norms():
     """Build upstream's model with ``_spyre_rms_norm``, which its classes look up as a
     module global at construction."""
     saved = mg.MuseGlimmerRMSNorm
-    mg.MuseGlimmerRMSNorm = _spyre_rms_norm  # ty: ignore[invalid-assignment]
+    mg.MuseGlimmerRMSNorm = _spyre_rms_norm
     try:
         yield
     finally:

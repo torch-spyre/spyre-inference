@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Nothing of ours references a vLLM module 0.34 removes. A scan, not a runtime block:
-vLLM 0.33's own MRV2 code still imports some of them."""
+"""Nothing of ours references a vLLM module 0.34 removed. A scan rather than an import:
+it also sees a module named only in a string, such as a monkeypatch target."""
 
 import ast
 import pathlib

@@ -348,8 +348,8 @@ compiles them once, as an fp16 cache does.
 The plugin runs vLLM's Model Runner V2 (MRV2), its only model runner: the V1 runner was
 removed (#1245), and `SPYRE_MODEL_RUNNER=v1` is refused at startup. MRV2's Triton
 kernels are replaced by host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so
-no Triton install is needed on any architecture. The plugin pins
-`VLLM_USE_V2_MODEL_RUNNER=1`, so don't set it yourself.
+no Triton install is needed on any architecture. That includes Power and Z, where vLLM's
+own CPU platform would pick its standalone CPU runner instead.
 
 Differences from the removed V1 runner:
 

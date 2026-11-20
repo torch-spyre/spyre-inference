@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The platform pins vLLM's V2 runner flag, picks the V2 worker, and rejects what V2
-lacks, a mismatched Triton gate, and the removed SPYRE_MODEL_RUNNER=v1."""
+"""The platform picks the V2 worker, and rejects what V2 lacks, a mismatched Triton gate,
+and the removed SPYRE_MODEL_RUNNER=v1."""
 
 import copy
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -41,9 +40,6 @@ def vllm_config(monkeypatch: pytest.MonkeyPatch, _base_config: VllmConfig) -> Vl
     """Built under this process's real gate."""
     config = copy.deepcopy(_base_config)
     config.parallel_config.worker_cls = "auto"
-    # setenv first, so teardown also removes a value the platform hook adds.
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "")
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER")
     return config
 
 
@@ -57,7 +53,7 @@ def _set_runner(monkeypatch: pytest.MonkeyPatch, runner: str | None) -> None:
 
 
 @pytest.mark.parametrize("runner", [None, "v2"])
-def test_the_v2_worker_is_picked_and_pinned(
+def test_the_v2_worker_is_picked(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig, runner: str | None
 ) -> None:
     _set_runner(monkeypatch, runner)
@@ -68,7 +64,11 @@ def test_the_v2_worker_is_picked_and_pinned(
         vllm_config.parallel_config.worker_cls
         == "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
     )
-    assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "1"
+
+
+def test_upstreams_standalone_cpu_runner_is_never_picked() -> None:
+    """CpuPlatform picks it on Power and Z without Triton, and it rejects spec decode."""
+    assert TorchSpyrePlatform.uses_standalone_cpu_model_runner() is False
 
 
 @pytest.mark.parametrize("runner", ["v1", "v3"])
@@ -186,28 +186,6 @@ def test_v2_on_triton_needs_triton_cpu(
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
-def test_a_conflicting_vllm_use_v2_model_runner_is_overridden(
-    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
-) -> None:
-    _set_runner(monkeypatch, None)
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
-    assert vllm_config.use_v2_model_runner is True
-
-
-def test_a_config_that_forces_v1_trips_the_pin(
-    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
-) -> None:
-    _set_runner(monkeypatch, None)
-    monkeypatch.setattr(VllmConfig, "use_v2_model_runner", property(lambda self: False))
-
-    with pytest.raises(RuntimeError, match="forces the V1 model runner"):
-        TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-
 def test_kernels_changed_after_import_are_rejected(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:
@@ -240,21 +218,5 @@ def test_register_logs_a_gate_error_and_keeps_the_platform(
         lambda name: type("L", (), {"exception": lambda self, msg: logged.append(msg)})(),
     )
 
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "")
-
     assert spyre_inference.register() == "spyre_inference.platform.TorchSpyrePlatform"
     assert logged == ["Spyre Triton gate could not be applied"]
-
-
-@pytest.mark.parametrize("requested", ["", "0"])
-def test_register_pins_v2_before_any_config(
-    monkeypatch: pytest.MonkeyPatch, requested: str
-) -> None:
-    """VllmConfig.__post_init__ reads use_v2_model_runner before the platform hook runs."""
-    monkeypatch.setattr(triton_gate, "close", lambda: None)
-    monkeypatch.setattr(triton_gate, "open", lambda: None)
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", requested)
-
-    spyre_inference.register()
-
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"

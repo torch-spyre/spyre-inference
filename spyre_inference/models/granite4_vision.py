@@ -340,7 +340,8 @@ class SpyreGranite4VisionForConditionalGeneration(
         query = proj.query + (groups * down).sum(dim=1)
         out = _qformer(proj.qformer, query, enc + proj.image_positions)
         return proj.out_linear(out).reshape(  # ty: ignore[call-non-callable]
-            -1, proj.out_linear.out_features
+            -1,
+            proj.out_linear.out_features,  # ty: ignore[possibly-missing-attribute]
         )
 
     def postprocess_encoder_output(

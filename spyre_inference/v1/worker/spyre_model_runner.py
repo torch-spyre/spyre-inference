@@ -948,7 +948,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         vision tower, whose eager ops compile per op on first use anyway.
         A compiled pooling model's vision tower, and any model's compiled one, also runs
         ``embed_multimodal`` at every image-batch width up to ``mm_max_items_per_batch``;
-        see ``_warmup_multimodal_encoder``.
+        see ``_warmup_multimodal_encoder``. A ``SpyreVisionEncoderMixin`` tower, pooling or
+        generative, compiles per token budget instead (``_record_vision_graphs``).
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -981,7 +982,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # the dummy-batch seq_lens bug. No-op for encoder-only pooling
                     # models (BERT/RoBERTa), which never get a KV cache.
                     self._record_attention_graphs()
-                self._warmup_multimodal_encoder()
+                # A mixin tower compiles per token budget instead, after the attention kernels.
+                if self._compiled_vision_model() is None:
+                    self._warmup_multimodal_encoder()
+            self._record_vision_graphs()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -1091,6 +1095,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         assert self.mm_budget is not None
         model.max_tokens_per_item = max(
             self.mm_budget.mm_max_toks_per_item[m] for m in model.vision_modalities
+        )
+        model.max_items_per_step = max(
+            self.mm_budget.mm_max_items_per_batch[m] for m in model.vision_modalities
         )
         return SpyreEncoderGraphManager(
             self.vllm_config, self._spyre_device, self._model_dtype(), model

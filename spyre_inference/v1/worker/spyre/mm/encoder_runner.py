@@ -14,10 +14,15 @@
 
 """MRV2: mm-embed staging (vllm/v1/worker/gpu/mm/encoder_runner.py:EncoderRunner).
 
-A Spyre-resident staging buffer for multimodal embeddings, ported from
-spyre_inference's existing mm-embed staging work (commit 2623972). Needs
-the model wrapper (load.load_and_wrap) installed first: the buffer must
-allocate on Spyre, not on the CPU device the base runner constructs on.
+Upstream allocates ``inputs_embeds`` on the runner's device, the host here, so a dummy
+run hands the model a host tensor beside Spyre weights, and get_inputs_embeds copies
+the wrapper's Spyre-resident result back onto the host. On Spyre the buffer lives on
+the card and is the wrapper's own staging buffer: _SpyreModelWrapper.embed_input_ids
+stages its result there at the bucket's shape and returns the prefix view, so
+upstream's ``inputs_embeds[:n] = x`` is a self-copy torch-spyre skips.
+
+Multimodal kwargs stay on the host (``device``): the wrapper's embed_multimodal moves
+the float ones to Spyre itself.
 """
 
 from typing import Any
@@ -28,7 +33,7 @@ from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 
 
 class SpyreEncoderRunner(EncoderRunner):
-    """MRV2: EncoderRunner, staging inputs_embeds on Spyre instead of the GPU."""
+    """MRV2: EncoderRunner, staging inputs_embeds on Spyre."""
 
     def __init__(
         self,
@@ -38,6 +43,13 @@ class SpyreEncoderRunner(EncoderRunner):
         encoder_cache: EncoderCache,
         dtype: torch.dtype,
         device: torch.device,
+        *,
+        spyre_device: torch.device,
         **kwargs: Any,
     ) -> None:
-        raise NotImplementedError
+        super().__init__(model, max_num_tokens, hidden_size, encoder_cache, dtype, device, **kwargs)
+        self.inputs_embeds = torch.zeros(
+            max_num_tokens, hidden_size, dtype=dtype, device=spyre_device
+        )
+        # Bypasses _SpyreModelWrapper.__setattr__, which forwards to the model.
+        object.__setattr__(model, "_inputs_embeds_buffer", self.inputs_embeds)

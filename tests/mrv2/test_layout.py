@@ -129,10 +129,6 @@ def _imports_model_runner(tree: ast.Module, containing_package: str) -> bool:
 @pytest.mark.parametrize(
     "path",
     _non_package_files(),
-    # Not just cosmetic: the root tests/conftest.py skips any item whose id
-    # contains "batched_decode" (unrelated to this package), which would
-    # otherwise silently skip, rather than run, this check on
-    # batched_decode.py / batched_decode_head_major.py.
     ids=lambda p: str(p.relative_to(_REPO_ROOT)).replace("_", "-"),
 )
 def test_nothing_outside_the_package_imports_it(path: pathlib.Path) -> None:
@@ -140,7 +136,7 @@ def test_nothing_outside_the_package_imports_it(path: pathlib.Path) -> None:
     if _imports_spyre_package(tree, _containing_package(path)):
         assert path in _ALLOWED_IMPORTERS, (
             f"{path.relative_to(_REPO_ROOT)} imports spyre_inference.v1.worker.spyre, "
-            "but nothing outside the package may import it until V2 is the default."
+            "but nothing outside the package may import it until V1 is removed (#1245)."
         )
 
 

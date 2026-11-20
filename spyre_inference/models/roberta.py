@@ -35,7 +35,7 @@ from vllm.model_executor.models.roberta import (
     RobertaForTokenClassification,
 )
 
-from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
@@ -122,43 +122,10 @@ def offset_host_positions(positions: torch.Tensor, delta: int) -> torch.Tensor:
 class SpyreRobertaEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, RobertaEmbedding):
     """``RobertaEmbedding`` reading segment ids from the side buffer.
 
-    ``position_ids`` already include ``padding_idx + 1``. One compiled forward
-    so the three gathers, the two adds, and the layer norm are one program.
+    ``position_ids`` already include ``padding_idx + 1``.
     """
 
     padding_idx: int
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Pass side-buffer segment ids, or zeros, into the compiled gather.
-        # ``position_ids`` already include the offset.
-        return self._compiled_forward(
-            input_ids,
-            position_ids,
-            self.spyre_token_type_ids_for(input_ids),
-            inputs_embeds,
-        )
-
-    @maybe_compile
-    def _compiled_forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        token_type_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if inputs_embeds is None:
-            inputs_embeds = self.word_embeddings(input_ids)
-        embeddings = (
-            inputs_embeds
-            + self.token_type_embeddings(token_type_ids)
-            + self.position_embeddings(position_ids)
-        )
-        return self.LayerNorm(embeddings)
 
 
 class SpyreRobertaEmbeddingMixin:

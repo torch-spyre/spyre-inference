@@ -83,6 +83,7 @@ runs:
           echo "Extracting $(basename "$rpm")..."
           rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
         done
+        python3 -I .github/scripts/relocate_spyre_libs.py "$SPYRE_LIBS"
 
         # Refresh the synthesized components.txt so the cache key reflects the
         # override. --merge because an override carries only a subset of packages.

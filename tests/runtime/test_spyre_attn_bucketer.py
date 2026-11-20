@@ -625,13 +625,8 @@ class TestBatchedDecodeVariants:
 
 
 class TestSingleKvHeadBlockFloor:
-    """A lone KV head on a lone page will not compile under the head-major layout, so
-    the block ladder floors to two -- see the note at the floor."""
-
-    @pytest.fixture(autouse=True)
-    def _head_major(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
-        envs.clear_env_cache()
+    """A lone KV head on a lone page will not compile, so the block ladder floors to
+    two -- see the note at the floor."""
 
     def test_floors_the_ladder_at_one_kv_head(self):
         b = SpyreAttnBucketer(make_config(num_kv_heads=1))
@@ -664,10 +659,154 @@ class TestSingleKvHeadBlockFloor:
         assert min(b.num_blocks_buckets) == 1
 
 
-class TestSingleKvHeadBlockFloorTokenMajor:
-    def test_token_major_keeps_the_single_block_bucket(self, monkeypatch):
-        """Only the head-major decode kernel has the constraint."""
-        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
+class TestLargeBatchLadder:
+    @pytest.fixture()
+    def hybrid(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+        monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "16")
         envs.clear_env_cache()
-        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
-        assert min(b.num_blocks_buckets) == 1
+        return SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
+
+    def test_off_by_default(self, bucketer):
+        for s in bucketer.num_seqs_buckets:
+            assert bucketer.batched_blocks_buckets(s) == bucketer.num_blocks_buckets
+
+    def test_dense_only_at_and_above_the_threshold(self, hybrid):
+        base = hybrid.num_blocks_buckets
+        for s in hybrid.num_seqs_buckets:
+            buckets = hybrid.batched_blocks_buckets(s)
+            if s >= 16:
+                assert set(base) < set(buckets)
+            else:
+                assert buckets == base
+
+    def test_never_rounds_up_further_than_the_base_ladder(self, hybrid):
+        for num_blocks in range(1, hybrid.num_blocks_buckets[-1] + 1):
+            for s in hybrid.num_seqs_buckets:
+                batched = hybrid.find_batched_blocks_bucket(num_blocks, s)
+                assert batched <= hybrid.find_blocks_bucket(num_blocks)
+
+    def test_variants_follow_each_batch_size_ladder(self, hybrid):
+        assert {(v.num_seqs, v.num_blocks) for v in hybrid.batched_decode_variants()} == {
+            (s, n) for s in hybrid.num_seqs_buckets for n in hybrid.batched_blocks_buckets(s)
+        }
+
+    def test_per_seq_variants_keep_the_base_ladder(self, hybrid):
+        assert {v.num_blocks for v in hybrid.variants()} == set(hybrid.num_blocks_buckets)
+
+    def test_explicit_buckets_reject_it(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "256,1024")
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match="cannot be combined with SPYRE_ATTN_KV_BUCKETS"):
+            SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
+
+    def test_a_threshold_above_every_batch_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+        envs.clear_env_cache()
+        with caplog.at_level("WARNING"):
+            b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=8))
+        assert b.batched_blocks_buckets(8) == b.num_blocks_buckets
+        assert any("never applies" in r.getMessage() for r in caplog.records)
+
+    def test_an_unknown_large_batch_name_names_its_own_variable(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "7_4")
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER_LARGE_BATCH='7_4'"):
+            SpyreAttnBucketer(make_config(max_model_len=4096, max_num_seqs=32))
+
+    @pytest.mark.parametrize(
+        ("raw", "match"),
+        [
+            ("0", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
+            ("-4", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
+            ("many", "invalid literal for int"),
+            ("1.5", "invalid literal for int"),
+        ],
+    )
+    def test_an_invalid_threshold_is_rejected(self, monkeypatch, raw, match):
+        monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", raw)
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match=match):
+            SpyreAttnBucketer(make_config())
+
+
+class TestDeclaredPages:
+    """The per-sequence kernels take a page range instead of the KV buckets when it fits."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_ts_limits(self):
+        from torch_spyre._inductor import config as ts_config
+
+        # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+        # config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+            yield
+
+    def test_one_variant_per_query_bucket(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        variants = b.variants()
+        assert {v.num_blocks for v in variants} == {b.num_blocks_buckets[-1]}
+        assert [v.padded_query_len for v in variants] == sorted(b.query_buckets, reverse=True)
+
+    def test_page_range_spans_two_pages_to_max_model_len(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
+        assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [2, 2, 7, 32]
+
+    def test_prefill_page_counts_are_multiples_of_eight_from_sixteen(self):
+        from torch_spyre._inductor import config as ts_config
+
+        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is not None
+        assert b.page_range["max"] == 31
+        assert b.prefill_page_range == {"min": 16, "max": 32, "granularity": 8}
+        assert ts_config.max_buckets >= 32
+        assert [b.find_declared_pages(n, prefill=True) for n in (1, 8, 16, 17, 32)] == [
+            16,
+            16,
+            16,
+            24,
+            32,
+        ]
+
+    def test_prefill_keeps_single_pages_above_the_exported_max_buckets(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        monkeypatch.setenv("MAX_BUCKETS", "31")
+        ts_config.max_buckets = 31
+        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is not None
+        assert b.prefill_page_range == b.page_range
+
+    def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
+        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
+        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        assert b.page_range is not None
+        assert b.page_range["min"] == 8
+        assert b.find_declared_pages(3) == 8
+
+    def test_a_context_at_an_exported_min_reserved_dim_size_keeps_the_buckets(self, monkeypatch):
+        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
+        b = SpyreAttnBucketer(make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is None
+        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+
+    def test_max_buckets_grows_to_cover_max_model_len(self):
+        from torch_spyre._inductor import config as ts_config
+
+        b = SpyreAttnBucketer(make_config(max_model_len=32768), declare_pages=True)
+        assert b.page_range == {"min": 2, "max": 32768 // BLOCK_SIZE, "granularity": 1}
+        assert ts_config.max_buckets == 32768 // BLOCK_SIZE
+
+    def test_a_context_above_the_exported_max_buckets_keeps_the_buckets(self, monkeypatch):
+        monkeypatch.setenv("MAX_BUCKETS", "32")
+        b = SpyreAttnBucketer(make_config(max_model_len=4096 + BLOCK_SIZE), declare_pages=True)
+        assert b.page_range is None
+        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+
+    def test_without_declare_pages_keeps_the_buckets(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.page_range is None

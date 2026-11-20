@@ -14,6 +14,7 @@ nav:
       - Speculative Decoding: user_guide/speculative_decoding.md
     - Developer Guide:
       - Contributing: contributing/README.md
+      - The Integration Tier: contributing/integration-tier.md
       - vLLM Upgrade Procedure: contributing/vllm-upgrade-procedure.md
 
   - Getting Started:
@@ -29,4 +30,5 @@ nav:
     - Speculative Decoding: user_guide/speculative_decoding.md
   - Developer Guide:
     - Contributing: contributing/README.md
+    - The Integration Tier: contributing/integration-tier.md
     - vLLM Upgrade Procedure: contributing/vllm-upgrade-procedure.md

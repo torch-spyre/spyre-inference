@@ -46,7 +46,7 @@ from typing import ClassVar, cast
 
 import torch
 import torch.nn.functional as F
-from vllm.config import get_current_vllm_config
+from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -565,6 +565,16 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Upstream checks supports_sink() on CUDA/ROCm only, and these kernels never read
+        # the sinks (openai_privacy_filter passes them), so this is the only guard.
+        if self._sinks_source is not None:
+            raise NotImplementedError("Spyre encoder attention does not support attention sinks")
+        # `== STOCK`, not `!= NONE`: a CompilationConfig that never went through the
+        # platform hook leaves mode unset (Python None), which `!= NONE` would wrongly
+        # treat as compiled. The platform resolves compiled runs to STOCK, which is also
+        # what the `default_vllm_config` test fixture ends up with.
+        mode = get_current_vllm_config().compilation_config.mode
+        self._compile_attn = mode == CompilationMode.STOCK_TORCH_COMPILE
         if self._compile_attn:
             self._rect_fn = _encoder_rect_compiled
             self._rect_out_fn = _encoder_rect_out_compiled

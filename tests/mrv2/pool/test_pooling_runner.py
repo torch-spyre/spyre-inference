@@ -30,6 +30,7 @@ from spyre_inference.v1.pool import warmup
 from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool
 from spyre_inference.v1.worker.spyre.pool import pooling_runner
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
+from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 
 _HIDDEN = 4
 
@@ -152,7 +153,11 @@ def test_host_pooling_unpads_the_grid_then_defers_to_upstream(monkeypatch) -> No
 def test_supported_tasks_see_through_the_wrapper(monkeypatch) -> None:
     """is_pooling_model is an isinstance check, which the wrapper fails."""
     bare = object()
-    wrapper = types.SimpleNamespace(_model=types.SimpleNamespace(_orig_mod=bare))
+    wrapper = _SpyreModelWrapper(
+        types.SimpleNamespace(_orig_mod=bare),  # ty: ignore[invalid-argument-type]
+        torch.device("cpu"),
+        model_dtype=torch.float16,
+    )
     seen = []
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.pool.pooling_runner.PoolingRunner.get_supported_tasks",

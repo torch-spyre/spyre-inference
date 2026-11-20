@@ -321,7 +321,6 @@ SPYRE_DEVICES=0,1,2,3            # derived from tensor-parallel-size</pre>
     <pre>defaults:
   server_health_timeout: 3600
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
   server_parameters:
     load-format: auto
@@ -354,7 +353,7 @@ export SPYRE_KERNEL_CACHE=1
 cd spyre-inference &amp;&amp; make perf-tests BENCH_TYPES=serve \
   BENCH_CONFIGS_DIR=../bench-prXXX RESULTS_DIR=../bench-prXXX/&lt;leg&gt;/results</pre>
     <p>Server command (from <code>_server.cmd</code>):</p>
-    <pre>AIU_WORLD_SIZE=4 DTLOG_LEVEL=error SPYRE_DEVICES=0,1,2,3 VLLM_CPU_KVCACHE_SPACE=64 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+    <pre>AIU_WORLD_SIZE=4 DTLOG_LEVEL=error SPYRE_DEVICES=0,1,2,3 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
   python -m vllm.entrypoints.cli.main serve ibm-granite/granite-3.3-8b-instruct \
   --load-format auto --max-num-seqs 4 --max-num-batched-tokens 512 --enable-prefix-caching \
   --tensor-parallel-size 4 --max-model-len 8192</pre>

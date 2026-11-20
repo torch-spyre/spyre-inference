@@ -253,7 +253,7 @@ def test_spyre_rmsnorm_compiled_outermost_matches_reference(
     layer.to("spyre")
     actual = layer.forward_oot(x.to("spyre"), residual.to("spyre") if use_residual else None)
 
-    assert layer.spyre_compiled_kernel is not None, "the outermost call did not compile"
+    assert layer.spyre_compiled_kernels, "the outermost call did not compile"
     pairs = zip(actual, expected) if use_residual else [(actual, expected)]
     for got, want in pairs:
         torch.testing.assert_close(got.cpu().float(), want.float(), atol=_ATOL, rtol=_RTOL)

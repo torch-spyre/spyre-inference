@@ -38,17 +38,22 @@ DECODER_MODELS = [
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",
     "google/gemma-4-26B-A4B",
+    "google/gemma-4-E2B",
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
-# Both gemma-4 checkpoints carry a vision tower this decoder test does not need. Every
+# Every gemma-4 checkpoint carries a vision tower this decoder test does not need. Every
 # modality at 0 keeps the default Gemma4ForConditionalGeneration load and stage-skips the
 # tower; test_compile.py pins the text backbone instead, so both text-only loads are covered.
 TEXT_ONLY_MM_LIMITS = {"image": 0, "video": 0, "audio": 0}
 MM_LIMITS = {
     "google/gemma-4-31B": TEXT_ONLY_MM_LIMITS,
     "google/gemma-4-26B-A4B": TEXT_ONLY_MM_LIMITS,
+    "google/gemma-4-E2B": {"image": 1, "video": 0, "audio": 0},
 }
+# An image prompt is the only path that reads upstream's PLE cache in forward, so E2B also
+# serves one on the same engine. One small encoder budget keeps the tower compile short.
+IMAGE_SMOKE_SOFT_TOKENS = {"google/gemma-4-E2B": 70}
 
 # Maps to the unquantized sibling whose prompts the smoke case borrows.
 FP8_DECODER_MODELS = {
@@ -122,6 +127,12 @@ def test_decoder_model_output(
         task="generate",
         enforce_eager=False,
     )
+    soft_tokens = IMAGE_SMOKE_SOFT_TOKENS.get(model)
+    compilation_config: dict[str, Any] = {"compile_sizes": COMPILE_SIZES}
+    vision_kwargs: dict[str, Any] = {}
+    if soft_tokens:
+        compilation_config["encoder_cudagraph_token_budgets"] = [soft_tokens]
+        vision_kwargs["mm_processor_kwargs"] = {"max_soft_tokens": soft_tokens}
     engine = LLM(
         model=model,
         revision=revision,
@@ -130,8 +141,9 @@ def test_decoder_model_output(
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        compilation_config={"compile_sizes": COMPILE_SIZES},
+        compilation_config=compilation_config,
         limit_mm_per_prompt=MM_LIMITS.get(model, {}),
+        **vision_kwargs,
     )
 
     outputs = engine.generate(
@@ -151,6 +163,19 @@ def test_decoder_model_output(
         for hf_result, output in zip(ref["results"], outputs)
     ]
     _report_reference_coverage(model, matched, max_tokens, record_property)
+
+    if soft_tokens:
+        from PIL import Image
+
+        (image_output,) = engine.generate(
+            {
+                "prompt": "<|image|>Describe this image in one short sentence.",
+                "multi_modal_data": {"image": Image.new("RGB", (176, 176), (40, 120, 200))},
+            },
+            SamplingParams(temperature=0.0, max_tokens=8),
+            use_tqdm=False,
+        )
+        assert image_output.outputs[0].text.strip(), f"empty generation from {model}'s vision path"
 
 
 @pytest.mark.parametrize("model", FP8_DECODER_MODELS)

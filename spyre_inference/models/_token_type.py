@@ -35,7 +35,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from spyre_inference.custom_ops.lazy_compile import CompileOutermost
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.models._retype import retype
 
 if TYPE_CHECKING:
     from torch import nn
@@ -43,7 +44,11 @@ if TYPE_CHECKING:
 
 
 class SpyreTokenTypeEmbedding:
-    """Embedding mixin taking ``token_type_ids`` as a side input."""
+    """Embedding mixin taking ``token_type_ids`` as a side input.
+
+    One compiled forward: the word, segment, and position tables and the layer norm
+    inline into it. Combine with ``CompileOutermost``, which arms that compile.
+    """
 
     spyre_token_type_ids: torch.Tensor | None = None
 
@@ -95,6 +100,36 @@ class SpyreTokenTypeEmbedding:
             return torch.zeros_like(input_ids)
         return token_type_ids
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self._compiled_forward(
+            input_ids,
+            position_ids,
+            self.spyre_token_type_ids_for(input_ids),
+            inputs_embeds,
+        )
+
+    @maybe_compile
+    def _compiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        embeddings = (
+            inputs_embeds
+            + self.token_type_embeddings(token_type_ids)
+            + self.position_embeddings(position_ids)
+        )
+        return self.LayerNorm(embeddings)
+
 
 class SpyreTokenTypeModel:
     """Top-level mixin handing ``token_type_ids`` to the embedding out of band.
@@ -111,15 +146,7 @@ class SpyreTokenTypeModel:
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)  # ty: ignore[unknown-argument]
-        embeddings = self.spyre_embeddings()
-        upstream_class = self.spyre_embedding_class.__bases__[-1]
-        if type(embeddings) is not upstream_class:
-            raise RuntimeError(
-                f"expected {upstream_class.__name__} embeddings, got "
-                f"{type(embeddings).__name__}; the Spyre token_type transport "
-                "needs updating for this vLLM version."
-            )
-        embeddings.__class__ = self.spyre_embedding_class
+        embeddings = retype(self.spyre_embeddings(), self.spyre_embedding_class)
         # The swap does not rerun ``__init__``. This is that constructor hook.
         CompileOutermost.arm_outer_compile(cast(CompileOutermost, embeddings))
 

@@ -503,15 +503,6 @@ def test_dense_kernel_matches_dense_sdpa_reference(
     ],
 )
 @pytest.mark.parametrize(
-    "block_size",
-    [
-        # Valid block_size values: must be multiples of 64 for Spyre stick alignment.
-        pytest.param(64, id="block_size(64)"),
-        pytest.param(128, id="block_size(128)"),
-        pytest.param(256, id="block_size(256)"),
-    ],
-)
-@pytest.mark.parametrize(
     "dtype",
     [
         pytest.param(torch.float16, id="dtype(fp16)"),
@@ -521,7 +512,6 @@ def test_dense_kernel_matches_dense_sdpa_reference(
 def test_spyre_encoder_attn(
     default_vllm_config,
     dtype: torch.dtype,
-    block_size: int,
     head_size: int,
     num_heads: tuple[int, int],
     seq_lens: list[tuple[int, int]],
@@ -530,6 +520,8 @@ def test_spyre_encoder_attn(
 ) -> None:
     """Validate SpyreEncoderAttentionImpl against a bidirectional reference."""
     num_query_heads, num_kv_heads = num_heads
+    # The encoder keeps no KV cache, so the block size reaches nothing it computes.
+    block_size = 64
     # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -687,6 +679,20 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
         query.contiguous(), key.contiguous(), value.contiguous(), [total_tokens], head_size**-0.5
     )
     torch.testing.assert_close(output.to("cpu"), ref, atol=0.2, rtol=0.2)
+
+
+def test_attention_sinks_are_rejected(default_vllm_config):
+    """openai_privacy_filter passes sinks to an encoder-only layer, and nothing upstream
+    screens it out on Spyre. These kernels never read sinks, so without the raise it would
+    silently run plain attention."""
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        SpyreEncoderAttentionImpl(
+            num_heads=8,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=8,
+            sinks=torch.zeros(8, dtype=torch.float16),
+        )
 
 
 @torch.inference_mode()

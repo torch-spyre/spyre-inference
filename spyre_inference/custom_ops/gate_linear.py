@@ -16,13 +16,19 @@
 
 Spyre cannot restickify fp32 (``spyre::ReStickifyOpHBM`` is unsupported for
 IEEE_FP32); the routing reduction over them is promoted in ``moe`` instead.
+
+The transposed-weight mixin also keeps vLLM's ``ModelWeightParameter`` out of
+``F.linear``: tracing its ``__torch_function__`` makes Dynamo run the whole block
+with it disabled, so the attention kernels inside recompile at serving time.
 """
 
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
+from spyre_inference.custom_ops.linear import _SpyreTransposedLinearMixin
+
 
 @GateLinear.register_oot(name="GateLinear")
-class SpyreGateLinear(GateLinear):
+class SpyreGateLinear(_SpyreTransposedLinearMixin, GateLinear):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Cleared here rather than through the argument, to also catch positional callers.

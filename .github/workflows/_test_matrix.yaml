@@ -737,7 +737,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-3
-          - cfg: Spyre attention tests (shard 5/5)
+          - cfg: Spyre attention tests (shard 5/8)
             test_types: unit regression trunk
             runs_on:
               - x86_64

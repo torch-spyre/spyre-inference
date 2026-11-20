@@ -46,6 +46,8 @@ def _meta(rows: int, *, greedy: bool) -> SamplingMetadata:
         allowed_token_ids_mask=None,
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
+        # The runner always passes one (often empty) list per request.
+        spec_token_ids=[[] for _ in range(rows)],
     )
 
 

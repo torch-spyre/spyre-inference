@@ -58,7 +58,7 @@ def batch_is_device_greedy(meta: SamplingMetadata, has_structured_output: bool) 
         or meta.bad_words_token_ids
         or meta.max_num_logprobs is not None
         or meta.logprob_token_ids
-        or meta.spec_token_ids
+        or any(meta.spec_token_ids or ())
         or meta.logitsprocs.argmax_invariant
         or meta.logitsprocs.non_argmax_invariant
     ):

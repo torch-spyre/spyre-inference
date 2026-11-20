@@ -95,7 +95,7 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).mean(dim=0)
 
 
-def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
+def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0, max_model_len=4096):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
@@ -103,10 +103,11 @@ def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
+            max_model_len=max_model_len,
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: videos if modality == "video" else 4,
                 mm_encoder_tp_mode=tp_mode,
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=2),
     )
@@ -122,6 +123,13 @@ def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     manager = _manager(_FakeVisionModel(max_tokens=300))
     assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
     assert all(b * MERGE_PATCHES % 64 == 0 for b in manager.token_budgets)
+
+
+def test_largest_budget_is_capped_at_max_model_len():
+    """An item longer than the context is rejected before the encoder, so no budget holds it."""
+    manager = _manager(_FakeVisionModel(max_tokens=300), max_model_len=128)
+    assert manager.token_budgets == [16, 32, 64, 128]
+    _manager(_FakeVisionModel(max_tokens=300), max_model_len=128, budgets=[64, 128])
 
 
 def test_user_budgets_below_the_largest_item_fail_at_startup():
@@ -531,6 +539,35 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     assert manager.graph_hits == 2 and manager.graph_misses == 0
     # Every bucket an image step can reach; the one-token bucket is never one.
     assert merged == [4, 16]
+
+
+def test_mrv2_encoder_runner_serves_through_the_captured_budgets(monkeypatch):
+    import vllm.v1.worker.gpu.mm.encoder_runner as encoder_runner_module
+    from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
+
+    model = _FakeVisionModel(max_tokens=300)
+    model.embed_multimodal = lambda **kwargs: pytest.fail("fell back to embed_multimodal")
+    manager = _manager(model)
+    assert not manager.is_captured()
+    manager.capture(graph_pool=None)
+    assert manager.is_captured()
+
+    monkeypatch.setattr(
+        encoder_runner_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **kwargs: [("image", len(items), {"tokens": [10, 30]})],
+    )
+    runner: Any = EncoderRunner.__new__(EncoderRunner)
+    runner.model = model
+    runner.device = torch.device("cpu")
+    runner.cudagraph_manager = manager
+
+    outputs = runner.execute_mm_encoder([("image", None), ("image", None)])
+
+    assert [o.shape[0] for o in outputs] == [10, 30]
+    assert (manager.graph_hits, manager.graph_misses) == (2, 0)
+    manager.clear()
+    assert not manager.is_captured()
 
 
 def _prompt(mask_rows: list[int], num_tokens: int = 12):

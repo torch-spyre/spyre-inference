@@ -186,13 +186,25 @@ def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
-    """The guard test on the V2 runner, plus a prompt-logprobs request: its chunk is the
-    one lm_head width wider than any sampled batch, which warmup once left cold.
+def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt-logprobs request's chunk is the one lm_head width wider than any sampled
+    batch, which warmup once left cold."""
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "1, 2, 3, 4, 5, 6,",
+        " 7, 8, 9, 10, 11",
+        monkeypatch,
+        prompt_logprobs=1,
+    )
 
-    In a fresh interpreter: the Triton gate binds the runner choice at vLLM import, which
-    this process has long since done."""
-    node = f"{__file__}::test_compile_guard_with_prompt_logprobs"
+
+def test_v1_runner_fallback() -> None:
+    """SPYRE_MODEL_RUNNER=v1 still serves a small greedy decoder, until V1 is removed (#1245).
+
+    In a fresh interpreter: register() pins vLLM's runner flag at vLLM import, which this
+    process has long since done."""
+    node = f"{__file__}::test_v1_runner_child"
     result = subprocess.run(
         [
             sys.executable,
@@ -205,7 +217,7 @@ def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
             "-m",
             "not upstream",
         ],
-        env={**os.environ, "SPYRE_MODEL_RUNNER": "v2", "_SPYRE_V2_CHILD": "1"},
+        env={**os.environ, "SPYRE_MODEL_RUNNER": "v1", "_SPYRE_V1_CHILD": "1"},
         capture_output=True,
         text=True,
     )
@@ -214,16 +226,29 @@ def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
     assert "1 passed" in result.stdout, result.stdout[-4000:]
 
 
-@pytest.mark.skipif(os.environ.get("_SPYRE_V2_CHILD") != "1", reason="run by the V2 test above")
-def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.skipif(os.environ.get("_SPYRE_V1_CHILD") != "1", reason="run by the V1 test above")
+def test_v1_runner_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.config import VllmConfig
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Checked from the platform hook's result, not the env, so a silent V2 run fails.
+    seen = []
+    hook = TorchSpyrePlatform.check_and_update_config.__func__
+
+    def record(cls, vllm_config: VllmConfig) -> None:
+        hook(cls, vllm_config)
+        seen.append(vllm_config.parallel_config.worker_cls)
+
+    monkeypatch.setattr(TorchSpyrePlatform, "check_and_update_config", classmethod(record))
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     _assert_compiled_output(
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
         "1, 2, 3, 4, 5, 6,",
         " 7, 8, 9, 10, 11",
         monkeypatch,
-        prompt_logprobs=1,
     )
+    assert seen and set(seen) == {"spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"}
 
 
 def _assert_compiled_output(

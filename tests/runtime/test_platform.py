@@ -602,11 +602,13 @@ def test_only_tensor_parallelism_is_accepted(field):
 
 @pytest.mark.parametrize("requested", ["1", "true", "0", None])
 def test_v1_model_runner_is_pinned(monkeypatch, requested):
-    """TorchSpyreWorker only builds the V1 runner, so the resolved config must agree
-    whatever the user asked for. An explicit VLLM_USE_V2_MODEL_RUNNER=1 short-circuits
-    upstream's HAS_TRITON fallback, so the override is what prevents V2 here."""
+    """With SPYRE_MODEL_RUNNER=v1, TorchSpyreWorker only builds the V1 runner, so the
+    resolved config must agree whatever the user asked for. An explicit
+    VLLM_USE_V2_MODEL_RUNNER=1 short-circuits upstream's HAS_TRITON fallback, so the
+    override is what prevents V2 here."""
     from spyre_inference.platform import TorchSpyrePlatform
 
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
     # After construction: register() pins the env var before VllmConfig reads it.
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
     if requested is None:
@@ -625,9 +627,11 @@ def test_v2_only_features_are_rejected(monkeypatch, feature):
     """hisparse and watermarking outrank VLLM_USE_V2_MODEL_RUNNER inside
     use_v2_model_runner: hisparse raises an error blaming the env var *we* set, and
     watermarking silently returns V2. AuxOutput never flips the runner, so the tripwire
-    cannot catch it, and it would be accepted and never produced. Reject all three here."""
+    cannot catch it, and it would be accepted and never produced. Reject all three on
+    SPYRE_MODEL_RUNNER=v1."""
     from spyre_inference.platform import TorchSpyrePlatform
 
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
     if feature == "hisparse":
@@ -763,13 +767,16 @@ def test_raise_dynamo_recompile_limits_survives_a_clobber():
         ) = saved
 
 
-def test_worker_reasserts_recompile_limits_after_autoload():
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_worker_reasserts_recompile_limits_after_autoload(runner):
     """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
     import inspect
 
-    from spyre_inference.v1.worker import spyre_worker
+    from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
+    from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
-    src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
+    worker = TorchSpyreWorker if runner == "v1" else SpyreWorkerV2
+    src = inspect.getsource(worker.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
 
 

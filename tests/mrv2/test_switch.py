@@ -58,7 +58,7 @@ def _set_runner(monkeypatch: pytest.MonkeyPatch, runner: str | None) -> None:
 @pytest.mark.parametrize(
     ("runner", "worker_cls", "use_v2"),
     [
-        (None, "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0"),
+        (None, "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2", "1"),
         ("v1", "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0"),
         ("v2", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2", "1"),
     ],
@@ -215,10 +215,10 @@ def test_runner_changed_after_import_is_rejected(
 ) -> None:
     """The env cache still holds the value register() saw; the check must not trust it."""
     monkeypatch.delenv("SPYRE_MODEL_RUNNER", raising=False)
+    monkeypatch.delenv("SPYRE_MRV2_KERNELS", raising=False)
     envs.clear_env_cache()
-    assert envs.SPYRE_MODEL_RUNNER == "v1"
+    assert (envs.SPYRE_MODEL_RUNNER, envs.SPYRE_MRV2_KERNELS) == ("v2", "host")
     monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: True)
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
     monkeypatch.setenv("SPYRE_MRV2_KERNELS", "triton")
 
     with pytest.raises(ValueError, match="SPYRE_MRV2_KERNELS=triton needs HAS_TRITON=True"):
@@ -248,7 +248,7 @@ def test_register_logs_a_gate_error_and_keeps_the_platform(
     assert logged == ["Spyre Triton gate could not be applied"]
 
 
-@pytest.mark.parametrize(("runner", "pinned"), [(None, "0"), ("v2", "1")])
+@pytest.mark.parametrize(("runner", "pinned"), [(None, "1"), ("v1", "0"), ("v2", "1")])
 def test_register_pins_the_runner_before_any_config(
     monkeypatch: pytest.MonkeyPatch, runner: str | None, pinned: str
 ) -> None:

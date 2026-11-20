@@ -36,19 +36,22 @@ Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B`,
 `Gemma4ForConditionalGeneration` and build a vision tower — weights to load and graphs to
 warm up that a text-only workload never runs.
 
-To use one of those repositories for text only, pin its decoder architecture:
+To use one of those repositories for text only, pass vLLM's `--language-model-only`
+(`language_model_only=True` offline). It sets every modality limit to 0, so the tower is
+neither built nor warmed up:
 
 ```python
 llm = LLM(
     model="google/gemma-4-26B-A4B",
-    hf_overrides={"architectures": ["Gemma4ForCausalLM"]},
+    language_model_only=True,
     tensor_parallel_size=2,
 )
 ```
 
-That is also the configuration the tensor-parallel and compile e2e tests run these
-checkpoints under. A repository with no vision tower gets the override by default, so
-this is only needed for the multimodal ones.
+The tensor-parallel and compile e2e tests instead pin the decoder architecture,
+`hf_overrides={"architectures": ["Gemma4ForCausalLM"]}`, which loads the decoder alone
+without the multimodal wrapper. A repository with no vision tower gets that override by
+default.
 
 ## Gemma-4: per-request image sizes
 
@@ -190,7 +193,7 @@ prefills don't pad up to the larger one:
 ```bash
 vllm serve google/gemma-4-26B-A4B -tp 4 --max-model-len 32768 \
     --max-num-batched-tokens 1024 \
-    --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'
+    --language-model-only
 ```
 
 Warmup takes longer, and for prompts under a few thousand tokens it gains little; decode

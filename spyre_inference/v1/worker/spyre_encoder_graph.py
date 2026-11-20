@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from spyre_inference.custom_ops.utils import convert
@@ -29,7 +31,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
 
-    from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
+    from spyre_inference.models._vision_encoder import (
+        SpyreVisionEncoderMixin,
+        VisionEncodeState,
+    )
+    from spyre_inference.v1.core.vision_slices import VisionSlices
 
 logger = init_logger(__name__)
 
@@ -118,6 +124,11 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                     budgets if fit is None else [b for b in budgets if b <= fit]
                 )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+        # Typed as the mixin: upstream types ``self.model`` as its protocol, which lacks
+        # ``vision_start`` and the other resumable pieces.
+        self._vision = model
+        # Encoder passes spread over steps (vision_slices), by mm_hash.
+        self._slice_passes: dict[str, tuple[VisionEncodeState, dict[str, Any]]] = {}
 
     def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
         """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
@@ -196,6 +207,66 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         # The compiled graphs live on the model; only the staging buffers are dropped.
         super().clear()
         self._staging.clear()
+
+    def start_item(self, mm_kwargs: dict[str, Any]) -> VisionEncodeState:
+        """Run ``vision_embed`` for one item at its smallest budget, for ``finish_item`` later.
+
+        The budget's staging buffers are uploaded here, so another batch may reuse them
+        before this item finishes.
+        """
+        (tokens,) = self._get_per_item_out_tokens(mm_kwargs)
+        budget = self._path_fitting_budget("default", tokens)
+        staging = self._staging.get("default", {}).get(budget) if budget is not None else None
+        if staging is None:
+            raise RuntimeError(f"No compiled vision encoder budget holds a {tokens}-token item.")
+        replay = self.model.prepare_encoder_cudagraph_replay_buffers(
+            mm_kwargs, self.max_batch_size, self.max_frames_per_batch
+        )
+        for key, buf in staging.items():
+            self.config.padding_logics[key](buf, cast(torch.Tensor, replay.values[key]))
+        with torch.inference_mode():
+            return self._vision.vision_start(self._upload(staging))
+
+    def finish_item(self, state: VisionEncodeState, mm_kwargs: dict[str, Any]) -> torch.Tensor:
+        """The item ``start_item`` began, run to the end and cut to its own tokens."""
+        with torch.inference_mode():
+            output = self._vision.vision_finish(state)
+        dest: dict[int, torch.Tensor] = {}
+        self.model.postprocess_encoder_output(
+            {"default": output},
+            [0],
+            self._get_per_item_out_tokens(mm_kwargs),
+            dest,
+            clone=True,
+            batch_mm_kwargs=mm_kwargs,
+        )
+        self.graph_hits += 1
+        return dest[0]
+
+    def run_slices(self, slices: VisionSlices, device: torch.device) -> dict[str, torch.Tensor]:
+        """Carry out one step's slices; return the outputs of the passes that finished.
+
+        ``device`` is where the runner batches multimodal kwargs, as for upstream's encoder.
+        """
+        for mm_hash in slices.cancel:
+            self._slice_passes.pop(mm_hash, None)
+        for item in slices.start:
+            _, _, mm_kwargs = next(
+                group_and_batch_mm_kwargs(
+                    [(item.modality, item.data)], device=device, pin_memory=PIN_MEMORY
+                )
+            )
+            self._slice_passes[item.mm_hash] = (self.start_item(mm_kwargs), mm_kwargs)
+        finished: dict[str, torch.Tensor] = {}
+        for mm_hash, num_blocks in slices.run.items():
+            state, mm_kwargs = self._slice_passes[mm_hash]
+            if num_blocks is not None:
+                with torch.inference_mode():
+                    self._vision.vision_advance(state, num_blocks)
+                continue
+            del self._slice_passes[mm_hash]
+            finished[mm_hash] = self.finish_item(state, mm_kwargs)
+        return finished
 
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Copy host buffers to the encoder's device."""

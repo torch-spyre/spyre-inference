@@ -79,6 +79,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.warmup import record_attention_graphs
+from spyre_inference.v1.core.vision_slices import VISION_SLICES_ATTR
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -924,6 +925,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else convert(self._draft_token_ids, device="cpu").tolist()
             )
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
+
+    def execute_model(self, scheduler_output, intermediate_tensors=None):
+        slices = getattr(scheduler_output, VISION_SLICES_ATTR, None)
+        # Ahead of upstream, so a pass finished here is cached before this step's prefill
+        # gathers it, and runs even in a step that schedules no tokens.
+        if slices is not None:
+            manager = self.encoder_cudagraph_manager
+            assert isinstance(manager, SpyreEncoderGraphManager)
+            for mm_hash, output in manager.run_slices(slices, self.device).items():
+                self._cache_encoder_output(
+                    mm_hash,
+                    output,
+                    scheduler_output.ec_manager_metadata,
+                    scheduler_output.free_encoder_mm_hashes,
+                )
+        return super().execute_model(scheduler_output, intermediate_tensors)
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)

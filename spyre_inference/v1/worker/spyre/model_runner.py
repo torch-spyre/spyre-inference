@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -34,12 +35,14 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     allocate_staging_buffers,
 )
+from spyre_inference.v1.core.vision_slices import VISION_SLICES_ATTR
 from spyre_inference.v1.spec_decode.config import validate_dflash_config
 from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
+from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
@@ -101,6 +104,19 @@ class SpyreModelRunnerV2(GPUModelRunner):
                 "V2 runner (#1240)."
             )
         super().update_requests(scheduler_output)
+
+    def execute_model(
+        self, scheduler_output: SchedulerOutput, *args: Any, **kwargs: Any
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
+        slices = getattr(scheduler_output, VISION_SLICES_ATTR, None)
+        # Ahead of upstream, so a pass finished here is cached before this step's prefill
+        # gathers it, and runs even in a step that schedules no tokens.
+        if slices is not None:
+            manager = self.model_state.encoder_runner.cudagraph_manager
+            assert isinstance(manager, SpyreEncoderGraphManager)
+            assert self.encoder_cache is not None
+            self.encoder_cache.encoder_outputs.update(manager.run_slices(slices, self.device))
+        return super().execute_model(scheduler_output, *args, **kwargs)
 
     def pool(self) -> ModelRunnerOutput | None:
         return pool_output.pool_sync(self)

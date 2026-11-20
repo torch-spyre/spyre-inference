@@ -341,6 +341,9 @@ def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
     vllm_config = _vllm_config(_model_repo(tmp_path, mistral_format=False))
     assert type(vllm_config.model_config.hf_config) is LlamaConfig
 
+    # The platform resolves "auto" to "spyre" for a native dense model while the
+    # config is built; restore it so this checks what _fix_generic_config does with "auto".
+    vllm_config.load_config.load_format = "auto"
     before = vllm_config.model_config.hf_config
     SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
 

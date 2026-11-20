@@ -34,7 +34,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention import spyre_attn_bucketer
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
@@ -2379,13 +2378,6 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
 
 
-needs_chunk_range = pytest.mark.skipif(
-    not spyre_attn_bucketer._chunk_index_takes_a_range(),
-    reason="needs dynamic= together with device_layout= (torch-spyre#6327)",
-)
-
-
-@needs_chunk_range
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2401,7 +2393,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     configure_compilation,
     configure_device,
 ):
-    """Past one full-width chunk, one compiled batched decode kernel serves every chunk
+    """Past one chunk, one compiled batched decode kernel serves every chunk
     count up to max_model_len, ragged batches included, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._C import get_reserved_dims
@@ -2444,7 +2436,6 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     assert set(chunk_counts) == {2, 3, 4}, chunk_counts
 
 
-@needs_chunk_range
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2460,7 +2451,7 @@ def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
     configure_compilation,
     configure_device,
 ):
-    """Every decode batch that fits in one chunk runs one compiled full-width kernel and
+    """Every decode batch that fits in one chunk runs one compiled one-chunk kernel and
     matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
@@ -3174,7 +3165,7 @@ def test_spyre_attn_batched_decode_correctness(
 )
 @pytest.mark.parametrize(
     "dynamic_chunks",
-    [False, pytest.param(True, marks=needs_chunk_range)],
+    [False, True],
     ids=["bucketed", "dynamic"],
 )
 def test_spyre_attn_warmup_records_a_batched_decode_variant(
@@ -3188,7 +3179,7 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
 
     One bucket, not the whole enumeration: what matters is that the recorder reaches the
     folded gather through builder-produced metadata. The dynamic bucket is the one kernel
-    past one full-width chunk.
+    past one chunk.
     """
     import sys
     from unittest.mock import MagicMock

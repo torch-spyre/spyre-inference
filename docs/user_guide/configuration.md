@@ -298,11 +298,9 @@ bucket pair, when any of these holds:
 The batched decode kernel takes its chunk count at run time in the same way, and under the
 same conditions. A chunk is `32 / num_seqs` blocks of each sequence, enough to fill the cores.
 A decode batch longer than one chunk walks only the chunks its longest sequence needs, up to
-`--max-model-len`. A batch that fits in one chunk runs as one full chunk. Warmup then
+`--max-model-len`. A batch that fits in one chunk runs as that one chunk. Warmup then
 compiles two batched kernels per num-sequences bucket. A num-sequences bucket whose
-`--max-model-len` fits in two chunks keeps its KV buckets. This needs a torch-spyre that can
-copy a tensor with both `dynamic=` and `device_layout=` (torch-spyre#6327); with an older
-one, batched decode keeps its KV buckets and startup logs why.
+`--max-model-len` fits in two chunks keeps its KV buckets.
 
 ## KV cache size
 

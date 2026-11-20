@@ -923,15 +923,12 @@ class TestRecordBatchedDecode:
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
 def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
     """With a chunk range, every decode batch realizes a recorded kernel: a single-chunk one
-    within one full-width chunk, the dynamic one past it at a chunk count in its range."""
+    within one chunk, the dynamic one past it at a chunk count in its range."""
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
-    from spyre_inference.v1.attention import spyre_attn_bucketer
-
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     envs.clear_env_cache()
-    monkeypatch.setattr(spyre_attn_bucketer, "_chunk_index_takes_a_range", lambda: True)
     max_model_len = 2048
     max_blocks = max_model_len // BLOCK_SIZE
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a

@@ -71,7 +71,8 @@ from spyre_inference.v1.attention.ops.reshape_and_cache import (
     reshape_and_cache_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
-    BatchedDecodeShape,
+    BatchedDecodePlan,
+    DynamicRange,
     SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
@@ -79,8 +80,6 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
 from spyre_inference.v1.worker import compile_guard
 
 if TYPE_CHECKING:
-    from torch_spyre._C import SpyreTensorLayout
-
     from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
         EncoderGroupPlan,
         EncoderRectPlan,
@@ -139,7 +138,7 @@ class BatchedDecodeGroup:
     rep_row_ids_cpu: torch.Tensor
     chunk_page_ids_cpu: torch.Tensor
     mask_by_chunk_cpu: torch.Tensor
-    chunk_range: dict[str, int] | None
+    chunk_range: DynamicRange | None
     rows_dev: torch.Tensor | None = None
     metadata: "SpyreAttentionMetadata | None" = None
 
@@ -165,27 +164,21 @@ class SpyrePagedKVCache(NamedTuple):
 
 
 def _to_device_with_page_range(
-    host: torch.Tensor,
-    page_range: dict[str, int],
-    device: torch.device,
-    device_layout: "SpyreTensorLayout | None" = None,
+    host: torch.Tensor, page_range: DynamicRange, device: torch.device
 ) -> torch.Tensor:
     """Copy ``host``, one row per page, to ``device`` with a dynamic page count.
 
     The device buffer is allocated for ``page_range["max"]`` pages, so every page count
     gets the same device layout and reuses one compiled kernel. The full buffer is
     copied and then shrunk to ``host``'s length, since copying only part of it is several
-    times slower (torch-spyre#6026). ``device_layout`` is the buffer's layout at the
-    maximum, None for the default one.
+    times slower (torch-spyre#6026).
     """
     # CPU unit tests run this path too, and only a copy to Spyre takes `dynamic=`.
     if device.type != "spyre":
         return convert(host, device=device)
     padded = host.new_zeros((page_range["max"], *host.shape[1:]))
     padded[: host.shape[0]] = host
-    dev = padded.to(  # ty: ignore[no-matching-overload]
-        device, dynamic={0: page_range}, device_layout=device_layout
-    )
+    dev = padded.to(device, dynamic={0: page_range})  # ty: ignore[no-matching-overload]
     return dev.resize_(host.shape)
 
 
@@ -246,7 +239,7 @@ def _build_query_row_tables(
 def _walked_pages(
     page_index_table: torch.Tensor,
     mask_stack: torch.Tensor,
-    page_range: dict[str, int] | None,
+    page_range: DynamicRange | None,
 ) -> int:
     """Return the number of pages the kernel loops over, ``page_index_table``'s length.
 
@@ -269,7 +262,7 @@ def page_attn_prefill(
     *,
     page_index_table: torch.Tensor,
     mask_stack: torch.Tensor,
-    page_range: dict[str, int] | None,
+    page_range: DynamicRange | None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """Run ``page_attn_prefill_kernel`` over every page in ``page_index_table``."""
@@ -285,7 +278,7 @@ def page_attn_decode(
     *,
     page_index_table: torch.Tensor,
     mask_stack: torch.Tensor,
-    page_range: dict[str, int] | None,
+    page_range: DynamicRange | None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """Run ``page_attn_decode_kernel`` over every page in ``page_index_table``."""
@@ -301,11 +294,12 @@ def batched_decode(
     *,
     chunk_page_ids: torch.Tensor,
     mask_by_chunk: torch.Tensor,
-    chunk_range: dict[str, int] | None,
+    chunk_range: DynamicRange | None,
     **kwargs: Any,
 ) -> torch.Tensor:
-    """Run ``batched_decode_kernel`` over every chunk in ``chunk_page_ids``."""
-    # A chunk is one trip, as a page is in the per-sequence kernels.
+    """Run ``batched_decode_kernel`` once per chunk in ``chunk_page_ids``."""
+    # The kernel loops over chunks the way the per-sequence kernels loop over pages, so
+    # the same checks bound a dynamic chunk count.
     _walked_pages(chunk_page_ids, mask_by_chunk, chunk_range)
     return batched_decode_kernel(
         chunk_page_ids=chunk_page_ids, mask_by_chunk=mask_by_chunk, **kwargs
@@ -354,9 +348,7 @@ def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
     return math.gcd(_PAGE_GROUP, num_blocks, max(1, num_blocks // 4))
 
 
-def _prefill_page_group_for_range(
-    page_range: dict[str, int], num_heads: int, head_size: int
-) -> int:
+def _prefill_page_group_for_range(page_range: DynamicRange, num_heads: int, head_size: int) -> int:
     """Return the prefill page group for a page range: a divisor of its granularity, so it
     divides every page count in the range."""
     if num_heads * head_size > _PAGE_GROUP_MAX_QUERY_WIDTH:
@@ -495,10 +487,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # The range of page counts the page index tables and mask stacks are copied to the
     # device with. None when page counts are rounded up to the KV buckets instead.
-    page_range: dict[str, int] | None = None
+    page_range: DynamicRange | None = None
     # The same for a prefill sequence (aligned query length > 1), whose page counts are
     # multiples of the prefill page group.
-    prefill_page_range: dict[str, int] | None = None
+    prefill_page_range: DynamicRange | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
@@ -516,9 +508,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # tiled walk needs it materialized (see the construction site).
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
-    # The range of chunk counts the chunk index and mask are copied to the device with.
-    # None when the kernel is compiled for this batch's chunk count alone.
-    chunk_range: dict[str, int] | None = None
+    # The chunk counts this batch's dynamic kernel runs; the chunk index and mask are
+    # copied to the device with this range. None for a kernel with a fixed chunk count.
+    chunk_range: DynamicRange | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
@@ -531,7 +523,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
-    def seq_page_range(self, seq_idx: int) -> dict[str, int] | None:
+    def seq_page_range(self, seq_idx: int) -> DynamicRange | None:
         """Return the page range sequence ``seq_idx``'s page table and mask stack are
         copied to the device with."""
         if self.page_range is not None and self.aligned_query_lens[seq_idx] > 1:
@@ -1144,13 +1136,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            shape = (
-                self._attn_bucketer.batched_decode_shape(b_seqs, max(decode_blocks))
+            plan = (
+                self._attn_bucketer.batched_decode_plan(b_seqs, max(decode_blocks))
                 if b_seqs is not None
                 else None
             )
 
-            if b_seqs is not None and shape is not None:
+            if b_seqs is not None and plan is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
@@ -1165,14 +1157,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 ) = self._batched_decode_tensors(
                     prefix,
                     b_seqs,
-                    shape,
+                    plan,
                     blocks_per_seq,
                     block_table,
                     query_start_loc,
                     active_block_indices,
                     attention_mask_stacks,
                 )
-                chunk_range = shape.chunk_range
+                chunk_range = plan.chunk_range
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
                 if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
@@ -1223,7 +1215,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self,
         members: list[int],
         b_seqs: int,
-        shape: BatchedDecodeShape,
+        plan: BatchedDecodePlan,
         blocks_per_seq: list[int],
         block_table: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -1236,7 +1228,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Padding columns gather page 0 under an all--inf mask and
         # contribute zero; chunk 0 still holds every real row's block 0,
         # so the running max stays finite.
-        b_blocks, blocks_per_chunk, num_chunks, _ = shape
+        b_blocks = plan.num_blocks
+        blocks_per_chunk = plan.blocks_per_chunk
+        num_chunks = plan.num_chunks
         padded_batch_blocks = num_chunks * blocks_per_chunk
         assert padded_batch_blocks >= b_blocks
         query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
@@ -1311,15 +1305,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     ) -> "list[BatchedDecodeGroup] | None":
         bucketer = self._attn_bucketer
 
-        def shape(members: list[int]) -> BatchedDecodeShape | None:
+        def group_plan(members: list[int]) -> BatchedDecodePlan | None:
             b_seqs = bucketer.find_sequence_bucket(len(members))
             if b_seqs is None:
                 return None
-            return bucketer.batched_decode_shape(b_seqs, max(decode_blocks[m] for m in members))
+            return bucketer.batched_decode_plan(b_seqs, max(decode_blocks[m] for m in members))
 
         def chunks(members: list[int]) -> int | None:
-            group_shape = shape(members)
-            return None if group_shape is None else group_shape.num_chunks
+            plan = group_plan(members)
+            return None if plan is None else plan.num_chunks
 
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
@@ -1346,12 +1340,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         for members in groups:
             members.sort()
             b_seqs = bucketer.find_sequence_bucket(len(members))
-            group_shape = shape(members)
-            assert b_seqs is not None and group_shape is not None
+            plan = group_plan(members)
+            assert b_seqs is not None and plan is not None
             fields = self._batched_decode_tensors(
                 members,
                 b_seqs,
-                group_shape,
+                plan,
                 blocks_per_seq,
                 block_table,
                 query_start_loc,
@@ -1363,7 +1357,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     len(members),
                     torch.tensor(members, dtype=torch.int32),
                     *fields,
-                    chunk_range=group_shape.chunk_range,
+                    chunk_range=plan.chunk_range,
                 )
             )
         return out
@@ -2301,31 +2295,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         chunk_range = attn_metadata.chunk_range
         if chunk_range is not None:
+            # Both tensors get a layout with the chunk axis outermost on the device. The
+            # buffer is reserved for chunk_range["max"] chunks, this batch's chunks are its
+            # first rows, and only those rows are copied. In torch-spyre's default layout
+            # the mask's chunks would be spread through the buffer, and copying part of such
+            # a buffer is slower than copying all of it (torch-spyre#6026).
             idx_layout = temporary_chunk_major_page_index_layout(chunk_range["max"], e)
-            mask_layout = (
-                row_outermost_layout((chunk_range["max"], *mask.shape[1:]), mask.dtype)
-                if device.type == "spyre"
-                else None
+            mask_layout = row_outermost_layout((chunk_range["max"], *mask.shape[1:]), mask.dtype)
+            # The mask's last dim is block_size, a multiple of 64, so it is whole sticks.
+            assert mask_layout is not None
+            dynamic = {0: chunk_range}
+            attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
+                device, dynamic=dynamic, device_layout=idx_layout
             )
-            if mask_layout is not None:
-                # Both layouts hold the chunk axis whole at device dim 0, so the real
-                # chunks are a prefix of the reservation and only they are copied. The
-                # default mask layout scatters them across it, which costs more than
-                # copying the whole reservation (torch-spyre#6026).
-                dynamic = {0: chunk_range}
-                attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
-                    device, dynamic=dynamic, device_layout=idx_layout
-                )
-                attn_metadata.mask_by_chunk_dev = mask.to(  # ty: ignore[no-matching-overload]
-                    device, dynamic=dynamic, device_layout=mask_layout
-                )
-            else:
-                attn_metadata.chunk_page_ids_dev = _to_device_with_page_range(
-                    idx, chunk_range, device, device_layout=idx_layout
-                )
-                attn_metadata.mask_by_chunk_dev = _to_device_with_page_range(
-                    mask, chunk_range, device
-                )
+            attn_metadata.mask_by_chunk_dev = mask.to(  # ty: ignore[no-matching-overload]
+                device, dynamic=dynamic, device_layout=mask_layout
+            )
             return
         attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
             device, device_layout=temporary_chunk_major_page_index_layout(c, e)
@@ -2340,7 +2325,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: torch.Tensor,
         chunk_index_tables: torch.Tensor,
         mask_by_chunk: torch.Tensor,
-        chunk_range: dict[str, int] | None,
+        chunk_range: DynamicRange | None,
         b_seqs: int,
         blocks_per_chunk: int,
         block_size: int,
@@ -2401,7 +2386,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         index_table: torch.Tensor,
         mask_stack: torch.Tensor,
         num_blocks: int,
-        page_range: dict[str, int] | None,
+        page_range: DynamicRange | None,
         padded_query_len: int,
         out: torch.Tensor,
     ) -> torch.Tensor:

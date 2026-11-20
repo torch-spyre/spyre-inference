@@ -296,11 +296,13 @@ bucket pair, when any of these holds:
 - the layer uses sliding-window attention.
 
 The batched decode kernel takes its chunk count at run time in the same way, and under the
-same conditions. A chunk is `32 / num_seqs` blocks of each sequence, enough to fill the cores.
-A decode batch longer than one chunk walks only the chunks its longest sequence needs, up to
-`--max-model-len`. A batch that fits in one chunk runs as that one chunk. Warmup then
-compiles two batched kernels per num-sequences bucket. A num-sequences bucket whose
-`--max-model-len` fits in two chunks keeps its KV buckets.
+same conditions. The kernel reads the KV cache one *chunk* per loop step: the next
+`32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
+cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
+and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
+masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
+chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
+num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
 
 ## KV cache size
 

@@ -834,14 +834,14 @@ class TestDynamicChunks:
             assert (dynamic.blocks_per_chunk, dynamic.num_chunks) == (width, max_pages // width)
             assert all(v.num_blocks <= width for v in variants if not v.dynamic_chunks)
             for nb in (width + 1, 3 * width - 1, max_pages):
-                shape = b.batched_decode_shape(num_seqs, nb)
-                assert shape is not None
-                assert shape.chunk_range == {"min": 2, "max": max_pages // width, "granularity": 1}
-                assert shape.blocks_per_chunk == width
-                assert (shape.num_chunks - 1) * width < nb <= shape.num_chunks * width
-            shape = b.batched_decode_shape(num_seqs, width)
-            assert shape is not None
-            assert (shape.chunk_range, shape.num_chunks) == (None, 1)
+                plan = b.batched_decode_plan(num_seqs, nb)
+                assert plan is not None
+                assert plan.chunk_range == {"min": 2, "max": max_pages // width, "granularity": 1}
+                assert plan.blocks_per_chunk == width
+                assert (plan.num_chunks - 1) * width < nb <= plan.num_chunks * width
+            plan = b.batched_decode_plan(num_seqs, width)
+            assert plan is not None
+            assert (plan.chunk_range, plan.num_chunks) == (None, 1)
 
     def test_one_chunk_kernel_serves_every_call_within_one_chunk(self):
         b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
@@ -852,7 +852,7 @@ class TestDynamicChunks:
                 (v.blocks_per_chunk, v.num_chunks) for v in variants if not v.dynamic_chunks
             ] == [(width, 1)]
             for nb in range(1, width + 1):
-                assert b.batched_decode_shape(num_seqs, nb) == (width, width, 1, None)
+                assert b.batched_decode_plan(num_seqs, nb) == (width, width, 1, None)
 
     def test_a_batch_size_whose_context_fits_two_chunks_keeps_the_buckets(self):
         # 32 pages: one chunk at one sequence, two at two sequences.
@@ -867,5 +867,5 @@ class TestDynamicChunks:
         b = SpyreAttnBucketer(make_config(max_model_len=8192))
         assert b.page_range is None
         assert not any(v.dynamic_chunks for v in b.batched_decode_variants())
-        shape = b.batched_decode_shape(4, 100)
-        assert shape is not None and shape.chunk_range is None
+        plan = b.batched_decode_plan(4, 100)
+        assert plan is not None and plan.chunk_range is None

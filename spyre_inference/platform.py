@@ -703,8 +703,6 @@ class TorchSpyrePlatform(CpuPlatform):
             # A CUDA-graph encoder manager; Spyre compiles towers per budget at warmup.
             "cudagraph_mm_encoder": vllm_config.compilation_config.cudagraph_mm_encoder,
             "prefill context parallelism": parallel_config.prefill_context_parallel_size > 1,
-            # The V1 runner carries out the scheduler's encoder slices; V2 would drop them.
-            "SPYRE_VISION_BLOCKS_PER_STEP": envs.SPYRE_VISION_BLOCKS_PER_STEP > 0,
         }
         for feature, requested in unsupported.items():
             if requested:

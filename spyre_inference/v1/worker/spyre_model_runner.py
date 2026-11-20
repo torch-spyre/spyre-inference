@@ -53,9 +53,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
-from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.tasks import PoolingTask
-from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -69,7 +67,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
-from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionEncodeState
+from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.moe import prepare_moe_layers_on_threads
@@ -81,7 +79,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.warmup import record_attention_graphs
-from spyre_inference.v1.core.vision_slices import VISION_SLICES_ATTR, VisionSlices
+from spyre_inference.v1.core.vision_slices import VISION_SLICES_ATTR
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -694,8 +692,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._forced_encoder_rect: tuple[int, int] | None = None
         self._force_encoder_ragged = False
         self.spyre_encoder_stats = EncoderDispatchStats()
-        # Encoder passes spread over steps (vision_slices), by mm_hash.
-        self._vision_passes: dict[str, tuple[VisionEncodeState, dict[str, Any]]] = {}
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -935,36 +931,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Ahead of upstream, so a pass finished here is cached before this step's prefill
         # gathers it, and runs even in a step that schedules no tokens.
         if slices is not None:
-            self._run_vision_slices(scheduler_output, slices)
-        return super().execute_model(scheduler_output, intermediate_tensors)
-
-    def _run_vision_slices(self, scheduler_output, slices: VisionSlices) -> None:
-        """Carry out the scheduler's share of the encoder passes for this step."""
-        model = self._compiled_vision_model()
-        manager = self.encoder_cudagraph_manager
-        assert model is not None and isinstance(manager, SpyreEncoderGraphManager)
-        for mm_hash in slices.cancel:
-            self._vision_passes.pop(mm_hash, None)
-        for item in slices.start:
-            _, _, mm_kwargs = next(
-                group_and_batch_mm_kwargs(
-                    [(item.modality, item.data)], device=self.device, pin_memory=PIN_MEMORY
+            manager = self.encoder_cudagraph_manager
+            assert isinstance(manager, SpyreEncoderGraphManager)
+            for mm_hash, output in manager.run_slices(slices, self.device).items():
+                self._cache_encoder_output(
+                    mm_hash,
+                    output,
+                    scheduler_output.ec_manager_metadata,
+                    scheduler_output.free_encoder_mm_hashes,
                 )
-            )
-            self._vision_passes[item.mm_hash] = (manager.start_item(mm_kwargs), mm_kwargs)
-        for mm_hash, num_blocks in slices.run.items():
-            state, mm_kwargs = self._vision_passes[mm_hash]
-            if num_blocks is not None:
-                with torch.inference_mode():
-                    model.vision_advance(state, num_blocks)
-                continue
-            del self._vision_passes[mm_hash]
-            self._cache_encoder_output(
-                mm_hash,
-                manager.finish_item(state, mm_kwargs),
-                scheduler_output.ec_manager_metadata,
-                scheduler_output.free_encoder_mm_hashes,
-            )
+        return super().execute_model(scheduler_output, intermediate_tensors)
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)

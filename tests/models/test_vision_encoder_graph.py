@@ -17,7 +17,7 @@ fake model: what a model author can rely on without touching any other file."""
 
 import dataclasses
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -25,6 +25,8 @@ import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
+from spyre_inference.v1.core.vision_slices import VisionSlices, VisionSliceStart
+from spyre_inference.v1.worker import spyre_encoder_graph as encoder_graph_module
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
 MERGE_PATCHES = 4  # 2x2 merge
@@ -836,6 +838,30 @@ def test_start_item_then_finish_item_matches_execute():
     assert out.shape[0] == 30
     torch.testing.assert_close(out, expected)
     assert manager.graph_hits == hits + 1
+
+
+def test_run_slices_spreads_a_pass_and_drops_a_cancelled_one(monkeypatch):
+    """The runner hook both model runners call: one pass over two steps, another cancelled."""
+    monkeypatch.setattr(
+        encoder_graph_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **_: iter([(modality, 1, data) for modality, data in items]),
+    )
+    model = _FakeVisionModel(max_tokens=300, num_blocks=4)
+    _ordered_blocks(model)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    (expected,) = manager.execute({"tokens": [30]})
+    data = cast(Any, {"tokens": [30]})
+    cpu = torch.device("cpu")
+
+    starts = [VisionSliceStart("a", "image", data), VisionSliceStart("b", "image", data)]
+    assert manager.run_slices(VisionSlices(start=starts, run={"a": 2}), cpu) == {}
+    finished = manager.run_slices(VisionSlices(cancel=["b"], run={"a": None}), cpu)
+
+    assert list(finished) == ["a"]
+    torch.testing.assert_close(finished["a"], expected)
+    assert not manager._slice_passes
 
 
 def test_start_item_needs_a_compiled_budget():

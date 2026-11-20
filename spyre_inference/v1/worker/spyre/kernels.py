@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: bind() puts a csrc/ host op (``torch.ops._spyre_C.mrv2_*``) over every
-``@triton.jit`` module global MRV2 launches, so V2 needs no Triton on any architecture."""
+"""MRV2: bind() registers a csrc/ host op (``torch.ops._spyre_C.mrv2_*``) for every
+``@triton.jit`` kernel MRV2 launches, so V2 needs no Triton on any architecture."""
 
+import ast
 import importlib
+import importlib.util
 import inspect
+import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -50,6 +54,7 @@ HOST_KERNELS: dict[str, str] = {
     "gpu.buffer_utils._apply_write_kernel": "mrv2_apply_write",
     "gpu.sample.gumbel._temperature_kernel": "mrv2_temperature",
     "gpu.sample.gumbel._gumbel_sample_kernel": "mrv2_gumbel_sample",
+    "gpu.sample.gumbel._gumbel_combine_kernel": "mrv2_gumbel_combine",
     "gpu.sample.min_p._min_p_kernel": "mrv2_min_p",
     "gpu.sample.penalties._penalties_kernel": "mrv2_penalties",
     "gpu.sample.penalties._bincount_kernel": "mrv2_bincount",
@@ -63,6 +68,7 @@ HOST_KERNELS: dict[str, str] = {
     ),
     "gpu.sample.output._compact_sampling_mask_kernel": "mrv2_compact_sampling_mask",
     "gpu.sample.trace_replay._trace_replay_kernel": "mrv2_trace_replay",
+    "gpu.sample.trace_replay._trace_replay_verified_kernel": "mrv2_trace_replay_verified",
     "gpu.sample.thinking_budget._update_committed_marker_cache_kernel": (
         "mrv2_update_committed_marker_cache"
     ),
@@ -111,7 +117,15 @@ UNSUPPORTED_KERNELS: dict[str, str] = {
     "mamba_utils.postprocess_mamba_fused_kernel": (
         "mamba prefix caching (mamba_cache_mode='align')"
     ),
-    "mamba_utils.batch_memcpy_kernel": "mamba prefix caching (mamba_cache_mode='align')",
+    "replayssm_utils._reset_new_replayssm_slots_kernel": "ReplaySSM",
+    "replayssm_utils._postprocess_replayssm_kernel": "ReplaySSM",
+    "replayssm_utils._compact_replayssm_requests_kernel": "ReplaySSM",
+    # greedy_argmax launches these on CUDA logits only; host logits take torch.argmax.
+    "gpu.sample.greedy_argmax._argmax_partial": "greedy_argmax on CUDA logits",
+    "gpu.sample.greedy_argmax._argmax_finish": "greedy_argmax on CUDA logits",
+    # A sharded draft logits cache (row_mapping set) only exists with batch sharding.
+    "gpu.spec_decode.draft_logits._assign_rows_kernel": "batch-sharded sampling",
+    "gpu.spec_decode.draft_logits._stale_drafts_kernel": "batch-sharded sampling",
     "gpu.sample.watermark._repeated_context_mask_kernel": (
         "watermarking on a device tensor (upstream runs host tensors in torch)"
     ),
@@ -127,6 +141,9 @@ UNSUPPORTED_KERNELS: dict[str, str] = {
         "adaptive draft verification"
     ),
     "gpu.spec_decode.acceptance_estimator._predict_kernel": "adaptive draft verification",
+    "gpu.spec_decode.adaptive_verification._assign_draft_token_budget_kernel": (
+        "adaptive draft verification"
+    ),
     # XPress's Triton Jacobi loop: the Spyre XPress model refines with its own head.
     "gpu.spec_decode.xpress.kernels._xpress_latent_kernel": "upstream's XPress Jacobi loop",
     "gpu.spec_decode.xpress.kernels._xpress_add_argmax_partial_kernel": (
@@ -142,23 +159,39 @@ UNSUPPORTED_KERNELS: dict[str, str] = {
 
 
 class HostKernel:
-    """Stands in for a ``@triton.jit`` kernel: ``kernel[grid](*args)`` runs a host op."""
+    """Stands in for a ``@triton.jit`` kernel: ``kernel[grid](*args)`` runs a host op.
 
-    def __init__(self, name: str, op: Callable[..., Any], params: list[str]) -> None:
+    Launch arguments bind to the upstream kernel's own parameter names, as Triton binds
+    them, so an upstream signature change can't shift an argument into the wrong slot."""
+
+    def __init__(
+        self, name: str, op: Callable[..., Any], kernel_params: list[str], op_params: list[str]
+    ) -> None:
+        if sorted(kernel_params) != sorted(op_params):
+            raise RuntimeError(
+                f"{name} takes {kernel_params} upstream, but its host op takes {op_params}: "
+                "port the signature change into csrc/."
+            )
         self.name = name
         self._op = op
-        self._params = params
+        self._kernel_params = kernel_params
+        self._op_params = op_params
         self._adapt = _ARG_ADAPTERS.get(name)
 
     def __getitem__(self, grid: tuple[int, ...]) -> Callable[..., None]:
         def launch(*args: Any, **kwargs: Any) -> None:
             for option in _LAUNCH_OPTIONS:
                 kwargs.pop(option, None)
-            values = dict(zip(self._params, args))
+            if len(args) > len(self._kernel_params):
+                raise TypeError(f"{self.name} got {len(args)} positional arguments.")
+            values = dict(zip(self._kernel_params, args))
+            unknown = set(kwargs) - set(self._kernel_params)
+            if unknown:
+                raise TypeError(f"{self.name} got unknown arguments {sorted(unknown)}.")
             values.update(kwargs)
             if self._adapt is not None:
                 self._adapt(values)
-            self._op(list(grid), *(values[p] for p in self._params))
+            self._op(list(grid), *(values[p] for p in self._op_params))
 
         return launch
 
@@ -274,8 +307,11 @@ def spyre_apply_top_k_top_p(
     return apply_top_k_top_p_sort_free(logits, k, p)
 
 
+_WORKER = "vllm.v1.worker"
+
+
 def _module(name: str) -> Any:
-    return importlib.import_module(f"vllm.v1.worker.{name.rpartition('.')[0]}")
+    return importlib.import_module(f"{_WORKER}.{name.rpartition('.')[0]}")
 
 
 def kernel_params(kernel: object) -> list[str]:
@@ -287,11 +323,11 @@ def kernel_params(kernel: object) -> list[str]:
 
 def op_params(op_name: str) -> list[str]:
     """The csrc op's argument names after the grid (its schema keeps C++'s)."""
-    schema = getattr(torch.ops._spyre_C, op_name).default._schema
+    schema = getattr(_host_namespace(), op_name).default._schema
     return [a.name for a in schema.arguments[1:]]
 
 
-def _host_op(op_name: str) -> Callable[..., Any]:
+def _host_namespace() -> Any:
     from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 
     if not has_sampling_kernels():
@@ -299,7 +335,7 @@ def _host_op(op_name: str) -> Callable[..., Any]:
             "Spyre's V2 model runner needs the csrc/ host kernels (spyre_inference._C), "
             "which failed to build or import; see the install log."
         )
-    return getattr(torch.ops._spyre_C, op_name)
+    return torch.ops._spyre_C
 
 
 def use_triton() -> bool:
@@ -308,34 +344,102 @@ def use_triton() -> bool:
     return envs.SPYRE_MRV2_KERNELS == "triton"
 
 
-_originals: dict[str, object] = {}
+# Speculators the platform refuses (only DFlash/XPress run on Spyre): their kernels are
+# never reached, so the sweep leaves them out. The verifier's modules stay in.
+_REFUSED_SPECULATORS = re.compile(
+    r"gpu\.spec_decode\.(?!(rejection_sampler|rejection_sampler_utils|acceptance_estimator"
+    r"|adaptive_verification|draft_logits|dflash\.speculator|xpress\.kernels)$)"
+)
+
+
+def _is_jit(decorator: ast.expr) -> bool:
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    return isinstance(target, ast.Attribute) and target.attr == "jit"
+
+
+def launch_sites() -> set[str]:
+    """``<module>.<kernel>`` for every ``kernel[grid](...)`` launch of a module-level
+    ``@triton.jit`` kernel under vllm/v1/worker, read from the installed sources."""
+    root = Path(importlib.util.find_spec(_WORKER).origin).parent  # ty: ignore
+    sources = {
+        ".".join(p.relative_to(root).with_suffix("").parts): p.read_text()
+        for p in root.rglob("*.py")
+    }
+    sources = {
+        m: src for m, src in sources.items() if "jit" in src and not _REFUSED_SPECULATORS.match(m)
+    }
+    trees = {module: ast.parse(source) for module, source in sources.items()}
+    jitted = {
+        node.name
+        for tree in trees.values()
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and any(_is_jit(d) for d in node.decorator_list)
+    }
+    # Kernels can be launched from a module that imports them by name.
+    launch = re.compile(rf"\b(?:{'|'.join(map(re.escape, jitted))})\[")
+    return {
+        f"{module}.{node.func.value.id}"
+        for module, tree in trees.items()
+        if launch.search(sources[module])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Subscript)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in jitted
+    }
+
+
+# name -> (the module holding it, the upstream kernel, the stand-in registered over it).
+_bound: dict[str, tuple[Any, Any, Any]] = {}
+_top_k_top_p_originals: dict[str, Callable[..., Any]] = {}
+
+
+def original(name: str) -> Any:
+    """Upstream's kernel, whether or not bind() has replaced it."""
+    if name in _bound:
+        return _bound[name][1]
+    return getattr(_module(name), name.rpartition(".")[2])
 
 
 def bind(force_host: bool = False) -> set[str]:
-    """Returns the names bound; ``force_host`` binds host ops under =triton too (parity)."""
+    """Returns the names bound; ``force_host`` binds host ops under =triton too (parity).
+
+    The kernels go through vLLM's register_kernels, which also rebinds every
+    ``from module import kernel`` copy and JIT warmup owner a plain setattr would miss."""
     bound = set()
     for site in _TOP_K_TOP_P_SITES:
         module = _module(f"{site}.x")
-        _originals.setdefault(f"{site}.apply_top_k_top_p", module.apply_top_k_top_p)
+        _top_k_top_p_originals.setdefault(site, module.apply_top_k_top_p)
         module.apply_top_k_top_p = spyre_apply_top_k_top_p
         bound.add(f"{site}.apply_top_k_top_p")
     if use_triton() and not force_host:
         return bound
 
+    stand_ins: dict[str, Any] = {}
     for name, op_name in HOST_KERNELS.items():
         module, attr = _module(name), name.rpartition(".")[2]
-        if not hasattr(module, attr):  # renamed or removed upstream: bind_or_raise names it
+        if name in _bound or not hasattr(module, attr):  # gone upstream: bind_or_raise names it
             continue
-        _originals.setdefault(name, getattr(module, attr))
-        setattr(module, attr, HostKernel(name, _host_op(op_name), op_params(op_name)))
-        bound.add(name)
+        stand_ins[name] = HostKernel(
+            name,
+            getattr(_host_namespace(), op_name),
+            kernel_params(getattr(module, attr)),
+            op_params(op_name),
+        )
     for name, feature in UNSUPPORTED_KERNELS.items():
         module, attr = _module(name), name.rpartition(".")[2]
-        if not hasattr(module, attr):
+        if name in _bound or not hasattr(module, attr):
             continue
-        _originals.setdefault(name, getattr(module, attr))
-        setattr(module, attr, UnsupportedKernel(name, feature))
-        bound.add(name)
+        stand_ins[name] = UnsupportedKernel(name, feature)
+    if stand_ins:
+        from vllm.triton_utils.dispatcher import register_kernels
+
+        originals = {name: getattr(_module(name), name.rpartition(".")[2]) for name in stand_ins}
+        register_kernels({f"{_WORKER}.{name}": impl for name, impl in stand_ins.items()})
+        for name, kernel in originals.items():
+            module = _module(name)
+            _bound[name] = (module, kernel, getattr(module, name.rpartition(".")[2]))
+    bound |= set(_bound)
     # vllm.triton_utils' placeholder lacks next_power_of_2, which several MRV2
     # wrappers call to size a block argument before the launch.
     from vllm.triton_utils import triton
@@ -351,9 +455,17 @@ def _next_power_of_2(n: int) -> int:
 
 def unbind() -> None:
     """Restore upstream's kernels (tests only)."""
-    for name, original in _originals.items():
-        setattr(_module(name), name.rpartition(".")[2], original)
-    _originals.clear()
+    from vllm.triton_utils import dispatcher
+
+    for site, kernel in _top_k_top_p_originals.items():
+        _module(f"{site}.x").apply_top_k_top_p = kernel
+    _top_k_top_p_originals.clear()
+    # register_kernels has no inverse: run its rebinding scan the other way round.
+    dispatcher._rebind_impls([(stand_in, kernel) for _, kernel, stand_in in _bound.values()])
+    for name, (module, kernel, _) in _bound.items():
+        setattr(module, name.rpartition(".")[2], kernel)
+        dispatcher._registry.pop(f"{_WORKER}.{name}", None)
+    _bound.clear()
     from vllm.triton_utils import triton
 
     if getattr(triton, "next_power_of_2", None) is _next_power_of_2:
@@ -361,10 +473,18 @@ def unbind() -> None:
 
 
 def bind_or_raise() -> None:
-    """Raise at startup if bind() left a kernel unbound, not at its first launch."""
+    """Raise at startup if bind() left a kernel unbound, not at its first launch: one
+    listed here but gone upstream, or a launch site under vllm/v1/worker listed nowhere."""
     expected = {f"{site}.apply_top_k_top_p" for site in _TOP_K_TOP_P_SITES}
     if not use_triton():
-        expected |= set(HOST_KERNELS) | set(UNSUPPORTED_KERNELS)
+        listed = set(HOST_KERNELS) | set(UNSUPPORTED_KERNELS)
+        unlisted = launch_sites() - listed
+        if unlisted:
+            raise RuntimeError(
+                f"MRV2 launches {sorted(unlisted)}, which kernels.py neither binds to a "
+                "host op nor lists as unsupported."
+            )
+        expected |= listed
     bound = bind()
     missing = expected - bound
     if missing:

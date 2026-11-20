@@ -144,6 +144,19 @@ Three adaptations worth knowing:
   all-expert form whatever its size, since each row's storage offset has to span whole sticks
   for the compiled loop to address it; a single token is handed to the gathered form whole, so
   it never needs that.
+  Traced into a compiled block, the all-expert form is one `for_each_tile` loop over the
+  experts, one expert per trip on all cores. A model's recipe can run G experts per trip
+  (`SpyreMoERecipe.expert_group`, default 1) for the stick-aligned batch sizes in
+  `expert_group_tokens`, both ends included: the cores form G groups, each core takes a block
+  of tokens through one whole expert, each group adds into its own accumulator, and one sum
+  over the G accumulators follows the loop. Only fp16 rounding changes. The range is the
+  recipe's because the batch sizes where grouping pays depend on the model's expert shapes.
+  G must divide the expert count and the core count, and the cores must divide a stick of
+  tokens; a recipe group that does not fit runs one expert per trip, with a warning. The
+  accumulators stay in LX only on a torch-spyre that gives the sum after the loop a relayout
+  copy of the loop's carry; without it the values are the same and the accumulators live in
+  HBM. Batches outside the range, batches that are not whole sticks of tokens (the usual decode
+  sizes) and the eager forms are unchanged. A grouped loop has device tests at TP 1 only.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` stacks those forms contract on (see
   [MoE expert weights](#moe-expert-weights)), freeing each source stack as it goes,

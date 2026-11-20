@@ -1,8 +1,8 @@
 name: Run matrix test config
 description: >-
   Builds spyre-inference and runs one _test_matrix.yaml matrix leg (RPM
-  install through JUnit upload). Shared by the `test` and `test_retry`
-  jobs so the pod-level retry doesn't need its own copy of every step.
+  install through JUnit upload). Shared by _test_leg.yaml's `attempt` and
+  `retry` jobs so the pod-level retry doesn't need its own copy of every step.
 
 inputs:
   cfg:
@@ -42,7 +42,7 @@ inputs:
     description: JSON array string of the runs-on labels the caller resolved to, forwarded to gather-runner-info
     required: true
   job_slot:
-    description: Unique per-job-attempt slot (e.g. strategy.job-index, or retry-<index>) used to scope the inductor cache dir and the coverage-data artifact name
+    description: Unique per-job-attempt slot (the leg's matrix index, or retry-<index> for its pod-level retry) used to scope the inductor cache dir and the coverage-data artifact name
     required: true
   retry:
     description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact, keeping its failures as result.prior_* properties

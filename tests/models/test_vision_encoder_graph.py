@@ -575,6 +575,47 @@ def test_mrv2_encoder_runner_serves_through_the_captured_budgets(monkeypatch):
     assert not manager.is_captured()
 
 
+def test_mrv2_warmup_sets_both_item_limits_before_building_the_manager(monkeypatch):
+    """The manager's __init__ reads the budget range, which may read either limit (CLIP's
+    reads ``max_items_per_step``), so MRV2 sets both first, as V1 does."""
+    from spyre_inference.v1.worker.spyre import warmup
+
+    seen = {}
+
+    class _Manager:
+        def __init__(self, vllm_config, device, dtype, model):
+            seen.update(tokens=model.max_tokens_per_item, items=model.max_items_per_step)
+
+        def capture(self, graph_pool):
+            pass
+
+    monkeypatch.setattr(warmup, "SpyreEncoderGraphManager", _Manager)
+    monkeypatch.setattr(
+        warmup,
+        "MultiModalBudget",
+        lambda *a, **kw: SimpleNamespace(
+            mm_max_toks_per_item={"image": 300}, mm_max_items_per_batch={"image": 5}
+        ),
+    )
+    model = _FakeVisionModel()
+    del model.max_tokens_per_item
+    model.compile_vision_graphs = lambda: None
+    runner: Any = SimpleNamespace(
+        get_model=lambda: model,
+        supports_mm_inputs=True,
+        vllm_config=None,
+        mm_registry=None,
+        model_config=SimpleNamespace(dtype=torch.float16),
+        model_state=SimpleNamespace(encoder_runner=SimpleNamespace()),
+        spyre_device=torch.device("cpu"),
+        model=None,
+    )
+
+    warmup._record_vision_graphs(runner, sizes=[])
+
+    assert seen == {"tokens": 300, "items": 5}
+
+
 @pytest.mark.parametrize("mixin", [True, False], ids=["mixin", "marked"])
 def test_compiled_pooling_warmup_runs_a_mixin_tower_per_budget_only(monkeypatch, mixin):
     """A compiled pooling model (CLIP) records a mixin tower's graphs after the attention

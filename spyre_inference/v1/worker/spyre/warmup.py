@@ -202,6 +202,9 @@ def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> Non
     budget = MultiModalBudget(runner.vllm_config, runner.mm_registry, enable_cache=False)
     # The processor's largest item, as upstream computes it for the scheduler's budget.
     model.max_tokens_per_item = max(budget.mm_max_toks_per_item[m] for m in model.vision_modalities)
+    model.max_items_per_step = max(
+        budget.mm_max_items_per_batch[m] for m in model.vision_modalities
+    )
     # The platform sets float16 for every engine run; the field is typed wider.
     dtype = cast(torch.dtype, runner.model_config.dtype)
     model.compile_vision_graphs()

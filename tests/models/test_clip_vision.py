@@ -307,12 +307,19 @@ def test_class_layout_gives_each_image_one_token_and_a_fixed_slot(tp_group):
     assert model.vision_item_tokens({"pixel_values": images}) == [1, 1, 1]
     assert model.patches_per_token == model.vision_patch_multiple == 128
     assert values["patches"].shape == (3 * 128, 192)
-    ids = values["segments"].argmax(-1).reshape(3, 128)
-    for i in range(3):
-        assert (ids[i, :65] == i).all() and (ids[i, 65:] == SEGMENT_ITEMS).all()
     # The class row has no patch: its embedding comes from the position table alone.
     assert not values["patches"].reshape(3, 128, -1)[:, 0].any()
     assert values["positions"].reshape(3, 128)[0, :65].tolist() == list(range(65))
+
+    # Slots batch on dim 0 under one key-padding row: no cross-image mask, whose size would
+    # grow with the square of the images per call.
+    assert "segments" not in values and "segments" not in model.vision_buffers
+    with torch.inference_mode():
+        x, block_kwargs = model.vision_embed(values)
+    assert x.shape == (3, 128, 128)
+    mask = block_kwargs["mask"]
+    assert mask.shape == (1, 1, 1, 128) and mask.dtype == x.dtype
+    assert (mask[..., :65] == 0).all() and (mask[..., 65:] < 0).all()
 
 
 def test_an_image_of_another_size_is_rejected(tp_group):
@@ -421,9 +428,11 @@ def _padded_device_inputs(model, images, token_budget):
 
 @pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
 def test_compiled_pipeline_matches_upstream_at_every_budget_on_spyre(tp_group, pooling_type):
-    """The compiled graphs at each budget of an eight-image step, fed the way the manager
+    """The compiled graphs at each budget of a three-image step, fed the way the manager
     feeds them; at the smallest one, also against the uncompiled pipeline on the same
-    device buffers."""
+    device buffers. Three images leave one budget per layout (``class`` 3, ``full`` 256,
+    which pads 195 tokens): each budget is a compile, and the CPU padding test covers the
+    larger ones."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
@@ -434,7 +443,7 @@ def test_compiled_pipeline_matches_upstream_at_every_budget_on_spyre(tp_group, p
     config = _tower_config()
     images = _pixels(3)
     model = _spyre_model(config, pooling_type).to("spyre")
-    model.max_items_per_step = 8
+    model.max_items_per_step = 3
     tokens = sum(model.vision_item_tokens({"pixel_values": images}))
     budgets = EncoderCudaGraphManager._generate_budgets(
         *model.get_encoder_cudagraph_budget_range(None)

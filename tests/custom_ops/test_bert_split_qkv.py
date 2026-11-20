@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``split_bert_qkv`` replaces the fused QKV projection with three bit-identical ones (CPU-only)."""
+"""CPU-only."""
 
 import torch
 import torch.nn as nn

@@ -231,8 +231,7 @@ class SpyreQKVParallelLinear(_SpyreTransposedLinearMixin, QKVParallelLinear):
     """OOT QKVParallelLinear for IBM's Spyre device.
 
     The fused QKV output is returned whole; the model splits it on-device with
-    the unmodified `qkv.split(...)` idiom. BertSelfAttention is the exception:
-    `split_bert_qkv` unfuses it on CPU before the device move.
+    the unmodified `qkv.split(...)` idiom, except BertSelfAttention (`split_bert_qkv`).
     """
 
     def __init__(self, *args, **kwargs):

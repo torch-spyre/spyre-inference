@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLIP on Spyre: ``SpyreCLIPEmbeddingModel``, the vision-tower layer that takes the
-same-image mask (``SpyreCLIPEncoderLayer``), and the EngineArgs override that must
+"""CLIP on Spyre: ``SpyreCLIPEmbeddingModel``, the vision-tower layer that takes an
+additive mask (``SpyreCLIPEncoderLayer``), and the EngineArgs override that must
 land before ModelConfig is built.
 
 The vision tower runs on ``SpyreVisionEncoderMixin``, in one of two layouts picked from the
@@ -21,7 +21,8 @@ pooling type:
 
 - ``"class"`` (``LAST``, ``CLS``): one image token per image. Each image fills a fixed slot of
   ``align_up(grid**2 + 1, 64)`` patches, class row first and padding at the slot's tail, so
-  ``patches_per_token`` is the slot and the token budgets count images.
+  ``patches_per_token`` is the slot and the token budgets count images. The blocks run the
+  slots batched on dim 0 under one key-padding row, so attention grows linearly with images.
 - ``"full"`` (``MEAN``, ``ALL``): every row is an image token, packed back to back as Pixtral's.
   ``MEAN`` is pooled by the pooler over the image's placeholders, not in the tower.
 """
@@ -52,6 +53,7 @@ from vllm.v1.attention.selector import get_attn_backend
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
+    MASK_MIN,
     SEGMENT_ITEMS,
     GatherTable,
     SpyreVisionEncoderMixin,
@@ -157,7 +159,8 @@ class SpyreCLIPAttention(CLIPAttention):
     """Upstream's vision attention with the stick-aligned SDPA under an additive mask.
 
     Upstream's ``attn`` takes packed sequence lengths and builds its mask on the host; this
-    one takes the same-image mask built once per encoder call in ``vision_embed``.
+    one takes the mask ``vision_embed`` builds once per encoder call: a key-padding row over
+    batched slots (``"class"``) or the same-image mask over packed images (``"full"``).
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -246,6 +249,7 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
     vision_items_limited_by_tokens = True
 
     _class_pick: torch.Tensor
+    _slot_key_pad: torch.Tensor
 
     # --- construction ---
 
@@ -285,14 +289,19 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
         self._patch_width = align_up(vision.num_channels * self._patch_size**2)
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
-            "segments": segment_buffer(),
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
+        if not self._class_layout:
+            self.vision_buffers["segments"] = segment_buffer()
         # Weighs a slot's rows down to its class row: a strided slice there is misread on the
         # card (see select_class_rows).
         pick = torch.zeros(1, self._slot, 1)
         pick[0, 0] = 1.0
         self.register_buffer("_class_pick", pick, persistent=False)
+        # Every slot holds the same rows, so one key-padding row masks every image's tail.
+        key_pad = torch.zeros(1, 1, 1, self._slot)
+        key_pad[..., self._image_rows :] = MASK_MIN
+        self.register_buffer("_slot_key_pad", key_pad, persistent=False)
 
         # With an image limit of 0, upstream leaves a placeholder instead of the tower.
         if not isinstance(self.vision_model, CLIPVisionTransformer):
@@ -378,11 +387,13 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
             seg += [torch.full((self._image_rows,), i), torch.full((tail,), SEGMENT_ITEMS)]
             pos += [torch.arange(self._image_rows), torch.zeros(tail, dtype=torch.int64)]
         flat = torch.cat(flat_patches)
-        return {
+        values = {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
-            "segments": one_hot_segments(torch.cat(seg)),
             "positions": torch.cat(pos),
         }
+        if not self._class_layout:
+            values["segments"] = one_hot_segments(torch.cat(seg))
+        return values
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_model
@@ -390,16 +401,19 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
         patch_weight_t = cast(torch.Tensor, tower.embeddings.patch_embedding.weight)
         x = torch.matmul(values["patches"], patch_weight_t)
         x = x + self.spyre_position_table.gather(values["positions"])
-        x = _vision_layer_norm(x, tower.pre_layrnorm).unsqueeze(0)
+        x = _vision_layer_norm(x, tower.pre_layrnorm)
+        if self._class_layout:
+            # [images, slot, D]: each image attends within its own slot, not to the others.
+            x = x.reshape(-1, self._slot, x.shape[-1])
+            return x, {"mask": self._slot_key_pad.to(x.dtype)}
+        x = x.unsqueeze(0)
         return x, {"mask": segment_mask(values["segments"], x.dtype)}
 
     def vision_blocks(self) -> nn.ModuleList:
         return self.vision_model.encoder.layers
 
     def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
-        x = x.squeeze(0)
-        if self._class_layout:
-            x = (x.reshape(-1, self._slot, x.shape[-1]) * self._class_pick).sum(dim=1)
+        x = (x * self._class_pick).sum(dim=1) if self._class_layout else x.squeeze(0)
         norm = self.vision_model.post_layernorm
         if norm is not None:
             x = _vision_layer_norm(x, norm)

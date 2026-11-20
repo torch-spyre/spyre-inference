@@ -37,6 +37,13 @@ length ladder:
 * ``encoder_group_shapes`` -- the ragged path of the largest body, for batches too wide
   for a rectangle. One ``(width, extent)`` per group of equal-extent requests. The other
   bodies' groups are on ``EncoderShapeTables.tier_groups``.
+
+``SPYRE_ENCODER_DENSE_LADDER`` replaces that ladder, for a model that fits in the fast
+body, with one length every stick up to ``max_model_len``. Each length then has its own
+body of ``L * B`` rows, so a 384-token prompt pads to 384 instead of 512. Ragged groups
+stay on the power-of-two extents of the largest body. A model with bodies above the fast
+one keeps the power-of-two tiers. With it on, a step pads to the chosen rectangle's body
+rather than to the smallest body that holds its token count.
 """
 
 from __future__ import annotations
@@ -121,6 +128,8 @@ class EncoderShapeTables:
     """Body row counts, ascending. A step pads to the smallest one that holds it."""
     tier_groups: tuple[tuple[int, tuple[tuple[int, int], ...]], ...]
     """``(body rows, ragged groups)`` for every body, including ones with no groups."""
+    dense_ladder: bool = False
+    """True when rectangles come from the stick-step ladder, one body per length."""
 
 
 def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
@@ -135,6 +144,7 @@ def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
         int(vllm_config.scheduler_config.max_num_batched_tokens),
         max(1, int(vllm_config.scheduler_config.max_num_seqs)),
         envs.SPYRE_ATTN_QUERY_BUCKETS,
+        bool(envs.SPYRE_ENCODER_DENSE_LADDER),
     )
 
 
@@ -144,8 +154,13 @@ def _encoder_shape_tables(
     max_num_batched_tokens: int,
     max_num_seqs: int,
     query_buckets_override: str | None,
+    dense_ladder: bool = False,
 ) -> EncoderShapeTables:
     del query_buckets_override  # read from envs below; a cache key only
+    if dense_ladder and not envs.SPYRE_ATTN_QUERY_BUCKETS:
+        dense = _dense_encoder_shape_tables(max_model_len, max_num_batched_tokens, max_num_seqs)
+        if dense is not None:
+            return dense
     lengths = _encoder_lengths(max_model_len)
     budgets = encoder_body_budgets(max_model_len, max_num_batched_tokens, max_num_seqs)
 
@@ -226,6 +241,57 @@ def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
         size *= 2
     ladder.append(limit)
     return tuple(ladder)
+
+
+def _dense_encoder_shape_tables(
+    max_model_len: int, max_num_batched_tokens: int, max_num_seqs: int
+) -> EncoderShapeTables | None:
+    """One rectangle per stick-step length, each with its own body. None if not applicable.
+
+    A model whose bodies already step past the fast body (an 8K reranker) keeps the
+    power-of-two tiers: densifying those would multiply the long graphs. An explicit
+    ``SPYRE_ATTN_QUERY_BUCKETS`` list is handled by the caller and also skips this.
+
+    ``B`` is the most sequences of that length that fit in the fast body, and no wider
+    than ``max_num_seqs``. The body is ``L * B``, so a narrow engine no longer pads a
+    short batch out to 2048 rows. Ragged groups stay on the power-of-two extents of the
+    largest body, which is what a step that misses every rectangle pads to.
+    """
+    tiers = encoder_body_budgets(max_model_len, max_num_batched_tokens, max_num_seqs)
+    if len(tiers) != 1 or tiers[0] > POOLING_FAST_BODY_ROWS:
+        return None
+
+    limit = min(_align_up_pow2(max_model_len), POOLING_FAST_BODY_ROWS)
+    lengths: list[int] = []
+    length = ENCODER_SEQ_ALIGNMENT
+    while length <= limit:
+        lengths.append(length)
+        length += ENCODER_SEQ_ALIGNMENT
+    rectangles = [
+        (length, min(max_num_seqs, POOLING_FAST_BODY_ROWS // length)) for length in lengths
+    ]
+    rectangles = [(length, batch) for length, batch in rectangles if batch >= 1]
+    if not rectangles:
+        return None
+
+    bodies = tuple(sorted({length * batch for length, batch in rectangles}))
+    pow2: list[int] = []
+    size = ENCODER_SEQ_ALIGNMENT
+    while size < limit:
+        pow2.append(size)
+        size *= 2
+    pow2.append(limit)
+    largest = bodies[-1]
+    groups = _encoder_groups(tuple(pow2), largest, max_num_seqs)
+    return EncoderShapeTables(
+        budget=largest,
+        lengths=tuple(lengths),
+        rectangles=tuple(rectangles),
+        groups=groups,
+        budgets=bodies,
+        tier_groups=tuple((body, groups if body == largest else ()) for body in bodies),
+        dense_ladder=True,
+    )
 
 
 def _extent_reaches_body(length: int, previous: int, max_num_seqs: int) -> bool:
@@ -389,6 +455,124 @@ def encoder_rectangle_for_batch(
         if length >= max_len:
             return (length, batch) if num_seqs <= batch else None
     return None
+
+
+def encoder_dense_step_rows(
+    num_seqs: int,
+    max_len: int,
+    rectangles: Sequence[tuple[int, int]],
+    bodies: Sequence[int],
+    ragged_rows: int,
+) -> int | None:
+    """Padded row count for one dense-ladder step, or None to keep the 1D bucket.
+
+    A rectangle pads to its own body (``L * B``), which is not always the smallest
+    body that holds the real token count: sixteen 100-token prompts belong on the
+    2048-row ``(128, 16)`` grid, not on a 1792-row body they happen to fit in.
+    A step no rectangle holds pads to ``ragged_rows``, the body the ragged groups
+    were compiled against.
+    """
+    warmed = {int(body) for body in bodies}
+    usable = [(length, batch) for length, batch in rectangles if length * batch in warmed]
+    rect = encoder_rectangle_for_batch(num_seqs, max_len, usable)
+    if rect is not None:
+        return rect[0] * rect[1]
+    if int(ragged_rows) in warmed:
+        return int(ragged_rows)
+    return None
+
+
+def choose_rectangle_admissions(
+    waiting_lengths: Sequence[int],
+    rectangles: Sequence[tuple[int, int]],
+    *,
+    token_budget: int,
+    max_new: int,
+    running_lengths: Sequence[int] = (),
+) -> list[int] | None:
+    """Indices into ``waiting_lengths`` that fill one rectangle, or None to leave FCFS.
+
+    Index 0 is the oldest waiting request and is always included, so nothing starves.
+    Among rectangles that cover it (and any request already running), this picks the
+    set with the most real tokens, then the most requests, then the shortest length.
+    ``running_lengths`` are tokens still to compute; they spend budget and width
+    before anyone waiting is considered.
+    """
+    if not waiting_lengths or max_new < 1 or token_budget < 1:
+        return None
+    head = int(waiting_lengths[0])
+    if head < 1:
+        return None
+    running = [int(n) for n in running_lengths if int(n) > 0]
+    budget = int(token_budget) - sum(running)
+    if head > budget:
+        return None
+    need = max(head, max(running, default=0))
+    best_rank: tuple[int, int, int] | None = None
+    best: list[int] | None = None
+    for length, batch in rectangles:
+        if length < need:
+            continue
+        room = int(batch) - len(running)
+        if room < 1:
+            continue
+        picked = _pack_rectangle(
+            waiting_lengths,
+            limit=int(length),
+            cap=min(room, max_new),
+            token_budget=budget,
+        )
+        if not picked:
+            continue
+        tokens = sum(int(waiting_lengths[i]) for i in picked)
+        rank = (tokens, len(picked), -int(length))
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best = picked
+    return best
+
+
+def _pack_rectangle(
+    lengths: Sequence[int],
+    *,
+    limit: int,
+    cap: int,
+    token_budget: int,
+) -> list[int] | None:
+    """Highest-token subset that includes index 0, with at most ``cap`` lengths <= ``limit``."""
+    head = int(lengths[0])
+    if cap < 1 or head < 1 or head > limit or head > token_budget:
+        return None
+    # states[count] is the best (tokens, indices) using exactly `count` requests.
+    states: list[tuple[int, list[int]] | None] = [None] * (cap + 1)
+    states[1] = (head, [0])
+    for idx in range(1, len(lengths)):
+        length = int(lengths[idx])
+        if length < 1 or length > limit:
+            continue
+        updates: list[tuple[int, int, list[int]]] = []
+        for count in range(1, cap):
+            state = states[count]
+            if state is None:
+                continue
+            tokens = state[0] + length
+            if tokens <= token_budget:
+                updates.append((count + 1, tokens, [*state[1], idx]))
+        for count, tokens, indices in updates:
+            current = states[count]
+            if current is None or tokens > current[0]:
+                states[count] = (tokens, indices)
+    best: tuple[int, list[int]] | None = None
+    for state in states:
+        if state is None:
+            continue
+        if (
+            best is None
+            or state[0] > best[0]
+            or (state[0] == best[0] and len(state[1]) > len(best[1]))
+        ):
+            best = state
+    return None if best is None else best[1]
 
 
 def encoder_dense_row_indices(query_lens: Sequence[int], len_bucket: int) -> torch.Tensor:

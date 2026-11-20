@@ -152,6 +152,16 @@ vllm serve ibm-granite/granite-embedding-125m-english \
   --runner pooling --max-num-seqs 4 --max-model-len 512
 ```
 
+Two knobs change how full those shapes get. `SPYRE_ENCODER_RECT_ADMISSION=1` (the
+default) makes a pooling step admit the oldest waiting request plus the companions that
+carry the most real tokens without exceeding one rectangle's width, so a mixed-length
+queue stays on the rectangular path. It does nothing while chunked prefill is enabled.
+`SPYRE_ENCODER_DENSE_LADDER=1` (off by default) declares a length every 64 tokens up to
+2048, each with its own body, so a 384-token prompt pads to 384 instead of 512. Extents
+such as 192 and bodies such as 1792 are not in the default warmup; enable it after a
+parity check on device. `SPYRE_ATTN_QUERY_BUCKETS` still overrides the ladder, and a
+model with bodies above 2048 keeps the power-of-two tiers either way.
+
 ## Tuning buckets for padding
 
 Bucketing trades warmup time for per-request padding. A request is padded up to the next

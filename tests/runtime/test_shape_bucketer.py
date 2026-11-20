@@ -19,10 +19,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from spyre_inference import envs
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    choose_rectangle_admissions,
     encoder_body_budgets,
     encoder_budget_rows,
+    encoder_dense_step_rows,
     encoder_group_shapes,
     encoder_len_ladder,
     encoder_rectangle_for_batch,
@@ -460,6 +463,203 @@ class TestEncoderDispatch:
 
     def test_no_rectangles_is_the_ragged_path(self):
         assert encoder_rectangle_for_batch(1, 64, []) is None
+
+
+def _rectangles_512() -> list[tuple[int, int]]:
+    return encoder_rectangles(
+        _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+    )
+
+
+class TestRectangleAdmission:
+    """The oldest request stays, and the batch stops at a rectangle's width."""
+
+    def test_five_long_prompts_stop_at_the_rectangle(self):
+        # 5 * 400 fits the 2048-token budget and misses (512, 4). Admit four.
+        picked = choose_rectangle_admissions(
+            [400, 400, 400, 400, 400],
+            _rectangles_512(),
+            token_budget=2048,
+            max_new=32,
+        )
+        assert picked == [0, 1, 2, 3]
+
+    def test_short_prompts_fill_the_wide_rectangle(self):
+        # 20 * 100 also fits the token budget, but (128, 16) holds 16.
+        picked = choose_rectangle_admissions(
+            [100] * 20,
+            _rectangles_512(),
+            token_budget=2048,
+            max_new=32,
+        )
+        assert picked is not None
+        assert picked[0] == 0
+        assert len(picked) == 16
+        assert sum(100 for _ in picked) == 1600
+
+    def test_a_long_head_is_not_skipped_for_a_fuller_short_batch(self):
+        picked = choose_rectangle_admissions(
+            [500, *([100] * 20)],
+            _rectangles_512(),
+            token_budget=2048,
+            max_new=32,
+        )
+        assert picked is not None
+        assert picked[0] == 0
+        assert len(picked) <= 4
+
+    def test_token_budget_beats_the_rectangle_width(self):
+        picked = choose_rectangle_admissions(
+            [400, 400],
+            _rectangles_512(),
+            token_budget=500,
+            max_new=32,
+        )
+        assert picked == [0]
+
+    def test_empty_waiting_leaves_fcfs_alone(self):
+        assert (
+            choose_rectangle_admissions([], _rectangles_512(), token_budget=2048, max_new=32)
+            is None
+        )
+
+
+class TestDenseLadder:
+    @pytest.fixture()
+    def enabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_DENSE_LADDER", "1")
+        envs.clear_env_cache()
+        yield
+        envs.clear_env_cache()
+
+    def test_stick_steps_and_one_body_per_length(self, enabled):
+        del enabled
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        tables = encoder_shape_tables(cfg)
+        assert tables.dense_ladder
+        assert tables.lengths == (64, 128, 192, 256, 320, 384, 448, 512)
+        assert tables.rectangles == (
+            (64, 32),
+            (128, 16),
+            (192, 10),
+            (256, 8),
+            (320, 6),
+            (384, 5),
+            (448, 4),
+            (512, 4),
+        )
+        assert tables.budgets == (1792, 1920, 2048)
+        # Ragged groups stay the power-of-two family, and only on the largest body.
+        assert group_width_caps(tables.groups) == {64: 32, 128: 16, 256: 8, 512: 4}
+        assert len(tables.groups) == 18
+        assert dict(tables.tier_groups)[1792] == ()
+        assert dict(tables.tier_groups)[1920] == ()
+        assert dict(tables.tier_groups)[2048] == tables.groups
+
+    def test_narrow_engine_shrinks_the_body(self, enabled):
+        """Four sequences never need a 32-wide grid, so the body is L * 4."""
+        del enabled
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
+        assert encoder_rectangles(cfg) == [
+            (64, 4),
+            (128, 4),
+            (192, 4),
+            (256, 4),
+            (320, 4),
+            (384, 4),
+            (448, 4),
+            (512, 4),
+        ]
+        assert encoder_group_shapes(cfg) == []
+
+    def test_long_context_keeps_the_power_of_two_tiers(self, enabled):
+        del enabled
+        cfg = _pooling_vllm_config(max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192)
+        tables = encoder_shape_tables(cfg)
+        assert not tables.dense_ladder
+        assert tables.budgets == (2048, 4096, 8192)
+
+    def test_query_bucket_override_wins(self, enabled, monkeypatch):
+        del enabled
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "64,512")
+        envs.clear_env_cache()
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 512]
+        assert not encoder_shape_tables(cfg).dense_ladder
+
+    def test_step_rows_follow_the_rectangle_not_the_token_count(self, enabled):
+        """Sixteen 100-token prompts are a 2048-row grid, not the 1792 body 1600 fits in."""
+        del enabled
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        tables = encoder_shape_tables(cfg)
+        assert (
+            encoder_dense_step_rows(16, 100, tables.rectangles, tables.budgets, tables.budget)
+            == 2048
+        )
+        # 6 * 300 misses (256, 8) and fits (320, 6), whose body is 1920.
+        assert (
+            encoder_dense_step_rows(6, 300, tables.rectangles, tables.budgets, tables.budget)
+            == 1920
+        )
+        # Wider than every covering rectangle: the ragged groups live on 2048.
+        assert (
+            encoder_dense_step_rows(5, 400, tables.rectangles, tables.budgets, tables.budget)
+            == 2048
+        )
+
+
+class TestRaggedGroupMerge:
+    """A one-request group is a whole launch per layer. Fold it into the next group."""
+
+    @staticmethod
+    def _plan(lengths: list[int], *, rectangles: list[tuple[int, int]], cap_512: int = 4):
+        from types import SimpleNamespace
+
+        import torch
+
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import build_encoder_plan
+
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        metadata = SimpleNamespace(
+            apply_causal_mask=False,
+            query_start_loc=torch.tensor(offsets, dtype=torch.int32),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            num_actual_tokens=offsets[-1],
+            num_seqs=len(lengths),
+        )
+        return build_encoder_plan(
+            metadata,
+            rectangles=rectangles,
+            width_cap_for={64: 32, 128: 16, 256: 8, 512: cap_512},
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            batched=True,
+        )
+
+    def test_two_singletons_become_one_group(self):
+        # (512, 1) cannot hold both, so this is the ragged path. One launch, not two.
+        plan = self._plan([64, 400], rectangles=[(512, 1)])
+        assert len(plan) == 1
+        assert plan[0].extent == 512
+        assert plan[0].group == 2
+
+    def test_a_merge_that_splits_straight_back_is_skipped(self):
+        """2 + 1 chunks as 2 + 1 again, so the short request keeps its own extent."""
+        plan = self._plan([64, 400, 400], rectangles=[(512, 1)])
+        assert sorted(group.extent for group in plan) == [64, 512]
+
+    def test_a_full_group_is_left_alone(self):
+        plan = self._plan([400, 400, 400, 400, 64], rectangles=[(512, 1)])
+        extents = sorted(group.extent for group in plan)
+        assert extents == [64, 512]
+        assert sum(group.group for group in plan) == 5
+
+    def test_a_lone_request_is_not_promoted(self):
+        plan = self._plan([64], rectangles=[])
+        assert len(plan) == 1
+        assert plan[0].extent == 64
 
 
 class TestLogitsRowBuckets:

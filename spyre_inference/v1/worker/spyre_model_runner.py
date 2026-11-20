@@ -112,6 +112,7 @@ from spyre_inference.v1.worker.model_load import (
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    encoder_dense_step_rows,
     encoder_len_ladder,
     encoder_shape_tables,
     expand_packed_token_types,
@@ -684,6 +685,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             rows: group_width_caps(groups) for rows, groups in self._encoder_groups_by_rows.items()
         }
         self._encoder_budget = tables.budget if tables is not None else 0
+        # Stick-step rectangles each have their own body; the 1D token bucket would
+        # pad a short batch onto the wrong one. See encoder_dense_step_rows.
+        self._encoder_dense_ladder = bool(tables.dense_ladder) if tables is not None else False
         self._encoder_buffer_rows = 0
         # (extent, width, query_lens) on the rectangular path; None on the ragged one.
         self._encoder_grid: tuple[int, int, list[int]] | None = None
@@ -1351,10 +1355,27 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Decoder and pooling share this path; the buckets are ``compile_sizes``.
         Pooling has one per body, and a step pads to the smallest that holds it.
+        The dense ladder instead pads to the chosen rectangle's own body.
         """
-        del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
-        padded = bucketer.warmed_bucket(num_tokens) if bucketer is not None else None
+        if bucketer is None or not bucketer.is_warmed_up:
+            return None
+        if (
+            self._encoder_dense_ladder
+            and num_scheduled_tokens_np is not None
+            and len(num_scheduled_tokens_np) > 0
+            and num_reqs > 0
+        ):
+            rows = encoder_dense_step_rows(
+                num_reqs,
+                int(num_scheduled_tokens_np[:num_reqs].max()),
+                self._encoder_rectangles,
+                bucketer.bucket_sizes,
+                self._encoder_budget,
+            )
+            if rows is not None:
+                return BatchDescriptor(num_tokens=rows)
+        padded = bucketer.warmed_bucket(num_tokens)
         return None if padded is None else BatchDescriptor(num_tokens=padded)
 
     def profile_run(self, randomize_inputs: bool = False) -> None:

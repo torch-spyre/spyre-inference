@@ -387,6 +387,50 @@ class EncoderGroupPlan:
         return len(self.starts)
 
 
+def _group_chunks(count: int, cap: int) -> int:
+    """Dispatches ``build_encoder_plan`` splits ``count`` requests into."""
+    chunks = 0
+    offset = 0
+    while offset < count:
+        chunks += 1
+        offset += min(1 << ((count - offset).bit_length() - 1), max(1, cap))
+    return chunks
+
+
+def _merge_small_extent_groups(
+    by_extent: dict[int, list[tuple[int, int, int]]],
+    width_cap_for: dict[int, int],
+) -> None:
+    """Move a 1- or 2-request group into the next larger group when that saves a launch.
+
+    Ragged attention launches once per power-of-two chunk per layer. Combining
+    two single-request groups into one pair removes a launch; combining into a
+    size that splits straight back (2 + 1 -> 2 + 1) does not, and only lengthens
+    the short requests' attention. The moved requests keep their real lengths.
+    A group that is the only one, or that would pass the destination's declared
+    width, stays where it is.
+    """
+    extents = sorted(by_extent)
+    for index, extent in enumerate(extents):
+        group = by_extent[extent]
+        if not group or len(group) > 2:
+            continue
+        for larger in extents[index + 1 :]:
+            dest = by_extent[larger]
+            if not dest:
+                continue
+            cap = width_cap_for.get(larger, 1)
+            combined = len(dest) + len(group)
+            if combined > cap:
+                continue
+            if _group_chunks(combined, cap) < _group_chunks(len(dest), cap) + _group_chunks(
+                len(group), cap
+            ):
+                dest.extend(group)
+                by_extent[extent] = []
+                break
+
+
 def build_encoder_plan(
     attn_metadata: SpyreAttentionMetadata,
     *,
@@ -445,6 +489,10 @@ def build_encoder_plan(
     for member in members:
         extent = _alignment_units_for(member[1]) * ENCODER_LEN_ALIGNMENT
         by_extent.setdefault(extent, []).append(member)
+    if batched:
+        # A group of one or two is a whole launch per layer. Fold it into the next
+        # larger group when that removes a launch rather than splitting straight back.
+        _merge_small_extent_groups(by_extent, width_cap_for)
 
     index_dtype = encoder_index_dtype(device)
 
@@ -470,6 +518,8 @@ def build_encoder_plan(
 
     plans: list[EncoderGroupPlan] = []
     for extent, group in sorted(by_extent.items()):
+        if not group:
+            continue
         if not batched:
             plans.extend(plan([m], extent) for m in group)
             continue

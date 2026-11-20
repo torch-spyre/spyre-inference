@@ -15,9 +15,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from spyre_inference import envs
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    choose_rectangle_admissions,
+    encoder_shape_tables,
+)
+
+# How far past the oldest waiting request rectangle admission looks for companions.
+# Past this the oldest request is still admitted; the rest wait for a later step.
+_RECT_ADMISSION_WINDOW = 256
 
 
 class TorchSpyreScheduler(Scheduler):
@@ -26,6 +35,13 @@ class TorchSpyreScheduler(Scheduler):
     Prefill attention runs one kernel per sequence, padding each to its own query bucket, so
     the short leftover chunk upstream uses to top up a batch costs a full-width
     prefill however few tokens it carries.
+
+    Pooling never decodes, so that cap is off. Instead, when chunked prefill is off,
+    a step admits only the requests that fill one encoder rectangle: the oldest
+    waiting request, plus the companions that carry the most real tokens without
+    exceeding that rectangle's width. Upstream admits by real token count and will
+    otherwise take one sequence more than the rectangle holds, which drops the step
+    onto the ragged path.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -39,6 +55,8 @@ class TorchSpyreScheduler(Scheduler):
         )
 
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
+        if self._rectangle_admission_applies():
+            return self._schedule_pooling_rectangle(*args, **kwargs)
         if self.max_num_partial_prefills <= 0:
             return super().schedule(*args, **kwargs)
 
@@ -61,3 +79,61 @@ class TorchSpyreScheduler(Scheduler):
             return super().schedule(*args, **kwargs)
         finally:
             self.max_num_active_reqs = max_num_active_reqs
+
+    def _rectangle_admission_applies(self) -> bool:
+        """Pooling, FCFS, whole prompts. Chunked prefill and priority keep upstream."""
+        if not envs.SPYRE_ENCODER_RECT_ADMISSION:
+            return False
+        if self.vllm_config.model_config.runner_type != "pooling":
+            return False
+        if self.scheduler_config.enable_chunked_prefill:
+            return False
+        return self.policy == SchedulingPolicy.FCFS
+
+    def _schedule_pooling_rectangle(self, *args, **kwargs) -> SchedulerOutput:
+        chosen = self._rectangle_waiting_requests()
+        if not chosen:
+            return super().schedule(*args, **kwargs)
+        # ``prepend_request`` is appendleft, so walk the chosen list backwards to
+        # leave the oldest request at the front. Upstream then admits that prefix
+        # and stops when the next one does not fit, which this cap makes be the
+        # first request outside the rectangle.
+        self.waiting.remove_requests(chosen)
+        for request in reversed(chosen):
+            self.waiting.prepend_request(request)
+        max_num_active_reqs = self.max_num_active_reqs
+        self.max_num_active_reqs = min(
+            max_num_active_reqs,
+            len(self.running) + self.num_waiting_for_streaming_input + len(chosen),
+        )
+        try:
+            return super().schedule(*args, **kwargs)
+        finally:
+            self.max_num_active_reqs = max_num_active_reqs
+
+    def _rectangle_waiting_requests(self) -> list:
+        if not self.waiting:
+            return []
+        window = []
+        for index, request in enumerate(self.waiting):
+            if index >= _RECT_ADMISSION_WINDOW:
+                break
+            window.append(request)
+        running = [left for request in self.running if (left := _tokens_left(request)) > 0]
+        free_slots = (
+            self.max_num_active_reqs - len(self.running) - self.num_waiting_for_streaming_input
+        )
+        indices = choose_rectangle_admissions(
+            [_tokens_left(request) for request in window],
+            encoder_shape_tables(self.vllm_config).rectangles,
+            token_budget=self.max_num_scheduled_tokens,
+            max_new=max(0, free_slots),
+            running_lengths=running,
+        )
+        if not indices:
+            return []
+        return [window[index] for index in indices]
+
+
+def _tokens_left(request) -> int:
+    return max(0, int(request.num_tokens) - int(request.num_computed_tokens))

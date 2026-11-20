@@ -13,7 +13,7 @@ Our platform sets `_enum = PlatformEnum.OOT`. This means `current_platform.is_cp
 
 **Don't** fix this by overriding `is_cpu()` to return `True`. `vllm/model_executor/custom_op.py` checks `is_cpu()` *before* `is_out_of_tree()` in its `forward_*` dispatch, and we rely on `forward_oot` for our custom-op overrides. Forcing `is_cpu()` reroutes every `CustomOp` to `forward_cpu`.
 
-**Do** add a surgical override on `TorchSpyreWorker` (or `TorchSpyrePlatform` if the wrapper is on `Platform`). The fix is always the same shape: return whatever no-op the CPU branch would have returned (usually `nullcontext()` or `None`), and leave a comment explaining why you're not fixing `is_cpu()`. For example, the v0.23.0 bump introduced a memory-pool context wrapper in `Worker.load_model`:
+**Do** add a surgical override on `SpyreWorkerV2` (or `TorchSpyrePlatform` if the wrapper is on `Platform`). The fix is always the same shape: return whatever no-op the CPU branch would have returned (usually `nullcontext()` or `None`), and leave a comment explaining why you're not fixing `is_cpu()`. For example, the v0.23.0 bump introduced a memory-pool context wrapper in `Worker.load_model`:
 
 ```python
 def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
@@ -116,25 +116,18 @@ If this fails with `ImportError` from inside vLLM, the upstream API moved out fr
 ## Step 2b: Re-sync the Vendored Host-Sampling Code
 
 Spyre copies logits to the host for sampling, and spyre-inference vendors vLLM's CPU
-sampling code to do it fast. Every bump must re-check that code against the new upstream,
+top-k/top-p code to do it fast. Every bump must re-check that code against the new upstream,
 even when nothing fails: the build and the tests only catch breakage, not upstream fixes we
 are missing.
 
 | Ours | Upstream (vLLM) | How ours differs |
 |---|---|---|
 | `csrc/cpu/cpu_types.hpp`, `cpu_types_{x86,vsx,vxe}.hpp` | same paths | Trimmed to `FP32Vec8`/`FP32Vec16`; every kept line is unchanged. Port fixes to those two types only. |
-| `csrc/cpu/sampling_kernels.cpp` | same path (added in vllm#53913, after v0.28.0) | Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); `greedy_argmax` matches `torch.argmax` on NaN; inputs are checked. Port performance and correctness changes, never the table. |
 | `csrc/cpu/topk_topp_sampler.cpp` | vLLM CPU top-k/top-p, AVX512 and AVX2 from vllm#43452, VSX and VXE from vllm#62440. Not a same-path file on current vLLM main. | Tie-inclusive top-k; upstream keeps exactly k. Top-k plus top-p is an exact softmax cut on the survivors. Top-p alone, and a top-p-only row in a mixed batch, stays the approximate upstream kernel. Re-sync those two PRs, not only the files in the diff below. |
 | `csrc/cpu/cpu_fast_exp.hpp` | No upstream file. The polynomial is the unmerged `DEFINE_FAST_EXP` from vllm#62440 (AVX512) and vllm#43452 (AVX2); vLLM did not merge it, Intel preferred Triton. | AVX2 FMA is a function attribute on `fast_exp` and the two top-p row functions that inline it. The rest of `_C_AVX2` is built with `-mno-fma`, because leaving `-mfma` off does not clear FMA when GCC defaults to x86-64-v3. s390x evaluates it on VXE lanes; Power calls `FP32Vec16::exp()`. Kept out of `cpu_types_*.hpp`, which stay line-unchanged copies. Nothing to diff for it on a vLLM bump. |
 | `csrc/core/registration.h`, `cmake/utils.cmake`, `cmake/cpu_extension.cmake` | same paths | Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of `-march=native`, so wheels are portable. |
-| `SpyreTopKTopPSampler.forward_native` (`spyre_inference/v1/sample/topk_topp_sampler.py`) | `TopKTopPSampler.forward_native` (`vllm/v1/sample/ops/topk_topp_sampler.py`) | Reimplements the upstream tail (kernel top-k/top-p when the ops are in the loaded extension, otherwise sort-free top-k, plus the kernel draw); its comment names the vLLM version it mirrors. |
+| `spyre_apply_top_k_top_p` (`spyre_inference/v1/worker/spyre/kernels.py`) | `apply_top_k_top_p` (`vllm/v1/sample/ops/topk_topp_sampler.py`), as MRV2's sampler and sampling states call it (`vllm/v1/worker/gpu/sample/`) | Bound over both call sites by `kernels.bind()`. Runs the `csrc/cpu/topk_topp_sampler.cpp` filters when the loaded extension has them, otherwise the sort-free top-k/top-p. Logits are already on the host, so it never takes MRV2's full-vocab sort. |
 | `spyre_inference/v1/spec_decode/xpress_head.py`, `SpyreQwen3XPressForCausalLM` (`spyre_inference/models/qwen3_dflash.py`) | `XPressRefinerHead` and `Qwen3XPressForCausalLM` (`vllm/model_executor/models/qwen3_xpress.py`) | Construction, key mapping and mixer folding are upstream's; Spyre checks required head weights and the raw mixer shape. `_spyre_xpress_classes()` swaps the two module-level class names upstream builds by, so a rename upstream fails `test_upstream_xpress_construction_builds_the_spyre_classes`. The head subclass only no-ops `build_fused_buffers()` and swaps the Triton Jacobi kernels for compiled step helpers and Spyre weight layouts. `tests/spec_decode/xpress_reference.py` drives upstream's own `hidden_cache`/`refine_bias` as the oracle, so a change to upstream's math fails `test_xpress_upstream.py`. |
-| `csrc/cpu/spec_decode_utils.cpp`, `spyre_inference/v1/spec_decode/rejection_sampler.py` and the platform kernel hook | The four rejection kernels in `csrc/cpu/spec_decode_utils.cpp` and their adapters in `vllm/utils/cpu_triton_utils.py` (unchanged from v0.32.0 `5df63a7203` through v0.33.0) | Native kernels in `_spyre_C`, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels. Upstream's opt-in FLy acceptance (`rejection_sample_method="fly"`, v0.33.0) is Triton-only and not ported. |
-| `TorchSpyreModelRunner._sample` / `_bookkeeping_sync` (`spyre_inference/v1/worker/spyre_model_runner.py`) | The same methods in `vllm/v1/worker/gpu_model_runner.py`, as patched by vllm#62688 (unmerged) | Temporary port for #1420: restores the full state of CPU generators around sampling and hides them from upstream's `set_offset` rewind, which CPU generators lack. Delete both overrides once the pin includes vllm#62688; `tests/runtime/test_sampling_fallback.py::test_upstream_rewind_still_needs_the_cpu_generator_port` fails once upstream restores CPU generators itself. V1 only: MRV2 samples from `(seed, position)` and keeps no generator state. |
-| The sampler patch in `TorchSpyreModelRunner.__init__` | `Sampler` (`vllm/v1/sample/sampler.py`), its construction and `RejectionSampler(self.sampler)` (`vllm/v1/worker/gpu_model_runner.py`) | Relies on `Sampler` calling `self.greedy_sample` and `self.topk_topp_sampler`, and on the rejection sampler holding the same `Sampler` object. |
-| `allow_xpress_on_v1()` (`spyre_inference/v1/spec_decode/config.py`) | `VllmConfig._get_v1_model_runner_unsupported_features` (`vllm/config/vllm.py`) | Drops "xpress speculative decoding" and "mixed sliding/full dflash drafts": Spyre drives both through its V1 DFlash proposer. This is the config-level half of the decoder-layer workaround below. Retain while V1 is supported; delete when speculative decoding moves to V2 (#1575) and V1 is removed (#1245, part of #906). |
-| `SpyreDFlashQwen3DecoderLayer.__init__` (`spyre_inference/models/qwen3_dflash.py`) | `_resolve_layer_attention`'s V2 check (`vllm/model_executor/models/qwen3_dflash.py`) | Stubs the module's `get_current_vllm_config` to report `use_v2_model_runner=True` during layer construction, allowing mixed sliding/full drafts on V1. Spyre gives these layers a shared full-allocation KV group (`SpyreGemma4ForCausalLM.get_kv_cache_groups`) and splits attention metadata by window. Other current-config reads in the layer's construction see the stub too (currently only `DFlashQwen3Attention`'s ROCm branch); audit them on each vLLM upgrade. Delete once these drafts use V2 (#1575) and V1 is removed (#1245, part of #906). |
-| `use_spyre_dflash_proposer()` (`spyre_inference/v1/spec_decode/dflash.py`) | The `DFlashProposer` import, construction and `isinstance` checks in `vllm/v1/worker/gpu_model_runner.py` | Temporarily replaces the module's constructor during runner initialization. The replacement remains an upstream `DFlashProposer` subclass so later checks in `_prepare_inputs` and `sample_tokens` still pass after restoration. |
 | `csrc/cpu/mrv2_kernels.cpp`, `csrc/cpu/mrv2_spec_decode_kernels.cpp`, `HOST_KERNELS` / `UNSUPPORTED_KERNELS` (`spyre_inference/v1/worker/spyre/kernels.py`) | Every `@triton.jit` kernel MRV2 launches under `vllm/v1/worker/gpu/` (plus `utils.py` and `mamba_utils.py`) | One host op per kernel, taking the kernel's own argument list; `kernels.bind()` assigns it over the module global. `tests/mrv2/test_kernel_coverage.py` fails on a new, renamed or re-signed kernel; port the change into the op and add a case to `tests/mrv2/kernels/`, whose parity suite must stay bit-exact against triton-cpu (`SPYRE_MRV2_KERNELS=triton`). |
 
 Diff the upstream side between the current pin and the target:
@@ -143,37 +136,29 @@ Diff the upstream side between the current pin and the target:
 cd <vllm checkout> && git fetch --tags
 git diff v<current> v{VERSION} --stat -- \
   csrc/cpu/cpu_types.hpp csrc/cpu/cpu_types_x86.hpp csrc/cpu/cpu_types_vsx.hpp \
-  csrc/cpu/cpu_types_vxe.hpp csrc/cpu/sampling_kernels.cpp \
-  csrc/cpu/spec_decode_utils.cpp csrc/cpu/torch_bindings.cpp csrc/core/registration.h \
+  csrc/cpu/cpu_types_vxe.hpp csrc/cpu/torch_bindings.cpp csrc/core/registration.h \
   cmake/cpu_extension.cmake cmake/utils.cmake \
-  vllm/v1/sample/ops/topk_topp_sampler.py vllm/v1/sample/sampler.py \
-  vllm/v1/sample/rejection_sampler.py vllm/utils/cpu_triton_utils.py \
-  vllm/v1/worker/gpu_model_runner.py
+  vllm/v1/sample/ops/topk_topp_sampler.py vllm/v1/worker/gpu/sample/
 ```
 
-For each changed file, port what applies and update the version in the `forward_native`
-comment. If the new vLLM pins a different torch, move every torch pin in `pyproject.toml`
+For each changed file, port what applies. If the new vLLM pins a different torch, move every torch pin in `pyproject.toml`
 together: the extension links libtorch, so a mismatch fails at import. The list (six
 places, including the ppc64le source build) is in §3b of the `upgrade-torch-spyre` skill,
 and torch-spyre must support the new torch as well.
 `uv sync` rebuilds the extension because `csrc/` and `pyproject.toml` are in its cache keys.
 
-Then check the kernels and ordinary-sampling PyTorch fallback (CPU only, no card needed).
-The rejection sampler requires the built extension:
+Then check the filters and their PyTorch fallback (CPU only, no card needed):
 
 ```bash
 uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
-  tests/runtime/test_sampling_fallback.py tests/runtime/test_spyre_topk_sampler.py \
-  tests/spec_decode/test_rejection_sampler.py --no-header
+  tests/runtime/test_top_k_top_p_sort_free.py tests/runtime/test_sampling_extension.py \
+  tests/mrv2/test_kernels.py --no-header
 ```
 
-- `test_sampling_kernels.py` checks the kernels against PyTorch baselines token for token:
-  `torch.argmax` for greedy, and a PyTorch implementation of the same hashed Gumbel draw.
-- `test_sampling_fallback.py` forces the fallback and checks it picks the same tokens as
-  upstream's stock `Sampler`, which catches upstream sampler changes we haven't mirrored.
-- `test_spyre_topk_sampler.py` checks the sort-free top-k/top-p against upstream's sort.
-- `test_rejection_sampler.py` exercises the native kernels through vLLM's dispatchers,
-  including mixed dtypes, FP64 noise, synthetic acceptance and target-distribution checks.
+- `test_sampling_kernels.py` checks the csrc/ filters against upstream's PyTorch filter.
+- `test_top_k_top_p_sort_free.py` checks the sort-free fallback against upstream's sort.
+- `test_sampling_extension.py` checks which extension build a host loads.
+- `tests/mrv2/test_kernels.py` checks `spyre_apply_top_k_top_p` on both paths.
 
 ## Step 3: Triage in This Order
 
@@ -209,7 +194,7 @@ uv run --no-sync pytest tests/attention/test_spyre_attn.py -m "not upstream" --n
 uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py -m "not upstream" --no-header
 ```
 
-This is the most common place to hit OOT platform traps (see above). Fix those with surgical `TorchSpyreWorker` overrides as described.
+This is the most common place to hit OOT platform traps (see above). Fix those with surgical `SpyreWorkerV2` overrides as described.
 
 Not all failures here are OOT traps — also watch for constructor or method signature changes on classes we instantiate or inherit from, new abstract methods on base classes, and import path moves (symbol relocated to a different vLLM module).
 
@@ -260,7 +245,7 @@ Five files typically change for a vLLM bump, plus the vendored sampling code whe
 1. `pyproject.toml` — two things: the `rev` in the `[tool.uv.sources]` vllm entry, and the `vllm>=X.Y.Z,<X.(Y+1)` constraint in `[project] dependencies`.
 2. `uv.lock` — auto-regenerated by `uv sync`. Don't hand-edit.
 3. `tests/plugin/pyproject.toml` — auto-regenerated by `sync-upstream-test-deps` from the allow-list. Review the diff but don't hand-edit; to add or drop a dep, edit `ALLOW_LIST`/`EXCLUDED` in `sync_upstream_test_deps.py` and re-run. The allow-list edit itself is the fourth file that may change on a bump.
-4. `spyre_inference/v1/worker/spyre_worker.py` (sometimes) or `spyre_inference/platform.py` — surgical overrides for new upstream wrappers.
+4. `spyre_inference/v1/worker/spyre/worker.py` (sometimes) or `spyre_inference/platform.py` — surgical overrides for new upstream wrappers.
 5. `tests/plugin/spyre_testing_plugin/pytest_plugin.py` (sometimes) — fixture updates for upstream test-infra churn.
 6. `csrc/cpu/`, `cmake/` and `spyre_inference/v1/sample/` (when upstream changed them) — the Step 2b re-sync of the vendored sampling code.
 

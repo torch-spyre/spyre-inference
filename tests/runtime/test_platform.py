@@ -600,53 +600,6 @@ def test_only_tensor_parallelism_is_accepted(field):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("requested", ["1", "true", "0", None])
-def test_v1_model_runner_is_pinned(monkeypatch, requested):
-    """With SPYRE_MODEL_RUNNER=v1, TorchSpyreWorker only builds the V1 runner, so the
-    resolved config must agree whatever the user asked for. An explicit
-    VLLM_USE_V2_MODEL_RUNNER=1 short-circuits upstream's HAS_TRITON fallback, so the
-    override is what prevents V2 here."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
-    # After construction: register() pins the env var before VllmConfig reads it.
-    vllm_config = _defaults_config(enforce_eager=True, mode=None)
-    if requested is None:
-        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", requested)
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
-    assert vllm_config.use_v2_model_runner is False
-
-
-@pytest.mark.parametrize("feature", ["hisparse", "watermark", "aux_output"])
-def test_v2_only_features_are_rejected(monkeypatch, feature):
-    """hisparse and watermarking outrank VLLM_USE_V2_MODEL_RUNNER inside
-    use_v2_model_runner: hisparse raises an error blaming the env var *we* set, and
-    watermarking silently returns V2. AuxOutput never flips the runner, so the tripwire
-    cannot catch it, and it would be accepted and never produced. Reject all three on
-    SPYRE_MODEL_RUNNER=v1."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    vllm_config = _defaults_config(enforce_eager=True, mode=None)
-    if feature == "hisparse":
-        monkeypatch.setattr(
-            vllm_config.attention_config, "hisparse_config", object(), raising=False
-        )
-    elif feature == "watermark":
-        monkeypatch.setattr(vllm_config, "watermark_config", object(), raising=False)
-    else:
-        monkeypatch.setattr(vllm_config.aux_output_config, "enable_return_routed_experts", True)
-
-    with pytest.raises(ValueError, match="Spyre does not support"):
-        TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-
 def test_fly_rejection_sampling_is_rejected(monkeypatch):
     """FLy is Triton-only, and upstream's CPU guard misses the spyre runner device."""
     from types import SimpleNamespace
@@ -767,16 +720,13 @@ def test_raise_dynamo_recompile_limits_survives_a_clobber():
         ) = saved
 
 
-@pytest.mark.parametrize("runner", ["v1", "v2"])
-def test_worker_reasserts_recompile_limits_after_autoload(runner):
+def test_worker_reasserts_recompile_limits_after_autoload():
     """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
     import inspect
 
     from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
-    from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
-    worker = TorchSpyreWorker if runner == "v1" else SpyreWorkerV2
-    src = inspect.getsource(worker.init_device)
+    src = inspect.getsource(SpyreWorkerV2.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
 
 

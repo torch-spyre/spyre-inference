@@ -30,7 +30,7 @@ _SCRIPT = (
 )
 
 # ruff: noqa: E501
-# Two TP workers; each line as spyre_model_runner.py, spyre_attn.py and vLLM core.py log it.
+# Two TP workers; each line as the Spyre warmup, spyre_attn.py and vLLM core.py log it.
 SERVER_LOG = """\
 INFO 10-13 10:00:00 vLLM API server version 0.0
 (TP0) INFO 10-13 10:01:00 Recording 12 per-seq + 4 batched-decode attention variants for layer...

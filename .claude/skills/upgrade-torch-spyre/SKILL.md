@@ -208,7 +208,7 @@ PyTorch baselines:
 
 ```bash
 uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
-  tests/runtime/test_sampling_fallback.py --no-header
+  tests/runtime/test_top_k_top_p_sort_free.py --no-header
 ```
 
 `test_sampling_kernels.py` skips when the extension didn't load, so check it ran rather

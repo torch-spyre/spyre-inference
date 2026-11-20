@@ -12,28 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
-
 import torch
 
 MAX_DFLASH_BATCH_SIZE = 4
-_SPYRE_V1_FEATURES = {"xpress speculative decoding", "mixed sliding/full dflash drafts"}
-
-
-def allow_xpress_on_v1() -> None:
-    """Allow XPress and mixed draft attention through Spyre's V1 proposer."""
-    from vllm.config.vllm import VllmConfig
-
-    original = VllmConfig._get_v1_model_runner_unsupported_features
-    if getattr(original, "_spyre_patched", False):
-        return
-
-    @functools.wraps(original)
-    def without_spyre_features(self) -> list[str]:
-        return [f for f in original(self) if f not in _SPYRE_V1_FEATURES]
-
-    without_spyre_features._spyre_patched = True
-    VllmConfig._get_v1_model_runner_unsupported_features = without_spyre_features  # ty: ignore[invalid-assignment]
 
 
 def normalize_speculative_config(engine_args) -> None:
@@ -48,11 +29,7 @@ def normalize_speculative_config(engine_args) -> None:
             method = "dflash"
     if method != "dflash":
         return
-    # Set before VllmConfig picks async scheduling, which this flag disables on V1.
-    engine_args.speculative_config = spec | {
-        "method": "dflash",
-        "disable_padded_drafter_batch": True,
-    }
+    engine_args.speculative_config = spec | {"method": "dflash"}
     if engine_args.enable_prefix_caching is None:
         engine_args.enable_prefix_caching = False
 
@@ -163,4 +140,3 @@ def validate_dflash_config(config) -> None:
         "sample_from_anchor", False
     ):
         raise ValueError("Spyre XPress requires a fixed anchor in slot zero")
-    spec.disable_padded_drafter_batch = True

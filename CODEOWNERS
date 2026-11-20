@@ -23,7 +23,8 @@ spyre_inference/models/roberta.py @torch-spyre/spyre-inference-default-codeowner
 spyre_inference/models/_token_type.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
 spyre_inference/v1/pool/ @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
 spyre_inference/v1/attention/backends/spyre_encoder_attn.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
-spyre_inference/v1/worker/spyre_model_runner.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/v1/worker/spyre/pool/ @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/v1/worker/spyre/model_states/encoder_only.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
 
 # FP8
 spyre_inference/custom_ops/fp8_linear_kernel.py @torch-spyre/spyre-inference-default-codeowners @yannicks1 @dilipgb @R3hankhan123

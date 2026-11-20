@@ -2030,7 +2030,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
             return as_strided_with_layout(base, shape, stride, 0, layout)
 
-        return SpyrePagedKVCache(_view(pages[0]), _view(pages[1]))
+        return SpyrePagedKVCache(
+            k_pages=_view(pages.k_pages),
+            v_pages=_view(pages.v_pages),
+        )
 
     @staticmethod
     def _page_geometry(num_blocks: int, spec: AttentionSpec):

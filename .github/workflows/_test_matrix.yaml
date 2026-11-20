@@ -805,17 +805,12 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention-smoke
           # The only job that installs triton; every other job runs triton-free, like Power and Z.
-          # CPU-only, so runs_on_pr takes the card-less pool; merge-queue and runner_label runs keep
-          # runs_on, since no card-less runner carries those labels (as for build_kernels).
+          # CPU-only, but a card-less (spyre_pf_x0) pod loses its runner partway through (likely memory).
           - cfg: MRV2 triton-cpu parity
             test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
-              - linux
-            runs_on_pr:
-              - x86_64
-              - spyre_pf_x0
               - linux
             image_label: image_torch_spyre
             test_target: test-triton-cpu
@@ -959,7 +954,6 @@ jobs:
       test_target: ${{ matrix.test_target }}
       test_types: ${{ matrix.test_types }}
       runs_on: ${{ toJSON(matrix.runs_on) }}
-      runs_on_pr: ${{ matrix.runs_on_pr && toJSON(matrix.runs_on_pr) || '' }}
       # First runs_on label is the arch; the ingest is pinned to x86_64 and cannot read it.
       leg_arch: ${{ matrix.runs_on[0] }}
       image_label: ${{ matrix.image_label }}

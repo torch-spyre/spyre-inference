@@ -21,13 +21,6 @@ on:
         description: JSON array of the leg's runner labels (toJSON(matrix.runs_on))
         required: true
         type: string
-      runs_on_pr:
-        description: >-
-          JSON array of runner labels for PR runs (toJSON(matrix.runs_on_pr)), used unless
-          runner_label is set or the event is merge_group; empty = always runs_on
-        required: false
-        type: string
-        default: ''
       leg_arch:
         description: Arch the leg's tests run on (matrix.runs_on[0]), hashed into run_id by the ingest
         required: true
@@ -125,13 +118,13 @@ env:
   HF_HUB_OFFLINE: '1'
   # inputs.runner_label replaces the standing image label (per-PR dispatch flow);
   # on merge_group the standing label gains the `_mq` suffix to select the merge-queue set.
-  RUNNER_LABELS: ${{ format('["{0}","{1}"]', join(fromJSON((inputs.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && inputs.runs_on_pr || inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label) }}
+  RUNNER_LABELS: ${{ format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label) }}
 
 jobs:
   # The run page lists a called workflow's jobs by their own names, so each carries the cfg.
   attempt:
     name: build and run tests (${{ inputs.cfg }})
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON((inputs.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && inputs.runs_on_pr || inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
     continue-on-error: true
     timeout-minutes: 720
     outputs:
@@ -227,7 +220,7 @@ jobs:
     name: build and run tests (${{ inputs.cfg }}) (pod-level retry)
     needs: attempt
     if: ${{ !cancelled() && needs.attempt.outputs.passed != 'true' }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON((inputs.runs_on_pr && !inputs.runner_label && github.event_name != 'merge_group') && inputs.runs_on_pr || inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(fromJSON(inputs.runs_on), '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', inputs.image_label)) || inputs.image_label)) }}
     timeout-minutes: 720
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

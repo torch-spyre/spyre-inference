@@ -100,12 +100,8 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
     ) -> Generator[None]:
         """Warmup only: plan every step inside as ``rect``, a declared ``(extent, width)``
         rectangle, or as ragged, whatever the dummy batch's own shape."""
-        if rect is not None:
-            # Warmup must not trace a rectangle serving never takes.
-            if self.supports_mm_inputs:
-                raise ValueError("multimodal encoders run packed until #1242")
-            if rect not in self._rectangles:
-                raise ValueError(f"{rect} is not a declared (extent, width): {self._rectangles}")
+        if rect is not None and rect not in self._rectangles:
+            raise ValueError(f"{rect} is not a declared (extent, width): {self._rectangles}")
         previous = self._forced_rect, self._force_ragged
         self._forced_rect, self._force_ragged = rect, ragged
         try:
@@ -164,11 +160,9 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
                 raise RuntimeError(f"forced {self._forced_rect} needs {body} rows, got {rows}")
         # A rectangle is its body. A 2048 or 4096 step on an 8K model still has one;
         # offering the whole ladder would lay a short grid over a longer buffer.
-        # Multimodal stays packed until #1242: its body arrives as inputs_embeds,
-        # which prepare_inputs never sees.
         rectangles = (
             []
-            if self._force_ragged or self.supports_mm_inputs
+            if self._force_ragged
             else [(length, batch) for length, batch in self._rectangles if length * batch == rows]
         )
         attn_plan = plan_encoder_step(
@@ -186,6 +180,32 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
             self.dispatch_stats.record(attn_plan, rows)
         self._set_plan(plan, input_batch)
         return attn_metadata
+
+    def prepare_inputs_embeds(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> torch.Tensor:
+        """A multimodal body (CLIP) arrives as embeddings: gather them onto the grid."""
+        embeds = super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
+        if self._planned_batch is not input_batch or self.encoder_plan is None:
+            return embeds
+        grid = self.encoder_plan.grid
+        if grid is None:
+            return embeds
+        # Upstream returns the whole staging buffer; the gather specialises on its
+        # source rows, so read exactly the body warmup compiled it for.
+        _, grid_embeds, _ = expand_body_to_grid(
+            None,
+            embeds[: input_batch.num_tokens_after_padding],
+            input_batch.positions,
+            grid,
+            pad_token_id=self._pad_token_id,
+            position_offset=self._position_offset,
+        )
+        assert grid_embeds is not None
+        return grid_embeds
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState

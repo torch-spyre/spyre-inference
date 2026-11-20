@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from spyre_inference.custom_ops.utils import convert
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
         SpyreVisionEncoderMixin,
         VisionEncodeState,
     )
+    from spyre_inference.v1.core.vision_slices import VisionSlices
 
 logger = init_logger(__name__)
 
@@ -124,6 +127,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         # Typed as the mixin: upstream types ``self.model`` as its protocol, which lacks
         # ``vision_start`` and the other resumable pieces.
         self._vision = model
+        # Encoder passes spread over steps (vision_slices), by mm_hash.
+        self._slice_passes: dict[str, tuple[VisionEncodeState, dict[str, Any]]] = {}
 
     def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
         """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
@@ -237,6 +242,31 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         )
         self.graph_hits += 1
         return dest[0]
+
+    def run_slices(self, slices: VisionSlices, device: torch.device) -> dict[str, torch.Tensor]:
+        """Carry out one step's slices; return the outputs of the passes that finished.
+
+        ``device`` is where the runner batches multimodal kwargs, as for upstream's encoder.
+        """
+        for mm_hash in slices.cancel:
+            self._slice_passes.pop(mm_hash, None)
+        for item in slices.start:
+            _, _, mm_kwargs = next(
+                group_and_batch_mm_kwargs(
+                    [(item.modality, item.data)], device=device, pin_memory=PIN_MEMORY
+                )
+            )
+            self._slice_passes[item.mm_hash] = (self.start_item(mm_kwargs), mm_kwargs)
+        finished: dict[str, torch.Tensor] = {}
+        for mm_hash, num_blocks in slices.run.items():
+            state, mm_kwargs = self._slice_passes[mm_hash]
+            if num_blocks is not None:
+                with torch.inference_mode():
+                    self._vision.vision_advance(state, num_blocks)
+                continue
+            del self._slice_passes[mm_hash]
+            finished[mm_hash] = self.finish_item(state, mm_kwargs)
+        return finished
 
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Copy host buffers to the encoder's device."""

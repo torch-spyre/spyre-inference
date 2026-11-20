@@ -159,8 +159,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental. Vision encoder blocks run per engine step while other requests are
     # running, so an image's encoder pass spreads over several steps instead of stalling
     # every running decode for its whole length. The image's prefill waits until its pass
-    # completes. "0" (default) encodes each image in one step. V1 runner and compiled vision
-    # towers (SpyreVisionEncoderMixin) only.
+    # completes. "0" (default) encodes each image in one step. Compiled vision towers
+    # (SpyreVisionEncoderMixin) only.
     "SPYRE_VISION_BLOCKS_PER_STEP": lambda: int(os.getenv("SPYRE_VISION_BLOCKS_PER_STEP", "0")),
 }
 # --8<-- [end:env-vars-definition]

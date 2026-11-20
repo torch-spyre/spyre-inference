@@ -28,6 +28,7 @@ uv run pytest -m upstream      # upstream vLLM compat tests (cached in ~/.cache/
 uv run pytest --upstream       # local + upstream
 uv sync --group dev --group triton-cpu        # x86 only: add triton-cpu, the MRV2 parity reference
 uv run --group triton-cpu pytest -m triton_cpu  # MRV2 host kernels vs triton-cpu (opt-in, like upstream)
+uv sync --group dev                             # drop triton again before the rest of the suite
 bash format.sh                 # format (prek via uvx)
 uv run ty                      # type check
 ```

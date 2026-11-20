@@ -86,10 +86,18 @@ def _probe(first: str, **env: str) -> list[str]:
     return _run(_PROBE.format(first=first), **env)[-3:]
 
 
+# Selection only: without triton these pass whether or not the gate works, so the triton_cpu
+# variant runs them in the parity job, where the gate has an installed triton-cpu to hide.
+_WITH_TRITON_CPU = pytest.mark.parametrize(
+    "_env", ["triton_free", pytest.param("triton_cpu", marks=pytest.mark.triton_cpu)]
+)
+
+
 @pytest.mark.subprocess_isolated
+@_WITH_TRITON_CPU
 @pytest.mark.parametrize("cuda_visible_devices", [None, ""])
 @pytest.mark.parametrize("first", _FIRST_IMPORTS)
-def test_v1_stays_triton_free(first: str, cuda_visible_devices: str | None) -> None:
+def test_v1_stays_triton_free(first: str, cuda_visible_devices: str | None, _env: str) -> None:
     """An empty CUDA_VISIBLE_DEVICES is where vLLM's own check keeps Triton on."""
     env = {"SPYRE_MODEL_RUNNER": "v1"}
     if cuda_visible_devices is not None:
@@ -98,8 +106,9 @@ def test_v1_stays_triton_free(first: str, cuda_visible_devices: str | None) -> N
 
 
 @pytest.mark.subprocess_isolated
+@_WITH_TRITON_CPU
 @pytest.mark.parametrize("first", _FIRST_IMPORTS)
-def test_v2_on_host_kernels_stays_triton_free(first: str) -> None:
+def test_v2_on_host_kernels_stays_triton_free(first: str, _env: str) -> None:
     """The default: kernels.bind() replaces every kernel, so vLLM never sees Triton."""
     assert _probe(_FIRST_IMPORTS[first], SPYRE_MODEL_RUNNER="v2") == [
         "False",

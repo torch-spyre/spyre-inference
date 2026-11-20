@@ -723,6 +723,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         if triton_cpu:
             items[:] = [item for item in items if not item.get_closest_marker(_TRITON_CPU_MARKER)]
             config.hook.pytest_deselected(items=triton_cpu)
+            _log(
+                f"[triton-cpu] deselected {len(triton_cpu)} triton_cpu tests: "
+                "pass -m triton_cpu to run them"
+            )
 
     upstream_tests_base = getattr(config, "_upstream_tests_base", None)
     if upstream_tests_base:

@@ -230,7 +230,8 @@ provides-extras = ["optree", "opt-einsum", "pyyaml"]
 # Vendored static metadata for the source-built (ppc64le/s390x) torchvision, copied
 # from torchvision 0.29.1 on PyPI.
 # xgrammar 0.2.8's own metadata, without `triton; platform_machine == "x86_64"`: it
-# imports Triton lazily for an optional bitmask kernel, and Triton stays dev-only (#1238).
+# imports Triton lazily for an optional bitmask kernel, and only the opt-in triton-cpu group
+# installs Triton (#1238).
 [[tool.uv.dependency-metadata]]
 name = "xgrammar"
 version = "0.2.8"

@@ -50,6 +50,7 @@ dependency group, which installs nothing off x86:
 ```bash
 uv sync --frozen --group dev --group triton-cpu
 uv run --group triton-cpu pytest -m triton_cpu
+uv sync --frozen --group dev   # drop triton again before running the rest of the suite
 ```
 
 The `triton_cpu` tests are collected only when `-m` names the marker. A later plain

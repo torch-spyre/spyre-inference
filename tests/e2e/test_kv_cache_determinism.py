@@ -161,6 +161,7 @@ def _block_counts() -> tuple[int, int]:
     from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
     config = MagicMock()
+    config.speculative_config = None
     config.cache_config.block_size = _BLOCK_SIZE
     config.model_config.max_model_len = _PAD_MAX_MODEL_LEN
     config.scheduler_config.max_num_batched_tokens = _PAD_MAX_MODEL_LEN

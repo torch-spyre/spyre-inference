@@ -91,6 +91,16 @@ HOST_KERNELS: dict[str, str] = {
     "gpu.spec_decode.dflash.speculator._prepare_dflash_inputs_kernel": (
         "mrv2_prepare_dflash_inputs"
     ),
+    # Gemma-4 MTP's draft steps.
+    "gpu.spec_decode.target_dependent_ar.speculator._prepare_prefill_inputs_kernel": (
+        "mrv2_draft_prepare_prefill_inputs"
+    ),
+    "gpu.spec_decode.target_dependent_ar.speculator._prepare_decode_inputs_kernel": (
+        "mrv2_draft_prepare_decode_inputs"
+    ),
+    "gpu.spec_decode.target_dependent_ar.speculator._update_draft_inputs_kernel": (
+        "mrv2_update_draft_inputs"
+    ),
 }
 
 # Launch sites behind a feature the platform rejects -> that feature.

@@ -39,8 +39,16 @@ def make_config(
     runner_type="generate",
     num_kv_heads=8,
     per_layer_kv_heads=None,
+    num_speculative_tokens=None,
 ):
     config = MagicMock()
+    config.speculative_config = (
+        None
+        if num_speculative_tokens is None
+        else SimpleNamespace(
+            num_speculative_tokens=num_speculative_tokens, use_gemma4_mtp=lambda: True
+        )
+    )
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
     config.model_config.runner_type = runner_type
@@ -160,6 +168,23 @@ class TestBuckets:
     def test_query_bucket_step_capped_by_max_num_batched_tokens(self):
         b = SpyreAttnBucketer(make_config(max_num_batched_tokens=300))
         assert b.query_buckets == [1, 300]
+
+    def test_speculative_verify_gets_its_own_query_bucket(self):
+        """Three drafts plus the bonus row would otherwise pad onto the prefill bucket."""
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.query_buckets == [1, 4, 512]
+        assert b.find_query_bucket(2) == 4
+
+    def test_only_gemma4_mtp_verifies_on_the_batched_kernel(self):
+        config = make_config(num_speculative_tokens=3)
+        config.speculative_config.use_gemma4_mtp = lambda: False
+        assert SpyreAttnBucketer(config).query_buckets == [1, 512]
+
+    def test_speculative_verify_bucket_joins_an_override(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,128,512")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=2))
+        assert b.query_buckets == [1, 3, 128, 512]
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
@@ -389,6 +414,17 @@ class TestVariants:
         assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [1, 2, 4, 8]
         assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [1, 2, 4, 6]
 
+    @pytest.mark.parametrize(
+        ("num_speculative_tokens", "expected"),
+        [(3, [1, 2, 4, 8, 16, 32]), (4, [1, 2, 4, 5, 8, 10, 20, 40])],
+    )
+    def test_num_seqs_buckets_cover_verify_rows(self, num_speculative_tokens, expected):
+        """A verify sequence is k + 1 batched-decode rows; an all-verify step has a bucket."""
+        b = SpyreAttnBucketer(
+            make_config(max_num_seqs=8, num_speculative_tokens=num_speculative_tokens)
+        )
+        assert b.num_seqs_buckets == expected
+
     @pytest.mark.parametrize("max_num_seqs", [1, 2, 3])
     def test_num_seqs_buckets_cover_small_batches(self, max_num_seqs, monkeypatch):
         """Small batches dispatch to the batched kernel too, so each has a bucket."""
@@ -566,6 +602,43 @@ class TestRecorderBuilders:
 
         assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets
         assert metadata.padded_num_seqs in bucketer.num_seqs_buckets
+
+
+def test_verify_sequences_run_one_batched_row_per_query_token(monkeypatch, default_vllm_config):
+    """Each verify token is its own row, at its own query row and its own causal cutoff."""
+    from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
+    envs.clear_env_cache()
+    vllm_config = get_current_vllm_config()
+    monkeypatch.setattr(
+        vllm_config,
+        "speculative_config",
+        SimpleNamespace(
+            num_speculative_tokens=4, parallel_drafting=False, use_gemma4_mtp=lambda: True
+        ),
+    )
+
+    # A verify step (4 drafts + 1) over 4 blocks, then a plain decode over 3.
+    metadata = _padded_mask_metadata(
+        [(5, 4 * BLOCK_SIZE), (1, 3 * BLOCK_SIZE)], max_num_blocks=32, is_prefilling=[False, False]
+    )
+
+    assert (metadata.num_decode_seqs, metadata.num_decode_tokens) == (2, 6)
+    assert metadata.padded_num_seqs is not None and metadata.padded_num_seqs >= 6
+    assert metadata.rep_row_ids_cpu[:6].tolist() == list(range(6))
+    mask = metadata.mask_by_chunk_cpu
+    assert mask is not None
+    # The verify rows' last block: the 5 queries sit at the last 5 KV positions, and
+    # query q sees up to its own, so it admits BLOCK_SIZE - 4 + q positions.
+    open_last_block = [int((mask[3, q, 0, 0] == 0).sum()) for q in range(5)]
+    assert open_last_block == [BLOCK_SIZE - 4 + q for q in range(5)]
+    # The decode row reads its 3 blocks whole and nothing past them.
+    assert int((mask[2, 5, 0, 0] == 0).sum()) == BLOCK_SIZE
+    assert int((mask[3, 5, 0, 0] == 0).sum()) == 0
 
 
 class TestBatchedDecodeVariants:

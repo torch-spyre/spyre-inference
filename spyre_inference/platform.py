@@ -393,6 +393,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 while size < num_seqs:
                     sizes.add(size)
                     size *= 2
+                # A speculative verify step packs each decode batch's drafts beside it.
+                spec = vllm_config.speculative_config
+                if spec is not None and spec.use_gemma4_mtp():
+                    per_seq = 1 + spec.num_speculative_tokens
+                    decode_sizes = [n for n in sizes if n <= num_seqs]
+                    sizes |= {min(n * per_seq, max_capture_size) for n in decode_sizes}
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
@@ -409,6 +415,10 @@ class TorchSpyrePlatform(CpuPlatform):
         # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
+        # The drafter's config was built beside the target's, with the checkpoint dtype.
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.use_gemma4_mtp():
+            spec.draft_model_config.dtype = torch.float16
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
@@ -694,9 +704,10 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            "speculative decoding other than DFlash/XPress": (
+            "speculative decoding other than DFlash/XPress and Gemma-4 MTP": (
                 vllm_config.speculative_config is not None
                 and not vllm_config.speculative_config.use_dflash()
+                and not vllm_config.speculative_config.use_gemma4_mtp()
             ),
             # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
             "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),
@@ -878,6 +889,19 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.cache_config.kv_sharing_fast_prefill:
             raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
 
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.use_gemma4_mtp():
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            draft_hf_config = spec.draft_model_config.hf_config
+            draft_text_config = getattr(draft_hf_config, "text_config", draft_hf_config)
+            repair_head_dim_access(draft_text_config)
+            # Validated synchronously only; Spyre's blocking forward leaves async
+            # scheduling nothing to overlap.
+            if vllm_config.scheduler_config.async_scheduling:
+                logger.info("Disabling async scheduling for Gemma-4 MTP speculative decoding.")
+                vllm_config.scheduler_config.async_scheduling = False
+
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
         # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
@@ -913,6 +937,12 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
+        if (
+            runner == "v1"
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_gemma4_mtp()
+        ):
+            raise ValueError("Spyre Gemma-4 MTP requires SPYRE_MODEL_RUNNER=v2")
         # Every process, ahead of the V1 validation that follows this hook in __post_init__.
         from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
 

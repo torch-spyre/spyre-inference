@@ -87,6 +87,7 @@ def _build_metadata(
     sliding_window: int | None = None,
     model_num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
+    is_prefilling: torch.Tensor | None = None,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata.
 
@@ -147,7 +148,7 @@ def _build_metadata(
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
         causal=True,
-        is_prefilling=(query_lens_per_seq > 1),
+        is_prefilling=(query_lens_per_seq > 1) if is_prefilling is None else is_prefilling,
     )
 
     return builder.build(
@@ -310,12 +311,14 @@ def _padded_mask_metadata(
     num_kv_heads: int = 8,
     head_size: int = 128,
     max_num_blocks: int | None = None,
+    is_prefilling: list[bool] | None = None,
 ):
     """Build metadata on CPU for a list of (query_len, kv_len) sequences.
 
     ``max_num_blocks`` is the block-table width build() pads onto; it defaults
     to no headroom, so a test wanting padding to actually happen must pass a
-    wider table, as a real engine's is.
+    wider table, as a real engine's is. ``is_prefilling`` defaults to every
+    multi-token query; a speculative verify row is multi-token but not prefilling.
     """
     query_lens = [q for q, _ in seq_lens]
     kv_lens = [kv for _, kv in seq_lens]
@@ -342,6 +345,7 @@ def _padded_mask_metadata(
         block_table=block_table,
         slot_mapping=slot_mapping,
         sliding_window=sliding_window,
+        is_prefilling=None if is_prefilling is None else torch.tensor(is_prefilling),
     )
 
 

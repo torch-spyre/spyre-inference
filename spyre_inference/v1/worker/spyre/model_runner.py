@@ -39,7 +39,7 @@ from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
-from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
+from spyre_inference.v1.worker.spyre.spec_decode import init_speculator
 from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
@@ -51,7 +51,7 @@ class SpyreModelRunnerV2(GPUModelRunner):
         super().__init__(vllm_config, torch.device("cpu"))
         self.spyre_device = device
         if self.speculator is not None:
-            self.speculator = SpyreDFlashSpeculator(vllm_config, self.device, device)
+            self.speculator = init_speculator(vllm_config, self.device, device)
         # Filled by initialize_kv_cache; warmup records the attention kernels against them.
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
         # Set by load_model.

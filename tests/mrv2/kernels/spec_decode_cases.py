@@ -280,3 +280,171 @@ def prepare_dflash_inputs(g):
 @case("gpu.spec_decode.dflash.speculator._prepare_dflash_inputs_kernel")
 def prepare_dflash_inputs_chunked_prefill(g):
     return _prepare_dflash(g, 3, chunked=True)
+
+
+_TDAR = "gpu.spec_decode.target_dependent_ar.speculator"
+
+
+def _draft_buffers(max_reqs: int, max_tokens: int):
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+    return InputBuffers(
+        max_num_reqs=max_reqs, max_num_tokens=max_tokens, device=torch.device("cpu")
+    )
+
+
+def _draft_prefill(g, num_reqs: int, chunked: bool):
+    sp = _m("spec_decode.target_dependent_ar.speculator")
+    max_reqs, max_tokens = 6, 64
+    qlens = torch.randint(1, 6, (num_reqs,), generator=g)
+    qlens[0] = 4  # room for rejections
+    qsl = torch.cat([torch.zeros(1, dtype=torch.int64), qlens.cumsum(0)]).to(torch.int32)
+    num_tokens = int(qsl[-1])
+    batch = types.SimpleNamespace(
+        num_reqs=num_reqs,
+        input_ids=torch.randint(0, 900, (num_tokens,), generator=g, dtype=torch.int32),
+        positions=torch.randint(0, 2000, (num_tokens,), generator=g),
+        idx_mapping=_perm_reqs(g, max_reqs, num_reqs),
+        query_start_loc=qsl,
+        seq_lens=torch.randint(10, 3000, (num_reqs,), generator=g, dtype=torch.int32),
+    )
+    buffers = _draft_buffers(max_reqs, max_tokens)
+    num_sampled = torch.ones(num_reqs, dtype=torch.int32)
+    if chunked:
+        num_sampled[-1] = 0
+    num_rejected = torch.minimum(torch.randint(0, 3, (num_reqs,), generator=g), qlens - 1).to(
+        torch.int32
+    )
+    last_sampled = torch.randint(0, 2**33, (max_reqs,), generator=g)  # truncated to int32
+    next_prefill = torch.randint(0, 900, (max_reqs,), generator=g, dtype=torch.int32)
+    state = dict(
+        last_token_indices=torch.full((max_reqs,), -9, dtype=torch.int64),
+        current_draft_step=torch.tensor(5, dtype=torch.int64),
+        input_ids=buffers.input_ids,
+        positions=buffers.positions,
+        query_start_loc=buffers.query_start_loc,
+        seq_lens=buffers.seq_lens,
+    )
+
+    def run(s):
+        sp.prepare_prefill_inputs(
+            s["last_token_indices"],
+            s["current_draft_step"],
+            buffers,
+            batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill,
+            max_reqs,
+        )
+
+    return run, state
+
+
+def _perm_reqs(g, max_reqs: int, num_reqs: int) -> torch.Tensor:
+    return torch.randperm(max_reqs, generator=g)[:num_reqs].to(torch.int32)
+
+
+@case(f"{_TDAR}._prepare_prefill_inputs_kernel")
+def draft_prepare_prefill_inputs(g):
+    return _draft_prefill(g, 4, chunked=False)
+
+
+@case(f"{_TDAR}._prepare_prefill_inputs_kernel")
+def draft_prepare_prefill_inputs_chunked_prefill(g):
+    return _draft_prefill(g, 3, chunked=True)
+
+
+def _draft_decode(g, advance: bool):
+    sp = _m("spec_decode.target_dependent_ar.speculator")
+    max_reqs, max_tokens, steps, num_reqs, max_model_len = 6, 64, 3, 4, 100
+    buffers = _draft_buffers(max_reqs, max_tokens)
+    buffers.positions[:max_reqs] = torch.randint(90, 100, (max_reqs,), generator=g)
+    draft_tokens = torch.randint(0, 900, (max_reqs, steps), generator=g)
+    state = dict(
+        input_ids=buffers.input_ids,
+        positions=buffers.positions,
+        query_start_loc=buffers.query_start_loc,
+        seq_lens=buffers.seq_lens,
+        sample_src_positions=torch.randint(0, 99, (max_reqs,), generator=g),
+    )
+    target_seq_lens = torch.randint(95, 101, (num_reqs,), generator=g, dtype=torch.int32)
+    num_rejected = torch.randint(0, 3, (num_reqs,), generator=g, dtype=torch.int32)
+
+    def run(s):
+        sp.prepare_decode_inputs(
+            draft_tokens[:num_reqs, 0],
+            target_seq_lens,
+            num_rejected,
+            buffers,
+            s["sample_src_positions"],
+            max_model_len,
+            max_reqs,
+            advance_draft_positions=advance,
+        )
+
+    return run, state
+
+
+@case(f"{_TDAR}._prepare_decode_inputs_kernel")
+def draft_prepare_decode_inputs(g):
+    return _draft_decode(g, advance=True)
+
+
+@case(f"{_TDAR}._prepare_decode_inputs_kernel")
+def draft_prepare_decode_inputs_fixed_positions(g):
+    """Gemma-4 MTP: Q-only drafts keep positions and seq_lens."""
+    return _draft_decode(g, advance=False)
+
+
+def _draft_update(g, step: int, advance: bool):
+    sp = _m("spec_decode.target_dependent_ar.speculator")
+    max_reqs, max_tokens, steps, num_reqs, hidden, max_model_len = 6, 64, 3, 4, 40, 100
+    buffers = _draft_buffers(max_reqs, max_tokens)
+    buffers.positions[:max_reqs] = torch.randint(95, 100, (max_reqs,), generator=g)
+    buffers.seq_lens[:max_reqs] = torch.randint(96, 101, (max_reqs,), generator=g)
+    state = dict(
+        input_ids=buffers.input_ids,
+        positions=buffers.positions,
+        seq_lens=buffers.seq_lens,
+        output_draft_tokens=torch.full((max_reqs, steps), -1, dtype=torch.int64),
+        next_input_hidden_states=torch.zeros(max_tokens, hidden, dtype=torch.float16),
+        sample_src_positions=torch.randint(0, 99, (max_reqs,), generator=g),
+    )
+    draft_tokens = torch.randint(0, 900, (num_reqs,), generator=g)
+    # Wider than the buffer's rows, as a draft model's output slice can be.
+    hidden_states = torch.randn(num_reqs + 2, hidden, generator=g).half()[:num_reqs]
+
+    def run(s):
+        sp.update_draft_inputs(
+            draft_tokens,
+            torch.tensor(step, dtype=torch.int64),
+            hidden_states,
+            s["output_draft_tokens"],
+            s["next_input_hidden_states"],
+            buffers,
+            s["sample_src_positions"],
+            num_reqs,
+            max_model_len,
+            steps,
+            advance_draft_positions=advance,
+        )
+
+    return run, state
+
+
+@case(f"{_TDAR}._update_draft_inputs_kernel")
+def update_draft_inputs(g):
+    return _draft_update(g, step=1, advance=True)
+
+
+@case(f"{_TDAR}._update_draft_inputs_kernel")
+def update_draft_inputs_fixed_positions(g):
+    return _draft_update(g, step=1, advance=False)
+
+
+@case(f"{_TDAR}._update_draft_inputs_kernel")
+def update_draft_inputs_final_step(g):
+    """The last step records its draft and leaves the next step's inputs alone."""
+    return _draft_update(g, step=2, advance=True)

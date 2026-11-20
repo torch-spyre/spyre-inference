@@ -82,8 +82,12 @@ def test_runner_switch(
     ("feature", "configure"),
     [
         pytest.param(
-            "speculative decoding other than DFlash/XPress",
-            lambda c: setattr(c, "speculative_config", SimpleNamespace(use_dflash=lambda: False)),
+            "speculative decoding other than DFlash/XPress and Gemma-4 MTP",
+            lambda c: setattr(
+                c,
+                "speculative_config",
+                SimpleNamespace(use_dflash=lambda: False, use_gemma4_mtp=lambda: False),
+            ),
             id="spec-decode-non-dflash",
         ),
         pytest.param(
@@ -117,6 +121,16 @@ def test_a_plain_v2_config_passes_the_feature_check(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:
     _set_runner(monkeypatch, "v2")
+    TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_gemma4_mtp_passes_the_v2_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    vllm_config.speculative_config = SimpleNamespace(  # ty: ignore[invalid-assignment]
+        use_dflash=lambda: False, use_gemma4_mtp=lambda: True
+    )
     TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
 
 

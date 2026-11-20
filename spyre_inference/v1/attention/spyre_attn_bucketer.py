@@ -310,6 +310,15 @@ def _resolve_buckets(
     return kept
 
 
+def speculative_verify_len(vllm_config: VllmConfig) -> int:
+    """Query rows a speculative verify step gives each decode: 1 + num_speculative_tokens
+    for Gemma-4 MTP, whose verification runs on the batched decode kernel, else 1."""
+    spec = vllm_config.speculative_config
+    if spec is None or not spec.use_gemma4_mtp():
+        return 1
+    return 1 + spec.num_speculative_tokens
+
+
 class SpyreAttnBucketer:
     """Enumerates the attention variants to record, and rounds lengths onto them.
 
@@ -345,14 +354,20 @@ class SpyreAttnBucketer:
                 block_size,
             )
 
+        # The batched decode kernel takes one row per decode query token: one per
+        # sequence, or 1 + num_speculative_tokens per speculative verify sequence.
+        verify_len = speculative_verify_len(vllm_config)
+
         # Default: powers of two up to max_num_seqs, the batch sizes the batched
-        # decode kernel can be asked for.
+        # decode kernel can be asked for, and each of them times the verify width, so
+        # an all-verify step lands on its own bucket.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        decode_rows = list(_powers_of_two_up_to(max_num_seqs))
         self._num_seqs_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
-            max_num_seqs,
+            max_num_seqs * verify_len,
             "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_num_seqs)),
+            lambda: sorted({*decode_rows, *(n * verify_len for n in decode_rows)}),
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
@@ -365,6 +380,11 @@ class SpyreAttnBucketer:
             "SPYRE_ATTN_QUERY_BUCKETS",
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
+        # A speculative verify step queries the drafts plus one per sequence; without its
+        # own bucket it would pad onto the prefill step. Added to an override too: a run
+        # with a drafter verifies every step.
+        if 1 < verify_len <= max_batched:
+            self._query_buckets = sorted({*self._query_buckets, verify_len})
 
         # Default: the SPYRE_ATTN_KV_LADDER preset. Sparse because the recorded set is a
         # product of both axes; the extra padding each bucket costs is absorbed by the mask.

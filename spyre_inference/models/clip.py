@@ -39,6 +39,7 @@ import torch.nn.functional as F
 import vllm.model_executor.models.clip as vllm_clip
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
+from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.models.clip import (
     CLIPAttention,
     CLIPEmbeddingModel,
@@ -318,10 +319,13 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
 
     def process_weights_after_loading(self) -> None:
         """Fold the patch conv into a linear and the class embedding into the position table,
-        on the host, before the runner moves the model to the card."""
+        on the host, before the runner moves the model to the card. Once only: a second call
+        finds the conv already replaced."""
         if not isinstance(self.vision_model, CLIPVisionTransformer):
             return
         emb = self.vision_model.embeddings
+        if not isinstance(emb.patch_embedding, Conv2dLayer):
+            return
         weight = emb.patch_embedding.weight.detach().flatten(1)
         weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
         # A plain holder, not the conv layer: nothing runs the conv, so the runner must not

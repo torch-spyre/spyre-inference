@@ -104,8 +104,9 @@ def copy_pooler_output_to_cpu(
 ) -> list[torch.Tensor | None]:
     """The finished requests' pooled outputs on CPU, None for the others.
 
-    vLLM 0.33's ``_copy_pooler_output_to_cpu`` (gpu_model_runner.py), after a Spyre→CPU
-    ``convert``: upstream's ``.to("cpu", non_blocking=True)`` is not a valid Spyre D2H.
+    The finished-mask split of upstream's AsyncPoolingOutput (gpu/async_utils.py), after a
+    Spyre→CPU ``convert``: upstream's ``.to("cpu", non_blocking=True)`` is not a valid
+    Spyre D2H.
     """
     raw_pooler_output = _pooler_output_on_cpu(raw_pooler_output)
     num_reqs = len(finished_mask)

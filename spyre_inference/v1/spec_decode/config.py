@@ -47,7 +47,7 @@ def validate_dflash_config(config) -> None:
             f"Supported architectures: {', '.join(sorted(supported_drafts))}"
         )
     target = config.model_config.hf_text_config
-    if spec.max_model_len is None and spec.draft_shares_target_positions():
+    if spec.max_model_len is None and spec.speculator_config.max_model_len is None:
         # The platform's default length cap must not stop drafts inside the target context.
         spec.draft_model_config.max_model_len = config.model_config.max_model_len
     parallel = config.parallel_config

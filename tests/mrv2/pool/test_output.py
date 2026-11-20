@@ -83,7 +83,7 @@ def test_pool_sync_returns_host_output_directly(monkeypatch) -> None:
 
     result = output.pool_sync(runner)  # ty: ignore[invalid-argument-type]
 
-    assert result.req_id_to_index == {"r0": 0, "r1": 1}
+    assert result.req_ids == ["r0", "r1"]
     assert result.kv_connector_output == "kv-out"
     assert result.pooler_output[1] is None
     assert result.pooler_output[0].device.type == "cpu"

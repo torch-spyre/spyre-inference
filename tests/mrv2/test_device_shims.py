@@ -57,7 +57,7 @@ def test_mrv2_pooling_output_fences_on_the_placeholders(monkeypatch: pytest.Monk
     monkeypatch.setattr(device_shims, "spyre_fence", lambda: fences.append(None))
 
     output = AsyncPoolingOutput(
-        model_runner_output=ModelRunnerOutput(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1}),
+        model_runner_output=ModelRunnerOutput(req_ids=["a", "b"]),
         pooler_output=torch.arange(4.0).reshape(2, 2),
         finished_mask=[True, True],
         main_stream=torch.cuda.current_stream(),

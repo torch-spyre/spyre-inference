@@ -99,6 +99,7 @@ def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0, max_mod
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
+            encoder_cudagraph_max_token_budget=5120,
             encoder_cudagraph_max_vision_items_per_batch=max_items,
             encoder_cudagraph_max_frames_per_batch=None,
         ),

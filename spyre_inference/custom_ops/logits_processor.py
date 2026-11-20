@@ -18,6 +18,7 @@ from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 from spyre_inference import envs
+from spyre_inference.v1.sample import device_greedy
 
 from .lazy_compile import CompileOutermost, maybe_compile
 from .utils import convert
@@ -26,6 +27,40 @@ from .vocab_parallel_embedding import promote_tied_lm_head
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
+    def forward(self, lm_head, hidden_states, embedding_bias=None, skip_gather=False):
+        """All-greedy batches return ``[B]`` token ids from the card.
+
+        Everything else keeps the host path: full logits, copied in ``_apply_head``.
+        Soft-cap and a non-unit scale stay on the host too. Both are monotonic for
+        the usual positive scale, but they run after ``_get_logits`` upstream, and
+        applying them again to token ids would corrupt the ids.
+        """
+        if (
+            device_greedy.sampling_active()
+            and not skip_gather
+            and not self.logits_as_input
+            and self.soft_cap is None
+            and self.scale == 1.0
+            and lm_head.tp_size <= 1
+        ):
+            promote_tied_lm_head(lm_head)
+            logits = LogitsProcessor._apply_head(self, lm_head, hidden_states, embedding_bias)
+            mask = self._vocab_padding_mask(logits.shape[-1], logits.device)
+            return convert(self._greedy_argmax(logits, mask), device="cpu")
+        return super().forward(lm_head, hidden_states, embedding_bias, skip_gather)
+
+    def _vocab_padding_mask(self, padded_vocab: int, device: torch.device) -> torch.Tensor:
+        cached = getattr(self, "_greedy_pad_mask", None)
+        if cached is None or cached.shape[0] != padded_vocab or cached.device != device:
+            self._greedy_pad_mask = device_greedy.padding_mask(
+                padded_vocab, self.org_vocab_size, device
+            )
+        return self._greedy_pad_mask
+
+    @maybe_compile
+    def _greedy_argmax(self, logits: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        return device_greedy.greedy_token_ids(logits, pad_mask)
+
     def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
         """Project through the lm_head, then D2H the logits on the single-card path.
 

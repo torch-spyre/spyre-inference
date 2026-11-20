@@ -392,6 +392,8 @@ def test_token_pooler_step_pool_is_unsupported():
 
 def _counts_metadata(counts: list[int]):
     class _Meta:
+        pooling_params: list = []
+
         def get_pooling_cursor(self):
             return type("C", (), {"num_scheduled_tokens_cpu": torch.tensor(counts)})()
 

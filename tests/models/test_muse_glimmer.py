@@ -97,3 +97,12 @@ def test_a_config_load_failure_leaves_engine_args_to_model_config(monkeypatch, g
     before = vars(engine_args).copy()
     apply_prelaunch_overrides(engine_args)
     assert vars(engine_args) == before
+
+
+def test_the_processor_normalizes_images_for_every_spyre_tower(glimmer_dir):
+    """vLLM 0.34 defaults to raw pixels for towers that normalize on the device, which
+    the Spyre towers' own patch embedding does not do."""
+    engine_args = EngineArgs(model=glimmer_dir)
+    assert engine_args.mm_device_do_normalize
+    apply_prelaunch_overrides(engine_args)
+    assert engine_args.mm_device_do_normalize is False

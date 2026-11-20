@@ -163,6 +163,9 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
 
     register_models()
     hf_config = load_hf_config(engine_args)
+    if hf_config is not None:
+        # The Spyre vision towers embed patches themselves, so the processor must normalize.
+        engine_args.mm_device_do_normalize = False
     gemma4.force_text_backbone(engine_args, hf_config)
     clip.force_disable_chunked_prefill(engine_args, hf_config)
     muse_glimmer.disable_vision(engine_args, hf_config)

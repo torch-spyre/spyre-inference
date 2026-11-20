@@ -28,6 +28,7 @@ import os
 import sys
 import uuid
 from argparse import ArgumentParser
+from collections.abc import Mapping
 from typing import Any
 
 import clickhouse_connect
@@ -356,6 +357,28 @@ def _write_v2_benchmarks(client, db: str, rows, run_id_value: str, leg_key: str 
         log.warning("v2 perf write failed, %s unaffected: %r", RESULTS_TABLE, exc)
 
 
+def _use_tls(env: Mapping[str, str], port: int) -> bool:
+    """Whether the ClickHouse connection should negotiate TLS.
+
+    The write credential (``CLICKHOUSE_PASS``) and every row travel in the clear
+    on ClickHouse's plain-HTTP interface (port 8123), so a credentialed CI job
+    talking to a remote instance leaks the password to anyone on the path. TLS
+    is enabled when ``CLICKHOUSE_SECURE`` is set truthy, or implicitly when the
+    port is the conventional HTTPS interface (8443) so an operator who already
+    moved the port gets encryption without a second knob. Default stays off so
+    an existing deployment pointed at a trusted-network 8123 endpoint keeps
+    working unchanged.
+    """
+    flag = (env.get("CLICKHOUSE_SECURE") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off", ""):
+        return port == 8443
+    # Any other explicit value is treated as "on": an operator who bothered to
+    # set the knob wants TLS, not a silent cleartext fallback on a typo.
+    return True
+
+
 def insert_to_clickhouse(
     rows: list[dict[str, Any]],
     v2_run_id_value: str = "",
@@ -385,6 +408,7 @@ def insert_to_clickhouse(
         username=user,
         password=password,
         database=database,
+        secure=_use_tls(os.environ, port),
     )
 
     if not rows:

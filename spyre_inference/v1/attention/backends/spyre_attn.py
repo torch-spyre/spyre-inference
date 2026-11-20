@@ -1032,12 +1032,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # Sliding window: arithmetic block-skip. Blocks entirely outside
             # every query's window are dropped; interior blocks share a
             # zero mask tile; only boundary blocks get real per-query cutoffs.
-            # The count is padded up to _max_active_blocks of its KV bucket so it stops
-            # sliding with the context, which would compile a new kernel inside the
-            # request, and so batched decode keeps its buckets. Not rounded onto the
-            # num_blocks ladder: that inflates the exact per-bucket bound several-fold.
-            # padded_num_blocks stays None so forward() keeps gathering through
-            # active_block_indices.
+            # Pad each sequence's window pages to the most its KV bucket can ever need
+            # (_max_active_blocks), so the page count stays fixed per bucket and always
+            # matches a kernel compiled at warmup.
             active_block_indices = []
             query_lens_list = query_lens.tolist()
             seq_lens_list = seq_lens.tolist()

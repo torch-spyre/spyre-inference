@@ -442,7 +442,7 @@ page count are skipped. When the per-sequence page count is dynamic (copied to t
 with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
 bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
 it. A sliding-window layer's range stops at the most pages its window can reach. When
-prefill gets its own range of multiples of 8 pages from 16, a prefill variant is traced at
+prefill gets its own range of multiples of 8 pages (starting from 16), a prefill variant is traced at
 that page count rounded up to a multiple of 8. Failed recordings are logged and compile on
 first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup

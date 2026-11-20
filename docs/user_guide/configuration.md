@@ -293,9 +293,9 @@ A sliding-window layer reads only the pages its window reaches, at most
 these bounds instead of `--max-model-len / block_size`. Each sequence keeps the bound of its KV
 bucket as its page count, as the batched decode kernel needs.
 
-The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
-bucket pair, when the largest page count is not above `MIN_RESERVED_DIM_SIZE`, or is above an
-exported `MAX_BUCKETS`; startup logs a warning.
+When the largest page count is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
+`MAX_BUCKETS`, the per-sequence kernels use the KV buckets above after all, with one kernel per
+(KV, query) bucket pair; startup logs a warning.
 
 The batched decode kernel always uses the KV buckets.
 

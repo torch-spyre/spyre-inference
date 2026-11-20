@@ -200,24 +200,16 @@ def test_spyre_single_row_index_select(spyre_device):
 
 
 @pytest.mark.parametrize("num_tokens", [4, 40])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "A multi-core compile pads a gather output's entry dim to the index stick "
-        "multiple, so the compiled lookup reports e.g. device_size [2, 32, 64] for 4 "
-        "rows where a fresh tensor has [2, 4, 64], and graphs compiled on fresh tensors "
-        "recompile for it. SpyreVocabParallelEmbedding multiplies the TP=1 lookup by "
-        "_spyre_unit_row to re-emit the fresh layout. Fixed by the torch-spyre PR "
-        "'fix(inductor): stop padding a gather output's partial-stick entry dim'. When "
-        "this probe passes, drop _spyre_unit_row and revisit _warm_sample_row_gathers."
-    ),
-)
 def test_spyre_compiled_lookup_returns_fresh_layout(spyre_device, num_tokens):
     """A compiled embedding lookup returns the layout of a fresh tensor of its shape.
 
     Decoder blocks compile on fresh tensors at warmup and guard on input layout, so
     layer 0 shares their graph only if the TP=1 lookup matches it.
+
+    Was strict-xfail until torch-spyre#6539: a multi-core compile padded the gather
+    output's entry dim to the index stick multiple (device_size [2, 32, 64] for 4 rows
+    where a fresh tensor has [2, 4, 64]), which SpyreVocabParallelEmbedding worked
+    around with a TP=1 multiply by a ones row.
     """
     from torch_spyre._C import get_spyre_tensor_layout
     from torch_spyre._inductor import config
@@ -1181,10 +1173,10 @@ def test_spyre_scalar_pow_cube(spyre_device, exponent):
 # 10. FP32 reduce then D2H (MEAN destagger)
 # ---------------------------------------------------------------------------
 #
-# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
-# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
-# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
-# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
+# Device fp32 is staggered inside sticks (torch-spyre#2971). A reduction over a
+# non-stick dim keeps that element arrangement in its output (torch-spyre#5598), and
+# the copy to host restores it (torch-spyre#5484), so both reads below match the CPU
+# sum. SpyreMeanPool reduces its rectangle lanes on device.
 
 
 def _fp32_mean_reduction(spyre_device):
@@ -1200,16 +1192,11 @@ def _destagger_fp32_to_host(tensor):
     return convert(tensor.to(dtype=torch.float16), "cpu").to(dtype=torch.float32)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Device fp32 is staggered inside sticks (torch-spyre#2971). convert() of "
-        "that layout is interleaved garbage. MEAN copies packed fp16 instead. "
-        "When this XPASS-es, MEAN can convert a device fp32 sum."
-    ),
-)
 def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
-    """Raw convert of a device fp32 sum."""
+    """Raw convert of a device fp32 sum.
+
+    Was strict-xfail on torch-spyre#2971: the copy returned the staggered order.
+    """
     from spyre_inference.custom_ops.utils import convert
 
     acc, ref = _fp32_mean_reduction(spyre_device)
@@ -1217,7 +1204,11 @@ def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
 
 
 def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
-    """to(fp16) before convert un-staggers a device fp32 sum."""
+    """to(fp16) before convert un-staggers a device fp32 sum.
+
+    Was strict-xfail on torch-spyre#5553: the sum was tagged STANDARD, so its fp16 cast
+    was tagged staggered and the copy to host permuted it.
+    """
     acc, ref = _fp32_mean_reduction(spyre_device)
     torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
 

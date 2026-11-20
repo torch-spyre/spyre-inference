@@ -363,6 +363,12 @@ def test_loaded_vision_weights_are_reshaped_in_place(tp_group):
     torch.testing.assert_close(table[1:], emb.position_embedding.weight[1:])
     torch.testing.assert_close(table[0], emb.position_embedding.weight[0] + emb.class_embedding)
 
+    # A second call (a weight reload's finish steps) leaves the fold as it is.
+    patch = emb.patch_embedding.weight
+    model.process_weights_after_loading()
+    assert emb.patch_embedding.weight is patch
+    assert model.spyre_position_table.table is table
+
 
 def test_image_limit_zero_keeps_the_placeholder(tp_group):
     from vllm.model_executor.models.utils import StageMissingLayer
@@ -426,13 +432,13 @@ def _padded_device_inputs(model, images, token_budget):
     return {k: convert(v, device="spyre") for k, v in bufs.items()}
 
 
-@pytest.mark.parametrize("pooling_type", ["LAST", "MEAN"])
+@pytest.mark.parametrize("pooling_type", ["MEAN"])
 def test_compiled_pipeline_matches_upstream_at_every_budget_on_spyre(tp_group, pooling_type):
     """The compiled graphs at each budget of a three-image step, fed the way the manager
     feeds them; at the smallest one, also against the uncompiled pipeline on the same
-    device buffers. Three images leave one budget per layout (``class`` 3, ``full`` 256,
-    which pads 195 tokens): each budget is a compile, and the CPU padding test covers the
-    larger ones."""
+    device buffers. Three images leave one budget (256, which pads 195 tokens): each budget
+    is a compile, and the CPU padding test covers the larger ones. Only ``full``: the
+    compiled ``class`` layout runs against HF in tests/e2e/test_clip_embeddings.py."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 

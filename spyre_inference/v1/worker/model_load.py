@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
+from spyre_inference.custom_ops.bert_split_qkv import install_bert_head_groups, split_bert_qkv
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_qk_norm_eps,
@@ -51,6 +52,7 @@ def install_pad_loaders(model_loader: Any, model_config: ModelConfig) -> None:
     text_config = model_config.hf_text_config
     install_padded_head_dim(model_config)
     install_bert_head_pad(model_config)
+    install_bert_head_groups(model_config)
     install_head_pad_weight_loader(model_loader, text_config, model_config)
     install_mlp_pad_weight_loader(model_loader, text_config, model_config)
 
@@ -71,6 +73,7 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
 
 def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     """Move the layer weights to Spyre."""
+    split_bert_qkv(model)
     # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
     # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
     # an nn.Module, but just the attention implementation.

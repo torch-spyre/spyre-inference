@@ -15,6 +15,7 @@
 """Model load steps shared by both model runners: head/MLP padding, the fp8 KV scales and the
 move to Spyre."""
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -69,13 +70,21 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
     fix_padded_qk_norm_eps(model, text_config, model_config)
 
 
-def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
+def move_model_to_spyre(
+    model: nn.Module,
+    device: torch.device,
+    *,
+    transfer: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> None:
     """Move the layer weights to Spyre."""
     # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
     # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
     # an nn.Module, but just the attention implementation.
     Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
-    model.to(device=device)
+    if transfer is None:
+        model.to(device=device)
+    else:
+        model._apply(transfer)
 
 
 def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) -> bool:

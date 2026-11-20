@@ -196,14 +196,13 @@ def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
         )
         return fn(src)
 
-    return convert(
-        src,
-        device=probe.device,
-        dtype=probe.dtype,
-        device_layout=SpyreTensorLayout(
-            device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],
-            stride_map=[row_width, elems_per_stick, 1],
-            device_dtype=get_device_dtype(probe.dtype),
-            valid_elements={(0,): num_rows, (1, 2): row_width},
-        ),
+    layout = SpyreTensorLayout(
+        device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],
+        stride_map=[row_width, elems_per_stick, 1],
+        device_dtype=get_device_dtype(probe.dtype),
+        valid_elements={(0,): num_rows, (1, 2): row_width},
     )
+    place_with_layout = getattr(fn, "place_with_layout", None)
+    if place_with_layout is not None and probe.dtype == src.dtype:
+        return place_with_layout(src, layout)
+    return convert(src, device=probe.device, dtype=probe.dtype, device_layout=layout)

@@ -765,7 +765,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.speculative_config and self.speculative_config.use_dflash():
             self.drafter.load_model(self.model)
 
-        fix_padded_model(self.model, self.model_config)
+        if self.load_config.load_format != "spyre_native":
+            fix_padded_model(self.model, self.model_config)
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.

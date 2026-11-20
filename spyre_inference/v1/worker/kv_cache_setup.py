@@ -21,7 +21,6 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     UniformTypeKVCacheSpecs,
@@ -121,17 +120,6 @@ def allocate_spyre_kv_caches(
             group_id, spec = group_of[layer_name]
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[layer_name]
-            if not isinstance(spec, AttentionSpec):
-                raise NotImplementedError(
-                    f"{layer_name}: Spyre allocates attention KV pages only, not "
-                    f"{type(spec).__name__}."
-                )
-            if kv_cache_tensor.block_stride != spec.page_size_bytes:
-                raise NotImplementedError(
-                    f"{layer_name}: Spyre KV pages are unpadded and layer-outermost, but its "
-                    f"KVCacheTensor strides blocks by {kv_cache_tensor.block_stride} bytes "
-                    f"for a {spec.page_size_bytes}-byte page."
-                )
             kernel_block_size = spec.block_size
             if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
                 kernel_block_size = kernel_block_sizes[group_id]
@@ -143,6 +131,12 @@ def allocate_spyre_kv_caches(
             start = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
             num_pages = num_blocks * pages_per_block
             if start in ranges:
+                if kv_cache_tensor.block_stride != spec.page_size_bytes:
+                    raise NotImplementedError(
+                        f"{layer_name}: Spyre KV pages are unpadded and layer-outermost, but its "
+                        f"KVCacheTensor strides blocks by {kv_cache_tensor.block_stride} bytes "
+                        f"for a {spec.page_size_bytes}-byte page."
+                    )
                 kv_caches[layer_name] = impl_cls.view_pages(ranges[start], num_pages, kernel_spec)
             else:
                 ranges[start] = impl_cls.allocate_pages(num_pages, kernel_spec, device)

@@ -541,6 +541,35 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     assert merged == [4, 16]
 
 
+def test_mrv2_encoder_runner_serves_through_the_captured_budgets(monkeypatch):
+    import vllm.v1.worker.gpu.mm.encoder_runner as encoder_runner_module
+    from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
+
+    model = _FakeVisionModel(max_tokens=300)
+    model.embed_multimodal = lambda **kwargs: pytest.fail("fell back to embed_multimodal")
+    manager = _manager(model)
+    assert not manager.is_captured()
+    manager.capture(graph_pool=None)
+    assert manager.is_captured()
+
+    monkeypatch.setattr(
+        encoder_runner_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **kwargs: [("image", len(items), {"tokens": [10, 30]})],
+    )
+    runner: Any = EncoderRunner.__new__(EncoderRunner)
+    runner.model = model
+    runner.device = torch.device("cpu")
+    runner.cudagraph_manager = manager
+
+    outputs = runner.execute_mm_encoder([("image", None), ("image", None)])
+
+    assert [o.shape[0] for o in outputs] == [10, 30]
+    assert (manager.graph_hits, manager.graph_misses) == (2, 0)
+    manager.clear()
+    assert not manager.is_captured()
+
+
 def _prompt(mask_rows: list[int], num_tokens: int = 12):
     is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
     is_multimodal[mask_rows] = True

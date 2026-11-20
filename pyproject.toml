@@ -93,7 +93,8 @@ required-environments = [
 override-dependencies = [
     # Any triton request resolves to triton-cpu, never PyPI's CUDA build. Only the dev group
     # asks for it: the reference the MRV2 host kernels' parity tests run against.
-    "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version == '3.11'",
+    # `< '3.12'`, not `== '3.11'`: the latter leaves an x86_64 python<3.11 fork that fails `uv lock --upgrade`.
+    "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version < '3.12'",
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version >= '3.12'",
 
     # Declared in [project.dependencies] too; this entry exists to neutralise any
@@ -120,6 +121,11 @@ override-dependencies = [
 
     # requests is used by many dependencies, make sure it's patched for CVEs
     "requests>=2.32.4",
+
+    # datasets caps fsspec<=2025.3.0, which is vulnerable to the Jinja2 SSTI RCE in
+    # ReferenceFileSystem (CVE-2026-104851 / GHSA-27vj-qcqg-25rc, fixed 2026.6.0);
+    # huggingface-hub and torch take fsspec with no upper bound.
+    "fsspec>=2026.6.0",
 
     # pyzmq (transitive vllm dep, built from sdist on ppc64le/s390x) <27.2.0 fails to build
     # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
@@ -168,7 +174,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "cab4721d4a3ff111338cc3edce0d495edb979012" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "75d8688bb5090e98c815b88471a50c351b6b4faf" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

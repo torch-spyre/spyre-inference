@@ -35,6 +35,7 @@ consecutive buckets is the *bucket step*.
 from __future__ import annotations
 
 import bisect
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -212,6 +213,68 @@ def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     )
 
 
+def _declared_page_range(max_pages: int) -> dict[str, int] | None:
+    """Return the range of page counts one per-sequence kernel is compiled for.
+
+    Returns None, and logs why, when ``max_pages`` does not fit torch-spyre's limits; the
+    kernels then use the KV buckets instead.
+    """
+    from torch_spyre._inductor import config as ts_config
+    from torch_spyre._inductor import pass_utils
+
+    if not hasattr(pass_utils, "declared_dims"):
+        raise RuntimeError(
+            "This torch-spyre cannot run for_each_tile over a dynamic number of tiles "
+            "(torch-spyre#6066), which the per-sequence attention kernels need. "
+            "Upgrade torch-spyre."
+        )
+    # The page count is the only dynamic size, so it sets these torch-spyre limits unless
+    # the user exported them. The minimum is two pages because torch.compile compiles a
+    # size of one separately (torch-spyre#6018); a one-page sequence gets a masked copy
+    # of its page as the second one.
+    if "MIN_RESERVED_DIM_SIZE" not in os.environ:
+        ts_config.min_reserved_dim_size = 2
+    if "MAX_BUCKETS" not in os.environ:
+        ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
+    min_pages = ts_config.min_reserved_dim_size
+    # With min == max the size is a constant, which fails to trace.
+    if not min_pages < max_pages <= ts_config.max_buckets:
+        logger.warning_once(
+            "A dynamic page count needs the %d pages per sequence to be above "
+            "MIN_RESERVED_DIM_SIZE=%d and at most MAX_BUCKETS=%d, so the per-sequence "
+            "attention kernels compile one variant per KV bucket instead.",
+            max_pages,
+            min_pages,
+            ts_config.max_buckets,
+        )
+        return None
+    return {"min": min_pages, "max": max_pages, "granularity": 1}
+
+
+# Prefill reads this many pages per loop step, so its page counts are multiples of it.
+PREFILL_PAGE_GRANULARITY = 8
+
+
+def _prefill_page_range(page_range: dict[str, int]) -> dict[str, int]:
+    """Return ``page_range`` with its bounds rounded up to multiples of
+    ``PREFILL_PAGE_GRANULARITY``.
+
+    The minimum is two loop steps, since torch.compile compiles a single loop step
+    separately, as it does a single page. Returns ``page_range`` unchanged when the
+    rounded range holds a single page count or is above an exported ``MAX_BUCKETS``.
+    """
+    from torch_spyre._inductor import config as ts_config
+
+    g = PREFILL_PAGE_GRANULARITY
+    min_pages = max(-(-page_range["min"] // g) * g, 2 * g)
+    max_pages = -(-page_range["max"] // g) * g
+    if "MAX_BUCKETS" not in os.environ:
+        ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
+    if not min_pages < max_pages <= ts_config.max_buckets:
+        return page_range
+    return {"min": min_pages, "max": max_pages, "granularity": g}
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -255,7 +318,7 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
+    def __init__(self, vllm_config: VllmConfig, *, declare_pages: bool = False) -> None:
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
@@ -324,6 +387,15 @@ class SpyreAttnBucketer:
         # does, and it lifts the SWA bound _max_active_blocks derives from it.
         if _min_num_kv_heads(vllm_config) == 1:
             self._num_blocks_buckets = sorted({max(2, n) for n in self._num_blocks_buckets})
+
+        # With a page range, the per-sequence kernels take the page count at run time, so
+        # they compile once per query bucket rather than once per (query, KV) bucket pair.
+        self._page_range: dict[str, int] | None = None
+        self._prefill_page_range: dict[str, int] | None = None
+        if declare_pages:
+            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
+        if self._page_range is not None:
+            self._prefill_page_range = _prefill_page_range(self._page_range)
 
         validate_kv_ladder_env()
 
@@ -399,6 +471,26 @@ class SpyreAttnBucketer:
     def find_blocks_bucket(self, num_blocks: int) -> int | None:
         return self._round_up(num_blocks, self._num_blocks_buckets)
 
+    @property
+    def page_range(self) -> dict[str, int] | None:
+        """The ``min``, ``max`` and ``granularity`` of the page count one per-sequence
+        kernel runs. None when page counts are rounded up to ``num_blocks_buckets``."""
+        return self._page_range
+
+    @property
+    def prefill_page_range(self) -> dict[str, int] | None:
+        """``page_range`` for a prefill sequence (query width > 1), whose page counts are
+        multiples of ``PREFILL_PAGE_GRANULARITY``."""
+        return self._prefill_page_range
+
+    def find_declared_pages(self, num_blocks: int, prefill: bool = False) -> int:
+        """The page count a sequence of ``num_blocks`` pages runs at: its own, rounded up
+        to the range granularity, or the range minimum if that is larger."""
+        page_range = self._prefill_page_range if prefill else self._page_range
+        assert page_range is not None
+        g = page_range["granularity"]
+        return max(-(-num_blocks // g) * g, page_range["min"])
+
     def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
         """The num_blocks buckets batched decode records and dispatches onto at this batch size.
 
@@ -436,7 +528,11 @@ class SpyreAttnBucketer:
         that variant and put a compile back in the serving path.
         """
         out: list[SpyreAttnBucket] = []
-        for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
+        # With a page range, one kernel per query bucket runs every page count in it.
+        blocks_buckets = self._num_blocks_buckets
+        if self._page_range is not None:
+            blocks_buckets = [blocks_buckets[-1]]
+        for num_blocks in sorted(blocks_buckets, reverse=True):
             max_query_here = num_blocks * self.block_size
             for padded_query_len in sorted(self._query_buckets, reverse=True):
                 if self.min_real_query_len(padded_query_len) > max_query_here:

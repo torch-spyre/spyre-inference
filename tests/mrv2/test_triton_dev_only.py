@@ -21,7 +21,7 @@ from pathlib import Path
 _LOCK = Path(__file__).resolve().parents[2] / "uv.lock"
 
 
-def test_only_the_dev_group_and_darwin_torch_request_triton() -> None:
+def test_only_the_dev_group_requests_triton() -> None:
     packages = tomllib.loads(_LOCK.read_text())["package"]
     requesters = set()
     for package in packages:
@@ -31,5 +31,4 @@ def test_only_the_dev_group_and_darwin_torch_request_triton() -> None:
         for group, deps in package.get("dev-dependencies", {}).items():
             if any(dep["name"] == "triton" for dep in deps):
                 requesters.add((f"{package['name']}[{group}]", None))
-    # PyPI's torch wheel is only locked for macOS, which Spyre does not run on.
-    assert requesters == {("spyre-inference[dev]", None), ("torch", "2.14.1")}, requesters
+    assert requesters == {("spyre-inference[dev]", None)}, requesters

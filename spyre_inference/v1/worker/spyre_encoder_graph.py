@@ -39,8 +39,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
     Inherited from upstream: budget selection and user overrides, packing items into budgets,
     replay padding, and the per-item output split. Overridden: capture compiles the model's
-    graphs at that budget's static shape, and replay copies the inputs into host staging
-    buffers, uploads them once and runs those graphs.
+    graphs at that budget's static shape, replay copies the inputs into host staging
+    buffers, uploads them once and runs those graphs, and the manager counts as captured
+    while those buffers are staged.
     """
 
     def __init__(
@@ -185,6 +186,16 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             output = self.model.encoder_cudagraph_forward(self._upload(staging), path=path)
         self.graph_hits += num_items
         return output
+
+    def is_captured(self) -> bool:
+        # Captured once a budget is staged; upstream's check reads the CUDA graph pool,
+        # which Spyre leaves None.
+        return bool(self._staging)
+
+    def clear(self) -> None:
+        # The compiled graphs live on the model; only the staging buffers are dropped.
+        super().clear()
+        self._staging.clear()
 
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Copy host buffers to the encoder's device."""

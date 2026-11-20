@@ -34,6 +34,9 @@ from spyre_testing_plugin.pytest_plugin import spyre_device_count
 # There is no smaller stand-in that exercises the same three-module vision
 # path (SigLIP + BLIP-2 projector + Granite decoder).
 MODEL = "ibm-granite/granite-vision-4.1-4b"
+# The repo ships its own Python under trust_remote_code; run the pinned revision,
+# not whatever its main holds when CI fetches.
+REVISION = "37d591f06319e8f1638b5adcf58bdf50e0f84f7a"
 
 MAX_MODEL_LEN = 4096
 MAX_TOKENS = 16
@@ -89,6 +92,8 @@ def _generate(conversations, enforce_eager: bool, images_per_prompt: int = 1):
         enforce_eager=enforce_eager,
         limit_mm_per_prompt={"image": images_per_prompt},
         trust_remote_code=True,
+        revision=REVISION,
+        tokenizer_revision=REVISION,
     )
     outputs = llm.chat(
         conversations,

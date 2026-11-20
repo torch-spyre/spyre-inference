@@ -155,9 +155,11 @@ def _newest_tar(arch_dir):
 
 def _extract(tar_path, dest):
     # tar preserves uv's internal hardlinks and avoids a per-file metadata storm
-    # over NFS; GNU tar auto-detects compression on extract.
+    # over NFS; GNU tar auto-detects compression on extract. It refuses `..`
+    # members and writes through no escaping symlink, and --no-same-owner keeps
+    # restored files owned by the runner user.
     subprocess.run(
-        ["tar", "-xf", str(tar_path), "-C", str(dest)],
+        ["tar", "--no-same-owner", "-xf", str(tar_path), "-C", str(dest)],
         check=True,
     )
 

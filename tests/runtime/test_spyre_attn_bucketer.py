@@ -807,6 +807,17 @@ class TestDeclaredPages:
         assert b.page_range is None
         assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
 
+    def test_a_sliding_window_declares_only_the_pages_its_window_reaches(self):
+        # Decode reaches 9 pages and a 512-token prefill 17, below max_model_len's 32.
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048, max_num_batched_tokens=512),
+            declare_pages=True,
+            sliding_window=512,
+        )
+        assert b.page_range == {"min": 2, "max": 17, "granularity": 1}
+        assert b.prefill_page_range == {"min": 16, "max": 24, "granularity": 8}
+        assert {v.num_blocks for v in b.variants()} == {b.num_blocks_buckets[-1]}
+
     def test_without_declare_pages_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048))
         assert b.page_range is None

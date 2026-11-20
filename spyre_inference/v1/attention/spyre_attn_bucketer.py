@@ -251,6 +251,17 @@ def _declared_page_range(max_pages: int) -> dict[str, int] | None:
     return {"min": min_pages, "max": max_pages, "granularity": 1}
 
 
+def sliding_window_page_bound(
+    num_blocks: int, aligned_query_len: int, sliding_window: int, block_size: int
+) -> int:
+    """Maximum number of pages a sliding-window sequence in the ``num_blocks`` bucket can
+    attend to.
+    """
+    # The window and query span can cross one more page than they fill.
+    span = sliding_window + aligned_query_len - 1
+    return min(num_blocks, (span + block_size - 1) // block_size + 1)
+
+
 # Prefill reads this many pages per loop step, so its page counts are multiples of it.
 PREFILL_PAGE_GRANULARITY = 8
 
@@ -318,7 +329,13 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig, *, declare_pages: bool = False) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        declare_pages: bool = False,
+        sliding_window: int | None = None,
+    ) -> None:
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
@@ -393,7 +410,13 @@ class SpyreAttnBucketer:
         self._page_range: dict[str, int] | None = None
         self._prefill_page_range: dict[str, int] | None = None
         if declare_pages:
-            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
+            max_pages = self._num_blocks_buckets[-1]
+            if sliding_window is not None:
+                max_pages = max(
+                    sliding_window_page_bound(max_pages, q, sliding_window, block_size)
+                    for q in self._query_buckets
+                )
+            self._page_range = _declared_page_range(max_pages)
         if self._page_range is not None:
             self._prefill_page_range = _prefill_page_range(self._page_range)
 

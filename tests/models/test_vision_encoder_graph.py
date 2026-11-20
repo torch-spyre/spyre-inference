@@ -649,6 +649,44 @@ def test_compiled_pooling_warmup_runs_a_mixin_tower_per_budget_only(monkeypatch,
     assert calls == expected
 
 
+@pytest.mark.parametrize("mixin", [True, False], ids=["mixin", "marked"])
+def test_mrv2_pooling_warmup_runs_a_mixin_tower_per_budget_only(monkeypatch, mixin):
+    """MRV2's twin of the V1 test above: a pooling model's mixin tower skips the per-width
+    pass, which would run it uncompiled at every width; any other tower keeps it."""
+    from spyre_inference.v1.worker.spyre import warmup
+
+    monkeypatch.setattr(
+        warmup,
+        "MultiModalBudget",
+        lambda *a, **kw: SimpleNamespace(
+            mm_max_items_per_batch={"image": 3},
+            get_dummy_encoder_profile_inputs=lambda modality, n: [None] * n,
+        ),
+    )
+    monkeypatch.setattr(
+        warmup, "group_and_batch_mm_kwargs", lambda items, **kw: [("image", len(items), {})]
+    )
+    widths = []
+    model = _FakeVisionModel() if mixin else nn.Module()
+    runner: Any = SimpleNamespace(
+        supports_mm_inputs=True,
+        is_pooling_model=True,
+        compiled_tower_blocks=False,
+        get_model=lambda: model,
+        model=SimpleNamespace(embed_multimodal=lambda **kw: widths.append(1)),
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False, multimodal_config=SimpleNamespace(mm_encoder_only=True)
+        ),
+        vllm_config=None,
+        mm_registry=None,
+        device=torch.device("cpu"),
+    )
+
+    warmup._warm_multimodal(runner, sizes=[16])
+
+    assert len(widths) == (0 if mixin else 3)
+
+
 def _prompt(mask_rows: list[int], num_tokens: int = 12):
     is_multimodal = torch.zeros(num_tokens, dtype=torch.bool)
     is_multimodal[mask_rows] = True

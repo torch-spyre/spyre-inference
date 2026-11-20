@@ -341,7 +341,7 @@ def test_an_image_of_another_size_is_rejected(tp_group):
 )
 def test_budget_range_covers_a_whole_step(tp_group, pooling_type, items, expected):
     """Eight images per step: eight 1-token images, or eight 65-token ones on 64-row sticks.
-    A larger step stops at the 63 items one call holds, as no budget past that is filled."""
+    A larger step stops at the 63-item call cap, as no budget past that is filled."""
     model = _spyre_model(_tower_config(num_layers=1), pooling_type)
     model.max_items_per_step = items
     assert model.get_encoder_cudagraph_budget_range(None) == expected

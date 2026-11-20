@@ -922,8 +922,9 @@ class TestRecordBatchedDecode:
 
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
 def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
-    """With a chunk range, every decode batch realizes a recorded kernel: a single-chunk one
-    within one chunk, the dynamic one past it at a chunk count in its range."""
+    """With a chunk range, every decode batch runs a kernel that warmup recorded: the
+    one-chunk kernel if it fits in one chunk, else the dynamic kernel at a chunk count in
+    its range."""
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 

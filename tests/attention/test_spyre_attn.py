@@ -2393,8 +2393,8 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     configure_compilation,
     configure_device,
 ):
-    """Past one chunk, one compiled batched decode kernel serves every chunk
-    count up to max_model_len, ragged batches included, and matches the reference."""
+    """Batches longer than one chunk all run one compiled kernel, at every chunk count up
+    to max_model_len and for ragged batches too, and match the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._C import get_reserved_dims
     from torch_spyre._inductor import config as ts_config
@@ -2408,8 +2408,8 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. Eight sequences fill the
-    # cores at 4 blocks per chunk, so the kernel runs 2 to 4 chunks: compiled at 4, then
+    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
+    # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks: compiled at 4, then
     # reused at 2 and 3.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
@@ -2451,8 +2451,8 @@ def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
     configure_compilation,
     configure_device,
 ):
-    """Every decode batch that fits in one chunk runs one compiled one-chunk kernel and
-    matches the reference."""
+    """Every decode batch that fits in one chunk runs the same compiled one-chunk kernel
+    and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
 
@@ -2464,8 +2464,8 @@ def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. Eight sequences fill
-    # one chunk at 4 blocks, so 1 to 4 blocks all run one chunk of 32 entries.
+    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
+    # chunk holds 4 pages of each, so batches of 1 to 4 pages all run as one chunk.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -3236,8 +3236,8 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=dynamic_chunks)
         if dynamic_chunks:
-            # max_model_len 2048 at block size 64 is 32 pages: 4 chunks of 8 blocks at 4
-            # sequences.
+            # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
+            # pages each.
             (bucket,) = [
                 v
                 for v in builder.attn_bucketer.batched_decode_variants()

@@ -75,14 +75,17 @@ def _kv_block_layout(
         return None
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
     # Offsets scale with the block count, which num_gpu_blocks_override may set.
-    placement = builder.get_kv_cache_config_from_groups(vllm_config, groups, 1)
-    pages: dict[int, int] = {}
+    placement = builder.get_kv_cache_config_from_groups(
+        vllm_config=vllm_config, kv_cache_groups=groups, num_blocks=1
+    )
+    page_bytes_by_offset: dict[int, int] = {}
     for tensor in placement.kv_cache_tensors:
         for index in range(len(tensor.layers)):
-            start = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
-            pages.setdefault(start, tensor.block_stride)
+            offset = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
+            if offset not in page_bytes_by_offset:
+                page_bytes_by_offset[offset] = tensor.block_stride
     # An attention page holds K and V, which allocate_pages allocates apart.
-    tensors = [page // 2 for page in pages.values() for _ in range(2)]
+    tensors = [page // 2 for page in page_bytes_by_offset.values() for _ in range(2)]
     per_request = _max_memory_usage_bytes_from_groups(builder, vllm_config, groups) // pool_bytes
     return pool_bytes, tensors, per_request
 

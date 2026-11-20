@@ -16,11 +16,12 @@
 
 from copy import copy
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     UniformTypeKVCacheSpecs,
@@ -126,7 +127,7 @@ def allocate_spyre_kv_caches(
             if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
                 kernel_block_size = kernel_block_sizes[group_id]
             pages_per_block = spec.block_size // kernel_block_size
-            kernel_spec = replace(spec, block_size=kernel_block_size)
+            kernel_spec = cast(AttentionSpec, replace(spec, block_size=kernel_block_size))
             # A layer without an impl (fixture stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl

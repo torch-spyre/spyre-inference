@@ -356,7 +356,8 @@ Differences from the removed V1 runner:
 - Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.
 - These are refused at startup: speculative decoding other than DFlash/XPress,
-  batch-sharded sampling, `cudagraph_mm_encoder`, and prefill context parallelism.
+  batch-sharded sampling, `cudagraph_mm_encoder`, prefill context parallelism, and,
+  untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).
 
 ## Offline engine in the calling process
 

@@ -687,6 +687,12 @@ class TorchSpyrePlatform(CpuPlatform):
             # A CUDA-graph encoder manager; Spyre compiles towers per budget at warmup.
             "cudagraph_mm_encoder": vllm_config.compilation_config.cudagraph_mm_encoder,
             "prefill context parallelism": parallel_config.prefill_context_parallel_size > 1,
+            # Accepted upstream but never tested on Spyre.
+            "HiSparse": getattr(vllm_config.attention_config, "hisparse_config", None) is not None,
+            "watermarking": getattr(vllm_config, "watermark_config", None) is not None,
+            "AuxOutput (e.g. returning routed experts)": bool(
+                getattr(getattr(vllm_config, "aux_output_config", None), "enabled", False)
+            ),
         }
         for feature, requested in unsupported.items():
             if requested:

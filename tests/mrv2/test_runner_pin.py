@@ -104,6 +104,21 @@ def test_any_other_runner_is_rejected(
             lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
             id="pcp",
         ),
+        pytest.param(
+            "HiSparse",
+            lambda c: setattr(c.attention_config, "hisparse_config", object()),
+            id="hisparse",
+        ),
+        pytest.param(
+            "watermarking",
+            lambda c: setattr(c, "watermark_config", object()),
+            id="watermark",
+        ),
+        pytest.param(
+            "AuxOutput",
+            lambda c: setattr(c.aux_output_config, "enable_return_routed_experts", True),
+            id="aux-output",
+        ),
     ],
 )
 def test_unsupported_v2_features_fail_at_startup(

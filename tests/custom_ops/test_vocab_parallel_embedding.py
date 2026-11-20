@@ -255,7 +255,7 @@ def test_lm_head_weight_not_relaid_out(tp_group):
 
 @pytest.mark.vocab_parallel_embedding
 def test_vocab_table_crosses_to_device_once(tp_group):
-    """Of the table, only the one-row probe goes through fn; the table itself is placed directly."""
+    """Only the one-row probe goes through fn; the table itself is placed directly."""
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
     )
@@ -271,8 +271,7 @@ def test_vocab_table_crosses_to_device_once(tp_group):
 
     layer._apply(fn)
 
-    table_moves = [shape for shape in moved if len(shape) == 2]
-    assert table_moves == [(1, embedding_dim)], (
+    assert moved == [(1, embedding_dim)], (
         f"expected only the one-row probe to go through fn, got {moved}"
     )
 

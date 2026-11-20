@@ -71,16 +71,6 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
         else:
             self._spyre_reindex_table = None
             self._spyre_keep_table = None
-        # The gather's padded row layout fails the decoder block graph's input guard. A multiply
-        # by a buffer (Inductor drops clone and x * 1.0) re-emits the standard layout.
-        if self.tp_size == 1:
-            self.register_buffer(
-                "_spyre_unit_row",
-                torch.ones(self.embedding_dim, dtype=self.params_dtype),
-                persistent=False,
-            )
-        else:
-            self._spyre_unit_row = None
 
     def _build_reindex_and_keep_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the reindex and keep lookup tables (vectorized over the vocab)."""
@@ -128,8 +118,6 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
         if keep is not None:
             output = output * keep.unsqueeze(-1)
             output = tensor_model_parallel_all_reduce(output)
-        if self._spyre_unit_row is not None:
-            output = output * self._spyre_unit_row
         return output
 
 

@@ -207,6 +207,33 @@ class SpyreLastPool(LastPool):
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
+@torch.compile(backend="inductor", dynamic=False)
+def _mean_pool_row_mask_mul(hidden_states: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+    """``[T, H]`` hidden states times a ``[T, 1]`` 0/1 mask, zeroing each lane's pad rows.
+
+    Chaining the reduce directly onto this product crashes the backend compiler
+    (``dbo-opt``), so ``.contiguous()`` and the caller's ``.clone()`` keep a real
+    boundary between the two kernels. The mask is per row, not ``[lanes, extent]``:
+    the latter, broadcast across the hidden (stick) dim after a lane ``view``, has no
+    restickify on Spyre.
+    """
+    return (hidden_states * row_mask).contiguous()
+
+
+@torch.compile(backend="inductor", dynamic=False)
+def _mean_pool_grid_reduce(prod: torch.Tensor, lens: torch.Tensor, extent: int) -> torch.Tensor:
+    """fp32 round-trip mean (torch-spyre#2619) of the first ``len(lens)`` grid lanes.
+
+    fp16 in, fp16 out, accumulating in fp32 in between; see ``SpyreMeanPool``.
+    """
+    grid = prod.view(-1, extent, prod.shape[-1])[: lens.shape[0]]
+    return (grid.to(torch.float32).sum(dim=1) / lens).to(prod.dtype)
+
+
+compile_guard.watch(_mean_pool_row_mask_mul, "mean-pool rectangle row mask")
+compile_guard.watch(_mean_pool_grid_reduce, "mean-pool rectangle fp32 sum")
+
+
 @dataclass
 class SpyrePoolingCursor(PoolingCursor):
     """``PoolingCursor`` plus the rectangle extent; set only on a rectangular MEAN step."""
@@ -215,13 +242,13 @@ class SpyrePoolingCursor(PoolingCursor):
 
 
 class SpyreMeanPool(MeanPool):
-    """MEAN per rectangle lane, else one packed D2H and the upstream reduce.
+    """MEAN per rectangle lane on device; one packed D2H and the upstream reduce otherwise.
 
     On the rectangular path the runner leaves ``hidden_states`` as the grid (lane ``i``
-    = sequence ``i``) and hands over a ``SpyrePoolingCursor``. The grid goes to the
-    host and each lane sums in fp32 there: a device fp32 sum over the token dim reads
-    back permuted (torch-spyre#5553, fixed by torch-spyre#5598). The fp16 result goes
-    back to the device, so the head sees the same tensor as before.
+    = sequence ``i``) and hands over a ``SpyrePoolingCursor``, so each lane reduces in
+    place. The sum is torch-spyre#2619's fp16->fp32->sum->fp16 round trip inside one
+    graph: a raw device fp32 sum is unsafe to move or cast (torch-spyre#2971), and an
+    fp16-accumulator matmul loses precision over a deep reduction.
 
     Off the rectangular path (ragged steps, mixed-task batches) there is no grid, so
     the buffer goes to the host for ``MeanPool``.
@@ -250,20 +277,22 @@ class SpyreMeanPool(MeanPool):
             # Pad on the host too, so a device head still sees only bucket widths.
             return pooled[row_idx] if self.defer_trim and num_seqs else pooled
 
+        device = hidden_states.device
         lanes = hidden_states.shape[0] // extent
         # A non-power-of-two grid can be narrower than the bucket; lanes past the real
         # count are dropped by the trim either way.
         bucket_lens = prompt_lens[row_idx][:lanes]
         lane_lens = torch.zeros(lanes, dtype=torch.int64)
         lane_lens[:num_seqs] = prompt_lens
-        width = bucket_lens.numel()
-        grid = convert(hidden_states, "cpu").view(lanes, extent, -1)[:width]
-        pad_rows = torch.arange(extent).unsqueeze(0) >= lane_lens[:width].unsqueeze(1)
-        sums = grid.to(torch.float32).masked_fill(pad_rows.unsqueeze(-1), 0).sum(dim=1)
+        cols = torch.arange(extent, dtype=torch.int64)
+        row_mask = (cols.unsqueeze(0) < lane_lens.unsqueeze(1)).reshape(-1, 1)
+        mask = convert(row_mask.to(torch.float16), device)
         # clamp(min=1) makes a zero-length segment pool to 0 rather than upstream's
         # NaN (0/0); fine since pooling requests always have at least one token.
-        means = sums / bucket_lens.clamp(min=1).unsqueeze(1)
-        pooled = convert(means.to(hidden_states.dtype), hidden_states.device)
+        lens = convert(bucket_lens.clamp(min=1).to(torch.float32).unsqueeze(1), device)
+
+        prod = _mean_pool_row_mask_mul(hidden_states, mask).clone()
+        pooled = _mean_pool_grid_reduce(prod, lens, extent)
         if self.defer_trim:
             return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled

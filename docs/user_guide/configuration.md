@@ -305,17 +305,17 @@ left of `--gpu-memory-utilization` (default 0.92) × total. The cache keeps ever
 that memory pays for, usually far more than `--max-num-seqs` requests at `--max-model-len`
 need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.
 
-Spyre turns vLLM's hybrid KV cache manager off, so every layer allocates its own page per
-block and the budget is converted into blocks at the device cost of all layers' pages. On the
-V2 model runner (`SPYRE_MODEL_RUNNER=v2`), `--no-disable-hybrid-kv-cache-manager` turns it
-on: a model that mixes sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets
-one KV cache group per kind, sliding-window groups return blocks that fall out of the window,
-and the groups overlay one another as upstream lays them out, each layer reading the shared
-pages in its own shape, so a block costs what vLLM's pool counts. The V1 runner rejects the
-flag. Every K and V page allocation is one tensor, and the Spyre allocator never splits a
-tensor across its 16 GiB memory regions, so a model with few layers gets fewer blocks than its
-budget: they must still pack into the regions. When memory runs out before a full batch fits,
-a warning names the knobs, and requests wait for pages instead of all running at full length.
+Spyre turns vLLM's hybrid KV cache manager off by default, so every layer allocates its own
+page per block and the budget is converted into blocks at the device cost of all layers' pages.
+On the V2 model runner `--no-disable-hybrid-kv-cache-manager` turns it on: a model that mixes
+sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets one KV cache group per
+kind, sliding-window groups return blocks that fall out of the window, and the groups overlay
+one another as upstream lays them out, each layer reading the shared pages in its own shape, so
+a block costs what vLLM's pool counts. The V1 runner rejects the flag. Every K and V page
+allocation is one tensor, and the Spyre allocator never splits a tensor across its 16 GiB
+memory regions, so a model with few layers gets fewer blocks than its budget: they must still
+pack into the regions. When memory runs out before a full batch fits, a warning names the
+knobs, and requests wait for pages instead of all running at full length.
 
 The profile run is skipped, as the first forward on Spyre would trace the model before
 the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`

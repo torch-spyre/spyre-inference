@@ -562,7 +562,7 @@ def test_spyre_attn_bfloat16(
 
 def test_kernel_block_sizes_accept_the_layer_spec():
     """vLLM's attention layer passes its `kv_cache_spec` positionally (sliding-window
-    layers included); every spec gets the same stick-aligned constraint."""
+    layers included); a spec whose blocks were not grown gets the stick-aligned constraint."""
     from vllm.v1.attention.backend import MultipleOf
     from vllm.v1.kv_cache_interface import SlidingWindowSpec
 

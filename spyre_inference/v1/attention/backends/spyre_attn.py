@@ -1434,7 +1434,12 @@ class SpyreAttentionBackend(AttentionBackend):
         # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
         # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
         # This matches the constraint on head_size in supports_head_size().
-        # Kernels, buckets and warmup run at cache_config.block_size; larger blocks are split.
+        # The metadata builder, impl and bucketer run at cache_config.block_size. The hybrid
+        # KV cache manager grows a group's blocks past it to unify page sizes, which
+        # MultipleOf(64) would accept unsplit. Returning the base size makes
+        # select_common_block_size split them into base-sized kernel blocks: for gemma-4's
+        # global layers this returns [128], so the manager allocates 256-token blocks and the
+        # kernels read each as two 128-token pages.
         config = get_current_vllm_config_or_none()
         base = config.cache_config.block_size if config is not None else None
         if kv_cache_spec is not None and base and kv_cache_spec.block_size > base:

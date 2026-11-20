@@ -358,8 +358,7 @@ def _is_jit(decorator: ast.expr) -> bool:
 
 
 def launch_sites() -> set[str]:
-    """``<module>.<kernel>`` for every ``kernel[grid](...)`` launch of a module-level
-    ``@triton.jit`` kernel under vllm/v1/worker, read from the installed sources."""
+    """Every ``<module>.<kernel>`` launched with ``kernel[grid]`` under vllm/v1/worker."""
     root = Path(importlib.util.find_spec(_WORKER).origin).parent  # ty: ignore
     sources = {
         ".".join(p.relative_to(root).with_suffix("").parts): p.read_text()
@@ -395,7 +394,6 @@ _top_k_top_p_originals: dict[str, Callable[..., Any]] = {}
 
 
 def original(name: str) -> Any:
-    """Upstream's kernel, whether or not bind() has replaced it."""
     if name in _bound:
         return _bound[name][1]
     return getattr(_module(name), name.rpartition(".")[2])

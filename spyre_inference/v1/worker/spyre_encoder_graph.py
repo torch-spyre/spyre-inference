@@ -165,8 +165,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         return [outputs[i] for i in range(len(tokens))]
 
     def _execute_packed(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
-        """vLLM 0.33's ``_execute_local``: pack items, smallest first, into batches that
-        each fit a budget, and run every batch through its budget's graphs."""
+        """vLLM 0.33's ``_execute_local``: smallest items first, into batches that each fit a budget."""
         item_specs = self._get_item_specs(mm_kwargs)
         num_items = len(item_specs)
         paths = tuple(self.path_token_budgets)
@@ -188,7 +187,6 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 batches.append((list(current_batch), path_budgets))
 
         def should_defer_item(item_tokens: dict[str, int]) -> bool:
-            """Whether closing the batch strictly reduces summed budgets."""
             for path in paths:
                 item = item_tokens[path]
                 if item == 0:

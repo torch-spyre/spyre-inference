@@ -308,7 +308,14 @@ class TorchSpyrePlatform(CpuPlatform):
             cls._user_max_num_batched_tokens = self.max_num_batched_tokens
             original(self, usage_context, model_config, parallel_config)
             if not user_supplied and self.max_num_seqs is not None:
-                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+                default = cls._DEFAULT_MAX_NUM_SEQS
+                if getattr(model_config, "runner_type", None) == "pooling":
+                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                        pooling_default_max_num_seqs,
+                    )
+
+                    default = pooling_default_max_num_seqs(model_config.max_model_len)
+                self.max_num_seqs = min(self.max_num_seqs, default)
 
         _spyre_patched._spyre_patched = True
         EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]

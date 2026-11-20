@@ -107,17 +107,17 @@ def allocate_spyre_kv_caches(
     each viewing it in its own page shape. A Spyre tensor never spans the allocator's
     regions, so each byte range is its own allocation rather than one backing buffer.
     """
-    group_of = {
+    group_by_layer = {
         layer_name: (group_id, group.kv_cache_spec)
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         for layer_name in group.layer_names
     }
     num_blocks = kv_cache_config.num_blocks
-    ranges: dict[int, SpyrePagedKVCache] = {}
+    pages_by_offset: dict[int, SpyrePagedKVCache] = {}
     kv_caches: dict[str, SpyrePagedKVCache] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         for index, layer_name in enumerate(kv_cache_tensor.layers):
-            group_id, spec = group_of[layer_name]
+            group_id, spec = group_by_layer[layer_name]
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[layer_name]
             kernel_block_size = spec.block_size
@@ -128,19 +128,21 @@ def allocate_spyre_kv_caches(
             # A layer without an impl (fixture stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            start = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
+            offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
             num_pages = num_blocks * pages_per_block
-            if start in ranges:
+            if offset in pages_by_offset:
                 if kv_cache_tensor.block_stride != spec.page_size_bytes:
                     raise NotImplementedError(
                         f"{layer_name}: Spyre KV pages are unpadded and layer-outermost, but its "
                         f"KVCacheTensor strides blocks by {kv_cache_tensor.block_stride} bytes "
                         f"for a {spec.page_size_bytes}-byte page."
                     )
-                kv_caches[layer_name] = impl_cls.view_pages(ranges[start], num_pages, kernel_spec)
+                kv_caches[layer_name] = impl_cls.view_pages(
+                    pages_by_offset[offset], num_pages, kernel_spec
+                )
             else:
-                ranges[start] = impl_cls.allocate_pages(num_pages, kernel_spec, device)
-                kv_caches[layer_name] = ranges[start]
+                pages_by_offset[offset] = impl_cls.allocate_pages(num_pages, kernel_spec, device)
+                kv_caches[layer_name] = pages_by_offset[offset]
 
     for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]

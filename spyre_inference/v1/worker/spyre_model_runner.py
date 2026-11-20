@@ -1721,8 +1721,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         selects a page by indexing with a one-element device tensor, so the page read is
         a real indirect access.
 
-        ``kernel_block_sizes`` is ignored: the backend accepts any 64-multiple, so the
-        kernel block size always equals the manager's.
+        ``kernel_block_sizes`` is ignored: V1 runs with the hybrid KV cache manager off, so
+        every block is cache_config.block_size and the kernel block size equals the manager's.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 

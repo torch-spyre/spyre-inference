@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
@@ -1431,10 +1431,19 @@ class SpyreAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
-        # `kv_cache_spec` is ignored: the stick constraint is the same for every spec.
         # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
         # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
         # This matches the constraint on head_size in supports_head_size().
+        # The metadata builder, impl and bucketer run at cache_config.block_size. The hybrid
+        # KV cache manager grows a group's blocks past it to unify page sizes, which
+        # MultipleOf(64) would accept unsplit. Returning the base size makes
+        # select_common_block_size split them into base-sized kernel blocks: for gemma-4's
+        # global layers this returns [128], so the manager allocates 256-token blocks and the
+        # kernels read each as two 128-token pages.
+        config = get_current_vllm_config_or_none()
+        base = config.cache_config.block_size if config is not None else None
+        if kv_cache_spec is not None and base and kv_cache_spec.block_size > base:
+            return [base]
         return [MultipleOf(64)]
 
     @staticmethod
@@ -1986,17 +1995,54 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
-        # Upstream sizes an fp8 cache as uint8 bytes; the pages hold e4m3 values.
-        dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
-        layout = head_major_kv_layout(
-            num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
-        )
-        shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
+        dtype, shape, layout = cls._page_geometry(num_blocks, spec)
 
         def _zeroed():
             return torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_()  # ty: ignore[no-matching-overload]
 
         return SpyrePagedKVCache(_zeroed(), _zeroed())
+
+    @classmethod
+    def view_pages(
+        cls, pages: SpyrePagedKVCache, num_blocks: int, spec: AttentionSpec
+    ) -> SpyrePagedKVCache:
+        """``pages``' storage in this impl's page layout for ``spec``.
+
+        Page rows are outermost and dense, so block ``b`` covers the same bytes in every
+        page shape of the same size, as upstream's KV cache group overlay requires.
+        """
+        from torch_spyre._C import (
+            as_strided_with_layout,
+            get_device_size_in_bytes,
+            get_spyre_tensor_layout,
+        )
+
+        dtype, shape, layout = cls._page_geometry(num_blocks, spec)
+        stride = torch.empty(shape, device="meta").stride()
+
+        def _view(base: torch.Tensor) -> torch.Tensor:
+            have = get_device_size_in_bytes(get_spyre_tensor_layout(base))
+            need = get_device_size_in_bytes(layout)
+            if base.dtype != dtype or have != need:
+                raise ValueError(
+                    f"KV pages {tuple(base.shape)} {base.dtype} ({have} device bytes) cannot "
+                    f"be viewed as {shape} {dtype} ({need} device bytes)."
+                )
+            return as_strided_with_layout(base, shape, stride, 0, layout)
+
+        return SpyrePagedKVCache(
+            k_pages=_view(pages.k_pages),
+            v_pages=_view(pages.v_pages),
+        )
+
+    @staticmethod
+    def _page_geometry(num_blocks: int, spec: AttentionSpec):
+        # Upstream sizes an fp8 cache as uint8 bytes; the pages hold e4m3 values.
+        dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
+        layout = head_major_kv_layout(
+            num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
+        )
+        return dtype, (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size), layout
 
     def _kernel_kv_scales(self) -> tuple[float | None, float | None]:
         """The (k_scale, v_scale) store arguments; both None for a model-dtype cache."""

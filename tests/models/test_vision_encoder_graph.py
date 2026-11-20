@@ -155,6 +155,159 @@ def test_encoder_data_parallel_is_rejected():
         _manager(_FakeVisionModel(), tp_mode="data")
 
 
+def _record_replay(manager, model):
+    """Events around one replay: host pad, device forward, then the host download."""
+    events: list[tuple[str, int]] = []
+    fill = manager._fill_and_copy
+    forward = model._encoder_device_forward
+    run = manager._run_budget_graph
+
+    def recording_fill(mm_kwargs, token_budget, path, slot):
+        events.append(("prepare", token_budget))
+        return fill(mm_kwargs, token_budget, path, slot)
+
+    def recording_forward(inputs, path="default"):
+        patches = inputs["patches"].shape[0]
+        events.append(("forward-enter", patches))
+        try:
+            return forward(inputs, path)
+        finally:
+            events.append(("forward-leave", patches))
+
+    def recording_run(*args, **kwargs):
+        output = run(*args, **kwargs)
+        # Logged after ``_run_budget_graph`` returns, so a prepare recorded during the
+        # call happened before this download. The slot upload uses the same copy helper
+        # and is not a download.
+        events.append(("download", -1 if output is None else output.shape[0]))
+        return output
+
+    manager._fill_and_copy = recording_fill
+    model._encoder_device_forward = recording_forward
+    manager._run_budget_graph = recording_run
+    return events
+
+
+def test_next_batch_is_staged_before_the_current_forward_returns():
+    """The next host pad runs after the device forward and before its download."""
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    events = _record_replay(manager, model)
+    model.forward_patches.clear()
+    outputs = manager.execute({"tokens": [10, 30]})
+
+    assert [o.shape[0] for o in outputs] == [10, 30]
+    # 16 and 32 token budgets, four patches per token. The second pad is queued
+    # before the first result is copied back.
+    assert events == [
+        ("prepare", 16),
+        ("forward-enter", 16 * MERGE_PATCHES),
+        ("forward-leave", 16 * MERGE_PATCHES),
+        ("prepare", 32),
+        ("download", 16),
+        ("forward-enter", 32 * MERGE_PATCHES),
+        ("forward-leave", 32 * MERGE_PATCHES),
+        ("download", 32),
+    ]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def test_lone_large_items_share_one_queue():
+    """``vision_pack_tokens`` runs each large item alone, and the next one is still staged."""
+
+    class _Model(_FakeVisionModel):
+        vision_pack_tokens = 40
+
+    model = _Model(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    events = _record_replay(manager, model)
+    model.forward_patches.clear()
+    outputs = manager.execute({"tokens": [200, 200]})
+
+    assert [o.shape[0] for o in outputs] == [200, 200]
+    assert events == [
+        ("prepare", 256),
+        ("forward-enter", 256 * MERGE_PATCHES),
+        ("forward-leave", 256 * MERGE_PATCHES),
+        ("prepare", 256),
+        ("download", 256),
+        ("forward-enter", 256 * MERGE_PATCHES),
+        ("forward-leave", 256 * MERGE_PATCHES),
+        ("download", 256),
+    ]
+
+
+def test_same_budget_batches_alternate_device_slots():
+    """Several items forced onto one budget use slot 0, then 1, and slot 1 is allocated then."""
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    assert all(slot == 0 for _, _, slot in manager._device_slots)
+    manager.max_batch_size = 1
+    slots: list[int] = []
+    forward = model._encoder_device_forward
+
+    def recording_forward(inputs, path="default"):
+        slots.append(manager._current_slot)
+        return forward(inputs, path)
+
+    model._encoder_device_forward = recording_forward
+    outputs = manager.execute({"tokens": [10, 10, 10, 10]})
+
+    assert slots == [0, 1, 0, 1]
+    assert ("default", 16, 1) in manager._device_slots
+    assert [o.shape[0] for o in outputs] == [10, 10, 10, 10]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def test_unstaged_next_budget_replays_the_following_batch_from_slot_0():
+    """Arming an unstaged budget leaves the queue unarmed, so the next replay uses slot 0."""
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    del manager._staging["default"][32]
+    first = {"tokens": [10], "ids": [0]}
+    missing = {"tokens": [30], "ids": [1]}
+    third = {"tokens": [10], "ids": [2]}
+    manager._queue = [
+        (first, 16, "default", ()),
+        (missing, 32, "default", ()),
+        (third, 16, "default", ()),
+    ]
+    slots: list[int] = []
+    forward = model._encoder_device_forward
+
+    def recording_forward(inputs, path="default"):
+        slots.append(manager._current_slot)
+        return forward(inputs, path)
+
+    model._encoder_device_forward = recording_forward
+    assert manager._run_budget_graph(first, 16) is not None
+    assert manager._run_budget_graph(missing, 32) is None
+    assert manager._run_budget_graph(third, 16) is not None
+    assert slots == [0, 0]
+
+
+def test_plan_matches_upstream_execute_local():
+    """The copied packer stays in step with ``EncoderCudaGraphManager._execute_local``."""
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    for tokens in ([10, 30], [15, 20], [20, 25]):
+        model.forward_patches.clear()
+        manager.execute({"tokens": tokens})
+        ours = list(model.forward_patches)
+        model.forward_patches.clear()
+        EncoderCudaGraphManager._execute_local(manager, {"tokens": tokens})
+        assert model.forward_patches == ours
+
+
 def test_execute_packs_pads_per_block_and_splits_per_item():
     model = _FakeVisionModel(max_tokens=300)
     manager = _manager(model)
@@ -462,14 +615,14 @@ def test_each_path_compiles_and_replays_from_its_own_staging():
         EncoderItemSpec(t * MERGE_PATCHES, t, {"local": t, "global": t})
         for t in mm_kwargs["tokens"]
     ]
-    forward = model.encoder_cudagraph_forward
+    forward = model._encoder_device_forward
     seen_paths = []
 
     def recording_forward(inputs, path="default"):
         seen_paths.append(path)
-        return forward(inputs) + (100.0 if path == "global" else 0.0)
+        return forward(inputs, path) + (100.0 if path == "global" else 0.0)
 
-    model.encoder_cudagraph_forward = recording_forward
+    model._encoder_device_forward = recording_forward
     model.postprocess_encoder_output = lambda outputs, indices, tokens, dest, **kw: [
         dest.__setitem__(i, outputs["local"][:t] + outputs["global"][:t])
         for i, t in zip(indices, [tokens[i] for i in indices])

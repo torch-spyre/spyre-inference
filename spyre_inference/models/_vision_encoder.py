@@ -350,7 +350,17 @@ class SpyreVisionEncoderMixin:
 
         One copy to the host here: device views at offsets off the stick read as offset 0
         (torch-spyre#3770), and the embedding merge runs on the host anyway.
+
+        Replay does not come through here. The graph manager runs ``_encoder_device_forward``
+        and copies the output back itself, so it can stage the next batch in between.
         """
+        return convert(self._encoder_device_forward(inputs, path), device="cpu")
+
+    def _encoder_device_forward(
+        self, inputs: dict[str, torch.Tensor], path: str = "default"
+    ) -> torch.Tensor:
+        """The three graphs, leaving the output on the device."""
+        del path
         embed = getattr(self, "_spyre_vision_embed", self.vision_embed)
         project = getattr(self, "_spyre_vision_project", self.vision_project)
         blocks = self.vision_blocks()
@@ -368,7 +378,7 @@ class SpyreVisionEncoderMixin:
             if i in wanted:
                 hidden[i] = x
         taps = [hidden[t % depth] for t in self.vision_taps]
-        return convert(project(x, taps), device="cpu")
+        return project(x, taps)
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"

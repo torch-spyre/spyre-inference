@@ -244,6 +244,7 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
     """CLIP with its text tower on the encoder backend, its vision tower compiled per token
     budget, and correct mixed image and text steps."""
 
+    # "full": the one-hot's width. "class" has no one-hot; the cap only bounds its largest budget.
     vision_max_items_per_call = SEGMENT_ITEMS
     # A "class" image is one token, so upstream's smallest budget would allow one per call.
     vision_items_limited_by_tokens = True

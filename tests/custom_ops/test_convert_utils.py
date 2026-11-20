@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test the convert helpers in spyre_inference.custom_ops.utils.
-
-Every model-runner, encoder-graph, spec-decode and pooling path moves tensors
-through `convert`/`convert_tensor_tree`, and the paged-KV and sampling gathers
-place their sources via `place_row_gathered`/`row_outermost_layout`, yet none
-of that had direct tests.
-"""
+"""Test the convert helpers in spyre_inference.custom_ops.utils."""
 
 import sys
 
@@ -28,9 +22,8 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
 def test_convert_noop_returns_same_tensor():
-    """A tensor already on the target device and dtype is returned as-is (the
-    short-circuit keeps a same-device spyre_convert out of Inductor graphs),
-    None passes through, and a str device is accepted."""
+    """A same-device/same-dtype tensor is returned unchanged (keeps the
+    short-circuit out of compiled graphs)."""
     from spyre_inference.custom_ops.utils import convert
 
     t = torch.randn(2, 64, dtype=torch.float16)
@@ -41,8 +34,7 @@ def test_convert_noop_returns_same_tensor():
 
 
 def test_convert_dtype_change_on_cpu(default_vllm_config):
-    """A dtype-only conversion routes through the opaque spyre_convert op
-    (registered by the fixture) and keeps the values."""
+    """A dtype-only conversion routes through the opaque spyre_convert op."""
     from spyre_inference.custom_ops.utils import convert
 
     t = torch.randn(2, 64, dtype=torch.float16)
@@ -52,17 +44,14 @@ def test_convert_dtype_change_on_cpu(default_vllm_config):
 
 
 def test_convert_op_rejects_same_device_and_dtype(default_vllm_config):
-    """The op body treats a true no-op as a bug (the Python boundary is
-    responsible for short-circuiting it) and must say so."""
+    """The op body rejects a true no-op — the Python boundary short-circuits it."""
     t = torch.randn(2, 64, dtype=torch.float16)
     with pytest.raises(RuntimeError, match="same device"):
         torch.ops.vllm.spyre_convert(t, None, None)
 
 
 def test_convert_tensor_tree_walks_and_filters(default_vllm_config):
-    """The tree walk converts every tensor in a nested structure, passes
-    non-tensors and None through untouched, and the predicate excludes
-    non-matching tensors."""
+    """The tree walk converts nested tensors and passes non-tensors through."""
     from spyre_inference.custom_ops.utils import convert_tensor_tree
 
     fp16 = torch.randn(2, 64, dtype=torch.float16)
@@ -78,7 +67,7 @@ def test_convert_tensor_tree_walks_and_filters(default_vllm_config):
         tree, dtype=torch.float32, predicate=lambda t: t.dtype == torch.float16
     )
     assert out["a"].dtype == torch.float32
-    assert out["b"][0] is fp32  # excluded by the predicate
+    assert out["b"][0] is fp32
 
 
 @pytest.mark.parametrize(
@@ -89,8 +78,7 @@ def test_convert_tensor_tree_walks_and_filters(default_vllm_config):
     ],
 )
 def test_row_outermost_layout_describes_gather_source(shape, expected_size, expected_strides):
-    """The layout puts the indexed (row) dim outermost and the last dim as the
-    stick axis, with valid elements covering exactly the logical tensor."""
+    """The indexed dim is outermost and the last dim is the stick axis."""
     from spyre_inference.custom_ops.utils import row_outermost_layout
 
     layout = row_outermost_layout(shape, torch.float16)
@@ -105,16 +93,14 @@ def test_row_outermost_layout_describes_gather_source(shape, expected_size, expe
 
 @pytest.mark.parametrize("shape", [(2, 32), (2, 96)])
 def test_row_outermost_layout_rejects_partial_sticks(shape):
-    """A last dim that is not a whole number of sticks has no exact padded
-    tiling, so no layout is returned."""
+    """A last dim that is not a whole stick has no exact padded tiling."""
     from spyre_inference.custom_ops.utils import row_outermost_layout
 
     assert row_outermost_layout(shape, torch.float16) is None
 
 
 def test_place_row_gathered_off_device_fn_uses_plain_path():
-    """A fn whose probe lands off Spyre needs no layout: the source goes
-    through fn unchanged, with exactly one call."""
+    """A fn whose probe lands off Spyre takes the plain path."""
     from spyre_inference.custom_ops.utils import place_row_gathered
 
     src = torch.randn(4, 128, dtype=torch.float16)
@@ -125,13 +111,13 @@ def test_place_row_gathered_off_device_fn_uses_plain_path():
         return t * 2
 
     out = place_row_gathered(src, fn, "test")
-    assert calls == [(1, 128), (4, 128)]  # one-row probe, then the plain call
+    assert calls == [(1, 128), (4, 128)]
     torch.testing.assert_close(out, src * 2)
 
 
 def test_convert_moves_cpu_to_spyre_and_back():
-    """cpu->spyre and spyre->cpu transfers round-trip the values (within fp16
-    ULPs: the device transfer is not bit-exact)."""
+    """cpu->spyre transfers are not bit-exact for fp16, so compare with the
+    repo's usual tolerance."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import convert
@@ -147,8 +133,7 @@ def test_convert_moves_cpu_to_spyre_and_back():
 
 
 def test_convert_spyre_dtype_change_detours_through_cpu():
-    """Spyre cannot change dtype on device, so a dtype change from a Spyre
-    tensor hops via the host before landing on the target device."""
+    """Spyre cannot change dtype on device; a dtype change detours via CPU."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import convert
@@ -160,8 +145,8 @@ def test_convert_spyre_dtype_change_detours_through_cpu():
 
 
 def test_place_row_gathered_puts_rows_outermost_on_spyre():
-    """A stick-aligned 2D source is placed on the device with its rows
-    outermost (probe learns the destination from fn) and survives the move."""
+    """A stick-aligned 2D source is placed row-outermost; fn is only probed
+    on one row."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import place_row_gathered
@@ -182,8 +167,7 @@ def test_place_row_gathered_puts_rows_outermost_on_spyre():
 
 
 def test_place_row_gathered_narrow_rows_keep_default_layout():
-    """A row width that is not a whole stick cannot be laid out row-outermost,
-    so the source falls back to the plain fn path (still correct values)."""
+    """A row width that is not a whole stick falls back to the plain fn path."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import place_row_gathered

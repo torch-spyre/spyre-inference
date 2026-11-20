@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: bind() registers a csrc/ host op (``torch.ops._spyre_C.mrv2_*``) for every
+"""MRV2: bind() puts a csrc/ host op (``torch.ops._spyre_C.mrv2_*``) in place of every
 ``@triton.jit`` kernel MRV2 launches, so V2 needs no Triton on any architecture."""
 
 import ast
@@ -20,6 +20,7 @@ import importlib
 import importlib.util
 import inspect
 import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -400,10 +401,7 @@ def original(name: str) -> Any:
 
 
 def bind(force_host: bool = False) -> set[str]:
-    """Returns the names bound; ``force_host`` binds host ops under =triton too (parity).
-
-    The kernels go through vLLM's register_kernels, which also rebinds every
-    ``from module import kernel`` copy and JIT warmup owner a plain setattr would miss."""
+    """Returns the names bound; ``force_host`` binds host ops under =triton too (parity)."""
     bound = set()
     for site in _TOP_K_TOP_P_SITES:
         module = _module(f"{site}.x")
@@ -430,13 +428,10 @@ def bind(force_host: bool = False) -> set[str]:
             continue
         stand_ins[name] = UnsupportedKernel(name, feature)
     if stand_ins:
-        from vllm.triton_utils.dispatcher import register_kernels
-
         originals = {name: getattr(_module(name), name.rpartition(".")[2]) for name in stand_ins}
-        register_kernels({f"{_WORKER}.{name}": impl for name, impl in stand_ins.items()})
+        _rebind({id(originals[name]): (originals[name], impl) for name, impl in stand_ins.items()})
         for name, kernel in originals.items():
-            module = _module(name)
-            _bound[name] = (module, kernel, getattr(module, name.rpartition(".")[2]))
+            _bound[name] = (_module(name), kernel, stand_ins[name])
     bound |= set(_bound)
     # vllm.triton_utils' placeholder lacks next_power_of_2, which several MRV2
     # wrappers call to size a block argument before the launch.
@@ -447,22 +442,30 @@ def bind(force_host: bool = False) -> set[str]:
     return bound
 
 
+def _rebind(replacements: dict[int, tuple[Any, Any]]) -> None:
+    """Swap each kernel for its stand-in wherever a vLLM module holds it, ``from module
+    import kernel`` copies included. register_kernels does this too, but compares every
+    attribute of every loaded module against every kernel, which takes seconds."""
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("vllm.") or module is None:
+            continue
+        namespace = vars(module)
+        for attr, value in list(namespace.items()):
+            hit = replacements.get(id(value))
+            if hit is not None and value is hit[0]:
+                namespace[attr] = hit[1]
+
+
 def _next_power_of_2(n: int) -> int:
     return 1 if n <= 1 else 1 << (int(n) - 1).bit_length()
 
 
 def unbind() -> None:
     """Restore upstream's kernels (tests only)."""
-    from vllm.triton_utils import dispatcher
-
     for site, kernel in _top_k_top_p_originals.items():
         _module(f"{site}.x").apply_top_k_top_p = kernel
     _top_k_top_p_originals.clear()
-    # register_kernels has no inverse: run its rebinding scan the other way round.
-    dispatcher._rebind_impls([(stand_in, kernel) for _, kernel, stand_in in _bound.values()])
-    for name, (module, kernel, _) in _bound.items():
-        setattr(module, name.rpartition(".")[2], kernel)
-        dispatcher._registry.pop(f"{_WORKER}.{name}", None)
+    _rebind({id(stand_in): (stand_in, kernel) for _, kernel, stand_in in _bound.values()})
     _bound.clear()
     from vllm.triton_utils import triton
 

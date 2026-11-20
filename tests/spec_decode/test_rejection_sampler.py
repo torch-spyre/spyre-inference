@@ -28,8 +28,16 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from spyre_inference.platform import TorchSpyrePlatform
 from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.spec_decode import rejection_sampler as native
+
+# Rejection sampling hard-requires the csrc/ kernels (rejection_sampler.py raises on
+# a missing spyre_inference._C), so a prebaked image without them fails instead of
+# skipping. Same guard as test_sampling_kernels.py.
+pytestmark = pytest.mark.skipif(
+    not has_sampling_kernels(), reason="csrc/ sampling kernels are not built"
+)
 
 
 @pytest.fixture(scope="module", autouse=True)

@@ -83,7 +83,6 @@ def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops import utils
-    from spyre_inference.v1.attention.ops.layout import temporary_chunk_major_page_index_layout
 
     utils.register()
     dev = torch.device("spyre")
@@ -94,16 +93,16 @@ def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
 
     for _ in range(20):
         # Two whole sticks: a same-format upload of this size skips torch-spyre's staging.
-        n = 8 if layout else 128 // dtype.itemsize * 2
+        n = 128 // dtype.itemsize * 2
         src = torch.arange(n, dtype=dtype) + 40
         want = src.clone()
         for _ in range(40):
             mm(a)
         if layout:
             dst = utils.convert(
-                src.reshape(2, 4, 1),
+                src.reshape(2, n // 2),
                 device=dev,
-                device_layout=temporary_chunk_major_page_index_layout(2, 4),
+                device_layout=utils.row_outermost_layout((2, n // 2), dtype),
             )
         else:
             dst = utils.convert(src, device=dev)

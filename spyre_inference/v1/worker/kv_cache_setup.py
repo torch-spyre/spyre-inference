@@ -120,6 +120,8 @@ def allocate_spyre_kv_caches(
             group_id, spec = group_by_layer[layer_name]
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[layer_name]
+            # The group's kernel block size from upstream, which can split a manager block
+            # into several kernel blocks. Without an entry the kernels read whole manager blocks.
             kernel_block_size = spec.block_size
             if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
                 kernel_block_size = kernel_block_sizes[group_id]
@@ -130,6 +132,8 @@ def allocate_spyre_kv_caches(
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
             offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
             num_pages = num_blocks * pages_per_block
+            # The first layer at an offset allocates its pages; layers of other groups at the
+            # same offset view them in their own page shape.
             if offset in pages_by_offset:
                 if kv_cache_tensor.block_stride != spec.page_size_bytes:
                     raise NotImplementedError(

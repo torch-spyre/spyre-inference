@@ -24,7 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
-from spyre_inference.custom_ops.bert_split_qkv import split_bert_qkv
+from spyre_inference.custom_ops.bert_split_qkv import install_bert_head_groups, split_bert_qkv
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_qk_norm_eps,
@@ -52,6 +52,7 @@ def install_pad_loaders(model_loader: Any, model_config: ModelConfig) -> None:
     text_config = model_config.hf_text_config
     install_padded_head_dim(model_config)
     install_bert_head_pad(model_config)
+    install_bert_head_groups(model_config)
     install_head_pad_weight_loader(model_loader, text_config, model_config)
     install_mlp_pad_weight_loader(model_loader, text_config, model_config)
 

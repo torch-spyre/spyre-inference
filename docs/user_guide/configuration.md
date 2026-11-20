@@ -343,6 +343,24 @@ different KV scales therefore compiles the transformer block and each recorded a
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.
 
+## Model runner
+
+The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
+host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so no Triton install is
+needed on any architecture.
+
+Set `SPYRE_MODEL_RUNNER=v1` to fall back to the V1 model runner. The fallback is
+best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
+the V1 runner (#1245). The plugin sets `VLLM_USE_V2_MODEL_RUNNER` from
+`SPYRE_MODEL_RUNNER`, so don't set it yourself.
+
+Differences on V2:
+
+- Seeded sampling draws a different token sequence for the same seed, because MRV2
+  seeds each position rather than one generator per request. Greedy output is unchanged.
+- These are refused at startup: speculative decoding other than DFlash/XPress,
+  batch-sharded sampling, `cudagraph_mm_encoder`, and prefill context parallelism.
+
 ## Offline engine in the calling process
 
 At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline

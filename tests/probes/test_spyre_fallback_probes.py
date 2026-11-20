@@ -199,6 +199,39 @@ def test_spyre_single_row_index_select(spyre_device):
 # It is intentionally not duplicated here.
 
 
+@pytest.mark.parametrize("num_tokens", [4, 40])
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "A multi-core compile pads a gather output's entry dim to the index stick "
+        "multiple, so the compiled lookup reports e.g. device_size [2, 32, 64] for 4 "
+        "rows where a fresh tensor has [2, 4, 64], and graphs compiled on fresh tensors "
+        "recompile for it. SpyreVocabParallelEmbedding multiplies the TP=1 lookup by "
+        "_spyre_unit_row to re-emit the fresh layout. Fixed by the torch-spyre PR "
+        "'fix(inductor): stop padding a gather output's partial-stick entry dim'. When "
+        "this probe passes, drop _spyre_unit_row and revisit _warm_sample_row_gathers."
+    ),
+)
+def test_spyre_compiled_lookup_returns_fresh_layout(spyre_device, num_tokens):
+    """A compiled embedding lookup returns the layout of a fresh tensor of its shape.
+
+    Decoder blocks compile on fresh tensors at warmup and guard on input layout, so
+    layer 0 shares their graph only if the TP=1 lookup matches it.
+    """
+    from torch_spyre._C import get_spyre_tensor_layout
+    from torch_spyre._inductor import config
+
+    if config.sencores == 1:
+        pytest.skip("a single-core compile never pads the gather output")
+    table = torch.randn(1024, 128, dtype=torch.float16, device=spyre_device)
+    ids = torch.randint(0, 1024, (num_tokens,), dtype=torch.int64)
+    out = torch.compile(lambda t, i: F.embedding(i, t), dynamic=False)(table, ids.to(spyre_device))
+    fresh = torch.zeros(num_tokens, 128, dtype=torch.float16).to(spyre_device)
+    torch.testing.assert_close(out.cpu(), table.cpu()[ids], atol=0, rtol=0)
+    assert get_spyre_tensor_layout(out) == get_spyre_tensor_layout(fresh)
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(

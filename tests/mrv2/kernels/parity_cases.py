@@ -16,7 +16,7 @@
 through triton-cpu and once with kernels.bind()'s host op in its place, and
 compares every output and every buffer the kernel may write.
 
-Run as a script under SPYRE_MODEL_RUNNER=v2 SPYRE_MRV2_KERNELS=triton (the
+Run as a script under SPYRE_MRV2_KERNELS=triton (the
 gate must open real Triton before vLLM imports), so test_parity.py spawns it.
 """
 
@@ -340,32 +340,32 @@ def _gumbel(g, use_fp64: bool, apply_temperature: bool, is_drafting: bool, dtype
     return lambda s: gb.gumbel_sample(**s), state
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample(g):
     return _gumbel(g, use_fp64=False, apply_temperature=False, is_drafting=False)
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample_temperature_drafting(g):
     return _gumbel(g, use_fp64=False, apply_temperature=True, is_drafting=True)
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample_fp64(g):
     return _gumbel(g, use_fp64=True, apply_temperature=True, is_drafting=False)
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample_fp16_logits(g):
     return _gumbel(g, False, apply_temperature=True, is_drafting=False, dtype=torch.float16)
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample_bf16_logits(g):
     return _gumbel(g, False, apply_temperature=True, is_drafting=False, dtype=torch.bfloat16)
 
 
-def _gumbel_logits_cache(g, per_token_col: bool, source: bool):
+def _gumbel_logits_cache(g, per_token_col: bool, source: bool, row_mapping: bool = False):
     run, state = _gumbel(g, use_fp64=False, apply_temperature=True, is_drafting=True)
     num_tokens, vocab = state["logits"].shape
     # Distinct requests: two tokens writing one (req, col) race in Triton's grid.
@@ -378,17 +378,52 @@ def _gumbel_logits_cache(g, per_token_col: bool, source: bool):
     )
     if source:
         state["logits_cache_source"] = torch.randn(num_tokens, vocab, generator=g)
+    if row_mapping:
+        # A sharded cache: -1 for a request another rank caches. No padded (-1) token:
+        # triton-cpu's masked row lookup returns row 0 for it, where CUDA returns -1.
+        state["logits_cache_row_mapping"] = torch.tensor([3, -1, 0, 6, 1, -1, 2], dtype=torch.int32)
+        state["expanded_idx_mapping"] = torch.tensor(
+            [0, 1, 2, 3, 5, 5, 4, 6, 1][:num_tokens], dtype=torch.int32
+        )
     return run, state
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample_logits_cache(g):
     return _gumbel_logits_cache(g, per_token_col=False, source=False)
 
 
-@case("gpu.sample.gumbel._gumbel_sample_kernel")
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
 def gumbel_sample_logits_cache_per_token_source(g):
     return _gumbel_logits_cache(g, per_token_col=True, source=True)
+
+
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
+def gumbel_sample_logits_cache_row_mapping(g):
+    return _gumbel_logits_cache(g, per_token_col=True, source=False, row_mapping=True)
+
+
+def _gumbel_bias(g, dtype: torch.dtype, cached: bool):
+    run, state = _gumbel(g, False, apply_temperature=True, is_drafting=cached, dtype=dtype)
+    num_tokens, vocab = state["logits"].shape
+    state["bias"] = (torch.randn(num_tokens, vocab, generator=g) * 3).to(dtype)
+    if cached:
+        state["expanded_idx_mapping"] = torch.tensor(
+            [0, 1, 2, 3, -1, 5, 4, 6, -1][:num_tokens], dtype=torch.int32
+        )
+        state["logits_cache"] = torch.full((7, 3, vocab + 8), -7.0).to(dtype)
+        state["logits_cache_col"] = torch.tensor(1)
+    return run, state
+
+
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
+def gumbel_sample_bias(g):
+    return _gumbel_bias(g, torch.float32, cached=False)
+
+
+@case("gpu.sample.gumbel._gumbel_sample_kernel", "gpu.sample.gumbel._gumbel_combine_kernel")
+def gumbel_sample_bias_fp16_logits_cache(g):
+    return _gumbel_bias(g, torch.float16, cached=True)
 
 
 @case("gpu.sample.min_p._min_p_kernel")
@@ -641,6 +676,30 @@ def trace_replay(g):
         prompt_len=torch.tensor([5, 5, 4, 8, 7], dtype=torch.int32),
     )
     return lambda s: tr.apply_trace_tokens(**s), state
+
+
+@case("gpu.sample.trace_replay._trace_replay_verified_kernel")
+def trace_replay_verified(g):
+    tr = _m("sample.trace_replay")
+    trace = torch.randint(0, 999, (5, 20), generator=g, dtype=torch.int32)
+    # Requests 2 and 0 have traces; 2 drafts two tokens matching its trace, then a miss.
+    idx = torch.tensor([2, -1, 0, 3], dtype=torch.int32)
+    cu = torch.tensor([0, 4, 6, 8, 9], dtype=torch.int32)
+    drafts = torch.randint(0, 999, (9,), generator=g, dtype=torch.int64)
+    drafts[1:3] = trace[2, 5:7]
+    drafts[7] = trace[0, 2]
+    state = dict(
+        sampled=torch.randint(0, 999, (4, 4), generator=g),
+        num_sampled=torch.full((4,), -7, dtype=torch.int32),
+        draft_sampled=drafts,
+        cu_num_logits=cu,
+        idx_mapping=idx,
+        trace_token_ids=trace,
+        trace_len=torch.tensor([3, 0, 10, 0, 3], dtype=torch.int32),
+        total_len=torch.tensor([6, 5, 9, 8, 7], dtype=torch.int32),
+        prompt_len=torch.tensor([4, 5, 4, 8, 7], dtype=torch.int32),
+    )
+    return lambda s: tr.apply_trace_tokens_to_verified(**s), state
 
 
 def _thinking(g, cold: bool):

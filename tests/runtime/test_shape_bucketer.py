@@ -91,34 +91,11 @@ class TestDispatch:
 
 
 class TestBucketerState:
-    def test_initial_state_not_warmed_up(self, bucketer):
-        assert not bucketer.is_warmed_up
-
-    def test_mark_warmed_up(self, bucketer):
-        bucketer.mark_warmed_up()
-        assert bucketer.is_warmed_up
-
     def test_bucket_sizes_sorted(self, bucketer):
         assert bucketer.bucket_sizes == [1, 2, 4, 8, 16]
 
     def test_max_bucket_size(self, bucketer):
         assert bucketer.max_bucket_size == 16
-
-
-class TestWarmedBucket:
-    """Runtime padding only starts once warmup has compiled the buckets."""
-
-    def test_none_before_warmup(self, bucketer):
-        assert bucketer.warmed_bucket(3) is None
-
-    def test_pads_after_warmup(self, bucketer):
-        bucketer.mark_warmed_up()
-        assert bucketer.warmed_bucket(3) == 4
-        assert bucketer.warmed_bucket(16) == 16
-
-    def test_none_past_the_last_bucket(self, bucketer):
-        bucketer.mark_warmed_up()
-        assert bucketer.warmed_bucket(17) is None
 
 
 class TestEdgeCases:

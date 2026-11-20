@@ -26,23 +26,6 @@ pytestmark = pytest.mark.probe
 
 @pytest.mark.xfail(
     strict=True,
-    reason=(
-        "Upstream Muse Glimmer builds its norms from the plain nn.Module "
-        "MuseGlimmerRMSNorm, which the platform cannot override, so "
-        "spyre_inference.models.muse_glimmer swaps it at construction. "
-        "vllm-project/vllm#64920 replaces it with the RMSNorm / GemmaRMSNorm CustomOps. "
-        "When this XPASS-es, delete _spyre_rms_norm, _spyre_norms and "
-        "SpyreMuseGlimmerForCausalLM, and register upstream's classes directly."
-    ),
-)
-def test_muse_glimmer_uses_custom_op_norms():
-    from vllm.model_executor.models import muse_glimmer as mg
-
-    assert not hasattr(mg, "MuseGlimmerRMSNorm")
-
-
-@pytest.mark.xfail(
-    strict=True,
     raises=AssertionError,
     reason=(
         "Upstream Gemma4ForConditionalGeneration keeps its PLE cache as a plain attribute "

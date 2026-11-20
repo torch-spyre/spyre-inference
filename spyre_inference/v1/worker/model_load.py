@@ -132,7 +132,7 @@ def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) 
 
 
 def rewarm_after_reload(runner: Any) -> None:
-    """After upstream's reload_weights, shared by the V1 and V2 runners.
+    """After upstream's reload_weights.
 
     The reload reprocesses the weights, which rewrites the layers' KV scales. The
     graphs that read them guard on their values, so only those retrace; warming here

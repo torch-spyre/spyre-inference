@@ -25,9 +25,41 @@ from spyre_inference.v1.worker.spyre import kernels
 
 def test_host_kernel_launches_by_position_and_keyword_and_drops_launch_options() -> None:
     calls = []
-    kernel = kernels.HostKernel("k", lambda *args: calls.append(args), ["a", "b", "C"])
+    kernel = kernels.HostKernel(
+        "k", lambda *args: calls.append(args), ["a", "b", "C"], ["a", "b", "C"]
+    )
     kernel[(3, 2)](1, b=2, C=3, num_warps=4, num_stages=1)
     assert calls == [([3, 2], 1, 2, 3)]
+
+
+def test_host_kernel_binds_positionals_by_the_upstream_kernels_names() -> None:
+    """An argument inserted upstream mid-signature lands in its own slot, not the next."""
+    calls = []
+    kernel = kernels.HostKernel(
+        "k", lambda *args: calls.append(args), ["a", "new", "b"], ["a", "b", "new"]
+    )
+    kernel[(1,)](1, 2, 3)
+    assert calls == [([1], 1, 3, 2)]
+
+
+def test_host_kernel_refuses_a_signature_its_op_does_not_take() -> None:
+    with pytest.raises(RuntimeError, match="port the signature change"):
+        kernels.HostKernel("k", lambda *args: None, ["a", "new", "b"], ["a", "b"])
+
+
+def test_host_kernel_refuses_unknown_launch_arguments() -> None:
+    kernel = kernels.HostKernel("k", lambda *args: None, ["a"], ["a"])
+    with pytest.raises(TypeError, match="unknown arguments"):
+        kernel[(1,)](a=1, b=2)
+    with pytest.raises(TypeError, match="positional"):
+        kernel[(1,)](1, 2)
+
+
+def test_bind_or_raise_names_an_unlisted_launch_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kernels, "use_triton", lambda: False)
+    monkeypatch.delitem(kernels.HOST_KERNELS, "gpu.sample.gumbel._gumbel_combine_kernel")
+    with pytest.raises(RuntimeError, match="gumbel_combine_kernel.*neither binds"):
+        kernels.bind_or_raise()
 
 
 def test_unsupported_kernel_names_the_feature() -> None:
@@ -53,10 +85,28 @@ def test_bind_then_unbind_restores_upstream() -> None:
     original = input_batch._post_update_kernel
     try:
         kernels.bind(force_host=True)
-        assert isinstance(input_batch._post_update_kernel, kernels.HostKernel)
+        assert input_batch._post_update_kernel is not original
+        assert kernels.original("gpu.input_batch._post_update_kernel") is original
     finally:
         kernels.unbind()
     assert input_batch._post_update_kernel is original
+
+
+def test_bind_also_replaces_a_copy_imported_by_name() -> None:
+    """mamba_hybrid launches mamba_utils' kernel through `from mamba_utils import ...`."""
+    from vllm.v1.worker import mamba_utils
+    from vllm.v1.worker.gpu.model_states import mamba_hybrid
+
+    original = mamba_utils.preprocess_mamba_align_fused_kernel
+    try:
+        kernels.bind(force_host=True)
+        stand_in = mamba_hybrid.preprocess_mamba_align_fused_kernel
+        assert stand_in is not original
+        assert mamba_utils.preprocess_mamba_align_fused_kernel is stand_in
+    finally:
+        kernels.unbind()
+    assert mamba_utils.preprocess_mamba_align_fused_kernel is original
+    assert mamba_hybrid.preprocess_mamba_align_fused_kernel is original
 
 
 def test_unbind_restores_top_k_top_p_and_triton_placeholder() -> None:
@@ -115,10 +165,19 @@ def test_placeholder_next_power_of_2() -> None:
     assert powers == [1, 1, 2, 4, 1024, 1024]
 
 
+@pytest.mark.parametrize("csrc_filters", [True, False], ids=["csrc", "sort_free"])
 @pytest.mark.parametrize("use_k", [True, False])
 @pytest.mark.parametrize("use_p", [True, False])
-def test_sort_free_top_k_top_p_keeps_the_same_tokens(use_k: bool, use_p: bool) -> None:
+def test_sort_free_top_k_top_p_keeps_the_same_tokens(
+    use_k: bool, use_p: bool, csrc_filters: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from spyre_inference.v1.sample import sampling_kernels
+
+    if csrc_filters and not sampling_kernels.has_topk_topp_kernels():
+        pytest.skip("the csrc/ top-k/top-p filters are not built")
+    monkeypatch.setattr(sampling_kernels, "has_topk_topp_kernels", lambda: csrc_filters)
 
     # Not torch.manual_seed: seeding every device's generator initializes Spyre.
     logits = torch.randn(4, 1000, generator=torch.Generator().manual_seed(0))

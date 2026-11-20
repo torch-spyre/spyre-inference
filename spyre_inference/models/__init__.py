@@ -56,10 +56,6 @@ _ADAPTED_ARCHS: dict[str, str] = {
     ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
-    "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
-    "MuseGlimmerForConditionalGeneration": (
-        "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM"
-    ),
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (
         "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"

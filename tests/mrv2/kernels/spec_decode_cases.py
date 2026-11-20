@@ -65,15 +65,32 @@ def _spec_batch(g, num_reqs: int, steps: int, vocab: int, greedy_mix: bool, inva
 
 
 def _rejection(
-    g, *, draft_logits: bool, greedy_mix: bool, fp64=False, invalid=False, all_greedy=False
+    g,
+    *,
+    draft_logits: bool,
+    greedy_mix: bool,
+    fp64=False,
+    invalid=False,
+    all_greedy=False,
+    row_mapping=False,
+    skip_masked=False,
 ):
     rs = _m("spec_decode.rejection_sampler_utils")
     b = _spec_batch(g, 4, 5, 9000, greedy_mix, invalid)
     if all_greedy:
         b["temps"].zero_()
+    if skip_masked:
+        # Whole vocab blocks masked out, as top-k/top-p leaves them.
+        b["target"][::2, 1024:5120] = float("-inf")
     dl = None
     if draft_logits:
-        dl = torch.randn(b["max_reqs"], b["steps"], 9000, generator=g) * 3
+        values = torch.randn(b["max_reqs"], b["steps"], 9000, generator=g) * 3
+        mapping = None
+        if row_mapping:
+            # A sharded cache's rows; a request on another rank (-1) reads row 0.
+            mapping = torch.randperm(b["max_reqs"], generator=g).to(torch.int32)
+            mapping[b["idx"][1].long()] = -1
+        dl = types.SimpleNamespace(values=values, row_mapping=mapping)
 
     def run(s):
         sampled, num_sampled = rs.rejection_sample(
@@ -89,6 +106,7 @@ def _rejection(
             b["seeds"],
             b["steps"],
             use_fp64=fp64,
+            skip_masked_vocab_blocks=skip_masked,
         )
         # Slots past num_sampled are torch.empty that neither side writes.
         keep = torch.arange(sampled.shape[1]) < num_sampled[:, None]
@@ -137,6 +155,16 @@ def rejection_sample_fp64(g):
     return _rejection(g, draft_logits=True, greedy_mix=False, fp64=True)
 
 
+@case(
+    f"{_RS}._compute_local_logits_stats_kernel",
+    f"{_RS}._rejection_kernel",
+    f"{_RS}._resample_kernel",
+    f"{_RS}._insert_resampled_kernel",
+)
+def rejection_sample_row_mapping_skip_masked(g):
+    return _rejection(g, draft_logits=True, greedy_mix=True, row_mapping=True, skip_masked=True)
+
+
 @case("gpu.spec_decode.rejection_sampler._gather_draft_sampled_kernel")
 def gather_draft_sampled(g):
     rsm = _m("spec_decode.rejection_sampler")
@@ -160,12 +188,16 @@ def flatten_sampled(g):
     cu = torch.tensor([0, 4, 6, 10, 11], dtype=torch.int32)
     num_sampled = torch.tensor([3, 2, 4, 1], dtype=torch.int32)
     sampled = torch.randint(0, 300, (num_reqs, steps + 1), generator=g)
-    logits = _logits(g, 11, 300)
-    sampler = types.SimpleNamespace(logprobs_mode="raw_logprobs")
-    self = types.SimpleNamespace(sampler=sampler, enable_adaptive_verification=False)
-    return lambda s: rsm.RejectionSampler._get_logprobs_tensors(
-        self, sampled, num_sampled, logits, cu, cu.numpy(), 2
-    ), {}
+    flat = torch.zeros(11, dtype=sampled.dtype)
+
+    def run(s):
+        # Launched as RejectionSampler._get_logprobs_tensors launches it.
+        rsm._flatten_sampled_kernel[(num_reqs,)](
+            flat, sampled, sampled.stride(0), num_sampled, cu, num_warps=1
+        )
+        return flat
+
+    return run, {}
 
 
 def _dflash_batch(g, num_reqs: int, chunked: bool):

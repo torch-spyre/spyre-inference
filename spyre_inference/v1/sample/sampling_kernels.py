@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Loads the host sampling kernels built from csrc/ (``torch.ops._spyre_C``)."""
+"""Loads the host kernels built from csrc/ (``torch.ops._spyre_C``)."""
 
 import platform
 from collections.abc import Mapping
@@ -29,8 +29,8 @@ def isa_from_capabilities(caps: Mapping[str, object]) -> tuple[bool, bool]:
     """``(avx512, avx2_fma)`` from ``torch.cpu.get_capabilities()``.
 
     That map comes from cpuinfo and ignores ``ATEN_CPU_CAPABILITY``. Pinning
-    ATen's dispatch level must not hide an extension the CPU can run: rejection
-    sampling has no Python path. ``avx512`` is the four flags ``_C`` is compiled
+    ATen's dispatch level must not hide an extension the CPU can run: the V2
+    model runner's host kernels have no Python path. ``avx512`` is the four flags ``_C`` is compiled
     with. ``avx2_fma`` is AVX2 plus FMA3, which ``_C_AVX2`` needs.
     """
     avx512 = all(bool(caps.get(flag)) for flag in _AVX512_BUILD_FLAGS)
@@ -68,19 +68,19 @@ try:
 except (ImportError, AttributeError) as e:
     _HAS_SAMPLING_KERNELS = False
     init_logger(__name__).warning(
-        "Failed to import the sampling kernels extension (spyre_inference._C): %s. "
-        "Ordinary sampling falls back to PyTorch; rejection sampling requires these kernels.",
+        "Failed to import the host kernels extension (spyre_inference._C): %s. "
+        "The V2 model runner requires it; top-k/top-p filtering falls back to PyTorch.",
         e,
     )
 
 
 def has_sampling_kernels() -> bool:
-    """Whether the csrc/ sampling kernels are built and loaded."""
+    """Whether the csrc/ host kernels are built and loaded."""
     return _HAS_SAMPLING_KERNELS
 
 
-# An older _C (greedy and Gumbel only) still imports. The top-k ops arrived
-# later, so decide once here instead of raising on the first filter call.
+# An older _C without the top-k ops still imports, so decide once here instead of
+# raising on the first filter call.
 _HAS_TOPK_TOPP_KERNELS = _HAS_SAMPLING_KERNELS and hasattr(
     torch.ops._spyre_C, "cpu_topk_topp_sampling"
 )
@@ -95,6 +95,5 @@ if _HAS_SAMPLING_KERNELS and not _HAS_TOPK_TOPP_KERNELS:
 def has_topk_topp_kernels() -> bool:
     """Whether this _C build has the top-k / top-p filter ops.
 
-    False on a stale extension, so top-k / top-p fall back to PyTorch while
-    greedy and the Gumbel kernel keep using the ops that build does have."""
+    False on a stale extension, so top-k / top-p fall back to PyTorch."""
     return _HAS_TOPK_TOPP_KERNELS

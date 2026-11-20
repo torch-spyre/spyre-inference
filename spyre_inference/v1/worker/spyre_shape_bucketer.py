@@ -532,7 +532,6 @@ class SpyreShapeBucketer:
         sizes: list[int] = [int(s) for s in (compilation_config.compile_sizes or [])]
         self._bucket_sizes = sorted(sizes)
         self._max_bucket_size = self._bucket_sizes[-1] if self._bucket_sizes else 0
-        self._is_warmed_up = False
         logger.info(
             "SpyreShapeBucketer initialized with %d body token buckets: min=%d, max=%d",
             len(self._bucket_sizes),
@@ -548,10 +547,8 @@ class SpyreShapeBucketer:
         body, and a step pads to the smallest that holds its token count.
 
         Pooling keeps a bucketer in eager *and* compile so *runtime* always
-        1D-pads the body. Warmup still differs: compile dummies each 1D size
-        (attention compiles through ``force_attention``); eager does one
-        dummy then ``mark_warmed_up()``. Decoder skips a bucketer when eager
-        because 1D pad exists only to hit compiled graphs.
+        1D-pads the body. Decoder skips a bucketer when eager because 1D pad
+        exists only to hit compiled graphs.
         """
         if vllm_config.model_config.runner_type == "pooling":
             return cls.for_pooling(vllm_config)
@@ -590,13 +587,6 @@ class SpyreShapeBucketer:
     def max_bucket_size(self) -> int:
         return self._max_bucket_size
 
-    @property
-    def is_warmed_up(self) -> bool:
-        return self._is_warmed_up
-
-    def mark_warmed_up(self) -> None:
-        self._is_warmed_up = True
-
     def find_bucket(self, num_tokens: int) -> int | None:
         """Find the smallest 1D bucket size >= num_tokens.
 
@@ -609,13 +599,6 @@ class SpyreShapeBucketer:
         if idx < len(self._bucket_sizes):
             return self._bucket_sizes[idx]
         return None
-
-    def warmed_bucket(self, num_tokens: int) -> int | None:
-        """The padded token count, or None before warmup or past the last bucket."""
-        if not self._is_warmed_up:
-            return None
-        desc = self.dispatch(num_tokens)
-        return None if desc is None else desc.padded_num_tokens
 
     def dispatch(self, num_tokens: int) -> SpyreBucketDescriptor | None:
         """Compute padded batch descriptor for the given token count.

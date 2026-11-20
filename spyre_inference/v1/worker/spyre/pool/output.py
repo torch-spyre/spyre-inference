@@ -48,14 +48,13 @@ def pool_sync(runner: "SpyreModelRunnerV2") -> ModelRunnerOutput | None:
     )
     output = ModelRunnerOutput(
         req_ids=input_batch.req_ids,
-        req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
         kv_connector_output=kv_connector_output,
         ec_connector_output=state.ec_connector_output,
     )
     if pooler_output is None or not any(finished_mask):
         output.pooler_output = [None] * input_batch.num_reqs
     else:
-        # V1's Spyre-safe D2H, then upstream's batch-size check and finished-mask split.
+        # The Spyre-safe D2H, then upstream's batch-size check and finished-mask split.
         output.pooler_output = copy_pooler_output_to_cpu(pooler_output, finished_mask)
     device_shims.spyre_fence()
     runner.postprocess_num_computed_tokens(input_batch)

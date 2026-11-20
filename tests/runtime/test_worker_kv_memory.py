@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TorchSpyreWorker sizes the KV cache through upstream's Worker.determine_available_memory
+"""SpyreWorkerV2 sizes the KV cache through upstream's Worker.determine_available_memory
 (spyre-inference#901), with every block the measured memory pays for. Only the card is
 faked: torch.accelerator's memory view, with free bytes the test sets.
 
@@ -27,12 +27,12 @@ import torch
 from vllm.config import VllmConfig
 from vllm.utils.mem_utils import MemorySnapshot
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.utils import request_memory
 
-from spyre_inference.v1.worker import spyre_model_runner
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
+from spyre_inference.v1.worker.spyre import model_runner
+from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
 
 GiB = 1 << 30
 TOTAL = 96 * GiB
@@ -59,7 +59,7 @@ def _worker(
     dtype: torch.dtype = torch.float16,
     kv_cache_spec: dict | None = None,
     hybrid_kv_cache_manager: bool = False,
-) -> TorchSpyreWorker:
+) -> SpyreWorkerV2:
     """A worker that started on an empty card and whose model now leaves free_after_load."""
     card = SimpleNamespace(free=TOTAL)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *_: (card.free, TOTAL))
@@ -78,7 +78,7 @@ def _worker(
     vllm_config.cache_config.gpu_memory_utilization = 0.9
     vllm_config.scheduler_config.max_num_seqs = max_num_seqs
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = not hybrid_kv_cache_manager
-    worker = object.__new__(TorchSpyreWorker)
+    worker = object.__new__(SpyreWorkerV2)
     worker.vllm_config = vllm_config
     worker.parallel_config = SimpleNamespace(data_parallel_size=1)
     worker.cache_config = vllm_config.cache_config
@@ -197,7 +197,7 @@ def test_requests_queue_for_pages_only_below_the_batch_area(
     worker = _worker(monkeypatch, free_after_load=TOTAL)
     worker.requested_memory = (BATCH_BLOCKS + spare_blocks) * NUM_LAYERS * BLOCK_BYTES
 
-    with caplog.at_level(logging.WARNING, logger="spyre_inference.v1.worker.spyre_worker"):
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.v1.worker.spyre.worker"):
         caplog.clear()
         blocks = worker.determine_available_memory() // (NUM_LAYERS * BLOCK_BYTES)
 
@@ -215,7 +215,7 @@ def test_the_batch_area_warning_checks_num_gpu_blocks_override(
     worker.requested_memory = 2 * BATCH_BLOCKS * NUM_LAYERS * BLOCK_BYTES
     worker.cache_config.num_gpu_blocks_override = override
 
-    with caplog.at_level(logging.WARNING, logger="spyre_inference.v1.worker.spyre_worker"):
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.v1.worker.spyre.worker"):
         caplog.clear()
         worker.determine_available_memory()
 
@@ -254,16 +254,14 @@ def test_sizing_allocates_the_staging_buffers_and_runs_no_forward(monkeypatch):
 
     staged = []
     monkeypatch.setattr(GPUModelRunner, "profile_run", forward)
-    monkeypatch.setattr(TorchSpyreModelRunner, "_dummy_run", forward)
-    monkeypatch.setattr(
-        spyre_model_runner, "allocate_staging_buffers", lambda *args: staged.append(args)
-    )
+    monkeypatch.setattr(GPUModelRunner, "_dummy_run", forward)
+    monkeypatch.setattr(model_runner, "allocate_staging_buffers", lambda *args: staged.append(args))
     worker = _worker(monkeypatch, free_after_load=60 * GiB)
-    runner = object.__new__(TorchSpyreModelRunner)
+    runner = object.__new__(SpyreModelRunnerV2)
     runner.model_memory_usage = 0
     runner.get_kv_cache_spec = worker.model_runner.get_kv_cache_spec
     runner.compilation_config = SimpleNamespace(static_forward_context={})
-    runner._spyre_device = torch.device("cpu")
+    runner.spyre_device = torch.device("cpu")
     worker.model_runner = runner
 
     assert worker.determine_available_memory() > 0

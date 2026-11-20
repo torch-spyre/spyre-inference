@@ -55,13 +55,11 @@ def test_x86_has_triton_cpu() -> None:
 
 
 def _run(script: str, **env: str) -> list[str]:
-    # Without the VLLM_USE_V2_MODEL_RUNNER an earlier in-process VllmConfig pinned.
-    base = {k: v for k, v in os.environ.items() if k != "VLLM_USE_V2_MODEL_RUNNER"}
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
         capture_output=True,
         text=True,
-        env={**base, **env},
+        env={**os.environ, **env},
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.split()
@@ -74,23 +72,11 @@ def _probe(first: str, **env: str) -> list[str]:
 @pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("cuda_visible_devices", [None, ""])
 @pytest.mark.parametrize("first", _FIRST_IMPORTS)
-def test_v1_stays_triton_free(first: str, cuda_visible_devices: str | None) -> None:
-    """An empty CUDA_VISIBLE_DEVICES is where vLLM's own check keeps Triton on."""
-    env = {"SPYRE_MODEL_RUNNER": "v1"}
-    if cuda_visible_devices is not None:
-        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+def test_v2_on_host_kernels_stays_triton_free(first: str, cuda_visible_devices: str | None) -> None:
+    """The default: kernels.bind() replaces every kernel, so vLLM never sees Triton. An
+    empty CUDA_VISIBLE_DEVICES is where vLLM's own check keeps Triton on."""
+    env = {} if cuda_visible_devices is None else {"CUDA_VISIBLE_DEVICES": cuda_visible_devices}
     assert _probe(_FIRST_IMPORTS[first], **env) == ["False", "TritonPlaceholder", "function"]
-
-
-@pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("first", _FIRST_IMPORTS)
-def test_v2_on_host_kernels_stays_triton_free(first: str) -> None:
-    """The default: kernels.bind() replaces every kernel, so vLLM never sees Triton."""
-    assert _probe(_FIRST_IMPORTS[first], SPYRE_MODEL_RUNNER="v2") == [
-        "False",
-        "TritonPlaceholder",
-        "function",
-    ]
 
 
 @pytest.mark.subprocess_isolated
@@ -101,7 +87,7 @@ def test_v2_on_triton_binds_real_triton_when_triton_cpu_is_installed(first: str)
         if _HAS_TRITON_CPU
         else ["False", "TritonPlaceholder", "function"]
     )
-    env = {"SPYRE_MODEL_RUNNER": "v2", "SPYRE_MRV2_KERNELS": "triton"}
+    env = {"SPYRE_MRV2_KERNELS": "triton"}
     assert _probe(_FIRST_IMPORTS[first], **env) == want
 
 
@@ -117,20 +103,20 @@ from vllm.config import VllmConfig
 
 try:
     config = VllmConfig()
-    print(config.use_v2_model_runner, config.parallel_config.worker_cls)
+    print(config.parallel_config.worker_cls)
 except Exception as e:
     print("refused", "requires Triton" in str(e) or "needs triton-cpu" in str(e))
 """
 
 
-_V2_WORKER = ["True", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"]
+_V2_WORKER = ["spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"]
 
 
 @pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("machine", ["ppc64le", "s390x", "x86_64"])
 def test_v2_on_host_kernels_builds_without_triton(machine: str) -> None:
-    out = _run(_V2_CONFIG_WITHOUT_TRITON.format(machine=machine), SPYRE_MODEL_RUNNER="v2")
-    assert out[-2:] == _V2_WORKER
+    out = _run(_V2_CONFIG_WITHOUT_TRITON.format(machine=machine))
+    assert out[-1:] == _V2_WORKER
 
 
 @pytest.mark.subprocess_isolated
@@ -138,7 +124,6 @@ def test_v2_on_host_kernels_builds_without_triton(machine: str) -> None:
 def test_v2_on_triton_refuses_without_triton_cpu(machine: str) -> None:
     out = _run(
         _V2_CONFIG_WITHOUT_TRITON.format(machine=machine),
-        SPYRE_MODEL_RUNNER="v2",
         SPYRE_MRV2_KERNELS="triton",
     )
     assert out[-2:] == ["refused", "True"]
@@ -245,7 +230,7 @@ def test_check_restores_the_patched_lookups(monkeypatch: pytest.MonkeyPatch) -> 
     assert half.find_spec is not find_spec
     assert half.vllm_version_matches_substr is not matches
 
-    triton_gate.check("v1", "host")
+    triton_gate.check("host")
 
     assert importlib.util.find_spec is half.find_spec is find_spec
     assert vllm.platforms.vllm_version_matches_substr is half.vllm_version_matches_substr is matches

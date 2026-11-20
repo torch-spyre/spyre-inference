@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     # Declarations so type checkers and IDEs resolve the lazily-provided
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
-    SPYRE_MODEL_RUNNER: str = "v2"
     SPYRE_MRV2_KERNELS: str = "host"
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
@@ -61,11 +60,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
-    # Which model runner the worker uses:
-    #  - "v2": vLLM's Model Runner V2 (default)
-    #  - "v1": the V1 runner, a best-effort fallback until it is removed (#1245)
-    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v2",
-    # What runs MRV2's Triton kernels under SPYRE_MODEL_RUNNER=v2:
+    # What runs Model Runner V2's (MRV2's) Triton kernels:
     #  - "host": the csrc/ host ops kernels.bind() puts in their place; vLLM never
     #    sees Triton (default, every arch)
     #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference)

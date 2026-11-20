@@ -251,6 +251,7 @@ def _manager(model, budgets=()):
     vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_max_token_budget=5120,
             encoder_cudagraph_max_vision_items_per_batch=0,
             encoder_cudagraph_max_frames_per_batch=None,
         ),

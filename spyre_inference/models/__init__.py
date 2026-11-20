@@ -15,8 +15,9 @@
 """Model-specific Spyre adaptations, per architecture.
 
 Every architecture ``spyre_models()`` names is replaced by a subclass that lives
-in the matching module here (the Transformers backend's lives in
-``spyre_inference.transformers_backend``); ``_``-prefixed modules hold machinery shared
+in the matching module here (the Transformers backend's live in
+``spyre_inference.transformers_backend`` and ``spyre_inference.transformers_encoder``);
+``_``-prefixed modules hold machinery shared
 between them. Registration is lazy: nothing is imported until vLLM resolves the
 architecture, so an architecture this deployment never serves costs nothing.
 """
@@ -67,6 +68,12 @@ _ADAPTED_ARCHS: dict[str, str] = {
     # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
+    ),
+    "TransformersEmbeddingModel": (
+        "spyre_inference.transformers_encoder:SpyreTransformersEmbeddingModel"
+    ),
+    "TransformersForSequenceClassification": (
+        "spyre_inference.transformers_encoder:SpyreTransformersForSequenceClassification"
     ),
 }
 

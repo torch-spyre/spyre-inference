@@ -13,10 +13,13 @@
 # limitations under the License.
 
 """Host-side Transformers-backend checks: RoPE rebuild, padded QK logits, the rotary
-patch and Mistral/HF config parsing. No card needed."""
+patch, Mistral/HF config parsing and the encoder embedding/position patches. No card
+needed."""
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 
 import pytest
@@ -346,3 +349,224 @@ def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
 
     assert vllm_config.model_config.hf_config is before
     assert vllm_config.load_config.load_format == "auto"
+
+
+def test_patch_encoder_gather_wraps_module_forward():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.roberta.modeling_roberta import RobertaConfig, RobertaEmbeddings
+
+    from spyre_inference.transformers_encoder import _patch_encoder_gather
+
+    cfg = RobertaConfig(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = RobertaEmbeddings(cfg)
+
+    model = FakeModel()
+    received_token_type_ids = []
+    orig_forward = model.embeddings.forward
+
+    @functools.wraps(orig_forward)
+    def intercept_forward(*args, **kwargs):
+        bound = inspect.signature(orig_forward).bind_partial(*args, **kwargs)
+        if "token_type_ids" in bound.arguments:
+            received_token_type_ids.append(bound.arguments["token_type_ids"])
+        return orig_forward(*args, **kwargs)
+
+    model.embeddings.forward = intercept_forward
+    _patch_encoder_gather(model)
+
+    assert model.embeddings.forward is not orig_forward
+
+    # 1. Keyword call with token_type_ids=None -> receives int32 zeros
+    x = torch.randint(0, 100, (1, 4))
+    out = model.embeddings(input_ids=x)
+    assert out.shape == (1, 4, 16)
+    assert len(received_token_type_ids) == 1
+    t = received_token_type_ids[0]
+    assert isinstance(t, torch.Tensor)
+    assert t.dtype == torch.int32
+    assert t.shape == (1, 4)
+    assert torch.equal(t, torch.zeros((1, 4), dtype=torch.int32))
+
+    # 2. Positional call (x, None)
+    received_token_type_ids.clear()
+    out = model.embeddings(x, None)
+    assert out.shape == (1, 4, 16)
+    assert len(received_token_type_ids) == 1
+    t = received_token_type_ids[0]
+    assert isinstance(t, torch.Tensor)
+    assert t.dtype == torch.int32
+    assert torch.equal(t, torch.zeros((1, 4), dtype=torch.int32))
+
+    # 3. Explicit non-zero segment ids preserved
+    received_token_type_ids.clear()
+    seg = torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
+    model.embeddings(input_ids=x, token_type_ids=seg)
+    assert len(received_token_type_ids) == 1
+    assert torch.equal(received_token_type_ids[0], seg)
+
+
+def test_patch_encoder_gather_wraps_bert_embeddings():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.bert.modeling_bert import BertConfig, BertEmbeddings
+
+    from spyre_inference.transformers_encoder import _patch_encoder_gather
+
+    cfg = BertConfig(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = BertEmbeddings(cfg)
+
+    model = FakeModel()
+    orig_forward = model.embeddings.forward
+
+    _patch_encoder_gather(model)
+
+    assert model.embeddings.forward is not orig_forward
+    x = torch.randint(0, 100, (1, 4))
+    out = model.embeddings(input_ids=x)
+    assert out.shape == (1, 4, 16)
+
+
+def test_patch_encoder_gather_wraps_albert_embeddings():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.albert.modeling_albert import AlbertConfig, AlbertEmbeddings
+
+    from spyre_inference.transformers_encoder import _patch_encoder_gather
+
+    cfg = AlbertConfig(
+        embedding_size=16,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = AlbertEmbeddings(cfg)
+
+    model = FakeModel()
+    x = torch.randint(0, 100, (1, 4))
+    ref = model.embeddings(input_ids=x)
+
+    _patch_encoder_gather(model)
+    out = model.embeddings(input_ids=x)
+    assert out.shape == (1, 4, 16)
+    assert torch.equal(out, ref)
+
+
+def test_patch_encoder_gather_noop_without_buffer():
+    import torch.nn as nn
+
+    from spyre_inference.transformers_encoder import _patch_encoder_gather
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    model = FakeLayer()
+    _patch_encoder_gather(model)
+    assert "forward" not in model.__dict__
+    assert all("forward" not in m.__dict__ for m in model.modules())
+
+
+def _positions_reaching_hf(cls, model_type, pad_token_id, positions):
+    """Run ``cls.forward`` with a stand-in HF model; return what it got as ``position_ids``."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import torch.nn as nn
+    from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+    from vllm.model_executor.models.transformers.base import Base
+    from vllm.model_executor.models.transformers.pooling import (
+        EmbeddingMixin,
+        SequenceClassificationMixin,
+    )
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    seen = {}
+
+    def hf_model(**kwargs):
+        seen.update(kwargs)
+        return (torch.zeros(1, kwargs["position_ids"].shape[-1], 4),)
+
+    # Only Base's heavy setup is replaced; LegacyMixin.__init__ and both forwards run for real.
+    def base_init(self, *, vllm_config, prefix=""):
+        nn.Module.__init__(self)
+        self.text_config = SimpleNamespace(model_type=model_type, pad_token_id=pad_token_id)
+        self.hf_to_vllm_mapper = WeightsMapper()
+        self.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        self.model = hf_model
+        self.attention_instances = {}
+        self._output_aux_hidden_states_kwargs = {}
+
+    def pooling_init(self, *, vllm_config, prefix=""):
+        super(VllmModelForPooling, self).__init__(vllm_config=vllm_config, prefix=prefix)
+
+    with (
+        patch.object(Base, "__init__", base_init),
+        patch.object(EmbeddingMixin, "__init__", pooling_init),
+        patch.object(SequenceClassificationMixin, "__init__", pooling_init),
+    ):
+        model = cls(vllm_config=None)
+    model.forward(input_ids=torch.tensor([5, 6, 7, 8, 9]), positions=positions)
+    return seen["position_ids"][0]
+
+
+@pytest.mark.parametrize(
+    "wrapper_name",
+    ["SpyreTransformersEmbeddingModel", "SpyreTransformersForSequenceClassification"],
+)
+@pytest.mark.parametrize(
+    ("model_type", "pad_token_id"), [("xlm-roberta", 1), ("roberta", 1), ("bert", 0)]
+)
+def test_spyre_encoder_wrappers_do_not_shift_runner_positions(
+    wrapper_name, model_type, pad_token_id
+):
+    """The runner already offsets RoBERTa positions by padding_idx + 1; HF must get them as is."""
+    from spyre_inference import transformers_encoder
+
+    delta = pad_token_id + 1 if "roberta" in model_type else 0
+    positions = torch.arange(5) + delta
+    got = _positions_reaching_hf(
+        getattr(transformers_encoder, wrapper_name), model_type, pad_token_id, positions
+    )
+    assert torch.equal(got, positions)
+
+
+@pytest.mark.parametrize(("model_type", "shift"), [("xlm-roberta", 2), ("bert", 0)])
+def test_upstream_legacy_mixin_shifts_roberta_positions_again(model_type, shift):
+    """Control: without the Spyre override upstream adds padding_idx + 1 a second time."""
+    from vllm.model_executor.models.transformers import TransformersEmbeddingModel
+
+    pad_token_id = 1 if model_type == "xlm-roberta" else 0
+    positions = torch.arange(5) + shift
+    got = _positions_reaching_hf(TransformersEmbeddingModel, model_type, pad_token_id, positions)
+    assert torch.equal(got, positions + shift)

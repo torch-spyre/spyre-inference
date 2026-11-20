@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The model wrapper the Spyre model runner holds as ``self.model``.
-
-The runner keeps its buffers on the host (``self.device`` is CPU); the wrapper moves
-integer inputs to Spyre int64 at the call boundary. Generative hidden states stay on
-Spyre as ``_SpyreHiddenStates``, so the sampled rows are gathered and projected there
-and only the logits come back; device poolers keep their outputs on Spyre too.
-"""
+"""The model wrapper the runner holds: Spyre int64 inputs, device-resident outputs."""
 
 from __future__ import annotations
 

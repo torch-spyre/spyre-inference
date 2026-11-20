@@ -12,12 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Nothing of ours reaches the vLLM modules 0.34 deletes with the V1 model runner.
-
-Scanned rather than imported with those modules blocked: on 0.33, vLLM's own MRV2 code
-still imports some of them, so a runtime block fails inside vLLM. The scan also sees
-imports inside functions and the dotted paths patches name as strings.
-"""
+"""Nothing of ours references a vLLM module 0.34 removes. A scan, not a runtime block:
+vLLM 0.33's own MRV2 code still imports some of them."""
 
 import ast
 import pathlib

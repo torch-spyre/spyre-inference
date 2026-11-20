@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre worker (vllm/v1/worker/gpu_worker.py:Worker).
-
-Inherits from Worker (gpu_worker) directly: Spyre is not a CPU device and needs none
-of CPUWorker's CPU-specific init (NUMA binding, torch.ops._C.init_cpu_memory_env,
-host-RAM profiling). No ``execute_model`` override: the stock ``Worker.execute_model``
-already calls ``runner.pool()`` once ``VLLM_USE_V2_MODEL_RUNNER`` is set.
-"""
+"""Spyre worker (vllm/v1/worker/gpu_worker.py:Worker), not CPUWorker: no NUMA or host-RAM init."""
 
 import logging
 import os

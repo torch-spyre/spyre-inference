@@ -1100,7 +1100,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 # a stand-in block never does.
                 from spyre_inference.moe import warm_opaque_regions
 
-                warm_opaque_regions(self.model, bucket_sizes, self._spyre_device)
+                warm_opaque_regions(unwrap_model(self.model), bucket_sizes, self._spyre_device)
         if not warm:
             # Forget the stand-in graphs; the loop below retraces the buckets into cache hits.
             # A warm start traced real graphs, which the loop reuses.

@@ -30,6 +30,11 @@ from contextvars import ContextVar
 
 import torch
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 
 _active: ContextVar[bool] = ContextVar("spyre_device_greedy", default=False)
@@ -59,12 +64,29 @@ def batch_is_device_greedy(meta: SamplingMetadata, has_structured_output: bool) 
         or meta.max_num_logprobs is not None
         or meta.logprob_token_ids
         or any(meta.spec_token_ids or ())
-        or meta.logitsprocs.argmax_invariant
-        or meta.logitsprocs.non_argmax_invariant
+        or _logitsprocs_change_argmax(meta.logitsprocs)
     ):
         return False
     holder = meta.thinking_budget_state_holder
     return holder is None or not holder.has_tracked_requests()
+
+
+def _logitsprocs_change_argmax(logitsprocs: LogitsProcessors) -> bool:
+    """True when a loaded processor could move the argmax this step.
+
+    vLLM loads the built-in processors for every generative model, so their presence
+    alone says nothing. Argmax-invariant ones (min-p) never matter for greedy.
+    """
+    for proc in logitsprocs.non_argmax_invariant:
+        if isinstance(proc, LogitBiasLogitsProcessor):
+            if proc.biases:
+                return True
+        elif isinstance(proc, MinTokensLogitsProcessor):
+            if proc.min_toks:
+                return True
+        else:
+            return True
+    return False
 
 
 def padding_mask(padded_vocab: int, org_vocab_size: int, device: torch.device) -> torch.Tensor:

@@ -20,6 +20,10 @@ The card path is the same function. It matches once torch-spyre #5845 runs
 
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from spyre_inference.v1.sample import device_greedy as dg
@@ -72,6 +76,20 @@ def test_penalties_logprobs_and_masks_stay_on_the_host() -> None:
     assert not dg.batch_is_device_greedy(meta, False)
     meta = _meta(2, greedy=True)
     meta.spec_token_ids = [[7]]
+    assert not dg.batch_is_device_greedy(meta, False)
+
+
+def test_idle_builtin_logitsprocs_do_not_block_the_device() -> None:
+    cpu = torch.device("cpu")
+    bias = LogitBiasLogitsProcessor(None, cpu, False)
+    min_tokens = MinTokensLogitsProcessor(None, cpu, False)
+    meta = _meta(2, greedy=True)
+    meta.logitsprocs = LogitsProcessors([bias, min_tokens])
+    assert dg.batch_is_device_greedy(meta, False)
+    bias.biases = {0: {3: 1.0}}
+    assert not dg.batch_is_device_greedy(meta, False)
+    bias.biases = {}
+    min_tokens.min_toks = {0: (4, [], {2}, False)}
     assert not dg.batch_is_device_greedy(meta, False)
 
 

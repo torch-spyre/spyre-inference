@@ -3174,9 +3174,11 @@ compile on first use instead.
 When the batched-decode kernel is enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default) warmup
 enumerates its variants, the product of the KV-length (<code>num_blocks</code>) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
-declined at dispatch. A single step can carry a mix of prefill and decode sequences; each
-sequence is padded to its own query bucket (decodes use the length-1 bucket) before
-dispatch. <code>SPYRE_ATTN_RECORD=0</code> restores lazy per-variant compilation.</p>
+declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
+just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
+recorded at the chunk count of <code>max_model_len</code>, that runs every longer batch. A single step can carry a mix of prefill
+and decode sequences; each sequence is padded to its own query bucket (decodes use the
+length-1 bucket) before dispatch. <code>SPYRE_ATTN_RECORD=0</code> restores lazy per-variant compilation.</p>
 <p>Under <code>dynamic=False</code> the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
 with KV length. The kernels therefore walk that axis with torch-spyre's <code>for_each_tile</code>,

@@ -123,6 +123,7 @@ def _runner(monkeypatch, *, cold, workers="3", helper=True):
 
 
 def test_a_cold_start_traces_every_bucket_in_the_pool_then_runs_the_normal_pass(monkeypatch):
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 8)  # the worker count is min(3, threads)
     runner, runs, pools, checks, resets = _runner(monkeypatch, cold=True)
     runner.warming_up_model()
 

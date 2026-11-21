@@ -40,6 +40,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.prompt_logprob import CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE
 
 from spyre_inference.models import check_spyre_model
+from spyre_inference.moe import prepare_moe_layers_on_threads
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.pool import configure_pooling_for_spyre
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre
@@ -103,7 +104,8 @@ class _SpyreModelLoaderWrapper:
     def load_model(self, *, vllm_config: VllmConfig, model_config: ModelConfig) -> nn.Module:
         runner = self._runner
         install_pad_loaders(self._loader, model_config)
-        model = self._loader.load_model(vllm_config=vllm_config, model_config=model_config)
+        with prepare_moe_layers_on_threads():
+            model = self._loader.load_model(vllm_config=vllm_config, model_config=model_config)
         check_spyre_model(model, get_model_architecture(model_config)[1])
         fix_padded_model(model, model_config)
         # Before any trace: resolved lazily inside the block graph, the scales become a
@@ -141,6 +143,9 @@ class _SpyreModelLoaderWrapper:
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
             model_dtype=model_dtype(model_config),
+            # As V1: without a bucketer the body is unpadded, so every prompt length
+            # would compile a fresh gather.
+            sample_rows_on_device=model_config.runner_type == "generate" and bucketer is not None,
             keep_aux_hidden_states_on_device=runner.use_aux_hidden_state_outputs,
         )
 

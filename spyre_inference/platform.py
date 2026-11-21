@@ -145,6 +145,101 @@ def _maybe_uniproc(parallel_config, requested_backend) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
+# Hosts where `--load-format spyre` is the default. Everywhere else it is opt-in.
+_SPYRE_LOADER_DEFAULT_MACHINES = frozenset({"ppc64le", "ppc64"})
+
+
+def _host_machine() -> str:
+    """CPU architecture of the host (``uname -m``). A function so tests can patch it.
+
+    os.uname() rather than the ``platform`` module: this file is itself named platform.py."""
+    return os.uname().machine
+
+
+# Expert-count attributes used across HF model families (Mixtral, Qwen MoE, Gemma 4,
+# DeepSeek, etc.).
+_MOE_EXPERT_ATTRS = ("num_experts", "num_local_experts", "n_routed_experts")
+
+
+def _hf_config_has_moe(text_config) -> bool:
+    """Return True when the HF text config describes a MoE model.
+
+    A missing attribute or a value of 0 / 1 is treated as a dense model.
+    """
+    if text_config is None:
+        return False
+    for attr in _MOE_EXPERT_ATTRS:
+        val = getattr(text_config, attr, None)
+        if val is not None and int(val) > 1:
+            return True
+    return False
+
+
+def _padding_active(vllm_config) -> bool:
+    """True when head_dim / intermediate_size padding was applied to the text config.
+
+    Padded models stay on the stock loader: the pad passes wrap
+    ``get_all_weights`` and need full, unsharded, host-resident tensors,
+    which the direct-to-device path does not provide:
+      - TP=1: it yields Spyre-resident tensors, so the pad runs as eager Spyre copies
+        that the backend cannot lower ("no offset-free alternative stick dim for
+        mutation target").
+      - TP>1: shard-on-read slices the tensor before the pad wrapper sees it, so the
+        wrapper's width checks no longer match and the TP narrowing then fails.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    text_cfg = getattr(model_config, "hf_text_config", None)
+    return (
+        getattr(text_cfg, "_spyre_orig_head_dim", None) is not None
+        or getattr(text_cfg, "_spyre_orig_intermediate_size", None) is not None
+    )
+
+
+def _spyre_loader_supported(vllm_config) -> bool:
+    """Return True when SpyreModelLoader is safe to use for this config.
+
+    Allow-list: only runner_type="generate", unquantized, dense, non-MoE,
+    non-transformers-backend models are supported. Any config outside that set
+    stays on the stock loader until explicitly validated.
+    Excluded:
+      - runner_type != "generate": pooling and any future runner types are
+        excluded; their host-residency needs are not yet covered (torch-spyre#2971).
+      - quantized: FP8 and other quant schemes have their own weight layout logic.
+      - transformers backend: uses a different model class hierarchy.
+      - padded head_dim / intermediate_size: the pad passes need the
+        full tensor on the host, but the direct path yields Spyre-resident (TP1)
+        or pre-sharded (TP>1) tensors. Those configs stay on the stock loader.
+      - MoE: dma_moe_expert_weight_to_spyre requires a CPU source tensor.
+      - speculative decoding: the draft model is loaded with the target's load_config,
+        and drafters such as XPress run host-side ops in load_weights that expect
+        host tensors.
+
+    Supported, and worth knowing about when touching the loader:
+      - TP > 1: linear weights are sharded on read (see
+        ``model_loader._iter_tp_sharded_weights``).
+      - multimodal: the language backbone streams direct-to-device; vision-tower and
+        projector parameters stay host-loaded (see ``_get_host_loaded_param_names``).
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return False
+    if getattr(model_config, "quantization", None) is not None:
+        return False
+    if getattr(model_config, "runner_type", None) != "generate":
+        return False
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        return False
+    if (
+        hasattr(model_config, "using_transformers_backend")
+        and model_config.using_transformers_backend()
+    ):
+        return False
+    return not (
+        _hf_config_has_moe(getattr(model_config, "hf_text_config", None))
+        or _padding_active(vllm_config)
+    )
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -410,6 +505,25 @@ class TorchSpyrePlatform(CpuPlatform):
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
 
+        # On POWER hosts the direct-to-device loader is the default; elsewhere a user opts in
+        # with --load-format spyre.
+        load_config = getattr(vllm_config, "load_config", None)
+        if (
+            load_config is not None
+            and load_config.load_format == "auto"
+            and _host_machine() in _SPYRE_LOADER_DEFAULT_MACHINES
+        ):
+            # Padding is normally applied in check_and_update_config, after this hook, so the
+            # gate would not see it. The passes are idempotent: run them first so padded
+            # models stay on the stock loader.
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            repair_head_dim_access(vllm_config.model_config.hf_config)
+            cls._maybe_pad_head_dim(vllm_config)
+            cls._maybe_pad_intermediate_size(vllm_config)
+            if _spyre_loader_supported(vllm_config):
+                load_config.load_format = "spyre"
+
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
@@ -633,8 +747,7 @@ class TorchSpyrePlatform(CpuPlatform):
             return
         if not supports_intermediate_padding(text_config):
             return
-        moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
-        is_moe = any(getattr(text_config, a, None) for a in moe_attrs)
+        is_moe = any(getattr(text_config, a, None) for a in _MOE_EXPERT_ATTRS)
         expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
             text_config, "expert_intermediate_size", None
         )
@@ -878,6 +991,23 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.cache_config.kv_sharing_fast_prefill:
             raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
 
+        # Reject --load-format spyre (explicit, or the POWER default) for configs the loader
+        # doesn't support, instead of failing later inside the loader. The head_dim /
+        # intermediate_size padding above has already run, so it is visible here.
+        load_config = getattr(vllm_config, "load_config", None)
+        if (
+            load_config is not None
+            and load_config.load_format == "spyre"
+            and not _spyre_loader_supported(vllm_config)
+        ):
+            raise ValueError(
+                "--load-format spyre is not supported for this configuration. "
+                "Supported: unquantized, dense, non-MoE, generate-only, "
+                "non-transformers-backend models without head_dim / "
+                "intermediate_size padding or speculative decoding. "
+                "Use --load-format auto or --load-format safetensors instead."
+            )
+
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
         # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
@@ -917,7 +1047,10 @@ class TorchSpyrePlatform(CpuPlatform):
         from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
 
         allow_xpress_on_v1()
-        triton_gate.check(runner)
+        mrv2_kernels = envs.environment_variables["SPYRE_MRV2_KERNELS"]()
+        if mrv2_kernels not in ("host", "triton"):
+            raise ValueError(f"SPYRE_MRV2_KERNELS={mrv2_kernels!r} is not host or triton.")
+        triton_gate.check(runner, mrv2_kernels)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 

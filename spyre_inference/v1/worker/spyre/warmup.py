@@ -37,7 +37,6 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
 from spyre_inference import envs
-from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -53,8 +52,13 @@ from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManag
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _set_spyre_compilation_settings,
     _SpyreModelWrapper,
+    warm_sample_row_gathers,
 )
-from spyre_inference.v1.worker.spyre_shape_bucketer import SpyreShapeBucketer, encoder_shape_tables
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    SpyreShapeBucketer,
+    encoder_shape_tables,
+    logits_row_buckets,
+)
 
 if TYPE_CHECKING:
     from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
@@ -85,18 +89,31 @@ def plan(runner: "SpyreModelRunnerV2") -> list[DummyCall]:
 
 
 def _dummy_run(runner: "SpyreModelRunnerV2", num_tokens: int, skip_attn: bool):
-    """MRV2's _dummy_run, with a pooling model's hidden states D2H'd for upstream's host
-    logits_indices gather and handed back on Spyre, where the pooler reads them."""
+    """MRV2's _dummy_run, D2H'ing for upstream's host gather but returning a pooling
+    model's raw device output: a CPU round trip changes the Spyre layout."""
     if skip_attn:
         # MRV2 builds no slot mappings with skip_attn, but the block graph's KV write
         # needs a target, or warmup traces a graph serving never runs.
         attn_layer.publish_null_slots(num_tokens)
-    with cast(_SpyreModelWrapper, runner.model).outputs_on_host() as keep:
-        hidden_states, sample_hidden_states = runner._dummy_run(
-            num_tokens, skip_attn=skip_attn, is_profile=True
-        )
-    if keep and hidden_states is not None and hidden_states.numel() > 0:
-        hidden_states = convert(hidden_states, runner.spyre_device)
+    wrapper = cast(_SpyreModelWrapper, runner.model)
+    model = wrapper._model
+    outputs = []
+
+    def capture(*args, **kwargs):
+        outputs.append(model(*args, **kwargs))
+        return outputs[-1]
+
+    if wrapper._keep_outputs_on_device:
+        object.__setattr__(wrapper, "_model", capture)
+    try:
+        with wrapper.outputs_on_host():
+            hidden_states, sample_hidden_states = runner._dummy_run(
+                num_tokens, skip_attn=skip_attn, is_profile=True
+            )
+    finally:
+        object.__setattr__(wrapper, "_model", model)
+    if outputs and hidden_states is not None and hidden_states.numel() > 0:
+        hidden_states = outputs[0]
     return hidden_states, sample_hidden_states
 
 
@@ -106,15 +123,18 @@ def _warm_pooling(runner: "SpyreModelRunnerV2", hidden_states: torch.Tensor) -> 
     if not runner.pooling_on_spyre:
         return
     rectangles = list(encoder_shape_tables(runner.vllm_config).rectangles)
+    pooler = cast(VllmModelForPooling, runner.get_model()).pooler
     warm_pooler_row_widths(
-        cast(VllmModelForPooling, runner.get_model()).pooler,
+        pooler,
         hidden_states,
         rectangles,
         runner.max_num_reqs,
     )
     if rectangles:
         # pool_rows_for's re-compaction gather keeps the buffer's row count.
-        select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+        packed = select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+        # LAST and token poolers read the re-compacted output, whose layout can differ.
+        warm_pooler_row_widths(pooler, packed, rectangles, runner.max_num_reqs)
 
 
 def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -> None:
@@ -242,6 +262,14 @@ def run(runner: "SpyreModelRunnerV2") -> None:
     t0 = time.time()
     # Under inference_mode like MRV2's execute_model: grad mode is a guard on every
     # compiled graph, so warming outside it misses each one at serving time.
+    bucketer = SpyreShapeBucketer.for_config(runner.vllm_config)
+    row_widths = (
+        []
+        if bucketer is None
+        else logits_row_buckets(
+            bucketer.bucket_sizes, runner.max_num_reqs, runner.num_speculative_steps
+        )
+    )
     with _set_spyre_compilation_settings(runner.vllm_config), torch.inference_mode():
         widest = None
         for call in calls:
@@ -250,7 +278,11 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             )
             if runner.pooling_runner is not None:
                 _warm_pooling(runner, hidden_states)
-            elif widest is None:
+                continue
+            warm_sample_row_gathers(
+                cast(_SpyreModelWrapper, runner.model), hidden_states, row_widths
+            )
+            if widest is None:
                 widest = sample_hidden_states
         if isinstance(runner.speculator, SpyreDFlashSpeculator):
             runner.speculator.warm_draft_batches()

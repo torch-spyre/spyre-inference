@@ -45,7 +45,8 @@ _COSINE_MIN = 0.99
         pytest.param(
             (
                 "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-                "\n\nIBMs main businesses are the companies that provide the services of the",
+                "1, 2, 3, 4, 5, 6,",
+                " 7, 8, 9, 10, 11",
                 None,
             ),
             marks=pytest.mark.e2e_smoke,
@@ -55,14 +56,16 @@ _COSINE_MIN = 0.99
         pytest.param(
             (
                 "ibm-ai-platform/micro-g3.3-8b-instruct-1b-FP8",
-                "\n\nIBMs are a set of standards that are used to measure the performance",
+                "1, 2, 3, 4, 5, 6,",
+                " 7, 8, 9, 10, 11",
                 None,
             ),
             marks=[pytest.mark.fp8, pytest.mark.e2e_smoke],
         ),
         (
             "google/gemma-3-1b-it",
-            "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
+            "January, February, March,",
+            " April, May, June, July, August, September, October, November,",
             None,
         ),
         # Both gemma-4 checkpoints carry a vision_config, so an unpinned run resolves
@@ -71,7 +74,8 @@ _COSINE_MIN = 0.99
         # path is covered by tests/models/test_gemma4_mm.py.
         (
             "google/gemma-4-31B",
-            "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
+            "A, B, C, D, E, F,",
+            " G, H, I, J, K, L, M, N,",
             GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
         # The 26B-A4B layout (MoE, sliding + full attention) at 6 layers, real weights;
@@ -79,7 +83,10 @@ _COSINE_MIN = 0.99
         pytest.param(
             (
                 "joerunde/gemma-4-moe-nano",
-                " street and nothing I account it high time to sea as I quietly take. This",
+                # The nano model's weights reproduce Moby-Dick; any other prompt opens on a tie.
+                "Call me Ishmael.",
+                " Some years ago never mind how long precisely having little or no money in"
+                " my purse",
                 GEMMA4_TEXT_BACKBONE_OVERRIDE,
             ),
             marks=pytest.mark.e2e_smoke,
@@ -87,7 +94,8 @@ _COSINE_MIN = 0.99
         # Per-layer embeddings and cross-layer KV sharing.
         (
             "google/gemma-4-E2B",
-            "\n\nWhat is the main business of IBM?\n\nWhat is the main business of",
+            "A, B, C, D, E, F,",
+            " G, H, I, J, K, L, M, N,",
             GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
     ],
@@ -112,8 +120,8 @@ def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) 
     warmup really compiles everything a request needs, arming changes nothing.
     """
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
-    model, ref_output, hf_overrides = model_ref_output
-    _assert_compiled_output(model, ref_output, monkeypatch, hf_overrides=hf_overrides)
+    model, prompt, ref_output, hf_overrides = model_ref_output
+    _assert_compiled_output(model, prompt, ref_output, monkeypatch, hf_overrides=hf_overrides)
 
 
 def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -121,7 +129,8 @@ def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
     _assert_compiled_output(
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        "\n\nIBMs main businesses are the companies that provide the services of the",
+        "1, 2, 3, 4, 5, 6,",
+        " 7, 8, 9, 10, 11",
         monkeypatch,
     )
 
@@ -170,19 +179,32 @@ def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     _assert_compiled_output(
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        "\n\nIBMs main businesses are the companies that provide the services of the",
+        "1, 2, 3, 4, 5, 6,",
+        " 7, 8, 9, 10, 11",
         monkeypatch,
         model_impl="transformers",
     )
 
 
-def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
-    """The guard test on the V2 runner, plus a prompt-logprobs request: its chunk is the
-    one lm_head width wider than any sampled batch, which warmup once left cold.
+def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt-logprobs request's chunk is the one lm_head width wider than any sampled
+    batch, which warmup once left cold."""
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "1, 2, 3, 4, 5, 6,",
+        " 7, 8, 9, 10, 11",
+        monkeypatch,
+        prompt_logprobs=1,
+    )
 
-    In a fresh interpreter: the Triton gate binds the runner choice at vLLM import, which
-    this process has long since done."""
-    node = f"{__file__}::test_compile_guard_with_prompt_logprobs"
+
+def test_v1_runner_fallback() -> None:
+    """SPYRE_MODEL_RUNNER=v1 still serves a small greedy decoder, until V1 is removed (#1245).
+
+    In a fresh interpreter: register() pins vLLM's runner flag at vLLM import, which this
+    process has long since done."""
+    node = f"{__file__}::test_v1_runner_child"
     result = subprocess.run(
         [
             sys.executable,
@@ -195,7 +217,7 @@ def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
             "-m",
             "not upstream",
         ],
-        env={**os.environ, "SPYRE_MODEL_RUNNER": "v2", "_SPYRE_V2_CHILD": "1"},
+        env={**os.environ, "SPYRE_MODEL_RUNNER": "v1", "_SPYRE_V1_CHILD": "1"},
         capture_output=True,
         text=True,
     )
@@ -204,19 +226,34 @@ def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
     assert "1 passed" in result.stdout, result.stdout[-4000:]
 
 
-@pytest.mark.skipif(os.environ.get("_SPYRE_V2_CHILD") != "1", reason="run by the V2 test above")
-def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.skipif(os.environ.get("_SPYRE_V1_CHILD") != "1", reason="run by the V1 test above")
+def test_v1_runner_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.config import VllmConfig
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Checked from the platform hook's result, not the env, so a silent V2 run fails.
+    seen = []
+    hook = TorchSpyrePlatform.check_and_update_config.__func__
+
+    def record(cls, vllm_config: VllmConfig) -> None:
+        hook(cls, vllm_config)
+        seen.append(vllm_config.parallel_config.worker_cls)
+
+    monkeypatch.setattr(TorchSpyrePlatform, "check_and_update_config", classmethod(record))
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     _assert_compiled_output(
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        "\n\nIBMs main businesses are the companies that provide the services of the",
+        "1, 2, 3, 4, 5, 6,",
+        " 7, 8, 9, 10, 11",
         monkeypatch,
-        prompt_logprobs=1,
     )
+    assert seen and set(seen) == {"spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"}
 
 
 def _assert_compiled_output(
     model: str,
+    prompt: str,
     ref_output: str,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -228,8 +265,6 @@ def _assert_compiled_output(
     from vllm.config import CompilationConfig
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-
-    prompt = "What are IBMs main businesses?"
 
     kwargs: dict = dict(
         model=model,

@@ -225,7 +225,7 @@ jobs:
 
       - name: Ingest XML into shared v2 ClickHouse tables (x86_64)
         if: steps.group-by-arch.outputs.has_x86_64 == 'true'
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@d5036e75e65f800ef4a92f3b183388128e2d1e8c # main pinned 2026-11-21
         with:
           # Already holds the ingest library, so the action skips a second install.
           venv: .venv-ingest
@@ -257,7 +257,7 @@ jobs:
 
       - name: Ingest XML into shared v2 ClickHouse tables (ppc64le)
         if: steps.group-by-arch.outputs.has_ppc64le == 'true'
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@d5036e75e65f800ef4a92f3b183388128e2d1e8c # main pinned 2026-11-21
         with:
           venv: .venv-ingest
           xml-dir: xml_by_arch/ppc64le
@@ -283,7 +283,7 @@ jobs:
 
       - name: Ingest XML into shared v2 ClickHouse tables (s390x)
         if: steps.group-by-arch.outputs.has_s390x == 'true'
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@d5036e75e65f800ef4a92f3b183388128e2d1e8c # main pinned 2026-11-21
         with:
           venv: .venv-ingest
           xml-dir: xml_by_arch/s390x

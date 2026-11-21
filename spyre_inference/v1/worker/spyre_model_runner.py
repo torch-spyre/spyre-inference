@@ -1080,7 +1080,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         workers = max(1, min(envs.SPYRE_PARALLEL_WARMUP_PRECOMPILE, torch.get_num_threads()))
         warm = False
         widest_hidden_states = None
-        with fork_inner_compiles(workers, timeout_s=1800.0, placeholders=True) as pool:
+        # The keyword lands with torch-spyre#6533 (checked by the signature test above); a dict
+        # keeps the call type-checkable against a torch-spyre that predates it.
+        options = {"placeholders": True}
+        with fork_inner_compiles(workers, timeout_s=1800.0, **options) as pool:
             for size in sorted(bucket_sizes, reverse=True):
                 hidden_states, last_hidden_states = self._dummy_run(size)
                 self._warm_sample_row_gathers(hidden_states, row_widths)

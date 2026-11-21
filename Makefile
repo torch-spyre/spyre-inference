@@ -124,7 +124,7 @@ RESULTS_DIR ?= .
         test-smoke test-smoke-shard test-smoke-unit-shard test-quality test-quality-shard \
         test-e2e-smoke test-e2e-smoke-shard test-e2e-smoke-dist-shard tests-integration \
         test-probes test-probes-shard \
-        test-attention test-attention-shard test-attention-smoke \
+        test-attention test-attention-shard test-attention-smoke test-triton-cpu \
         test-distributed test-distributed-shard test-distributed-tp4 \
         test-upstream test-upstream-shard \
         test-upstream-distributed \
@@ -205,7 +205,7 @@ test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # The integration tier's unit-level jobs: the smoke expression without tests/e2e.
-SMOKE_UNIT_SHARDS ?= 4
+SMOKE_UNIT_SHARDS ?= 8
 SMOKE_UNIT_SHARD_ID ?= 0
 test-smoke-unit-shard: ## Run one unit-level smoke shard, tests/e2e excluded (SMOKE_UNIT_SHARDS=N SMOKE_UNIT_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' \
@@ -316,6 +316,10 @@ test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 # so the same cases still run inside the full shards under the other tiers.
 test-attention-smoke: ## Run the small attention smoke subset (integration-tier attention coverage). Needs 1 card.
 	$(MAKE) run-one MARK_OVERRIDE='attention_smoke and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+# The only suite that needs triton (the triton-cpu group). CPU-only, x86-only.
+test-triton-cpu: ## Run the MRV2 host-kernel parity tests against triton-cpu. Needs `uv sync --group dev --group triton-cpu`.
+	$(MAKE) run-one MARK_OVERRIDE='triton_cpu' JUNIT_XML=$(JUNIT_XML)
 
 test-distributed: ## Run the distributed marker combo (excludes probes; they run in test-probes), unsharded.
 	$(MAKE) run-one MARK_OVERRIDE='distributed and not (upstream or probe)' JUNIT_XML=$(JUNIT_XML)

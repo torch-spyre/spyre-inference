@@ -638,6 +638,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#mrv2-kernel-parity-tests-x86-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MRV2 kernel parity tests (x86 only)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#verification" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1482,6 +1493,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#mrv2-kernel-parity-tests-x86-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MRV2 kernel parity tests (x86 only)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#verification" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2013,6 +2035,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#mrv2-kernel-parity-tests-x86-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MRV2 kernel parity tests (x86 only)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#verification" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2104,9 +2137,21 @@ Unlike the Install command below, <code>--rebuild</code> runs
 <li>Install or reuse the torch-spyre wheel for the pinned source revision (RPMs are provisioned separately)</li>
 <li>Install PyTorch 2.14.1 from the CPU-specific index</li>
 </ol>
+<h2 id="mrv2-kernel-parity-tests-x86-only">MRV2 kernel parity tests (x86 only)<a class="headerlink" href="#mrv2-kernel-parity-tests-x86-only" title="Permanent link">&para;</a></h2>
+<p>The Model Runner V2 host kernels are checked against upstream's Triton kernels on
+triton-cpu. triton is never a runtime dependency; it lives in the opt-in <code>triton-cpu</code>
+dependency group, which installs nothing off x86:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>uv<span class="w"> </span>sync<span class="w"> </span>--frozen<span class="w"> </span>--group<span class="w"> </span>dev<span class="w"> </span>--group<span class="w"> </span>triton-cpu
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>uv<span class="w"> </span>run<span class="w"> </span>--group<span class="w"> </span>triton-cpu<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span>triton_cpu
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>uv<span class="w"> </span>sync<span class="w"> </span>--frozen<span class="w"> </span>--group<span class="w"> </span>dev<span class="w">   </span><span class="c1"># drop triton again before running the rest of the suite</span>
+</span></code></pre></div>
+<p>The <code>triton_cpu</code> tests are collected only when <code>-m</code> names the marker. A later plain
+<code>uv sync</code> removes triton again (a plain <code>uv run</code> leaves it). Every other test expects a
+triton-free environment, as on Power and Z: <code>test_triton_is_not_installed</code> fails while
+the group is installed.</p>
 <h2 id="verification">Verification<a class="headerlink" href="#verification" title="Permanent link">&para;</a></h2>
 <p>After installation, verify the plugin is correctly installed:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import spyre_inference; print(spyre_inference.__version__)"</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import spyre_inference; print(spyre_inference.__version__)"</span>
 </span></code></pre></div>
 <h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&para;</a></h2>
 <h3 id="build-failures">Build Failures<a class="headerlink" href="#build-failures" title="Permanent link">&para;</a></h3>

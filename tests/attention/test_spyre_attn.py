@@ -22,6 +22,7 @@ from spyre_testing_plugin.attn_helpers import (
     _fused_qkv_kv_views,
     _padded_mask_metadata,
     assert_close_outliers,
+    drop_cpu_device_layouts,
     random_block_tables,
     ref_attn,
     split_by_chunk,
@@ -1089,6 +1090,7 @@ def test_page_index_tables_skipped_on_a_fully_batched_step(
     """A step the batched kernel fully serves uploads no per-sequence index table."""
     torch.set_default_device("cpu")
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    drop_cpu_device_layouts(monkeypatch)
     metadata = _padded_mask_metadata(seq_lens, block_size=64)
     assert metadata.padded_num_seqs is not None
     assert metadata.num_decode_seqs == sum(q == 1 for q, _ in seq_lens)
@@ -1118,6 +1120,93 @@ def test_page_index_tables_skipped_on_a_fully_batched_step(
         assert attn_impl._online_softmax_attention(*args) is output
         assert metadata.kernel_index_tables is None
     assert dispatched == [1]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "grouped"),
+    [
+        # One sequence decodes as one 32-page chunk: the gather a one-row query fails.
+        pytest.param([(1, 128)], False, id="single_decode"),
+        pytest.param([(1, 256)] * 4, False, id="decode_batch"),
+        pytest.param([(1, 256), (1, 256), (7, 256)], False, id="mixed"),
+        # Two groups of one static chunk each, so the CPU mirror needs no dynamic copy.
+        pytest.param([(1, 2000)] + [(1, 200)] * 4, True, id="jagged"),
+    ],
+)
+def test_an_unstaged_query_reaches_the_batched_kernel_through_the_staging_buffers(
+    default_vllm_config, monkeypatch, seq_lens, grouped
+):
+    """A layer attn_layer does not split hands forward() its token bucket's own rows.
+
+    The batched kernel must still run on the staging buffers it was recorded with: any
+    other query shape compiles in the serving path, and on a card a one-row query
+    cannot be laid out for the one-sequence gather.
+    """
+    from vllm.config import get_current_vllm_config
+
+    torch.set_default_device("cpu")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    envs.clear_env_cache()
+    drop_cpu_device_layouts(monkeypatch)
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.model_config.max_model_len = 8192
+    metadata = _padded_mask_metadata(seq_lens, block_size=64)
+    assert (metadata.decode_groups is not None) == grouped
+    if len(seq_lens) == 1:
+        assert (metadata.padded_num_seqs, metadata.blocks_per_chunk) == (1, 32)
+
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
+    q_staging, out_staging = impl.staging_buffers(torch.device("cpu"))
+    # Rows no stub writes keep this, so the copy back to the caller is checked too.
+    out_staging.fill_(5.0)
+    batched_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    page_attn_queries: list[torch.Tensor] = []
+
+    def batched_kernel(
+        query_dev, rep_row_ids, k_pages, v_pages, chunks, mask, chunk_range, b_seqs, bpc, bs, out
+    ):
+        batched_calls.append((query_dev, out))
+        out[:b_seqs] = 7.0
+        return out
+
+    def page_attn(query, row_table, k_pages, v_pages, index_table, mask, n, rng, width, out):
+        page_attn_queries.append(query)
+        return out
+
+    def scatter_rows(dst, rows, src):
+        # CPU stand-in for the compiled store: eager index_copy_ needs an int64 index.
+        return dst.index_copy_(0, rows.long(), src[: rows.shape[0]])
+
+    monkeypatch.setattr(impl, "_run_batched_decode", batched_kernel)
+    monkeypatch.setattr(impl, "_run_page_attn", page_attn)
+    monkeypatch.setattr(spyre_attn, "_scatter_rows_compiled", scatter_rows)
+
+    num_tokens = sum(q for q, _ in seq_lens)
+    query = torch.randn(num_tokens, 32, 128, dtype=torch.float16)
+    output = torch.full_like(query, float("nan"))
+    pages = torch.zeros(200, 8, 64, 128, dtype=torch.float16)
+    impl.forward(
+        layer=None,
+        query=query,
+        key=None,
+        value=None,
+        kv_cache=SpyrePagedKVCache(k_pages=pages, v_pages=pages),
+        attn_metadata=metadata,
+        output=output,
+    )
+
+    expected_out = impl._group_staging if grouped else out_staging
+    assert len(batched_calls) == (len(metadata.decode_groups) if grouped else 1)
+    for query_dev, out in batched_calls:
+        assert query_dev is q_staging, "the batched kernel read the caller's query"
+        assert out is expected_out, "the batched kernel wrote outside the staging buffers"
+    assert all(q is q_staging for q in page_attn_queries)
+    torch.testing.assert_close(q_staging[:num_tokens], query)
+    num_decode = metadata.num_decode_seqs
+    assert torch.all(output[:num_decode] == 7.0), "decode rows did not reach the caller"
+    assert torch.all(output[num_decode:] == 5.0), "prefill rows did not reach the caller"
 
 
 def test_empty_mask_stack_cannot_be_mirrored(default_vllm_config):

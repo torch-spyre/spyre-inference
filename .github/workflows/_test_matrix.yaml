@@ -306,7 +306,7 @@ jobs:
           echo "installed=${TOKENS}" >> "$GITHUB_OUTPUT"
 
       - name: Derive and upload the artifact identity
-        uses: torch-spyre/torch-spyre/.github/actions/derive-gha-artifact-id@main
+        uses: torch-spyre/torch-spyre/.github/actions/derive-gha-artifact-id@d5036e75e65f800ef4a92f3b183388128e2d1e8c # main pinned 2026-11-21
         with:
           component: spyre-inference
           arch: x86_64

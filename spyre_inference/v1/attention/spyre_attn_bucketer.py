@@ -261,11 +261,12 @@ def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     )
 
 
-def _declared_page_range(max_pages: int) -> DynamicRange | None:
+def _declared_page_range(max_pages: int, min_pages: int) -> DynamicRange | None:
     """Return the range of page counts one per-sequence kernel is compiled for.
 
-    Returns None, and logs why, when ``max_pages`` does not fit torch-spyre's limits; the
-    kernels then use the KV buckets instead.
+    ``min_pages`` is the fewest pages a kernel can run. Returns None, and logs why, when
+    ``max_pages`` does not fit torch-spyre's limits; the kernels then use the KV buckets
+    instead.
     """
     from torch_spyre._inductor import config as ts_config
     from torch_spyre._inductor import pass_utils
@@ -277,20 +278,18 @@ def _declared_page_range(max_pages: int) -> DynamicRange | None:
             "Upgrade torch-spyre."
         )
     # The page count is the only dynamic size, so it sets these torch-spyre limits unless
-    # the user exported them. The minimum is two pages because torch.compile compiles a
-    # size of one separately (torch-spyre#6018); a one-page sequence gets a masked copy
-    # of its page as the second one.
+    # the user exported them.
     if "MIN_RESERVED_DIM_SIZE" not in os.environ:
-        ts_config.min_reserved_dim_size = 2
+        ts_config.min_reserved_dim_size = 1
     if "MAX_BUCKETS" not in os.environ:
         ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
-    min_pages = ts_config.min_reserved_dim_size
+    min_pages = max(min_pages, ts_config.min_reserved_dim_size)
     # With min == max the size is a constant, which fails to trace.
     if not min_pages < max_pages <= ts_config.max_buckets:
         logger.warning_once(
-            "A dynamic page count needs the %d pages per sequence to be above "
-            "MIN_RESERVED_DIM_SIZE=%d and at most MAX_BUCKETS=%d, so the per-sequence "
-            "attention kernels compile one variant per KV bucket instead.",
+            "A dynamic page count needs the %d pages per sequence to be above the "
+            "minimum of %d and at most MAX_BUCKETS=%d, so the per-sequence attention "
+            "kernels compile one variant per KV bucket instead.",
             max_pages,
             min_pages,
             ts_config.max_buckets,
@@ -307,14 +306,13 @@ def _prefill_page_range(page_range: DynamicRange) -> DynamicRange:
     """Return ``page_range`` with its bounds rounded up to multiples of
     ``PREFILL_PAGE_GRANULARITY``.
 
-    The minimum is two loop steps, since torch.compile compiles a single loop step
-    separately, as it does a single page. Returns ``page_range`` unchanged when the
-    rounded range holds a single page count or is above an exported ``MAX_BUCKETS``.
+    Returns ``page_range`` unchanged when the rounded range holds a single page count or is
+    above an exported ``MAX_BUCKETS``.
     """
     from torch_spyre._inductor import config as ts_config
 
     g = PREFILL_PAGE_GRANULARITY
-    min_pages = max(-(-page_range["min"] // g) * g, 2 * g)
+    min_pages = -(-page_range["min"] // g) * g
     max_pages = -(-page_range["max"] // g) * g
     if "MAX_BUCKETS" not in os.environ:
         ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
@@ -324,22 +322,27 @@ def _prefill_page_range(page_range: DynamicRange) -> DynamicRange:
 
 
 def _declared_chunk_ranges(
-    page_range: DynamicRange, num_seqs_buckets: list[int]
+    page_range: DynamicRange, num_seqs_buckets: list[int], single_chunk_kernel: bool
 ) -> dict[int, DynamicRange]:
     """For each num_seqs bucket, the chunk counts its dynamic batched decode kernel runs:
-    from ``page_range["min"]`` up to the count ``max_model_len`` needs.
+    from the chunks ``page_range["min"]`` pages need up to the count ``max_model_len``
+    needs.
 
-    A bucket that never needs more than ``page_range["min"]`` chunks gets no entry and
+    The minimum is at least two chunks when ``single_chunk_kernel`` runs the calls that
+    fit in one chunk. A bucket that never needs more than its minimum gets no entry and
     keeps its KV buckets.
     """
+    from torch_spyre._inductor import config as ts_config
+
+    floor = max(ts_config.min_reserved_dim_size, 2 if single_chunk_kernel else 1)
     ranges: dict[int, DynamicRange] = {}
     for num_seqs in num_seqs_buckets:
-        max_chunks = -(-page_range["max"] // _chunk_width(num_seqs))
+        width = _chunk_width(num_seqs)
+        min_chunks = max(-(-page_range["min"] // width), floor)
+        max_chunks = -(-page_range["max"] // width)
         # A range needs at least two sizes; a range with min == max does not compile.
-        # With page_range["min"] at 2, a bucket whose max_model_len fits in two chunks
-        # therefore gets no range.
-        if page_range["min"] < max_chunks:
-            ranges[num_seqs] = {"min": page_range["min"], "max": max_chunks, "granularity": 1}
+        if min_chunks < max_chunks:
+            ranges[num_seqs] = {"min": min_chunks, "max": max_chunks, "granularity": 1}
     return ranges
 
 
@@ -453,23 +456,27 @@ class SpyreAttnBucketer:
         # One KV head on one page leaves torch-spyre's codegen no spare dim for the stick
         # dim, so the decode kernel will not compile there. A second, fully masked page
         # does, and it lifts the SWA bound _max_active_blocks derives from it.
-        if _min_num_kv_heads(vllm_config) == 1:
-            self._num_blocks_buckets = sorted({max(2, n) for n in self._num_blocks_buckets})
+        min_pages = 2 if _min_num_kv_heads(vllm_config) == 1 else 1
+        self._num_blocks_buckets = sorted({max(min_pages, n) for n in self._num_blocks_buckets})
 
         # With a page range, the per-sequence kernels take the page count at run time, so
         # they compile once per query bucket rather than once per (query, KV) bucket pair.
         self._page_range: DynamicRange | None = None
         self._prefill_page_range: DynamicRange | None = None
         if declare_pages:
-            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
+            self._page_range = _declared_page_range(self._num_blocks_buckets[-1], min_pages)
         if self._page_range is not None:
             self._prefill_page_range = _prefill_page_range(self._page_range)
 
-        # Batched decode gets one dynamic kernel per num_seqs bucket for batches longer
-        # than one chunk.
+        # Batched decode gets one dynamic kernel per num_seqs bucket. A call that fits in one
+        # chunk runs a fixed one-chunk kernel instead unless SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0:
+        # the dynamic kernel's launch cost grows with max_model_len.
+        self._single_chunk_kernel = envs.SPYRE_ATTN_SINGLE_CHUNK_KERNEL
         self._chunk_ranges: dict[int, DynamicRange] = {}
         if self._page_range is not None:
-            self._chunk_ranges = _declared_chunk_ranges(self._page_range, self._num_seqs_buckets)
+            self._chunk_ranges = _declared_chunk_ranges(
+                self._page_range, self._num_seqs_buckets, self._single_chunk_kernel
+            )
 
         validate_kv_ladder_env()
 
@@ -614,8 +621,9 @@ class SpyreAttnBucketer:
         must be no larger. With one KV head the smallest KV bucket is 2 pages, because the
         decode kernel does not compile on a single page. At 32 sequences a chunk is 1
         page, so there is no one-chunk kernel and every call runs the dynamic kernel.
+        ``SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0`` drops it everywhere.
         """
-        if num_seqs_bucket not in self._chunk_ranges:
+        if not self._single_chunk_kernel or num_seqs_bucket not in self._chunk_ranges:
             return False
         return self._num_blocks_buckets[0] <= _chunk_width(num_seqs_bucket)
 

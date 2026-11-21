@@ -67,8 +67,11 @@ def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, 
     return _kernel(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap, sinks)
 
 
-def _kernel(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None):
+def _kernel(
+    query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None, **kwargs
+):
     return bdhm.batched_decode_kernel(
+        **kwargs,
         query=query,
         rep_row_ids=rep,
         k_pages=k_pages,
@@ -122,6 +125,31 @@ def test_one_chunk_keeps_chunk_reduction(monkeypatch):
     got = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
     torch.testing.assert_close(
         got, _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0)
+    )
+
+
+def test_per_slot_state_at_one_chunk_matches_the_chunk_reduction(monkeypatch):
+    """A dynamic chunk count keeps per-slot state at one chunk too, which must give what the
+    single-chunk reduction gives, a wholly masked padding slot included."""
+    b, bpc, c, kv, q = 2, 2, 1, 2, 4
+    query, rep = _meta(b, bpc, kv, q)
+    k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
+    mask[1, 0] = torch.finfo(mask.dtype).min
+    page_ids_c, mask_c = split_by_chunk(page_ids, mask, bpc)
+    merges = []
+    merge = bdhm._merge_entry_local
+
+    def counting_merge(**kwargs):
+        merges.append(True)
+        return merge(**kwargs)
+
+    monkeypatch.setattr(bdhm, "_merge_entry_local", counting_merge)
+    args = (query, rep, k_pages, v_pages, page_ids_c, mask_c, b, bpc, kv, q)
+    per_slot = _kernel(*args, entry_local=True)
+    assert merges, "entry_local=True did not take the per-slot path"
+    torch.testing.assert_close(per_slot, _kernel(*args))
+    torch.testing.assert_close(
+        per_slot, _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0)
     )
 
 

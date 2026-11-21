@@ -2331,8 +2331,8 @@ def test_spyre_attn_dispatches_by_query_width(
 
 
 @pytest.mark.parametrize(
-    ("query_len", "kernel_name"),
-    [(1, "page_attn_decode"), (64, "page_attn_prefill")],
+    ("query_len", "kernel_name", "page_counts"),
+    [(1, "page_attn_decode", {16, 1, 3, 8}), (64, "page_attn_prefill", {16, 8})],
     ids=["decode", "prefill"],
 )
 @pytest.mark.parametrize(
@@ -2348,18 +2348,28 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
     monkeypatch,
     query_len,
     kernel_name,
+    page_counts,
     configure_compilation,
     configure_device,
 ):
     """One compiled per-sequence kernel per query width serves every page count up to
-    max_model_len, a one-page sequence included, and matches the reference."""
+    max_model_len, one page included, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
     envs.clear_env_cache()
-    # The fixture's max_model_len 2048 at block size 128 gives a range of 2 to 16 pages. The
-    # kernel compiles at 16, as in warmup, and is reused at 1 page (run as 2), 3 and 8.
+    walked: set[int] = set()
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        walked.add(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    # The fixture's max_model_len 2048 at block size 128 gives a range of 1 to 16 pages. The
+    # kernel compiles at 16, as in warmup, and is reused at 1, 3 and 8 pages; prefill rounds
+    # them up to 8.
     kernel_code = getattr(spyre_attn, kernel_name).__code__
     # Restores the MIN_RESERVED_DIM_SIZE the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -2376,8 +2386,10 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
                 num_kv_heads=2,
             )
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
+    assert walked == page_counts
 
 
+@pytest.mark.parametrize("single_chunk_kernel", [True, False], ids=["single_chunk", "dynamic_only"])
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2390,11 +2402,13 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     default_vllm_config,
     monkeypatch,
     batched_decode_calls,
+    single_chunk_kernel,
     configure_compilation,
     configure_device,
 ):
     """Batches longer than one chunk all run one compiled kernel, at every chunk count up
-    to max_model_len and for ragged batches too, and match the reference."""
+    to max_model_len and for ragged batches too, and match the reference. Without the
+    one-chunk kernel, batches that fit in one chunk run it too."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._C import get_reserved_dims
     from torch_spyre._inductor import config as ts_config
@@ -2408,15 +2422,22 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", str(int(single_chunk_kernel)))
+    envs.clear_env_cache()
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks: compiled at 4, then
-    # reused at 2 and 3.
+    # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks, or 1 to 4 without the
+    # one-chunk kernel: compiled at 4, then reused at the others.
+    one_chunk = (
+        [] if single_chunk_kernel else [[(1, 100)] * 8, [(1, 500 - 50 * i) for i in range(8)]]
+    )
+    expected = {2, 3, 4} if single_chunk_kernel else {1, 2, 3, 4}
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         for seq_lens in (
             [(1, 2048)] * 8,
+            *one_chunk,
             [(1, 600)] * 8,
             [(1, 1100 - 60 * i) for i in range(8)],
             [(1, 1600), (1, 520)] * 4,
@@ -2433,7 +2454,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert set(chunk_counts) == {2, 3, 4}, chunk_counts
+    assert set(chunk_counts) == expected, chunk_counts
 
 
 @pytest.mark.parametrize(

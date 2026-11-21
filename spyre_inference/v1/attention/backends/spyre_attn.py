@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
+from torch.fx.experimental import _config as fx_config
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -309,16 +310,47 @@ def batched_decode(
     # the same checks bound a dynamic chunk count.
     _walked_pages(chunk_page_ids, mask_by_chunk, chunk_range)
     return batched_decode_kernel(
-        chunk_page_ids=chunk_page_ids, mask_by_chunk=mask_by_chunk, **kwargs
+        chunk_page_ids=chunk_page_ids,
+        mask_by_chunk=mask_by_chunk,
+        entry_local=chunk_range is not None or chunk_page_ids.shape[0] > 1,
+        **kwargs,
     )
+
+
+def _compile_with_dynamic_count(
+    fn: Callable[..., torch.Tensor], range_arg: str
+) -> Callable[..., torch.Tensor]:
+    """``torch.compile`` ``fn``, whose trip count may vary over its ``range_arg`` range.
+
+    Dynamo traces a size of 1 as a constant, so a graph traced at another size guards the
+    count at 2 or more and recompiles for one page or chunk. Where the range admits 1,
+    ``fn`` traces size-obliviously instead: the count starts at 0 and only the range's own
+    checks bound it. The count is the only size these kernels leave dynamic. The inductor
+    caches do not key on this setting, so an artifact traced without it keeps the floor.
+    """
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+
+    @functools.wraps(fn)
+    def run(**kwargs: Any) -> torch.Tensor:
+        size_range = kwargs[range_arg]
+        if size_range is None or size_range["min"] > 1:
+            return compiled(**kwargs)
+        prior = fx_config.backed_size_oblivious
+        fx_config.backed_size_oblivious = True  # ty: ignore[invalid-assignment]
+        try:
+            return compiled(**kwargs)
+        finally:
+            fx_config.backed_size_oblivious = prior
+
+    return run
 
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
 # Compiled even under --enforce-eager: the eager page gather fails (torch-spyre#4334).
-_page_attn_prefill_compiled = torch.compile(page_attn_prefill, dynamic=False, fullgraph=True)
-_page_attn_decode_compiled = torch.compile(page_attn_decode, dynamic=False, fullgraph=True)
-_batched_decode_compiled = torch.compile(batched_decode, dynamic=False, fullgraph=True)
+_page_attn_prefill_compiled = _compile_with_dynamic_count(page_attn_prefill, "page_range")
+_page_attn_decode_compiled = _compile_with_dynamic_count(page_attn_decode, "page_range")
+_batched_decode_compiled = _compile_with_dynamic_count(batched_decode, "chunk_range")
 
 
 # Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
@@ -1109,8 +1141,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             if active_block_indices is not None:
                 blocks_s = active_block_indices[s]
             elif self._attn_bucketer.page_range is not None:
-                # Pad with the last real page, as forward() does: raising the count to the
-                # range minimum can take it past the block table's width.
+                # Pad with the last real page, as forward() does: rounding the count up to
+                # the range's minimum or granularity can take it past the block table's width.
                 real = real_num_blocks[s]
                 blocks_s = list(range(real)) + [real - 1] * (n - real)
             else:

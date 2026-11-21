@@ -211,8 +211,8 @@ host and copied into its slice of the device tensor. The copy is host-bound (the
 conversion), so the chunking costs no time, and a chunk's transpose stays in cache where a
 whole stack's does not.
 
-On a first start, `SPYRE_PARALLEL_WARMUP_PRECOMPILE=N` traces the warm-up buckets once with each
-graph's Spyre inner compile in one of `N` forked processes (torch-spyre's `fork_inner_compiles`,
+On a first start, with either model runner, `SPYRE_PARALLEL_WARMUP_PRECOMPILE=N` traces the warm-up
+buckets once with each graph's Spyre inner compile in one of `N` forked processes (torch-spyre's `fork_inner_compiles`,
 with stand-in graphs that return zeros of the right shape so a bucket's forward runs to its end),
 then resets Dynamo and runs the normal warm-up as a second pass of cache hits. The buckets whose
 token count is off the stick run their experts behind the opaque MoE op, whose compiled regions a

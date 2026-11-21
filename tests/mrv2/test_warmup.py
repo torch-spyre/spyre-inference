@@ -402,3 +402,102 @@ def test_run_warms_the_draft_batches_once(monkeypatch) -> None:
     warmup.run(runner)
 
     assert warmed == [True]
+
+
+def _parallel_runner(monkeypatch, *, cold, max_reqs=2, chunk=8):
+    """run() with the first pass in a fake fork pool: records every dummy run, sampler width
+    and MoE warm-up as ("pool" | "loop", what)."""
+    import sys
+    import types
+
+    from spyre_inference import envs, moe
+
+    monkeypatch.setenv("SPYRE_PARALLEL_WARMUP_PRECOMPILE", "3")
+    envs.clear_env_cache()
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
+    monkeypatch.setattr(warmup, "allocate_staging_buffers", lambda *args: None)
+    monkeypatch.setattr(
+        warmup, "_set_spyre_compilation_settings", lambda config: contextlib.nullcontext()
+    )
+    runs, pools, checks, resets, in_pool = [], [], [], [], []
+
+    @contextlib.contextmanager
+    def fork_inner_compiles(n, timeout_s, placeholders):
+        assert placeholders is True
+        pool = SimpleNamespace(submitted=0, ok=0, failed=0, workers=n)
+        pools.append(pool)
+        in_pool.append(True)
+        try:
+            yield pool
+        finally:
+            in_pool.pop()
+        pool.ok = pool.submitted
+
+    def second_pass_check(expected):
+        check = SimpleNamespace(expected=expected, finished=False)
+        check.finish = lambda: setattr(check, "finished", True)
+        checks.append(check)
+        return check
+
+    module = types.SimpleNamespace(
+        fork_inner_compiles=fork_inner_compiles, SecondPassCheck=second_pass_check
+    )
+    monkeypatch.setitem(sys.modules, "torch_spyre._inductor.parallel_precompile", module)
+    monkeypatch.setattr(torch._dynamo, "reset", lambda: resets.append(True))
+
+    def where():
+        return "pool" if in_pool else "loop"
+
+    def dummy_run(runner, num_tokens, skip_attn):
+        runs.append((where(), num_tokens))
+        if cold and in_pool:
+            pools[-1].submitted += 1
+        return torch.zeros(num_tokens, 4), torch.zeros(min(num_tokens, max_reqs), 4)
+
+    monkeypatch.setattr(warmup, "_dummy_run", dummy_run)
+    wrapper = SimpleNamespace(
+        _logits_row_buckets=[1, max_reqs, chunk],
+        compute_logits=lambda hidden: runs.append((where(), f"logits={hidden.shape[0]}")),
+    )
+    runner = _runner(buckets=(1, chunk), max_reqs=max_reqs, max_tokens=chunk)
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.pooling_runner = None
+    runner.supports_mm_inputs = False
+    runner.get_model = lambda: None
+    runner.spyre_kv_caches = {}
+    runner.spyre_device = torch.device("cpu")
+    runner.model = wrapper
+    runner._dummy_sampler_run = lambda hidden: runs.append((where(), f"rows={hidden.shape[0]}"))
+
+    def warm_opaque_regions(model, sizes, device):
+        assert model is wrapper and device == runner.spyre_device
+        runs.append((where(), f"moe={sizes}"))
+
+    monkeypatch.setattr(moe, "warm_opaque_regions", warm_opaque_regions)
+    return runner, runs, pools, checks, resets
+
+
+def test_run_precompiles_the_dummies_in_workers_then_runs_the_normal_pass(monkeypatch) -> None:
+    runner, runs, pools, checks, resets = _parallel_runner(monkeypatch, cold=True)
+
+    warmup.run(runner)
+
+    # The pool pass runs what the normal pass runs, every bucket then the logits widths, and
+    # ends with the experts the opaque MoE op hides from the stand-in blocks.
+    one_pass = [8, 1, "logits=8", "rows=2", "rows=1"]
+    assert runs == [("pool", s) for s in one_pass] + [("pool", "moe=[8, 1]")] + [
+        ("loop", s) for s in one_pass
+    ]
+    assert pools[0].workers == 3 and pools[0].submitted == 2
+    assert resets == [True]  # the stand-in graphs are forgotten before the normal pass
+    assert checks[0].expected == 2 and checks[0].finished
+
+
+def test_run_on_warm_caches_stops_the_pool_pass_after_the_first_bucket(monkeypatch) -> None:
+    runner, runs, pools, checks, resets = _parallel_runner(monkeypatch, cold=False)
+
+    warmup.run(runner)
+
+    one_pass = [8, 1, "logits=8", "rows=2", "rows=1"]
+    assert runs == [("pool", 8)] + [("loop", s) for s in one_pass]  # no MoE warm-up either
+    assert resets == [] and checks == []  # the first bucket's real graphs stay

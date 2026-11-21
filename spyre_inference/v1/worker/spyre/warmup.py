@@ -47,11 +47,13 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inl
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
+from spyre_inference.v1.worker.parallel_precompile import precompile_in_workers
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
     _set_spyre_compilation_settings,
     _SpyreModelWrapper,
+    unwrap_model,
     warm_sample_row_gathers,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -254,6 +256,50 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
     )
 
 
+def _warm_logits_widths(runner: "SpyreModelRunnerV2", widest: torch.Tensor) -> None:
+    """The wrapper pads compute_logits onto these widths, so the lm_head and the sampler
+    compile one graph per width here instead of on first use."""
+    wrapper = cast(_SpyreModelWrapper, runner.model)
+    for rows in sorted(wrapper._logits_row_buckets, reverse=True):
+        if rows <= widest.shape[0]:
+            runner._dummy_sampler_run(widest[:rows])
+        else:
+            # Wider than any sampled batch: the prompt-logprobs chunk, which only goes
+            # through compute_logits, never the sampler.
+            wrapper.compute_logits(widest.new_zeros(rows, widest.shape[1]))
+
+
+def _precompile_in_workers(runner: "SpyreModelRunnerV2", calls: list[DummyCall], row_widths):
+    """The dummy runs once more, first, with their graphs compiled in forked workers."""
+    wrapper = cast(_SpyreModelWrapper, runner.model)
+
+    def trace(pool) -> bool:
+        widest = None
+        for call in calls:
+            hidden_states, sample_hidden_states = _dummy_run(
+                runner, call.num_tokens, call.skip_attn
+            )
+            warm_sample_row_gathers(wrapper, hidden_states, row_widths)
+            if pool.submitted == 0:
+                return True  # a restart: the first bucket found every graph cached
+            if widest is None:
+                widest = sample_hidden_states
+        if widest is not None:
+            _warm_logits_widths(runner, widest)
+        return False
+
+    def warm_regions() -> None:
+        # The regions behind the opaque MoE op compile when a block runs, which a stand-in
+        # block never does.
+        from spyre_inference.moe import warm_opaque_regions
+
+        warm_opaque_regions(
+            unwrap_model(runner.model), [c.num_tokens for c in calls], runner.spyre_device
+        )
+
+    return precompile_in_workers(trace, warm_regions)
+
+
 def run(runner: "SpyreModelRunnerV2") -> None:
     """Execute plan(runner), then record attention and the sampler dummy."""
     allocate_staging_buffers(runner.compilation_config.static_forward_context, runner.spyre_device)
@@ -270,7 +316,10 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             bucketer.bucket_sizes, runner.max_num_reqs, runner.num_speculative_steps
         )
     )
+    check = None
     with _set_spyre_compilation_settings(runner.vllm_config), torch.inference_mode():
+        if envs.SPYRE_PARALLEL_WARMUP_PRECOMPILE > 0 and runner.pooling_runner is None:
+            check = _precompile_in_workers(runner, calls, row_widths)
         widest = None
         for call in calls:
             hidden_states, sample_hidden_states = _dummy_run(
@@ -291,16 +340,9 @@ def run(runner: "SpyreModelRunnerV2") -> None:
         if not runner.model_config.enforce_eager:
             _warm_multimodal(runner, [c.num_tokens for c in calls])
         if widest is not None:
-            # The wrapper pads compute_logits onto these widths, so the lm_head and the
-            # sampler compile one graph per width here instead of on first use.
-            wrapper = cast(_SpyreModelWrapper, runner.model)
-            for rows in sorted(wrapper._logits_row_buckets, reverse=True):
-                if rows <= widest.shape[0]:
-                    runner._dummy_sampler_run(widest[:rows])
-                else:
-                    # Wider than any sampled batch: the prompt-logprobs chunk, which
-                    # only goes through compute_logits, never the sampler.
-                    wrapper.compute_logits(widest.new_zeros(rows, widest.shape[1]))
+            _warm_logits_widths(runner, widest)
+        if check is not None:
+            check.finish()
         if runner.spyre_kv_caches:
             _record_attention(runner)
         if not runner.model_config.enforce_eager:

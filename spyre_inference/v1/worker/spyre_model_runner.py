@@ -36,6 +36,7 @@ Data flow in the current WIP version:
 from __future__ import annotations
 
 import bisect
+import inspect
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -1013,7 +1014,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs, self.num_spec_tokens)
         t0 = time.time()
+        check = None
         with _set_spyre_compilation_settings(self.vllm_config):
+            if envs.SPYRE_PARALLEL_WARMUP_PRECOMPILE > 0:
+                check = self._precompile_buckets_in_workers(bucket_sizes, row_widths)
             # Compile largest bucket first: Inductor's internal caches benefit
             # from seeing the most complex shape first, so subsequent smaller
             # shapes compile faster via partial cache hits.
@@ -1035,6 +1039,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
             self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
+        if check is not None:
+            check.finish()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
             time.time() - t0,
@@ -1042,6 +1048,76 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs()
         self._record_vision_graphs()
+
+    def _precompile_buckets_in_workers(self, bucket_sizes, row_widths):
+        """Compile the buckets' graphs in forked workers; the loop after it hits the cache."""
+        try:
+            from torch_spyre._inductor.parallel_precompile import (  # ty: ignore[unresolved-import]
+                SecondPassCheck,
+                fork_inner_compiles,
+            )
+        except ImportError:
+            logger.warning(
+                "SPYRE_PARALLEL_WARMUP_PRECOMPILE needs a torch-spyre with fork_inner_compiles "
+                "(torch-spyre/torch-spyre#6262); compiling the buckets one after another."
+            )
+            return None
+        if "placeholders" not in inspect.signature(fork_inner_compiles).parameters:
+            logger.warning(
+                "SPYRE_PARALLEL_WARMUP_PRECOMPILE needs fork_inner_compiles(placeholders=True); "
+                "compiling the buckets one after another."
+            )
+            return None
+        if torch._dynamo.config.caching_precompile:
+            logger.info(
+                "SPYRE_PARALLEL_WARMUP_PRECOMPILE stays off under TORCH_CACHING_PRECOMPILE: "
+                "Dynamo packages need every compile's output code, which the workers' "
+                "stand-ins do not provide; compiling the buckets one after another."
+            )
+            return None
+        t0 = time.time()
+        # At TP > 1 every rank precompiles, so stay within this rank's CPU share.
+        workers = max(1, min(envs.SPYRE_PARALLEL_WARMUP_PRECOMPILE, torch.get_num_threads()))
+        warm = False
+        widest_hidden_states = None
+        # The keyword lands with torch-spyre#6533 (checked by the signature test above); a dict
+        # keeps the call type-checkable against a torch-spyre that predates it.
+        options = {"placeholders": True}
+        with fork_inner_compiles(workers, timeout_s=1800.0, **options) as pool:
+            for size in sorted(bucket_sizes, reverse=True):
+                hidden_states, last_hidden_states = self._dummy_run(size)
+                self._warm_sample_row_gathers(hidden_states, row_widths)
+                self._warmup_input_embedding(size)
+                if pool.submitted == 0:
+                    warm = True  # a restart: the first bucket found every graph cached
+                    break
+                if widest_hidden_states is None:
+                    widest_hidden_states = (
+                        hidden_states if self.num_spec_tokens else last_hidden_states
+                    )
+            if widest_hidden_states is not None:
+                for rows in sorted(row_widths, reverse=True):
+                    self._dummy_sampler_run(widest_hidden_states[:rows])
+            if not warm:
+                # The regions behind the opaque MoE op compile when a block runs, which
+                # a stand-in block never does.
+                from spyre_inference.moe import warm_opaque_regions
+
+                warm_opaque_regions(unwrap_model(self.model), bucket_sizes, self._spyre_device)
+        if not warm:
+            # Forget the stand-in graphs; the loop below retraces the buckets into cache hits.
+            # A warm start traced real graphs, which the loop reuses.
+            torch._dynamo.reset()
+        logger.info(
+            "Parallel warm-up precompile: %s in %.1fs.",
+            "skipped, the caches are warm"
+            if warm
+            else f"{pool.submitted} graphs compiled in {workers} workers ({pool.failed} failed)",
+            time.time() - t0,
+        )
+        if warm or not pool.submitted:
+            return None
+        return SecondPassCheck(expected=pool.ok)
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:

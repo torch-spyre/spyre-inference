@@ -168,7 +168,7 @@ def _warm_encoder_embed_gather(runner: "SpyreModelRunnerV2", bodies: set[int]) -
     }
     buffer = runner.model_state.encoder_runner.inputs_embeds
     for rows in sorted(rects & bodies):
-        select_rows(buffer[:rows], torch.zeros(rows, dtype=torch.int64))
+        buffer[:rows].copy_(select_rows(buffer[:rows], torch.zeros(rows, dtype=torch.int64)))
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:

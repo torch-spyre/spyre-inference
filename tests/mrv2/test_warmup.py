@@ -271,11 +271,15 @@ def test_a_pooling_encoder_traces_its_rectangles_multimodal_or_not(monkeypatch, 
 def test_a_multimodal_encoder_warms_the_embeds_gather_once_per_rectangle_body(
     monkeypatch, mm
 ) -> None:
-    """Over that many rows of the staging buffer, the source prepare_inputs_embeds reads."""
+    """Over that many rows of the staging buffer, the source prepare_inputs_embeds reads,
+    and the copy back into it."""
     gathers = []
-    monkeypatch.setattr(
-        warmup, "select_rows", lambda src, idx: gathers.append((src.shape[0], idx.shape[0]))
-    )
+
+    def select_rows(src, idx):
+        gathers.append((src.shape[0], idx.shape[0]))
+        return src.clone()
+
+    monkeypatch.setattr(warmup, "select_rows", select_rows)
     tables = SimpleNamespace(rectangles=[(64, 2), (32, 4), (64, 8)])
     monkeypatch.setattr(warmup, "encoder_shape_tables", lambda config: tables)
     buffer = torch.zeros(512, 4)

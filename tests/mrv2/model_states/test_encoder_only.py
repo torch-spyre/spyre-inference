@@ -223,28 +223,33 @@ def test_multimodal_plans_a_fitting_batch_rectangular(monkeypatch):
 
 
 @pytest.mark.parametrize("buffer_rows", [_BUDGET, 2 * _BUDGET], ids=["body", "larger-buffer"])
-def test_multimodal_embeds_land_on_the_grid_rows(monkeypatch, buffer_rows):
-    """Real rows go where the ids do, pad rows read the pad source (row 0), and only
-    the body is read, whatever the staging buffer's size."""
+def test_multimodal_embeds_land_on_the_grid_rows_of_the_staging_buffer(monkeypatch, buffer_rows):
+    """Real rows go where the ids do and pad rows read the pad source (row 0), in the
+    staging buffer itself, the tensor warmup traced the blocks on. Rows past the body
+    are neither read nor written."""
     query_lens = [7, 1, 63]
-    embeds = torch.arange(buffer_rows, dtype=torch.float32).unsqueeze(1).repeat(1, 4)
-    state = _mm_state(monkeypatch, embeds)
-    grid_embeds = _mm_step(state, make_input_batch(query_lens, num_tokens_after_padding=_BUDGET))
+    packed = torch.arange(buffer_rows, dtype=torch.float32).unsqueeze(1).repeat(1, 4)
+    buffer = packed.clone()
+    state = _mm_state(monkeypatch, buffer)
+    out = _mm_step(state, make_input_batch(query_lens, num_tokens_after_padding=_BUDGET))
 
-    assert grid_embeds.shape == (_BUDGET, 4)
+    assert out is buffer
     rows = encoder_dense_row_indices(query_lens, 64)
-    assert torch.equal(grid_embeds[rows], embeds[: sum(query_lens)])
+    assert torch.equal(buffer[rows], packed[: sum(query_lens)])
     pad = torch.ones(_BUDGET, dtype=torch.bool)
     pad[rows] = False
-    assert grid_embeds[pad].unique().tolist() == [0.0]
+    assert buffer[:_BUDGET][pad].unique().tolist() == [0.0]
+    assert torch.equal(buffer[_BUDGET:], packed[_BUDGET:])
 
 
 def test_multimodal_ragged_embeds_stay_packed(monkeypatch):
     embeds = torch.randn(_BUDGET, 4)
+    packed = embeds.clone()
     state = _mm_state(monkeypatch, embeds)
     with state.forced_plan(ragged=True):
         assert _mm_step(state, make_input_batch([3, 2], num_tokens_after_padding=_BUDGET)) is embeds
     assert _mm_step(state, make_input_batch([3, 2])) is embeds  # unpadded: no plan fits
+    assert torch.equal(embeds, packed)
 
 
 def test_multimodal_embeds_of_another_batch_stay_packed(monkeypatch):
@@ -253,11 +258,13 @@ def test_multimodal_embeds_of_another_batch_stay_packed(monkeypatch):
     state = _mm_state(monkeypatch, embeds)
     _step(state, make_input_batch([3, 2], num_tokens_after_padding=_BUDGET))
     other = make_input_batch([3, 2], num_tokens_after_padding=_BUDGET)
+    packed = embeds.clone()
     assert state.prepare_inputs_embeds({}, other, req_states=None) is embeds  # ty: ignore[invalid-argument-type]
 
     state = _mm_state(monkeypatch, embeds)
     assert state.encoder_plan is None
     assert state.prepare_inputs_embeds({}, other, req_states=None) is embeds  # ty: ignore[invalid-argument-type]
+    assert torch.equal(embeds, packed)
 
 
 def test_a_batch_without_prepare_attn_does_not_inherit_the_last_grid():

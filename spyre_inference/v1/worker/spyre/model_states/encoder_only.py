@@ -196,16 +196,20 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
             return embeds
         # Upstream returns the whole staging buffer; the gather specialises on its
         # source rows, so read exactly the body warmup compiled it for.
+        body = embeds[: input_batch.num_tokens_after_padding]
         _, grid_embeds, _ = expand_body_to_grid(
             None,
-            embeds[: input_batch.num_tokens_after_padding],
+            body,
             input_batch.positions,
             grid,
             pad_token_id=self._pad_token_id,
             position_offset=self._position_offset,
         )
         assert grid_embeds is not None
-        return grid_embeds
+        # Back into the staging buffer: the gather's output is an inference tensor, and
+        # the block graphs were traced on the buffer, whose dispatch keys differ.
+        body.copy_(grid_embeds)
+        return embeds
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState

@@ -68,7 +68,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # What runs MRV2's Triton kernels under SPYRE_MODEL_RUNNER=v2:
     #  - "host": the csrc/ host ops kernels.bind() puts in their place; vLLM never
     #    sees Triton (default, every arch)
-    #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference)
+    #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference,
+    #    installed by the opt-in triton-cpu dependency group)
     "SPYRE_MRV2_KERNELS": lambda: os.getenv("SPYRE_MRV2_KERNELS") or "host",
     # Granularity of the decoder's torch.compile graph:
     #  - "block": compile one transformer block at a time (default)

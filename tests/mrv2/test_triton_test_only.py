@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""triton-cpu is the host kernels' parity reference, so only the dev group installs it;
-a runtime dependency that starts requesting triton fails here."""
+"""triton-cpu is the host kernels' parity reference, so only the opt-in triton-cpu group
+installs it; a runtime dependency, or the default dev group, that starts requesting
+triton fails here."""
 
 import tomllib
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 _LOCK = Path(__file__).resolve().parents[2] / "uv.lock"
 
 
-def test_only_the_dev_group_requests_triton() -> None:
+def test_only_the_triton_cpu_group_requests_triton() -> None:
     packages = tomllib.loads(_LOCK.read_text())["package"]
     requesters = set()
     for package in packages:
@@ -31,4 +32,5 @@ def test_only_the_dev_group_requests_triton() -> None:
         for group, deps in package.get("dev-dependencies", {}).items():
             if any(dep["name"] == "triton" for dep in deps):
                 requesters.add((f"{package['name']}[{group}]", None))
-    assert requesters == {("spyre-inference[dev]", None)}, requesters
+    assert ("spyre-inference[dev]", None) not in requesters, "dev is a default group"
+    assert requesters == {("spyre-inference[triton-cpu]", None)}, requesters

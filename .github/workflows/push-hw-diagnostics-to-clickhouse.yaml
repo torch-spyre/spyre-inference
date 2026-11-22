@@ -1,7 +1,7 @@
 name: push-hw-diagnostics-to-clickhouse
 
 # Parses hardware/RAS failure signatures out of the raw job logs of a completed
-# test run and ingests them into ClickHouse (spyre.hw_failure_diagnostics), which
+# test run and ingests them into ClickHouse (spyre_v2.hw_failure_diagnostics), which
 # backs the "Spyre Hardware Health" Grafana dashboard. Without this, a card-level
 # fault (e.g. RAS::CBRB::ResponseTimeout) surfaces only as a pytest failure and
 # never reaches the hardware-health view.
@@ -67,8 +67,13 @@ jobs:
       # workflow follows only runs on the x86 Spyre pool today. arch is a run_id hash
       # input, so a wrong value here derives a run_id that joins nothing, silently.
       LEG_ARCH: x86_64
-      # Dual-write during the migration window; empty CLICKHOUSE_DB_V2 makes v2 a no-op.
-      INGEST_SCHEMA: both
+      # v2 only: the writer login has no DDL, and v1 would self-migrate its table.
+      INGEST_SCHEMA: v2
+      # CLICKHOUSE_V2_USER / _PASSWORD are the writer login; _HOST / _PORT are optional and fall
+      # back to CLICKHOUSE_HOST / _PORT, the port following whichever host is used.
+      CH_HOST: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+      CH_PORT: ${{ secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT || !secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT || '' }}
+      CH_DB_V2: spyre_v2
 
     steps:
       # Nested local `uses: ./...` actions inside ingest-hw-diagnostics-to-clickhouse resolve against this checkout, not torch-spyre's own repo.
@@ -121,12 +126,12 @@ jobs:
           component: ${{ env.INGEST_COMPONENT }}
           arch: ${{ env.LEG_ARCH }}
           gh-token: ${{ secrets.GITHUB_TOKEN }}
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-host: ${{ env.CH_HOST }}
+          clickhouse-port: ${{ env.CH_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
+          clickhouse-db: ${{ env.CH_DB_V2 }}
+          clickhouse-db-v2: ${{ env.CH_DB_V2 }}
           schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Upload JSON artifact

@@ -16,7 +16,7 @@
 
 ingest_vllm_benchmarks installs that library from a floating `@main`, so what CI verified
 and what the production job resolved are two different snapshots. These tests cover the
-guard that closes the gap: the golden it carries, and that a drift takes the v2 write out
+guard that closes the gap: the golden it carries, and that a drift refuses the write
 rather than writing rows nothing can join.
 """
 
@@ -53,9 +53,8 @@ def vllm_mod():
 
 
 # --- the goldens each writer carries ----------------------------------------------------
-# ingest_xml_si no longer carries its own goldens: schema-v2 for JUnit XML is written by
-# push-to-clickhouse.yaml calling torch-spyre's ingest-xml-to-clickhouse action, so the
-# identity contract for that path is torch-spyre's own to guard, not duplicated here.
+# JUnit XML is written by push-to-clickhouse.yaml calling torch-spyre's
+# ingest-xml-to-clickhouse action, so that path's identity contract is torch-spyre's to guard.
 
 
 def test_vllm_goldens_hold_against_the_installed_library(vllm_mod):
@@ -144,32 +143,53 @@ def _flat():
     }
 
 
-def _run_ingest(vllm_mod, monkeypatch, goldens):
+def _run_ingest(vllm_mod, monkeypatch, goldens, run_id="dab2a67f-14bf-53be-b6e4-fc9642086e47"):
     client = _Client()
+    connects = []
+
+    def get_client(**kw):
+        connects.append(kw)
+        return client
+
     monkeypatch.setattr(vllm_mod, "IDENTITY_GOLDENS", goldens)
     monkeypatch.setattr(
-        vllm_mod, "clickhouse_connect", types.SimpleNamespace(get_client=lambda **kw: client)
+        vllm_mod, "clickhouse_connect", types.SimpleNamespace(get_client=get_client)
     )
+    monkeypatch.delenv("CLICKHOUSE_DB", raising=False)
     for k, v in dict(
         CLICKHOUSE_HOST="h",
         CLICKHOUSE_USER="u",
         CLICKHOUSE_PASS="p",
-        CLICKHOUSE_DB="spyre",
         CLICKHOUSE_DB_V2="spyre_v2",
     ).items():
         monkeypatch.setitem(os.environ, k, v)
-    vllm_mod.insert_to_clickhouse([_flat()], "dab2a67f-14bf-53be-b6e4-fc9642086e47")
-    return {db for db, _t in client.sent}
+    vllm_mod.insert_to_clickhouse([_flat()], run_id)
+    return {db for db, _t in client.sent}, connects
 
 
-def test_intact_goldens_let_the_v2_write_through(vllm_mod, monkeypatch):
-    assert "spyre_v2" in _run_ingest(vllm_mod, monkeypatch, vllm_mod.IDENTITY_GOLDENS)
+def test_intact_goldens_write_v2_only(vllm_mod, monkeypatch):
+    written, connects = _run_ingest(vllm_mod, monkeypatch, vllm_mod.IDENTITY_GOLDENS)
+    assert written == {"spyre_v2"}
+    assert {c["database"] for c in connects} == {"spyre_v2"}
 
 
-def test_drift_takes_out_v2_and_leaves_the_flat_tables(vllm_mod, monkeypatch):
+def test_drift_refuses_the_whole_write(vllm_mod, monkeypatch):
     # Refusing is the point: rows minted by a library nobody else is running would be
     # orphans, and an orphan reads downstream as "no perf ran".
     broken = (("run_id_of", vllm_mod.run_id_of, ("gha", "1", "amd64", "perf"), "not-the-id"),)
-    written = _run_ingest(vllm_mod, monkeypatch, broken)
-    assert "spyre_v2" not in written
-    assert None in written, "results_v3 / run_metadata must still be written"
+    with pytest.raises(RuntimeError, match="not-the-id"):
+        _run_ingest(vllm_mod, monkeypatch, broken)
+
+
+def test_no_run_id_refuses_rather_than_dropping_silently(vllm_mod, monkeypatch):
+    with pytest.raises(ValueError, match="run_id"):
+        _run_ingest(vllm_mod, monkeypatch, vllm_mod.IDENTITY_GOLDENS, run_id="")
+
+
+def test_missing_v2_database_refuses(vllm_mod, monkeypatch):
+    monkeypatch.setitem(os.environ, "CLICKHOUSE_HOST", "h")
+    monkeypatch.setitem(os.environ, "CLICKHOUSE_USER", "u")
+    monkeypatch.setitem(os.environ, "CLICKHOUSE_PASS", "p")
+    monkeypatch.delenv("CLICKHOUSE_DB_V2", raising=False)
+    with pytest.raises(OSError, match="CLICKHOUSE_DB_V2"):
+        vllm_mod.insert_to_clickhouse([_flat()], "dab2a67f-14bf-53be-b6e4-fc9642086e47")

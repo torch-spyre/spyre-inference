@@ -13,11 +13,11 @@
 # limitations under the License.
 
 """
-Ingest vLLM benchmark JSON results into ClickHouse.
+Ingest vLLM benchmark JSON results into the schema-v2 database.
 
 Expects the following environment variables:
   CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER,
-  CLICKHOUSE_PASS, CLICKHOUSE_DB
+  CLICKHOUSE_PASS, CLICKHOUSE_DB_V2 (the v2 database name)
 """
 
 import datetime
@@ -55,9 +55,6 @@ from spyre_clickhouse_ingest.vllm import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-RESULTS_TABLE = "results_v3"
-METADATA_TABLE = "run_metadata"
-
 
 def parse_args() -> Any:
     parser = ArgumentParser("Ingest vLLM benchmark results into ClickHouse")
@@ -77,8 +74,7 @@ def parse_args() -> Any:
     # naming makes the cross-repo caller correct without it having to know our column layout.
     # The numeric GitHub run id is --gha-run-id, below, because it is GHA-specific and only
     # in-repo workflows have one.
-    # Not required: a Jenkins standalone run may have neither, and the v2 write is then skipped
-    # rather than landing an unjoinable row.
+    # Not required here: a run with neither this nor a derivable id is refused at insert time.
     parser.add_argument("--run-id", type=str, default="")
     # The numeric GitHub Actions run id -> upstream's workflow_id (Int64) and, when --run-id
     # carries no uuid, the external_run_id half of a DERIVED v2 run_id. GHA-only by nature:
@@ -196,8 +192,8 @@ def resolve_v2_run_id(args) -> str:
 
     Two paths, kept explicit. Jenkins already HOLDS the orchestrator's v2 run_id
     (params.RUN_ID) -- use it verbatim. GHA holds only its own integer run id, so the id is
-    derived from (gha, run id, arch, test_type). Empty means the v2 write is skipped rather
-    than writing an unjoinable row, which downstream cannot tell apart from "no perf ran".
+    derived from (gha, run id, arch, test_type). Empty makes the insert refuse rather
+    than write an unjoinable row, which downstream cannot tell apart from "no perf ran".
     """
     # --run-id first, then --v2-run-id: the latter is kept only so a caller already passing it
     # keeps working. Both mean the same thing -- an already-derived uuid, used verbatim.
@@ -212,7 +208,7 @@ def resolve_v2_run_id(args) -> str:
             # to the derive path rather than skipping: that is what the caller meant.
             if verbatim.isdigit():
                 return run_id_of("gha", verbatim, args.arch, getattr(args, "test_type", "perf"))
-            log.warning("--run-id %r is neither a uuid nor numeric; v2 rows skipped", verbatim)
+            log.warning("--run-id %r is neither a uuid nor numeric", verbatim)
             return ""
         return verbatim
     gha = (getattr(args, "gha_run_id", "") or "").strip()
@@ -237,7 +233,7 @@ def _ci_tags(leg) -> list:
 def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> None:
     """This leg's artifacts row and its performance verdict in artifact_results.
 
-    Contained: a failure here must not cost the benchmark rows already written.
+    Contained: a failure here must not cost the benchmark rows written after it.
     """
     try:
         tables = (schema.ARTIFACTS, schema.ARTIFACT_RESULTS)
@@ -343,17 +339,14 @@ IDENTITY_GOLDENS = (
 
 
 def _write_v2_benchmarks(client, db: str, rows, run_id_value: str, leg_key: str = "") -> None:
-    """benchmarks + benchmark_runs for this leg; a failure must not cost the flat rows."""
-    try:
-        if leg_key:
-            # Dedup per leg, not per run: legs share the run_id, and only the first would land.
-            write_benchmarks(
-                client, db, rows, run_id_value, row_props={"upload_id": leg_key}, append=True
-            )
-        else:
-            write_benchmarks(client, db, rows, run_id_value)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("v2 perf write failed, %s unaffected: %r", RESULTS_TABLE, exc)
+    """benchmarks + benchmark_runs for this leg."""
+    if leg_key:
+        # Dedup per leg, not per run: legs share the run_id, and only the first would land.
+        write_benchmarks(
+            client, db, rows, run_id_value, row_props={"upload_id": leg_key}, append=True
+        )
+    else:
+        write_benchmarks(client, db, rows, run_id_value)
 
 
 def insert_to_clickhouse(
@@ -362,115 +355,47 @@ def insert_to_clickhouse(
     leg: Any = None,
     leg_key: str = "",
 ) -> None:
-    """Insert rows into ClickHouse using environment-configured connection."""
+    """Write rows to the v2 database named by CLICKHOUSE_DB_V2, over the env-configured login."""
     clickhouse_env_vars = {
         "CLICKHOUSE_HOST": os.environ.get("CLICKHOUSE_HOST"),
         "CLICKHOUSE_USER": os.environ.get("CLICKHOUSE_USER"),
         "CLICKHOUSE_PASS": os.environ.get("CLICKHOUSE_PASS"),
-        "CLICKHOUSE_DB": os.environ.get("CLICKHOUSE_DB"),
+        "CLICKHOUSE_DB_V2": target_database(),
     }
     missing = [k for k, v in clickhouse_env_vars.items() if not v]
     if missing:
         raise OSError(f"Missing required environment variables: {', '.join(missing)}")
-
-    host = clickhouse_env_vars["CLICKHOUSE_HOST"]
-    port = int(os.environ.get("CLICKHOUSE_PORT") or "8123")
-    user = clickhouse_env_vars["CLICKHOUSE_USER"]
-    password = clickhouse_env_vars["CLICKHOUSE_PASS"]
-    database = clickhouse_env_vars["CLICKHOUSE_DB"]
-
-    client = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        username=user,
-        password=password,
-        database=database,
-    )
-
+    if not v2_run_id_value:
+        # Without a run_id the rows cannot reach an artifact, and there is no other table.
+        raise ValueError(
+            "no v2 run_id (pass --v2-run-id on Jenkins, or --run-id + --arch on Actions)"
+        )
     if not rows:
         log.warning("No rows to insert")
         return
 
-    columns = list(rows[0].keys())
-    data = [[row[col] for col in columns] for row in rows]
-
-    client.insert(
-        RESULTS_TABLE,
-        data,
-        column_names=columns,
+    v2db = clickhouse_env_vars["CLICKHOUSE_DB_V2"]
+    client = clickhouse_connect.get_client(
+        host=clickhouse_env_vars["CLICKHOUSE_HOST"],
+        port=int(os.environ.get("CLICKHOUSE_PORT") or "8123"),
+        username=clickhouse_env_vars["CLICKHOUSE_USER"],
+        password=clickhouse_env_vars["CLICKHOUSE_PASS"],
+        database=v2db,
     )
-    log.info("Inserted %d rows into %s", len(rows), RESULTS_TABLE)
 
-    # v2 rows, additive. One client serves both generations, so every v2 statement is
-    # QUALIFIED with this database name; "" means v2 is not configured and the write is a
-    # clean no-op rather than an error.
-    v2db = target_database()
-    if v2db and v2_run_id_value:
-        # Logged whether or not it drifted: this is what attributes a row to the code that
-        # wrote it once `main` has moved past it.
-        log.info("v2 identity: %s", library_provenance())
-        drift = golden_drift(IDENTITY_GOLDENS)
-        if drift:
-            # ::error:: so it is an annotation, not a line in a 10k-line log. results_v3 and
-            # run_metadata still go in: the drift costs v2 visibility, and writing ids
-            # nothing else can join costs more.
-            print(
-                "::error::v2 skipped — the shared identity library no longer mints the ids "
-                "this ingest was built against, so its rows would not join any other "
-                f"writer's: {'; '.join(drift)}",
-                file=sys.stderr,
-            )
-            v2db = ""
-    if v2_run_id_value and v2db:
-        if leg is not None:
-            _write_artifact_results(client, v2db, rows, v2_run_id_value, leg)
-        _write_v2_benchmarks(client, v2db, rows, v2_run_id_value, leg_key)
-    elif v2_run_id_value:
-        # Cause-agnostic: a drift has already said its piece as an ::error:: above, and this
-        # is the only report when the database is simply not configured.
-        log.warning(
-            "no v2 database (CLICKHOUSE_DB_V2 unset, or the identity drift above) — "
-            "v2 perf rows skipped, %s still written",
-            RESULTS_TABLE,
+    # Logged whether or not it drifted: this is what attributes a row to the code that
+    # wrote it once `main` has moved past it.
+    log.info("v2 identity: %s", library_provenance())
+    drift = golden_drift(IDENTITY_GOLDENS)
+    if drift:
+        # Fatal: ids nothing else can join are worse than no rows.
+        raise RuntimeError(
+            "the shared identity library no longer mints the ids this ingest was built "
+            f"against: {'; '.join(drift)}"
         )
-    else:
-        # Loud: without a run_id the perf numbers cannot reach an artifact, and a blank
-        # artifact page reads as "no perf ran" rather than "not linked".
-        log.warning(
-            "no v2 run_id (pass --v2-run-id on Jenkins, or --run-id + --arch on Actions) "
-            "— v2 perf rows skipped, %s still written",
-            RESULTS_TABLE,
-        )
-
-    # Insert metadata rows (required for dashboard commit picker)
-    metadata_rows: list[dict[str, Any]] = []
-    seen: set[tuple[int, str, str]] = set()
-    for row in rows:
-        extra_data = json.loads(row["extra"])
-        key = (row["workflow_id"], row["metric"], extra_data.get("model", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        metadata_rows.append(
-            {
-                "timestamp": row["timestamp"],
-                "repo": row["repo"],
-                "head_branch": row["head_branch"],
-                "head_sha": extra_data.get("head_sha", ""),
-                "workflow_id": row["workflow_id"],
-                "benchmark_name": row["name"],
-                "model_name": extra_data.get("model", ""),
-                "metric_name": row["metric"],
-                "device": extra_data.get("device", "spyre"),
-                "arch": extra_data.get("arch", "x86_64"),
-            }
-        )
-
-    if metadata_rows:
-        meta_columns = list(metadata_rows[0].keys())
-        meta_data = [[r[col] for col in meta_columns] for r in metadata_rows]
-        client.insert(METADATA_TABLE, meta_data, column_names=meta_columns)
-        log.info("Inserted %d rows into %s", len(metadata_rows), METADATA_TABLE)
+    if leg is not None:
+        _write_artifact_results(client, v2db, rows, v2_run_id_value, leg)
+    _write_v2_benchmarks(client, v2db, rows, v2_run_id_value, leg_key)
 
 
 def main() -> None:
@@ -483,7 +408,7 @@ def main() -> None:
         branch=args.branch,
         sha=args.sha,
         # workflow_id's source: the NUMERIC id. --run-id may hold a uuid (Jenkins), which
-        # int()s to 0 and would blank run_url and collapse run_metadata's dedup key.
+        # int()s to 0 and would blank run_url.
         run_id=args.gha_run_id,
         job_id=args.job_id,
         workflow=args.workflow,

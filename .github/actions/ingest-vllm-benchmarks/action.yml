@@ -83,43 +83,37 @@ inputs:
     required: false
     default: ''
   clickhouse-user:
-    description: ClickHouse user.
+    description: ClickHouse writer login on the v2 database. Empty = skip the ingest.
     required: false
     default: ''
   clickhouse-pass:
-    description: ClickHouse password.
-    required: false
-    default: ''
-  clickhouse-db:
-    description: ClickHouse database.
+    description: Password of clickhouse-user. Empty = skip the ingest.
     required: false
     default: ''
   clickhouse-db-v2:
-    description: >-
-      Schema-v2 database NAME, not a second connection: one instance holds both
-      generations, so the same client serves both provided every v2 statement is
-      qualified. Empty makes the v2 write (benchmarks / benchmark_runs / the artifact
-      link) a clean no-op, leaving results_v3 and run_metadata untouched.
+    description: Schema-v2 database the benchmarks / benchmark_runs / artifact link are written to (spyre_v2).
     required: false
     default: ''
 
 runs:
   using: composite
   steps:
-    # ingest_vllm_benchmarks.py reads CLICKHOUSE_HOST as required and --results-dir
-    # as required. So the no-op gate MUST live here: when the connection is not
-    # configured, or no JSON is present, set configured=false and every later
-    # step is a no-op. This lets a caller without ClickHouse secrets (or a run
-    # that produced no benchmark JSON) pass cleanly.
+    # The script requires the connection and --results-dir, so the no-op gate lives here: with
+    # no connection (fork PRs get no secrets) or no JSON, every later step is skipped.
     - name: Gate on ClickHouse config and results
       id: gate
       shell: bash
       env:
         CH_HOST: ${{ inputs.clickhouse-host }}
+        CH_USER: ${{ inputs.clickhouse-user }}
+        CH_PASS: ${{ inputs.clickhouse-pass }}
         RESULTS_DIR: ${{ inputs.results-dir }}
       run: |
         if [ -z "${CH_HOST}" ]; then
           echo "::notice::ClickHouse host not configured; skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        elif [ -z "${CH_USER}" ] || [ -z "${CH_PASS}" ]; then
+          echo "::warning::ClickHouse v2 login (CLICKHOUSE_V2_USER/CLICKHOUSE_V2_PASSWORD) not configured; benchmark results NOT ingested."
           echo "configured=false" >> "$GITHUB_OUTPUT"
         elif [ -z "${RESULTS_DIR}" ]; then
           echo "::notice::No results-dir provided; skipping ingest."
@@ -154,19 +148,13 @@ runs:
       env:
         CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
         CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
-        # Port/user/db are optional. Only export them when non-empty: the script
-        # reads PORT via int(os.environ.get("CLICKHOUSE_PORT") or "8123"), and an
-        # empty user/db would override the client defaults.
+        # The script reads the port via int(env or "8123"), so export it only when set.
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
-        CH_USER_IN: ${{ inputs.clickhouse-user }}
-        CH_DB_IN: ${{ inputs.clickhouse-db }}
-        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
+        CLICKHOUSE_USER: ${{ inputs.clickhouse-user }}
+        CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 }}
       run: |
         source "${RUNNER_TEMP}/ingest-venv/bin/activate"
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
-        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
-        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
-        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         # Invoke by path: the script's own directory is sys.path[0], so its
         # sibling `from ingest_identity import ...` resolves without extra PYTHONPATH.
         python3 .github/scripts/ingest_vllm_benchmarks.py \

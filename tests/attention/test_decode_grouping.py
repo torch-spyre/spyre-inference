@@ -16,7 +16,7 @@
 
 import pytest
 import torch
-from spyre_testing_plugin.attn_helpers import _build_metadata
+from spyre_testing_plugin.attn_helpers import _build_metadata, use_per_bucket_decode
 
 BLOCK = 128
 KV_HEADS, HEAD = 2, 64
@@ -24,9 +24,11 @@ KV_HEADS, HEAD = 2, 64
 
 @pytest.fixture()
 def decode_config(default_vllm_config, monkeypatch):
+    """The per-bucket kernels' grouping; ``shared_slot_config`` covers the shared-slot one's."""
     from vllm.config import get_current_vllm_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    use_per_bucket_decode(monkeypatch)
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 32768
@@ -178,3 +180,105 @@ def test_group_padding_never_overwrites_a_live_row(decode_config, monkeypatch, k
         out[: len(rows), 0] = torch.tensor(rows, dtype=torch.float) + 1
         _scatter_rows_kernel(store, dst.long(), out)
     assert store[: len(kv_lens), 0].tolist() == [r + 1.0 for r in range(len(kv_lens))]
+
+
+@pytest.fixture()
+def shared_slot_config(default_vllm_config, monkeypatch):
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 32
+    cfg.model_config.max_model_len = 32768
+    return cfg
+
+
+def test_shared_slot_call_keeps_a_jagged_batch_that_fits_its_slots(shared_slot_config):
+    """1 x 235 + 4 x 5 blocks: 27 block slots and 1 each over 9 chunks together, 8 + 1 apart."""
+    md = _build([235 * BLOCK] + [5 * BLOCK] * 4)
+    assert md.shared_slot_seqs == 32
+    assert md.padded_batch_blocks == 9 * 32
+    assert md.decode_groups is None
+
+
+def test_shared_slot_grouping_splits_one_long_sequence_from_many_short(shared_slot_config):
+    """1 x 256 + 31 x 8 blocks: one block slot each over 256 chunks together, past one call's 32;
+    8 + 8 apart."""
+    md = _build([256 * BLOCK] + [8 * BLOCK] * 31)
+    assert md.padded_num_seqs is None
+    assert _members(md) == [[0], list(range(1, 32))]
+    assert [(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups] == [
+        (32, 8),
+        (32, 8),
+    ]
+
+
+@pytest.mark.parametrize("jagged", ["1", "0"])
+def test_a_shared_slot_batch_past_one_call_splits_into_calls_that_fit(
+    shared_slot_config, monkeypatch, jagged
+):
+    """32 x 256 blocks need 256 chunks in one call; 8 calls of 4 sequences need 32 each, the
+    most one call runs. Splitting is not jagged grouping, so it happens with that off too."""
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", jagged)
+    md = _build([256 * BLOCK] * 32)
+    assert md.padded_num_seqs is None
+    assert _members(md) == [list(range(i, i + 4)) for i in range(0, 32, 4)]
+    assert {(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups} == {
+        (32, 32)
+    }
+
+
+def test_each_shared_slot_group_matches_its_own_batch(shared_slot_config):
+    """A shared-slot group's precomputes are those of a batch holding only its members, with its
+    query rows mapped back to their place in the full batch."""
+    kv_lens = [256 * BLOCK] + [8 * BLOCK] * 31
+    block_table = torch.randperm(len(kv_lens) * 256, dtype=torch.int32).reshape(-1, 256)
+    md = _build(kv_lens, block_table=block_table)
+    assert md.decode_groups is not None
+    for g in md.decode_groups:
+        rows = g.rows_cpu.tolist()
+        alone = _build([kv_lens[r] for r in rows], block_table=block_table[rows])
+        assert alone.decode_groups is None
+        for name in ("chunk_page_ids_cpu", "mask_by_chunk_cpu", "slot_onehot_cpu"):
+            assert torch.equal(getattr(g, name), getattr(alone, name)), name
+        # A spare block slot, in no row, reads query row 0.
+        real = alone.slot_onehot_cpu.flatten(1).sum(1) > 0
+        expected = torch.where(real, torch.tensor(rows)[alone.rep_row_ids_cpu.long()], 0)
+        assert torch.equal(g.rep_row_ids_cpu, expected.to(torch.int32))
+
+
+def test_shared_slot_groups_store_every_row_once(shared_slot_config):
+    """Each shared-slot group writes all 32 rows; padding goes to the spare last row only."""
+    from types import SimpleNamespace
+
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        SpyreAttentionImpl,
+        _scatter_rows_kernel,
+    )
+
+    kv_lens = [256 * BLOCK] + [8 * BLOCK] * 31
+    md = _build(kv_lens)
+    staging_rows = len(kv_lens) + 1
+    owner = SimpleNamespace(staging_rows=staging_rows)
+    store = torch.zeros(staging_rows, 1)
+    for g in md.decode_groups:
+        rows = g.rows_cpu.tolist()
+        dst = SpyreAttentionImpl._group_store_rows(owner, rows, g.out_rows)
+        assert dst.shape == (32,)
+        assert set(dst[len(rows) :].tolist()) <= {staging_rows - 1}
+        out = torch.full((32, 1), -1.0)
+        out[: len(rows), 0] = torch.tensor(rows, dtype=torch.float) + 1
+        _scatter_rows_kernel(store, dst.long(), out)
+    assert store[: len(kv_lens), 0].tolist() == [r + 1.0 for r in range(len(kv_lens))]
+
+
+def test_shared_slot_call_covers_only_the_decode_prefix(shared_slot_config):
+    """The block slots read decode rows only, and the rows past them repeat row 0."""
+    md = _build([32000, 2000, 300], query_lens=[1, 1, 100])
+    assert md.num_decode_seqs == 2
+    assert md.shared_slot_seqs == 32
+    assert md.rep_row_ids_cpu.max() < 2
+    onehot = md.slot_onehot_cpu.flatten(1)
+    assert onehot.shape == (32, 32)
+    assert torch.equal(onehot[:, 2:], onehot[:, :1].expand(-1, 30))

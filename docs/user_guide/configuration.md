@@ -284,15 +284,15 @@ their own page count.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
-export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 1, and `MAX_BUCKETS` to at least
 `--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
 below that rounded value, prefill reads one page per loop step instead.
 
 The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
 bucket pair, when any of these holds:
 
-- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
-  `MAX_BUCKETS`; startup logs a warning;
+- `--max-model-len / block_size` is 2 or less (or not above an exported
+  `MIN_RESERVED_DIM_SIZE`), or is above an exported `MAX_BUCKETS`; startup logs a warning;
 - the layer uses sliding-window attention.
 
 The batched decode kernel takes its chunk count at run time in the same way, and under the
@@ -303,6 +303,37 @@ and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter seq
 masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
 chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
 num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
+
+#### One batched decode kernel for every batch size
+
+Batched decode of up to 32 sequences (or up to `--max-num-seqs`, if that is lower) does not
+compile kernels per num-sequences bucket.
+
+Each chunk still reads 32 pages, one per core. Each of these 32 reads is a *block slot*. The
+per-bucket kernels above give every sequence the same number of block slots, 32 divided by
+the bucket. These kernels share the 32 block slots by length instead, at every step: a long
+sequence gets many, a short one gets few. So a batch runs only as many chunks as all its pages
+need together, not as many as its longest sequence needs.
+
+For example, take one sequence of 235 pages and four of 5 pages. The kernel for the bucket of
+8 sequences gives each sequence 4 block slots, so the batch runs 59 chunks, most of them
+reading nothing but padding. Shared by length, the long sequence gets 27 block slots and each
+short one gets 1, and the batch runs 9 chunks.
+
+Warmup compiles two of these kernels for every batch size up to 32, instead of two per
+num-sequences bucket:
+
+- one for a batch that fits in a single chunk, that is, 32 pages or fewer in total;
+- one for every other batch, which runs up to 32 chunks per call (more if one sequence at
+  `--max-model-len` needs more). A batch that needs more chunks runs as several calls.
+
+Batches of more than 32 sequences keep their per-bucket kernels, and sliding-window layers keep
+their KV buckets. These kernels need the same torch-spyre as the dynamic chunk count above.
+
+`SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` skips the single-chunk kernel, which saves one compile at
+warmup. A batch that fits in one chunk then runs on the other kernel, which is slower to launch:
+before every call, it prepares data on the host for every chunk it could run. The default, `1`,
+keeps both kernels.
 
 ## KV cache size
 

@@ -463,7 +463,27 @@ enumerates its variants, the product of the KV-length (`num_blocks`) and num-seq
 buckets; combinations that reach or exceed the allocated page count are skipped and
 declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
 just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
-recorded at the chunk count of `max_model_len`, that runs every longer batch. A single step can carry a mix of prefill
+recorded at the chunk count of `max_model_len`, that runs every longer batch.
+
+With the shared-slot kernels, the num-sequences buckets up to `S = min(32, max_num_seqs)`
+record nothing of their own. A chunk has 32 *block slots*, one page each, and each block slot
+keeps its own running softmax across chunks. The per-bucket kernels give every sequence
+`32 / bucket` block slots. The shared-slot kernels let the host share them out by length at
+every step instead: it picks the fewest chunks `C` that fit the batch and gives each sequence
+`ceil(blocks / C)` consecutive block slots. At chunk `c`, a sequence's block slot `k` reads
+its block `c * slots + k`. After the last chunk, a `[32, S]` one-hot sums each sequence's
+block slots into its output row, as the per-bucket kernel sums a sequence's block slots.
+Output rows past the batch copy row 0, so they stay finite.
+
+Two variants serve every batch of up to `S` sequences: a single-chunk one and a dynamic one.
+The dynamic one runs at most 32 chunks per call, or as many as one `max_model_len` sequence
+needs if that is more. This keeps its launches cheap, because every launch of a dynamic kernel
+prepares host data for every chunk in its range. A batch that needs more chunks runs as several
+grouped calls. `SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` records only the dynamic variant. Its range
+then starts at one chunk, and it is traced with `backed_size_oblivious` so that a single chunk
+does not get its own compiled kernel.
+
+A single step can carry a mix of prefill
 and decode sequences; each sequence is padded to its own query bucket (decodes use the
 length-1 bucket) before dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
@@ -548,7 +568,9 @@ Key constraints:
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
-  eligible `(num_blocks, num_seqs)` combinations are recorded during warmup
+  eligible `(num_blocks, num_seqs)` combinations are recorded during warmup. With the
+  shared-slot kernels, only the buckets above 32 sequences are, since those kernels serve
+  every batch of up to 32
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a

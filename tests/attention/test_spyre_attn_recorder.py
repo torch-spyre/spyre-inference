@@ -29,7 +29,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from spyre_testing_plugin.attn_helpers import use_kv_buckets, use_python_for_each_tile
+from spyre_testing_plugin.attn_helpers import (
+    use_kv_buckets,
+    use_per_bucket_decode,
+    use_python_for_each_tile,
+)
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
 from vllm.config import get_current_vllm_config
@@ -890,10 +894,13 @@ class TestRecordBatchedDecode:
             _dispatch_batched(impl, builder, wide_cache, bucket)
         assert compiles() == snapshot
 
-    def test_real_decode_batch_lands_on_a_recorded_key(self, builder):
+    def test_real_decode_batch_lands_on_a_recorded_key(self, builder, monkeypatch):
         """A batch the scheduler could hand over must realize a key warmup enumerated."""
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+        # The per-bucket keys; test_shared_slot_dispatch_lands_on_a_recorded_shared_slot_kernel
+        # covers the shared-slot kernels.
+        use_per_bucket_decode(monkeypatch)
         bucketer = builder._attn_bucketer = make_bucketer()
         keys = {
             (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
@@ -929,6 +936,9 @@ def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch,
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    # The per-bucket kernels; test_shared_slot_dispatch_lands_on_a_recorded_shared_slot_kernel
+    # covers the shared-slot kernels.
+    use_per_bucket_decode(monkeypatch)
     envs.clear_env_cache()
     max_model_len = 2048
     max_blocks = max_model_len // BLOCK_SIZE
@@ -1059,3 +1069,145 @@ def test_large_batch_dispatch_lands_on_a_recorded_key(builder, monkeypatch, num_
         (num_seqs, *batched_decode_chunking(num_seqs, nb)) for nb in bucketer.num_blocks_buckets
     }
     assert realized - base, "dispatch never used a large-batch bucket"
+
+
+def _batched_key(md) -> tuple[int, int, int, bool, bool]:
+    """The ``(out_rows, blocks_per_chunk, num_chunks, dynamic, shared_slots)`` key a batched call
+    dispatches on, from metadata or a decode group."""
+    return (
+        md.shared_slot_seqs or md.padded_num_seqs,
+        md.blocks_per_chunk,
+        md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
+        md.chunk_range is not None,
+        md.shared_slot_seqs is not None,
+    )
+
+
+@pytest.fixture(params=["1", "0"], ids=["single_chunk", "dynamic_only"])
+def shared_slot_builder(builder, monkeypatch, request):
+    """The shared-slot kernels over 128 pages: 8 rows, the dynamic kernel runs up to 32 chunks,
+    with and without the single-chunk kernel."""
+    from torch_spyre._inductor import config as ts_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", request.param)
+    envs.clear_env_cache()
+    # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+        builder._attn_bucketer = make_bucketer(max_model_len=8192, declare_pages=True)
+        assert builder.attn_bucketer.shared_slot_seqs == 8
+        yield builder
+
+
+def _decode_batch(builder, seq_lens: list[int], max_blocks: int, num_pages: int):
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    num_seqs = len(seq_lens)
+    lens = torch.tensor(seq_lens, dtype=torch.int32)
+    return builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=CommonAttentionMetadata(
+            query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
+            query_start_loc_cpu=torch.arange(num_seqs + 1, dtype=torch.int32),
+            seq_lens=lens,
+            num_reqs=num_seqs,
+            num_actual_tokens=num_seqs,
+            max_query_len=1,
+            max_seq_len=int(lens.max()),
+            block_table_tensor=torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
+                num_seqs, max_blocks
+            )
+            % num_pages,
+            slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+            causal=True,
+            is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+        ),
+    )
+
+
+@pytest.mark.parametrize("num_seqs", [1, 3, 8])
+def test_shared_slot_dispatch_lands_on_a_recorded_shared_slot_kernel(shared_slot_builder, num_seqs):
+    """Every decode batch of up to shared_slot_seqs sequences, at any lengths, realizes one of
+    the shared-slot kernels warmup records, and so does each of its groups."""
+    bucketer = shared_slot_builder.attn_bucketer
+    single_chunk = envs.SPYRE_ATTN_SINGLE_CHUNK_KERNEL
+    recorded = {}
+    for v in bucketer.shared_slot_variants():
+        key = _batched_key(shared_slot_builder.build_for_batched_decode_variant(v))
+        assert key == (
+            v.num_seqs,
+            v.blocks_per_chunk,
+            v.num_chunks,
+            v.dynamic_chunks,
+            v.shared_slots,
+        )
+        recorded[key[3]] = key
+    assert set(recorded) == ({False, True} if single_chunk else {True})
+    chunk_range = bucketer.shared_slot_chunk_range
+    assert chunk_range is not None and chunk_range["min"] == (2 if single_chunk else 1)
+
+    for kv_len in range(1, 8193, 331):
+        seq_lens = [max(1, kv_len - 997 * i) for i in range(num_seqs)]
+        md = _decode_batch(shared_slot_builder, seq_lens, 128, 1 << 20)
+        for call in [md, *(md.decode_groups or [])]:
+            key = _batched_key(call)
+            dynamic = recorded[True]
+            if key[3]:
+                assert key[:2] + key[3:] == dynamic[:2] + dynamic[3:], f"{seq_lens=} {key}"
+                assert call.chunk_range == chunk_range
+                assert chunk_range["min"] <= key[2] <= chunk_range["max"]
+            else:
+                assert key == recorded.get(False), f"{seq_lens=} {key}"
+
+
+@pytest.mark.usefixtures("stub_forward")
+def test_shared_slot_mode_records_its_kernels_and_the_buckets_above(
+    impl, shared_slot_builder, spyre_device
+):
+    """Two shared-slot kernels serve up to shared_slot_seqs sequences; only the buckets above
+    keep theirs."""
+    pages = 128
+    cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
+    bucketer = shared_slot_builder._attn_bucketer = make_bucketer(
+        max_model_len=8192, max_num_seqs=64, declare_pages=True
+    )
+    shared = bucketer.shared_slot_variants()
+    above = bucketer.batched_decode_variants()
+    assert [v.num_seqs for v in shared] == [32] * (2 if envs.SPYRE_ATTN_SINGLE_CHUNK_KERNEL else 1)
+    assert {v.num_seqs for v in above} == {64}
+
+    assert _record(impl, cache, shared_slot_builder) == len(_recordable(bucketer, pages)) + len(
+        shared
+    ) + len(above)
+
+
+def test_shared_slot_dispatch_after_recording_compiles_nothing(
+    impl, shared_slot_builder, spyre_device
+):
+    """The acceptance criterion in shared-slot mode: once warmup has recorded its kernels,
+    decode batches of any size up to shared_slot_seqs and any lengths compile nothing. Without the
+    single-chunk kernel the dynamic one runs every chunk count, one chunk included."""
+    # 16 pages: the dynamic shared-slot kernel runs 2 (or 1) to 4 chunks of 8 sequences.
+    shared_slot_builder._attn_bucketer = make_bucketer(max_model_len=1024, declare_pages=True)
+    assert shared_slot_builder.attn_bucketer.shared_slot_chunk_range["max"] == 4
+    pages = 64
+    cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
+    _record(impl, cache, shared_slot_builder)
+    q_staging, out_staging = impl._staging_buffers(spyre_device)
+
+    snapshot = compiles()
+    chunk_counts = set()
+    for seq_lens in (
+        [65],
+        [1024] * 8,
+        [1000, 65, 300],
+        [200] * 5,
+        [1024, 1024, 700],
+        [1024] * 4 + [100] * 4,
+    ):
+        md = _decode_batch(shared_slot_builder, seq_lens, 16, pages)
+        chunk_counts.add(_batched_key(md)[2])
+        impl.forward(MagicMock(), q_staging, q_staging, q_staging, cache, md, out_staging)
+    assert compiles() == snapshot
+    assert chunk_counts == {1, 2, 3, 4}

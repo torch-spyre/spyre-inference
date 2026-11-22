@@ -26,6 +26,7 @@ from spyre_testing_plugin.attn_helpers import (
     ref_attn,
     split_by_chunk,
     use_kv_buckets,
+    use_per_bucket_decode,
     use_python_for_each_tile,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -1393,8 +1394,14 @@ def _decode_reference_fp32(
     ],
 )
 def test_bucketed_block_ids_match_scalar_fill(
-    default_vllm_config, enable_batched_decode, kv_lens: list[int], sliding_window: int | None
+    default_vllm_config,
+    enable_batched_decode,
+    monkeypatch,
+    kv_lens: list[int],
+    sliding_window: int | None,
 ) -> None:
+    # The per-bucket [C*J, B] fill; the shared-slot layout has its own tests.
+    use_per_bucket_decode(monkeypatch)
     block_size = 64
     seq_lens = [(1, kv) for kv in kv_lens]
     metadata = _padded_mask_metadata(seq_lens, block_size=block_size, sliding_window=sliding_window)
@@ -2378,6 +2385,17 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
 
 
+# Which batched decode kernels a decode batch of up to 32 sequences runs on.
+_BATCHED_DECODE_KERNELS = ["per_bucket", "shared_slots", "shared_slots_without_single_chunk"]
+
+
+def _use_batched_decode_kernels(monkeypatch, kernels: str) -> None:
+    if kernels == "per_bucket":
+        use_per_bucket_decode(monkeypatch)
+    elif kernels == "shared_slots_without_single_chunk":
+        monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", "0")
+
+
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2386,12 +2404,14 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
+@pytest.mark.parametrize("kernels", _BATCHED_DECODE_KERNELS)
 def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     default_vllm_config,
     monkeypatch,
     batched_decode_calls,
     configure_compilation,
     configure_device,
+    kernels,
 ):
     """Batches longer than one chunk all run one compiled kernel, at every chunk count up
     to max_model_len and for ragged batches too, and match the reference."""
@@ -2408,9 +2428,10 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    _use_batched_decode_kernels(monkeypatch, kernels)
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
     # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks: compiled at 4, then
-    # reused at 2 and 3.
+    # reused at 2 and 3. The shared-slot kernels split these batches into 2 to 4 chunks too.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -2444,26 +2465,31 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
+@pytest.mark.parametrize("kernels", _BATCHED_DECODE_KERNELS)
 def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
     default_vllm_config,
     monkeypatch,
     batched_decode_calls,
     configure_compilation,
     configure_device,
+    kernels,
 ):
     """Every decode batch that fits in one chunk runs the same compiled one-chunk kernel
-    and matches the reference."""
+    and matches the reference. Without the single-chunk kernel that is the dynamic kernel."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch_spyre._C import get_reserved_dims
     from torch_spyre._inductor import config as ts_config
 
-    chunk_shapes: set[tuple[int, int]] = set()
+    chunk_shapes: set[tuple[int, int, bool]] = set()
     run = SpyreAttentionImpl._run_batched_decode
 
     def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
-        chunk_shapes.add(tuple(chunk_page_ids.shape[:2]))
+        dynamic = bool(get_reserved_dims(chunk_page_ids))
+        chunk_shapes.add((*chunk_page_ids.shape[:2], dynamic))
         return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    _use_batched_decode_kernels(monkeypatch, kernels)
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
     # chunk holds 4 pages of each, so batches of 1 to 4 pages all run as one chunk.
     kernel_code = spyre_attn.batched_decode.__code__
@@ -2483,7 +2509,7 @@ def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert chunk_shapes == {(1, 32)}, chunk_shapes
+    assert chunk_shapes == {(1, 32, kernels == "shared_slots_without_single_chunk")}, chunk_shapes
 
 
 @pytest.mark.parametrize(
@@ -2556,6 +2582,8 @@ def test_spyre_attn_grouped_decode_matches_reference(
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    # The per-bucket kernels: the shared-slot kernel runs each of these batches as one call.
+    use_per_bucket_decode(monkeypatch)
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
@@ -2563,14 +2591,7 @@ def test_spyre_attn_grouped_decode_matches_reference(
     if token_budget is not None:
         cfg.scheduler_config.max_num_batched_tokens = token_budget
 
-    groups_run = []
-    run_grouped = SpyreAttentionImpl._run_grouped_decode
-
-    def spy(self, query_dev, k_pages, v_pages, attn_metadata, output, device):
-        groups_run.append(len(attn_metadata.decode_groups))
-        return run_grouped(self, query_dev, k_pages, v_pages, attn_metadata, output, device)
-
-    monkeypatch.setattr(SpyreAttentionImpl, "_run_grouped_decode", spy)
+    groups_run = _spy_grouped_decode(monkeypatch)
 
     _run_spyre_attn_test(
         seq_lens=seq_lens,
@@ -2579,6 +2600,90 @@ def test_spyre_attn_grouped_decode_matches_reference(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         use_sinks=use_sinks,
+    )
+
+    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+
+
+def _spy_grouped_decode(monkeypatch) -> list[int]:
+    """Record the group count of each grouped decode step."""
+    groups_run = []
+    run_grouped = SpyreAttentionImpl._run_grouped_decode
+
+    def spy(self, query_dev, k_pages, v_pages, attn_metadata, output, device):
+        groups_run.append(len(attn_metadata.decode_groups))
+        return run_grouped(self, query_dev, k_pages, v_pages, attn_metadata, output, device)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_grouped_decode", spy)
+    return groups_run
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_shared_slot_grouped_decode_matches_reference(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """One long sequence beside 31 short ones takes 32 chunks as one shared-slot call and
+    one chunk each as two. Each group writes all 32 rows; the store keeps every row."""
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    envs.clear_env_cache()
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 32
+    cfg.model_config.max_model_len = 4096
+    groups_run = _spy_grouped_decode(monkeypatch)
+
+    _run_spyre_attn_test(
+        seq_lens=[(1, 4096)] + [(1, 100)] * 31,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_shared_slot_batch_past_one_call_splits_and_matches_reference(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """With shared-slot calls capped at 4 chunks, 8 decode sequences that need 7 together run as
+    two calls of 4 chunks or fewer, with jagged grouping off."""
+    from vllm.config import get_current_vllm_config
+
+    from spyre_inference.v1.attention import spyre_attn_bucketer
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
+    envs.clear_env_cache()
+    monkeypatch.setattr(spyre_attn_bucketer, "_SHARED_SLOT_CALL_CHUNKS", 4)
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.model_config.max_model_len = 4096
+    groups_run = _spy_grouped_decode(monkeypatch)
+
+    _run_spyre_attn_test(
+        seq_lens=[(1, 4000)] * 4 + [(1, 3000), (1, 2000), (1, 1000), (1, 100)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
     )
 
     assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
@@ -3164,22 +3269,22 @@ def test_spyre_attn_batched_decode_correctness(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 @pytest.mark.parametrize(
-    "dynamic_chunks",
-    [False, True],
-    ids=["bucketed", "dynamic"],
+    "mode",
+    ["bucketed", "dynamic", "shared_slots"],
 )
 def test_spyre_attn_warmup_records_a_batched_decode_variant(
     default_vllm_config,
+    monkeypatch,
     batched_decode_calls,
     configure_compilation,
     configure_device,
-    dynamic_chunks,
+    mode,
 ):
     """Warmup can trace this layout's batched kernel, so serving does not compile it.
 
     One bucket, not the whole enumeration: what matters is that the recorder reaches the
     folded gather through builder-produced metadata. The dynamic bucket is the one kernel
-    past one chunk.
+    past one chunk, the shared-slot bucket the dynamic kernel of every batch size.
     """
     import sys
     from unittest.mock import MagicMock
@@ -3196,6 +3301,8 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
         batched_decode_chunking,
     )
 
+    if mode != "shared_slots":
+        use_per_bucket_decode(monkeypatch)
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
     num_seqs, num_blocks, num_pages = 4, 4, 64
@@ -3234,8 +3341,8 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
-        builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=dynamic_chunks)
-        if dynamic_chunks:
+        builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=mode != "bucketed")
+        if mode == "dynamic":
             # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
             # pages each.
             (bucket,) = [
@@ -3243,11 +3350,22 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
                 for v in builder.attn_bucketer.batched_decode_variants()
                 if v.num_seqs == num_seqs and v.dynamic_chunks
             ]
+        elif mode == "shared_slots":
+            # 32 sequences of one block slot each over the 32 pages.
+            bucket = builder.attn_bucketer.shared_slot_variants()[0]
+            assert (bucket.num_seqs, bucket.num_chunks, bucket.dynamic_chunks) == (32, 32, True)
         realized = impl._record_batched_one(
             bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize
         )
 
-    assert realized == (num_seqs, bucket.blocks_per_chunk, bucket.num_chunks, dynamic_chunks)
+    assert realized == (
+        bucket.num_seqs,
+        bucket.blocks_per_chunk,
+        bucket.num_chunks,
+        bucket.dynamic_chunks,
+        bucket.shared_slots,
+    )
+    assert (mode == "bucketed") == (not bucket.dynamic_chunks)
     assert batched_decode_calls, "the recorder traced the per-seq loop, not the batched kernel"
 
     del kv_cache

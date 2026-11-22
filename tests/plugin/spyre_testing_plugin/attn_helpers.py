@@ -410,3 +410,14 @@ def use_kv_buckets(monkeypatch) -> None:
     monkeypatch.setattr(
         spyre_attn, "SpyreAttnBucketer", lambda vllm_config, **_: SpyreAttnBucketer(vllm_config)
     )
+
+
+def use_per_bucket_decode(monkeypatch) -> None:
+    """Make bucketers built afterwards run batched decode on one kernel per num_seqs bucket,
+    as they do above the shared-slot kernels' batch sizes, rather than on the shared-slot
+    kernels."""
+    from spyre_inference.v1.attention import spyre_attn_bucketer
+
+    monkeypatch.setattr(
+        spyre_attn_bucketer, "_shared_slot_chunk_range", lambda *args, **kwargs: None
+    )

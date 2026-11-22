@@ -80,6 +80,14 @@ jobs:
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
     steps:
+      # A host without the v2 login must fail loudly (fork PRs have no host and skip).
+      - name: Require the v2 login
+        run: |
+          if [ -n "${CH_HOST}" ] && { [ -z "${CH_USER}" ] || [ -z "${CH_PASS}" ]; }; then
+            echo "::error::ClickHouse host is set but CLICKHOUSE_V2_USER/CLICKHOUSE_V2_PASSWORD is empty; results would be lost."
+            exit 1
+          fi
+
       # workflow_run always executes this file as it exists on the default
       # branch, so a plain checkout (no ref:) here pulls the canonical copy
       # of the ingest scripts regardless of which ref triggered the run.
@@ -238,6 +246,8 @@ jobs:
           platform: x86_64
           component: spyre-inference
           schema: v2
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
           clickhouse-host: ${{ env.CH_HOST }}
           clickhouse-port: ${{ env.CH_PORT }}
           clickhouse-user: ${{ env.CH_USER }}
@@ -262,6 +272,8 @@ jobs:
           platform: ppc64le
           component: spyre-inference
           schema: v2
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
           clickhouse-host: ${{ env.CH_HOST }}
           clickhouse-port: ${{ env.CH_PORT }}
           clickhouse-user: ${{ env.CH_USER }}
@@ -286,6 +298,8 @@ jobs:
           platform: s390x
           component: spyre-inference
           schema: v2
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
           clickhouse-host: ${{ env.CH_HOST }}
           clickhouse-port: ${{ env.CH_PORT }}
           clickhouse-user: ${{ env.CH_USER }}

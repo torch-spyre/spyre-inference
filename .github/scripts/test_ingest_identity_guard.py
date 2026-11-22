@@ -193,3 +193,21 @@ def test_missing_v2_database_refuses(vllm_mod, monkeypatch):
     monkeypatch.delenv("CLICKHOUSE_DB_V2", raising=False)
     with pytest.raises(OSError, match="CLICKHOUSE_DB_V2"):
         vllm_mod.insert_to_clickhouse([_flat()], "dab2a67f-14bf-53be-b6e4-fc9642086e47")
+
+
+def test_benchmark_write_failure_propagates(vllm_mod, monkeypatch):
+    # The benchmark write is the only write, so its failure must fail the step.
+    def boom(*_a, **_k):
+        raise RuntimeError("insert refused")
+
+    monkeypatch.setattr(vllm_mod, "write_benchmarks", boom)
+    with pytest.raises(RuntimeError, match="insert refused"):
+        _run_ingest(vllm_mod, monkeypatch, vllm_mod.IDENTITY_GOLDENS)
+
+
+def test_port_defaults_to_443(vllm_mod, monkeypatch):
+    _written, connects = _run_ingest(vllm_mod, monkeypatch, vllm_mod.IDENTITY_GOLDENS)
+    assert connects[0]["port"] == 443
+    monkeypatch.setitem(os.environ, "CLICKHOUSE_PORT", "8123")
+    _written, connects = _run_ingest(vllm_mod, monkeypatch, vllm_mod.IDENTITY_GOLDENS)
+    assert connects[0]["port"] == 8123

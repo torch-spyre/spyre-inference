@@ -79,7 +79,7 @@ inputs:
     required: false
     default: ''
   clickhouse-port:
-    description: ClickHouse port (default 8123 inside the script).
+    description: ClickHouse port (default 443 inside the script, as the shared ingest library).
     required: false
     default: ''
   clickhouse-user:
@@ -113,8 +113,8 @@ runs:
           echo "::notice::ClickHouse host not configured; skipping ingest."
           echo "configured=false" >> "$GITHUB_OUTPUT"
         elif [ -z "${CH_USER}" ] || [ -z "${CH_PASS}" ]; then
-          echo "::warning::ClickHouse v2 login (CLICKHOUSE_V2_USER/CLICKHOUSE_V2_PASSWORD) not configured; benchmark results NOT ingested."
-          echo "configured=false" >> "$GITHUB_OUTPUT"
+          echo "::error::ClickHouse host is set but the v2 login (CLICKHOUSE_V2_USER/CLICKHOUSE_V2_PASSWORD) is empty; benchmark results would be lost."
+          exit 1
         elif [ -z "${RESULTS_DIR}" ]; then
           echo "::notice::No results-dir provided; skipping ingest."
           echo "configured=false" >> "$GITHUB_OUTPUT"
@@ -148,7 +148,7 @@ runs:
       env:
         CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
         CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
-        # The script reads the port via int(env or "8123"), so export it only when set.
+        # The script reads the port via int(env or "443"), so export it only when set.
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CLICKHOUSE_USER: ${{ inputs.clickhouse-user }}
         CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 }}

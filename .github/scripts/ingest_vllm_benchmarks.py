@@ -377,7 +377,7 @@ def insert_to_clickhouse(
     v2db = clickhouse_env_vars["CLICKHOUSE_DB_V2"]
     client = clickhouse_connect.get_client(
         host=clickhouse_env_vars["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT") or "8123"),
+        port=int(os.environ.get("CLICKHOUSE_PORT") or "443"),
         username=clickhouse_env_vars["CLICKHOUSE_USER"],
         password=clickhouse_env_vars["CLICKHOUSE_PASS"],
         database=v2db,

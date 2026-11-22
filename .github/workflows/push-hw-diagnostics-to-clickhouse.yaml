@@ -111,7 +111,7 @@ jobs:
 
       - name: Ingest hardware-failure diagnostics into ClickHouse
         id: ingest
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-hw-diagnostics-to-clickhouse@d5036e75e65f800ef4a92f3b183388128e2d1e8c # main pinned 2026-11-21
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-hw-diagnostics-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726 # main pinned 2026-11-22
         with:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}

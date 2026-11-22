@@ -18,72 +18,46 @@ import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
-from spyre_inference.custom_ops.utils import _async_source
-
 POISON = -7
 
 
 @pytest.mark.parametrize(
-    "dtype,owned,copied",
-    [
-        (torch.int32, False, True),
-        (torch.float32, False, True),
-        (torch.int32, True, False),
-        (torch.int64, False, False),
-        (torch.float16, False, False),
-    ],
+    "extra",
+    [{"device_layout": object()}, {"dynamic": {0: {"min": 8, "max": 16}}}],
+    ids=["layout", "dynamic"],
 )
-def test_async_source_copies_only_unstaged_caller_buffers(dtype, owned, copied):
-    src = torch.zeros(8, dtype=dtype)
-    assert (_async_source(src, owned).data_ptr() != src.data_ptr()) == copied
-
-
-@pytest.mark.parametrize(
-    "source,device,dtype",
-    [
-        (torch.zeros(4, dtype=torch.int32), "cpu", None),
-        (torch.zeros(4, dtype=torch.float32), "spyre", torch.float16),
-        (torch.zeros(8, dtype=torch.int32)[::2], "spyre", None),
-    ],
-    ids=["cpu-target", "dtype-change", "strided"],
-)
-def test_layout_convert_falls_back_to_tensor_to(source, device, dtype, monkeypatch):
+def test_layout_and_dynamic_uploads_do_not_wait(extra, monkeypatch):
+    """`convert` asks `Tensor.to` for a non-blocking copy and forwards the Spyre arguments."""
     from spyre_inference.custom_ops import utils
 
-    def no_async(*args, **kwargs):
-        raise AssertionError("must not take the async layout upload")
-
-    layouts = []
+    calls = []
 
     def record_to(tensor, *args, **kwargs):
-        layouts.append(kwargs.get("device_layout"))
+        calls.append(kwargs)
         return tensor
 
-    monkeypatch.setattr(utils, "_to_layout_async", no_async)
     monkeypatch.setattr(torch.Tensor, "to", record_to)
-    sentinel = object()
-    utils.convert(source, device=device, dtype=dtype, device_layout=sentinel)
-    assert layouts == [sentinel]
+    utils.convert(torch.zeros(8, 4), device="spyre", **extra)
+    assert calls == [{"dtype": torch.float32, "non_blocking": True, **extra}]
 
 
 @pytest.mark.parametrize(
-    "layout,dtype",
+    "entry,dtype",
     [
-        (False, torch.int32),
-        (False, torch.float32),
-        # Passed through uncloned: these fail if torch-spyre stops staging them.
-        (False, torch.int64),
-        (False, torch.float16),
-        (True, torch.int32),
+        ("convert", torch.int32),
+        ("convert", torch.float32),
+        ("convert", torch.int64),
+        ("convert", torch.float16),
+        ("layout", torch.int32),
+        ("dynamic", torch.int32),
     ],
-    ids=["convert-int32", "convert-fp32", "convert-int64", "convert-fp16", "layout-int32"],
+    ids=lambda v: str(v).removeprefix("torch."),
 )
-def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
+def test_upload_ignores_source_rewrite_after_enqueue(entry, dtype):
     """A caller rewriting its buffer while the upload is queued must not reach the card."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops import utils
-    from spyre_inference.v1.attention.ops.layout import temporary_chunk_major_page_index_layout
 
     utils.register()
     dev = torch.device("spyre")
@@ -92,21 +66,24 @@ def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
     mm(a)
     torch.spyre.synchronize()
 
+    # The flat and row-outermost uploads are dense on the card, the copy torch-spyre submits
+    # without converting; that source is the one a DMA would read after `convert` returns.
+    # The reserved upload keeps the default layout, as `_to_device_with_page_range` does.
+    width = 128 // dtype.itemsize * 2
     for _ in range(20):
-        # Two whole sticks: a same-format upload of this size skips torch-spyre's staging.
-        n = 8 if layout else 128 // dtype.itemsize * 2
-        src = torch.arange(n, dtype=dtype) + 40
+        # Small integers: exact in every device format, including fp16's 9-bit mantissa.
+        src = (torch.arange(8 * width) % 31 + 40).to(dtype).reshape(8, width)
         want = src.clone()
         for _ in range(40):
             mm(a)
-        if layout:
+        if entry == "layout":
             dst = utils.convert(
-                src.reshape(2, 4, 1),
-                device=dev,
-                device_layout=temporary_chunk_major_page_index_layout(2, 4),
+                src, device=dev, device_layout=utils.row_outermost_layout(src.shape, dtype)
             )
+        elif entry == "dynamic":
+            dst = utils.convert(src, device=dev, dynamic={0: {"min": 8, "max": 8}})
         else:
-            dst = utils.convert(src, device=dev)
+            dst = utils.convert(src.reshape(-1), device=dev)
         src.fill_(POISON)
         torch.spyre.synchronize()
-        assert torch.equal(dst.cpu().reshape(-1), want)
+        assert torch.equal(dst.cpu().reshape(src.shape), want)

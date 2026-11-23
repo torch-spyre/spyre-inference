@@ -63,6 +63,7 @@ def _split_qkv_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
 class _SplitQKVLinearMethod(SpyreUnquantizedLinearMethod):
     def __init__(self, sizes: list[int]) -> None:
+        super().__init__()
         self.sizes = sizes
 
     def build_weight_t(self, layer: nn.Module, w: torch.Tensor) -> None:

@@ -317,9 +317,10 @@ class TorchSpyrePlatform(CpuPlatform):
                         pooling_default_max_num_seqs,
                     )
 
-                    # Derive from the capped length: 514 -> 512, not 1024.
+                    # Widen a short model, never narrow below 4: a long one keeps
+                    # batching short documents and pays for the ragged warmup instead.
                     cap_max_model_len_for_position_offset(model_config)
-                    default = pooling_default_max_num_seqs(model_config.max_model_len)
+                    default = max(default, pooling_default_max_num_seqs(model_config.max_model_len))
                 self.max_num_seqs = min(self.max_num_seqs, default)
 
         _spyre_patched._spyre_patched = True

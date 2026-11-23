@@ -1218,11 +1218,16 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    ("architectures", "want_len", "want_seqs"),
-    [(["XLMRobertaModel"], 512, 4), (["BertModel"], 514, 2)],
+    ("architectures", "rows", "want_len", "want_seqs"),
+    [
+        (["XLMRobertaModel"], 258, 256, 8),
+        (["BertModel"], 258, 258, 4),
+        (["XLMRobertaModel"], 514, 512, 4),
+        (["BertModel"], 8192, 8192, 4),
+    ],
 )
-def test_pooling_default_max_num_seqs_uses_the_capped_max_model_len(
-    monkeypatch, architectures, want_len, want_seqs
+def test_pooling_default_max_num_seqs_is_capped_and_floored_at_4(
+    monkeypatch, architectures, rows, want_len, want_seqs
 ):
     from vllm.engine.arg_utils import EngineArgs
 
@@ -1239,11 +1244,11 @@ def test_pooling_default_max_num_seqs_uses_the_capped_max_model_len(
 
     hf_config = SimpleNamespace(
         architectures=architectures,
-        max_position_embeddings=514,
+        max_position_embeddings=rows,
         pad_token_id=1,
         position_embedding_type="absolute",
     )
-    model_config = SimpleNamespace(runner_type="pooling", hf_config=hf_config, max_model_len=514)
+    model_config = SimpleNamespace(runner_type="pooling", hf_config=hf_config, max_model_len=rows)
     args = SimpleNamespace(max_num_seqs=None, max_num_batched_tokens=None)
     EngineArgs._set_default_max_num_seqs_and_batched_tokens_args(args, None, model_config, None)
     assert model_config.max_model_len == want_len

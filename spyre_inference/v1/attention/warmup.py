@@ -14,7 +14,10 @@
 
 """Attention warmup, shared by both model runners."""
 
+import contextlib
 import functools
+import hashlib
+import os
 import sys
 import time
 from typing import Any
@@ -42,9 +45,12 @@ def record_attention_graphs(
     """Pre-compile every Spyre attention layer's kernels; returns the graph count."""
     # The kernels are module-level torch.compile objects: a layer matching an already
     # recorded one on builder, graph_key() and causality would only replay its graphs.
-    check = None
+    check = marker = None
     if envs.SPYRE_PARALLEL_ATTN_PRECOMPILE > 0:
-        check = _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer)
+        marker = _variant_set_marker(static_ctx, kv_caches, builders, causal_by_layer)
+        check = _precompile_in_workers(
+            static_ctx, kv_caches, builders, causal_by_layer, marker=marker
+        )
     t0 = time.time()
     total = 0
     num_skipped = 0
@@ -72,6 +78,9 @@ def record_attention_graphs(
         recorded.add(key)
     if check is not None:
         check.finish()  # warns when the recording missed what the workers compiled
+    if marker is not None:
+        with contextlib.suppress(OSError):
+            open(marker, "a").close()
     logger.info(
         "Attention graph recording complete: %d graphs in %.3fs; %d layers share "
         "an earlier layer's graphs.",
@@ -82,11 +91,47 @@ def record_attention_graphs(
     return total
 
 
-def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer):
+def _variant_set_marker(static_ctx, kv_caches, builders, causal_by_layer) -> str | None:
+    """A file in the Inductor cache dir that exists once this start's set of attention
+    variants has been recorded in full into that cache."""
+    entries = set()
+    for name, kv_cache in kv_caches.items():
+        impl = getattr(static_ctx.get(name), "impl", None)
+        builder = builders.get(name)
+        if not isinstance(impl, SpyreAttentionImpl) or not builder:
+            continue
+        num_pages = kv_cache[0].shape[0]
+        bucketer = builder.attn_bucketer
+        batched = bucketer.batched_decode_variants() if impl._batched_decode_supported() else []
+        entries.add(
+            repr(
+                (
+                    impl.graph_key(),
+                    causal_by_layer[name],
+                    [(tuple(t.shape), t.dtype) for t in kv_cache],
+                    [b for b in bucketer.variants() if b.num_blocks <= num_pages],
+                    batched,
+                )
+            )
+        )
+    try:
+        from torch._inductor.runtime.cache_dir_utils import cache_dir
+
+        path = os.path.join(cache_dir(), "spyre_attn_record")
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return None
+    digest = hashlib.sha256(repr(sorted(entries)).encode()).hexdigest()[:32]
+    return os.path.join(path, digest)
+
+
+def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer, marker=None):
     """Trace every attention variant once, with its Spyre inner compile in a forked
     process (SPYRE_PARALLEL_ATTN_PRECOMPILE of them at once), so the recording that
     follows finds every compile in this start's caches. A restart already has them:
-    then the first variant runs without compiling, and this stops at once.
+    then the first variant runs without compiling, and this stops at once. That stop
+    needs ``marker`` to exist: another config (say a different max_num_seqs) shares
+    some variants with this one, so one cache hit alone does not mean all are cached.
 
     Returns a started ``SecondPassCheck`` for the recording when the workers compiled
     something, else None.
@@ -116,6 +161,7 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer):
                 layers.append((layer, impl, kv_cache, builder, causal_by_layer[name]))
     t0 = time.time()
     traced, warm = 0, False
+    recorded_before = marker is not None and os.path.exists(marker)
     # At TP > 1 every rank precompiles, so stay within this rank's CPU share, which
     # vLLM's threading setup gives torch.
     workers = max(1, min(envs.SPYRE_PARALLEL_ATTN_PRECOMPILE, torch.get_num_threads()))
@@ -144,7 +190,7 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer):
                 except Exception:  # noqa: BLE001 - the recording below compiles and reports it
                     pass
                 else:
-                    warm = traced == 0  # a cache hit before any compile: a restart
+                    warm = traced == 0 and recorded_before
                     if warm:
                         break
             if warm:

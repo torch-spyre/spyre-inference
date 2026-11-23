@@ -15,6 +15,7 @@
 """Tests for the parallel attention precompile in warmup (no device needed)."""
 
 import contextlib
+import os
 import sys
 from types import SimpleNamespace
 
@@ -27,8 +28,29 @@ from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 pytestmark = pytest.mark.attention
 
 
-def _run(monkeypatch, cold):
-    """Two layers that share their graphs; returns what the precompile did."""
+def _layers(num_seqs=(1,)):
+    """Two layers that share their graphs, and their builders."""
+    static_ctx = {}
+    for i in range(2):
+        impl = object.__new__(SpyreAttentionImpl)
+        impl.graph_key = lambda: "same"
+        impl._batched_decode_supported = lambda: True
+        static_ctx[f"l{i}"] = SimpleNamespace(impl=impl)
+    builder = SimpleNamespace(
+        attn_bucketer=SimpleNamespace(
+            # 9 blocks do not fit the 4 KV pages, so that variant is skipped.
+            variants=lambda: [SimpleNamespace(num_blocks=n) for n in (1, 2, 9)],
+            batched_decode_variants=lambda: [
+                SimpleNamespace(num_blocks=1, num_seqs=n) for n in num_seqs
+            ],
+        )
+    )
+    kv_caches = {name: [torch.empty(4)] for name in static_ctx}
+    return static_ctx, kv_caches, dict.fromkeys(static_ctx, builder)
+
+
+def _run(monkeypatch, cold, marker=None):
+    """Returns what the precompile did for the layers of _layers()."""
     monkeypatch.setenv("SPYRE_PARALLEL_ATTN_PRECOMPILE", "4")
 
     class CompileOnlyAbort(Exception):
@@ -64,27 +86,13 @@ def _run(monkeypatch, cold):
 
         return run
 
-    static_ctx = {}
-    for i in range(2):
-        impl = object.__new__(SpyreAttentionImpl)
-        impl.graph_key = lambda: "same"
-        impl.kernel = kernel
-        impl._record_one = record("one", i)
-        impl._record_batched_one = record("batched", i)
-        impl._batched_decode_supported = lambda: True
-        static_ctx[f"l{i}"] = SimpleNamespace(impl=impl)
-    builder = SimpleNamespace(
-        attn_bucketer=SimpleNamespace(
-            # 9 blocks do not fit the 4 KV pages, so that variant is skipped.
-            variants=lambda: [SimpleNamespace(num_blocks=n) for n in (1, 2, 9)],
-            batched_decode_variants=lambda: [SimpleNamespace(num_blocks=1)],
-        )
-    )
+    static_ctx, kv_caches, builders = _layers()
+    for i, layer in enumerate(static_ctx.values()):
+        layer.impl.kernel = kernel
+        layer.impl._record_one = record("one", i)
+        layer.impl._record_batched_one = record("batched", i)
     check = warmup._precompile_in_workers(
-        static_ctx,
-        {name: [torch.empty(4)] for name in static_ctx},
-        dict.fromkeys(static_ctx, builder),
-        dict.fromkeys(static_ctx, True),
+        static_ctx, kv_caches, builders, dict.fromkeys(static_ctx, True), marker=marker
     )
     return calls, resets, compiled, check
 
@@ -96,8 +104,44 @@ def test_cold_start_traces_every_variant_once_for_shared_layers(monkeypatch):
     assert check.expected == 3  # the recording is checked against the workers' compiles
 
 
-def test_restart_with_warm_caches_skips_the_precompile(monkeypatch):
-    calls, resets, compiled, check = _run(monkeypatch, cold=False)
+def test_restart_with_warm_caches_skips_the_precompile(monkeypatch, tmp_path):
+    marker = tmp_path / "recorded"
+    marker.touch()
+    calls, resets, compiled, check = _run(monkeypatch, cold=False, marker=str(marker))
     assert calls == [("one", 0, 1)]
     assert compiled.__code__ in resets
     assert check is None
+
+
+def test_a_cache_hit_alone_does_not_skip_the_precompile(monkeypatch, tmp_path):
+    # Another config filled the cache: its variants hit, but this set was never recorded.
+    marker = str(tmp_path / "never-recorded")
+    calls, _, _, check = _run(monkeypatch, cold=False, marker=marker)
+    assert calls == [("one", 0, 1), ("one", 0, 2), ("batched", 0, 1)]
+    assert check is None
+
+
+def test_the_marker_follows_the_variant_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    causal = dict.fromkeys(["l0", "l1"], True)
+    a = warmup._variant_set_marker(*_layers(num_seqs=(1, 32)), causal)
+    assert a == warmup._variant_set_marker(*_layers(num_seqs=(1, 32)), causal)
+    assert a != warmup._variant_set_marker(*_layers(num_seqs=(1, 256)), causal)
+    assert a.startswith(str(tmp_path))
+
+
+def test_the_recording_writes_the_marker(monkeypatch, tmp_path):
+    monkeypatch.setenv("SPYRE_PARALLEL_ATTN_PRECOMPILE", "4")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    static_ctx, kv_caches, builders = _layers()
+    causal = dict.fromkeys(static_ctx, True)
+    marker = warmup._variant_set_marker(static_ctx, kv_caches, builders, causal)
+    seen = []
+    monkeypatch.setattr(warmup, "_precompile_in_workers", lambda *a, marker: seen.append(marker))
+    for layer in static_ctx.values():
+        layer.impl.record_graphs = lambda *a, **k: 1
+    assert (
+        warmup.record_attention_graphs(static_ctx, kv_caches, builders, causal_by_layer=causal) == 1
+    )
+    assert seen == [marker]
+    assert os.path.exists(marker)

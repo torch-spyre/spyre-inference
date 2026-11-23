@@ -158,9 +158,7 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
 
 
 def _warm_encoder_embed_gather(runner: "SpyreModelRunnerV2", bodies: set[int]) -> None:
-    """The embeddings-to-grid gather of prepare_inputs_embeds, once per rectangle's body
-    (V1's _warm_encoder_embed_gather). A dummy run hands the model the staging buffer
-    directly, so it never reaches the gather."""
+    """prepare_inputs_embeds' grid gather, which no dummy run reaches."""
     if not runner.supports_mm_inputs:
         return
     rects = {

@@ -199,8 +199,6 @@ def test_ragged_steps_keep_the_body_packed(query_lens, padded, force_ragged):
 
 
 def _mm_state(monkeypatch, embeds: torch.Tensor) -> SpyreEncoderOnlyModelState:
-    """A multimodal state whose upstream prepare_inputs_embeds returns ``embeds``,
-    the staging buffer as upstream hands it over."""
     monkeypatch.setattr(
         EncoderOnlyModelState, "prepare_inputs_embeds", lambda self, *args: embeds, raising=False
     )
@@ -224,9 +222,7 @@ def test_multimodal_plans_a_fitting_batch_rectangular(monkeypatch):
 
 @pytest.mark.parametrize("buffer_rows", [_BUDGET, 2 * _BUDGET], ids=["body", "larger-buffer"])
 def test_multimodal_embeds_land_on_the_grid_rows_of_the_staging_buffer(monkeypatch, buffer_rows):
-    """Real rows go where the ids do and pad rows read the pad source (row 0), in the
-    staging buffer itself, the tensor warmup traced the blocks on. Rows past the body
-    are neither read nor written."""
+    """Pad rows read row 0; rows past the body are left alone."""
     query_lens = [7, 1, 63]
     packed = torch.arange(buffer_rows, dtype=torch.float32).unsqueeze(1).repeat(1, 4)
     buffer = packed.clone()

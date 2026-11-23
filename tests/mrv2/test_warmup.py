@@ -271,8 +271,6 @@ def test_a_pooling_encoder_traces_its_rectangles_multimodal_or_not(monkeypatch, 
 def test_a_multimodal_encoder_warms_the_embeds_gather_once_per_rectangle_body(
     monkeypatch, mm
 ) -> None:
-    """Over that many rows of the staging buffer, the source prepare_inputs_embeds reads,
-    and the copy back into it."""
     gathers = []
 
     def select_rows(src, idx):

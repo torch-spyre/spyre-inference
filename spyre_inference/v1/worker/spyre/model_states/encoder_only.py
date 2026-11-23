@@ -187,15 +187,13 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> torch.Tensor:
-        """A multimodal body (CLIP) arrives as embeddings: gather them onto the grid."""
         embeds = super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
         if self._planned_batch is not input_batch or self.encoder_plan is None:
             return embeds
         grid = self.encoder_plan.grid
         if grid is None:
             return embeds
-        # Upstream returns the whole staging buffer; the gather specialises on its
-        # source rows, so read exactly the body warmup compiled it for.
+        # The gather specialises on its source rows: read only the warmed body.
         body = embeds[: input_batch.num_tokens_after_padding]
         _, grid_embeds, _ = expand_body_to_grid(
             None,
@@ -206,8 +204,7 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
             position_offset=self._position_offset,
         )
         assert grid_embeds is not None
-        # Back into the staging buffer: the gather's output is an inference tensor, and
-        # the block graphs were traced on the buffer, whose dispatch keys differ.
+        # The gather returns an inference tensor; the blocks were traced on the buffer.
         body.copy_(grid_embeds)
         return embeds
 

@@ -255,7 +255,7 @@ def test_no_id_at_all_skips_the_v2_write(mod):
 def test_workflow_id_comes_from_the_numeric_flag(mod):
     """upstream's workflow_id is Int64 and built as `int(x) if x.isdigit() else 0`, so it must be
     sourced from --gha-run-id. Taking it from --run-id would yield 0 on the Jenkins path, which
-    blanks run_url, collapses run_metadata's dedup key and hands the HUD a non-existent run.
+    blanks run_url and hands the HUD a non-existent run.
 
     Asserted against main()'s own wiring rather than a copy of it: the source line is read out of
     the file, so re-pointing it at args.run_id fails here.

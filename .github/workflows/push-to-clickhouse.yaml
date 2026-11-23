@@ -236,7 +236,7 @@ jobs:
         # perf tier only: the perf-zero refusal is structural here (see extract-tier);
         # the verify step below still reads this step's raw outcome.
         continue-on-error: ${{ steps.extract-tier.outputs.perf == 'true' }}
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726
         with:
           # Already holds the ingest library, so the action skips a second install.
           venv: .venv-ingest
@@ -272,7 +272,7 @@ jobs:
         # perf tier only: the perf-zero refusal is structural here (see extract-tier);
         # the verify step below still reads this step's raw outcome.
         continue-on-error: ${{ steps.extract-tier.outputs.perf == 'true' }}
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726
         with:
           venv: .venv-ingest
           xml-dir: xml_by_arch/ppc64le
@@ -302,7 +302,7 @@ jobs:
         # perf tier only: the perf-zero refusal is structural here (see extract-tier);
         # the verify step below still reads this step's raw outcome.
         continue-on-error: ${{ steps.extract-tier.outputs.perf == 'true' }}
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726
         with:
           venv: .venv-ingest
           xml-dir: xml_by_arch/s390x

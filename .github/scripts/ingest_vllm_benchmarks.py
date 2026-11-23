@@ -55,6 +55,9 @@ from spyre_clickhouse_ingest.vllm import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# ClickHouse's ACCESS_DENIED: a grant only an admin can add, so no rerun of this leg fixes it.
+ACCESS_DENIED = 497
+
 
 def parse_args() -> Any:
     parser = ArgumentParser("Ingest vLLM benchmark results into ClickHouse")
@@ -168,6 +171,20 @@ def leg_installed(sha: str, rpm_lock: str, extra: str) -> str:
             log.warning("%s unreadable — left out of the installed delta", rpm_lock)
     tokens += (extra or "").replace(",", " ").split()
     return " ".join(tokens)
+
+
+def denied_grant(err: BaseException) -> bool:
+    """The driver's code, else the `Code: N. DB::Exception:` text a wrapped error leaves."""
+    seen: set[int] = set()
+    e: BaseException | None = err
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if getattr(e, "code", None) == ACCESS_DENIED:
+            return True
+        if f"Code: {ACCESS_DENIED}. DB::Exception:" in str(e):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
 
 
 def _is_uuid(value) -> bool:
@@ -428,9 +445,20 @@ def main() -> None:
             print(f"... and {len(rows) - 5} more")
         return
 
-    insert_to_clickhouse(
-        rows, resolve_v2_run_id(args), args if links_artifact(args) else None, args.leg_key
-    )
+    try:
+        insert_to_clickhouse(
+            rows, resolve_v2_run_id(args), args if links_artifact(args) else None, args.leg_key
+        )
+    except Exception as exc:
+        if not denied_grant(exc):
+            raise
+        # The rows are lost either way, so failing would only cost a leg whose benchmarks ran.
+        print(
+            "::error title=ClickHouse ingest denied::The v2 CI login (CLICKHOUSE_V2_USER) lacks "
+            "a grant, so this leg's benchmark rows were NOT written; a rerun cannot fix it. Ask a "
+            f"ClickHouse admin for the grant the server names: {' '.join(str(exc).split())[:800]}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

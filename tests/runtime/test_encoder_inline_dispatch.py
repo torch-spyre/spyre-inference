@@ -222,6 +222,26 @@ class TestTracedForward:
         query, key, value = self._inputs(layer, 256)
         assert layer.forward(query, key, value, output_dtype=torch.float32) == "upstream"
 
+    def test_an_extent_past_4096_stays_on_the_opaque_path(self, monkeypatch):
+        """The fused 8192 block graph scores a long rerank pair ~0.004 (#1723).
+
+        The opaque kernel matches the CPU score, so that extent must not be traced in.
+        """
+        layer = _layer()
+        install_encoder([layer])
+        extent = 8192
+        publish_encoder_grid(
+            EncoderRectPlan(
+                extent=extent,
+                width=1,
+                mask=encoder_key_pad_mask(extent, [extent], torch.float16),
+                query_lens=[extent],
+            )
+        )
+        monkeypatch.setattr(enc, "_ORIG_ATTENTION_FORWARD", lambda *a, **k: "upstream")
+        assert layer.forward(*self._inputs(layer, extent)) == "upstream"
+        publish_encoder_grid(None)
+
     def test_falls_through_on_a_requested_output_shape(self, monkeypatch):
         """The inline path returns [tokens, heads * head_size] and ignores output_shape.
 

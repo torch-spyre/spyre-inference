@@ -71,6 +71,10 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 # aligned, and it is the width of a shared mask tile. Encoder attention has no KV
 # cache and so no block walk -- this is alignment, not a block size.
 ENCODER_LEN_ALIGNMENT = 64
+# Longer than this, fusing attention into the block graph scores a relevant
+# bge-reranker pair ~0.004 instead of ~0.92 (#1723). The opaque kernel matches.
+# The cutoff is the mask's extent, so each rectangle's graph takes one side.
+_INLINE_MAX_EXTENT = 4096
 
 logger = init_logger(__name__)
 
@@ -697,11 +701,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         # Traced in, a rectangle's shape *is* a block graph, warmed by the runner's
         # per-rectangle dummy runs; tracing it here would compile a kernel nothing calls.
-        rectangles = (
-            []
-            if encoder_inline_active()
-            else [(extent, width) for extent, width in self._rectangles if extent * width == rows]
-        )
+        # An extent past _INLINE_MAX_EXTENT falls out of that graph, so it still needs one.
+        rectangles = [
+            (extent, width)
+            for extent, width in self._rectangles
+            if extent * width == rows
+            and (not encoder_inline_active() or extent > _INLINE_MAX_EXTENT)
+        ]
         for extent, width in rectangles:
             mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device)
             self._run_rect(
@@ -953,8 +959,14 @@ def _spyre_encoder_attention_forward(
     """
     mask = _encoder_grid.mask
     # The inline path returns [tokens, num_heads * head_size], so a caller asking for any
-    # other output shape or dtype has to take the fallthrough.
-    if mask is None or output_dtype not in (None, query.dtype) or output_shape is not None:
+    # other output shape or dtype has to take the fallthrough. So does an extent past
+    # _INLINE_MAX_EXTENT: the fused graph scores that rectangle wrong (#1723).
+    if (
+        mask is None
+        or mask.shape[-1] > _INLINE_MAX_EXTENT
+        or output_dtype not in (None, query.dtype)
+        or output_shape is not None
+    ):
         return _ORIG_ATTENTION_FORWARD(self, query, key, value, output_shape, output_dtype)
 
     num_heads, num_kv_heads = self.num_heads, self.num_kv_heads

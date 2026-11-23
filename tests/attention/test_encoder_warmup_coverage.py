@@ -166,6 +166,25 @@ class TestWarmKernelsTracesTheDeclaredSet:
         assert seen_groups == encoder_group_shapes(config)
         assert traced == len(seen_groups)
 
+    def test_a_long_rectangle_is_still_warmed_when_inlined(self, monkeypatch):
+        """Extents past 4096 leave the block graph, so warm_kernels must trace them.
+
+        Otherwise the first long rerank request compiles the opaque kernel mid-serve.
+        """
+        monkeypatch.setattr(spyre_encoder_attn, "encoder_inline_active", lambda: True)
+        config = _config(8192, 4, 8192)
+        impl = _make_impl(config)
+        rows = encoder_shape_tables(config).budget
+
+        seen_rects: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            impl, "_run_rect", lambda out, q, k, v, m, w, e, *a: seen_rects.append((e, w))
+        )
+        monkeypatch.setattr(impl, "_run_fused", lambda *a, **k: None)
+        impl.warm_kernels(*_buffers(impl, rows), impl.num_heads, impl.num_kv_heads, 64)
+
+        assert seen_rects == [(8192, 1)]
+
     def test_warmed_against_the_callers_own_output_tensor(self, monkeypatch):
         """Regression: the store's destination layout is part of its cache key.
 

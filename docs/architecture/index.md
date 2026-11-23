@@ -610,9 +610,11 @@ the step's group multiset. The rectangular path is traced *into* the block graph
 whenever every encoder layer qualifies — attention compiled, and a head size that fills whole
 sticks (`install_encoder` is the only gate). The runner publishes the rectangle's mask
 (`publish_encoder_grid`), and the layer's forward reads `(width, extent)` off that mask's
-shape, so inductor fuses attention with the projections and the FFN. The rectangle then is
-part of the block graph's shape: one block graph per declared rectangle, plus the
-opaque-attention one the ragged path runs. An unpadded 32-wide encoder layer and any eager
+shape, so inductor fuses attention with the projections and the FFN. A rectangle longer
+than 4096 stays on the opaque kernel instead: fusing that extent scores a long
+bge-reranker pair wrong (#1723). The rectangle then is part of the block graph's shape:
+one block graph per declared rectangle, plus the opaque-attention one the ragged path runs.
+An unpadded 32-wide encoder layer and any eager
 run keep both paths opaque; pooling models such as granite-30m and MiniLM pad their original
 32-wide heads to 64 before construction. Either way path selection is never a branch inside a
 compiled region: it is decided before the forward, and the traced graph only sees the shape

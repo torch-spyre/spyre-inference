@@ -212,7 +212,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         """Run ``vision_embed`` for one item at its smallest budget, for ``finish_item`` later.
 
         The budget's staging buffers are uploaded here, so another batch may reuse them
-        before this item finishes.
+        before this item finishes. The returned state must therefore never read the staging
+        again: ``vision_advance`` and ``vision_finish`` work from its on-card activations.
         """
         (tokens,) = self._get_per_item_out_tokens(mm_kwargs)
         budget = self._path_fitting_budget("default", tokens)

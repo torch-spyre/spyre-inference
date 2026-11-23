@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, CompilationMode, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -38,9 +38,15 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from spyre_inference import envs
+from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.core import scheduler as scheduler_module
 from spyre_inference.v1.core.scheduler import TorchSpyreScheduler
-from spyre_inference.v1.core.vision_slices import VISION_SLICES_ATTR, VisionSlicing
+from spyre_inference.v1.core.vision_slices import (
+    VISION_SLICES_ATTR,
+    VisionSlicing,
+    vision_slicing,
+)
 
 # A 200-token prompt against a 256-token budget leaves 56 tokens over, which is
 # exactly the leftover upstream tops the batch up with.
@@ -195,7 +201,8 @@ def _text(request_id: str) -> Request:
     )
 
 
-def _image(request_id: str, mm_hash: str = "h") -> Request:
+def _image(request_id: str, *mm_hashes: str) -> Request:
+    """One image per hash (``h`` if none), each ``IMAGE_TOKENS`` long, 10 tokens apart."""
     return Request(
         request_id=request_id,
         prompt_token_ids=list(range(PROMPT_LEN)),
@@ -206,8 +213,11 @@ def _image(request_id: str, mm_hash: str = "h") -> Request:
                 data=MultiModalKwargsItem({}),
                 modality="image",
                 identifier=mm_hash,
-                mm_position=PlaceholderRange(offset=10, length=IMAGE_TOKENS),
+                mm_position=PlaceholderRange(
+                    offset=10 + i * (IMAGE_TOKENS + 10), length=IMAGE_TOKENS
+                ),
             )
+            for i, mm_hash in enumerate(mm_hashes or ("h",))
         ],
     )
 
@@ -328,6 +338,37 @@ def test_passes_run_one_at_a_time_in_waiting_order(scheduler):
     assert runs == [{"ha": 2}, {"ha": 2}, {"ha": None}, {"hb": 2}, {"hb": 2}, {"hb": None}]
 
 
+def test_images_that_never_fit_the_cache_together_go_to_upstream(scheduler):
+    """Held, they would wait forever for space, and so would every image request behind them."""
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=60)
+    scheduler.max_num_encoder_input_tokens = 60
+    _with_running_decode(scheduler)
+    scheduler.add_request(_image("img", "ha", "hb"))
+
+    out, slices = _step(scheduler)
+    assert slices is None
+    assert out.scheduled_encoder_inputs == {"img": [0]}
+
+
+def test_a_request_holding_kv_blocks_waits_for_the_pass_of_its_image(scheduler):
+    """Stands in for a streaming session whose next chunk brings an image already in a pass."""
+    _with_running_decode(scheduler)
+    scheduler.add_request(_image("a"))
+    _step(scheduler)
+    session = _image("session")
+    scheduler.requests[session.request_id] = session
+    scheduler.kv_holding_waiting.add_request(session)
+
+    out, slices = _step(scheduler)
+    assert slices.run == {"h": 2}
+    assert "session" not in out.num_scheduled_tokens
+    assert session in scheduler.kv_holding_waiting
+
+    out, slices = _step(scheduler)
+    assert slices.run == {"h": None}
+    assert "session" in out.num_scheduled_tokens
+
+
 def test_text_requests_are_not_held_behind_a_pass(scheduler):
     _with_running_decode(scheduler)
     scheduler.add_request(_image("img"))
@@ -340,3 +381,70 @@ def test_text_requests_are_not_held_behind_a_pass(scheduler):
 def test_off_by_default():
     sched = _scheduler()
     assert sched._vision_slicing is None
+
+
+class _SlicedVisionModel(SpyreVisionEncoderMixin):
+    pass
+
+
+@pytest.fixture
+def slicing_config(monkeypatch):
+    """A config ``vision_slicing`` accepts: K=6 over a 24-block compiled tower."""
+    monkeypatch.setattr(envs, "SPYRE_VISION_BLOCKS_PER_STEP", 6, raising=False)
+    monkeypatch.setattr(
+        "spyre_inference.models.spyre_model_cls", lambda architecture: _SlicedVisionModel
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            is_multimodal_model=True,
+            architecture="SlicedVisionModel",
+            multimodal_config=SimpleNamespace(mm_processor_cache_type="lru"),
+            hf_config=SimpleNamespace(vision_config=SimpleNamespace(num_hidden_layers=24)),
+        ),
+        compilation_config=SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        lora_config=None,
+        ec_transfer_config=None,
+        ec_manager_config=SimpleNamespace(get_encoder_cache_manager_obj=lambda: None),
+    )
+
+
+def test_vision_slicing_spreads_the_tower_over_ceil_depth_by_k_steps(slicing_config):
+    assert vision_slicing(slicing_config) == VisionSlicing(6, 4, ("image",))
+
+
+@pytest.mark.parametrize(
+    ("feature", "turn_on"),
+    [
+        ("async scheduling", lambda c: setattr(c.scheduler_config, "async_scheduling", True)),
+        (
+            "mm_processor_cache_type='shm'",
+            lambda c: setattr(c.model_config.multimodal_config, "mm_processor_cache_type", "shm"),
+        ),
+        ("LoRA", lambda c: setattr(c, "lora_config", object())),
+        ("encoder cache transfer connector", lambda c: setattr(c, "ec_transfer_config", object())),
+        (
+            "custom encoder cache manager",
+            lambda c: setattr(c.ec_manager_config, "get_encoder_cache_manager_obj", lambda: object),
+        ),
+    ],
+)
+def test_vision_slicing_refuses_features_that_break_the_plan(slicing_config, feature, turn_on):
+    turn_on(slicing_config)
+    with pytest.raises(ValueError, match=feature):
+        vision_slicing(slicing_config)
+
+
+def test_vision_slicing_needs_the_tower_depth(slicing_config):
+    slicing_config.model_config.hf_config.vision_config = SimpleNamespace()
+    with pytest.raises(ValueError, match="num_hidden_layers"):
+        vision_slicing(slicing_config)
+
+
+def test_vision_slicing_is_off_for_an_eager_tower_or_a_one_step_k(slicing_config, monkeypatch):
+    slicing_config.compilation_config.mode = CompilationMode.NONE
+    assert vision_slicing(slicing_config) is None
+    slicing_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    monkeypatch.setattr(envs, "SPYRE_VISION_BLOCKS_PER_STEP", 24, raising=False)
+    assert vision_slicing(slicing_config) is None

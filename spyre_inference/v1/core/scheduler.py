@@ -49,7 +49,8 @@ class TorchSpyreScheduler(Scheduler):
     With SPYRE_VISION_BLOCKS_PER_STEP (experimental) it also spreads each image's encoder pass
     over several steps while other requests run (see ``vision_slices``). One pass runs at a
     time, in the order requests wait. A waiting request is held out of upstream's scan while
-    it has an image a pass would encode, so upstream never encodes one inside a single step.
+    it has an image a pass would encode, so upstream never encodes one inside a single step,
+    and so is any request, those holding KV blocks included, with an image a pass is encoding.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -72,15 +73,25 @@ class TorchSpyreScheduler(Scheduler):
         if self._vision_slicing is None:
             return self._schedule_capped(*args, **kwargs)
         slices = self._plan_vision_slices()
-        held = [request for request in self.waiting if self._held_for_vision(request)]
-        if held:
-            self.waiting.remove_requests(held)
+        # Upstream drains kv_holding_waiting first (e.g. a streaming session's next chunk),
+        # and its requests never start a pass, so only an in-flight one holds them.
+        held = [
+            (self.waiting, [r for r in self.waiting if self._held_for_vision(r)]),
+            (
+                self.kv_holding_waiting,
+                [r for r in self.kv_holding_waiting if self._reads_vision_pass(r)],
+            ),
+        ]
+        for queue, requests in held:
+            if requests:
+                queue.remove_requests(requests)
         try:
             output = self._schedule_capped(*args, **kwargs)
         finally:
-            if held:
-                # FCFS prepends in reverse, so reverse first to keep their order.
-                self.waiting.prepend_requests(reversed(held))
+            for queue, requests in held:
+                if requests:
+                    # FCFS prepends in reverse, so reverse first to keep their order.
+                    queue.prepend_requests(reversed(requests))
         if slices.cancel or slices.start or slices.run:
             setattr(output, VISION_SLICES_ATTR, slices)
         return output
@@ -162,9 +173,13 @@ class TorchSpyreScheduler(Scheduler):
         return slices
 
     def _held_for_vision(self, request: Request) -> bool:
-        if any(f.identifier in self._vision_passes for f in request.mm_features):
-            return True
-        return bool(self.running) and self._wants_vision_pass(request)
+        return self._reads_vision_pass(request) or (
+            bool(self.running) and self._wants_vision_pass(request)
+        )
+
+    def _reads_vision_pass(self, request: Request) -> bool:
+        """Whether an image of the request is mid-pass: its entry already reads as cached."""
+        return any(f.identifier in self._vision_passes for f in request.mm_features)
 
     def _wants_vision_pass(self, request: Request) -> bool:
         """A new request with an image to encode, that a pass can take.
@@ -176,6 +191,14 @@ class TorchSpyreScheduler(Scheduler):
             return False
         new = self._new_vision_items(request)
         if not new or any(request.mm_features[i].data is None for i in new.values()):
+            return False
+        # Images that can never be cached together would hold the request (and every one
+        # queued behind it) forever; upstream encodes them a chunk at a time instead.
+        sizes = [request.get_num_encoder_embeds(i) for i in new.values()]
+        if (
+            sum(sizes) > self.encoder_cache_manager.cache_size
+            or max(sizes) > self.max_num_encoder_input_tokens
+        ):
             return False
         elsewhere = {
             f.identifier

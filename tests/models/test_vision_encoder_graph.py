@@ -25,7 +25,11 @@ import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
-from spyre_inference.v1.core.vision_slices import VisionSlices, VisionSliceStart
+from spyre_inference.v1.core.vision_slices import (
+    VISION_SLICES_ATTR,
+    VisionSlices,
+    VisionSliceStart,
+)
 from spyre_inference.v1.worker import spyre_encoder_graph as encoder_graph_module
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
@@ -867,6 +871,60 @@ def test_run_slices_spreads_a_pass_and_drops_a_cancelled_one(monkeypatch):
     assert list(finished) == ["a"]
     torch.testing.assert_close(finished["a"], expected)
     assert not manager._slice_passes
+
+
+def _hooked_runner(kind: str, manager: SpyreEncoderGraphManager, monkeypatch) -> Any:
+    """A bare runner of ``kind`` whose upstream execute_model returns the encoder cache it sees."""
+    if kind == "v1":
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+        runner: Any = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+        runner.encoder_cudagraph_manager = manager
+        runner.encoder_cache = cache = {}
+    else:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+        from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+
+        runner = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
+        runner.model_state = SimpleNamespace(
+            encoder_runner=SimpleNamespace(cudagraph_manager=manager)
+        )
+        runner.encoder_cache = SimpleNamespace(encoder_outputs={})
+        cache = runner.encoder_cache.encoder_outputs
+    runner.device = torch.device("cpu")
+    monkeypatch.setattr(GPUModelRunner, "execute_model", lambda self, *a, **k: dict(cache))
+    return runner
+
+
+@pytest.mark.parametrize("kind", ["v1", "mrv2"])
+def test_each_runner_caches_a_finished_pass_before_upstream_runs(monkeypatch, kind):
+    monkeypatch.setattr(
+        encoder_graph_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **_: iter([(modality, 1, data) for modality, data in items]),
+    )
+    model = _FakeVisionModel(max_tokens=300, num_blocks=4)
+    _ordered_blocks(model)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    (expected,) = manager.execute({"tokens": [30]})
+    runner = _hooked_runner(kind, manager, monkeypatch)
+
+    def step(slices: VisionSlices | None):
+        scheduler_output = SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[])
+        if slices is not None:
+            setattr(scheduler_output, VISION_SLICES_ATTR, slices)
+        return runner.execute_model(scheduler_output)
+
+    start = VisionSliceStart("a", "image", cast(Any, {"tokens": [30]}))
+    assert step(VisionSlices(start=[start], run={"a": 2})) == {}
+    seen = step(VisionSlices(run={"a": None}))
+    assert list(seen) == ["a"]
+    torch.testing.assert_close(seen["a"], expected)
+    assert step(None) == seen
 
 
 def test_start_item_needs_a_compiled_budget():

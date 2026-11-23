@@ -353,7 +353,7 @@ test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (lo
 # job; the weighted partition (--upstream-shards) balances them automatically,
 # by recorded per-test runtime when a durations file is present else by models/
 # path weight. UPSTREAM_SHARDS is the single source of the count.
-UPSTREAM_SHARDS ?= 2
+UPSTREAM_SHARDS ?= 5
 UPSTREAM_SHARD_ID ?= 0
 test-upstream-shard: ## Run one non-distributed upstream shard (UPSTREAM_SHARDS=N UPSTREAM_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not gsm8k' \

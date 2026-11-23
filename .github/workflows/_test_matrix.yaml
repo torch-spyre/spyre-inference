@@ -891,7 +891,7 @@ jobs:
           # (models/ paths weighted heavy) now balances them across the shards.
           # Excluded from integration/unit (heavy). Adding/removing a shard =
           # add/remove an entry here and bump UPSTREAM_SHARDS (Makefile default).
-          - cfg: Upstream vLLM tests (shard 1/2)
+          - cfg: Upstream vLLM tests (shard 1/5)
             test_types: regression trunk
             runs_on:
               - x86_64
@@ -899,7 +899,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-shard-0
-          - cfg: Upstream vLLM tests (shard 2/2)
+          - cfg: Upstream vLLM tests (shard 2/5)
             test_types: regression trunk
             runs_on:
               - x86_64
@@ -907,6 +907,30 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-shard-1
+          - cfg: Upstream vLLM tests (shard 3/5)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-2
+          - cfg: Upstream vLLM tests (shard 4/5)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-3
+          - cfg: Upstream vLLM tests (shard 5/5)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-4
           - cfg: Upstream distributed vLLM tests
             test_types: regression trunk
             runs_on:

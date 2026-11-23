@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LADDER: str = "pow2"
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
-    SPYRE_ATTN_SINGLE_CHUNK_KERNEL: bool = True
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
@@ -107,13 +106,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS": lambda: int(
         os.getenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS") or "16"
-    ),
-    # Default "1": a batched decode call that fits in one chunk runs a static full-width
-    # single-chunk kernel, one more warmup compile per num_seqs bucket. "0" runs it on the
-    # dynamic chunk-count kernel too, whose launch cost grows with max_model_len. Applies
-    # only where the chunk count is dynamic.
-    "SPYRE_ATTN_SINGLE_CHUNK_KERNEL": lambda: bool(
-        int(os.getenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", "1"))
     ),
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.

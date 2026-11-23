@@ -462,11 +462,10 @@ When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
 declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
-just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
-recorded at the chunk count of `max_model_len`, that runs every longer batch (with
-`SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0`, only the dynamic one, which then runs a single chunk
-too). A single step can carry a mix of prefill and decode sequences; each sequence is
-padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
+one dynamic variant, at the chunk count of `max_model_len`, that runs every batch, a
+single chunk included. A single step can carry a mix of prefill and decode sequences;
+each sequence is padded to its own query bucket (decodes use the length-1 bucket) before
+dispatch.
 `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace

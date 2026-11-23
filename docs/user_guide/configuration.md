@@ -300,16 +300,9 @@ same conditions. The kernel reads the KV cache one *chunk* per loop step: the ne
 `32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
 cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
 and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
-masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
-chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
-num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
-
-`SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` runs a batch that fits in one chunk on the dynamic kernel
-too, so warmup compiles one batched kernel per num-sequences bucket, and a bucket keeps its
-KV buckets only when `--max-model-len` fits in one chunk. That shortens startup (by 11-15%
-for granite-4.2-8b at a 32k context), but short contexts decode slower: each launch of the
-dynamic kernel computes a program correction on the host for every chunk up to
-`--max-model-len`, whatever the batch's own chunk count.
+masked past their own length. The same kernel runs a batch that fits in one chunk, so warmup
+compiles one batched kernel per num-sequences bucket. A num-sequences bucket whose
+`--max-model-len` fits in one chunk keeps its KV buckets.
 
 ## KV cache size
 

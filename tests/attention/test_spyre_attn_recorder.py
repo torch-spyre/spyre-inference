@@ -922,19 +922,15 @@ class TestRecordBatchedDecode:
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
 
 
-@pytest.mark.parametrize("single_chunk_kernel", [True, False], ids=["single_chunk", "dynamic_only"])
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
-def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(
-    builder, monkeypatch, num_seqs, single_chunk_kernel
-):
-    """With a chunk range, every decode batch runs a kernel that warmup recorded: the
-    one-chunk kernel if it fits in one chunk and there is one, else the dynamic kernel at a
-    chunk count in its range."""
+def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
+    """Every decode batch runs a kernel that warmup recorded: the dynamic kernel at a chunk
+    count in its range, a single chunk included, or the KV bucket's kernel for a batch size
+    without a chunk range."""
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", str(int(single_chunk_kernel)))
     envs.clear_env_cache()
     max_model_len = 2048
     max_blocks = max_model_len // BLOCK_SIZE

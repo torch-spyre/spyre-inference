@@ -179,17 +179,21 @@ CACHE_SIZE = 1000
 IMAGE_TOKENS = 40
 
 
-@pytest.fixture
-def scheduler(monkeypatch):
+def _sliced_scheduler(monkeypatch, max_num_seqs: int = 4) -> TorchSpyreScheduler:
     monkeypatch.setattr(
         scheduler_module,
         "vision_slicing",
         lambda vllm_config: VisionSlicing(blocks_per_step=2, steps=3, modalities=("image",)),
     )
-    sched = _scheduler()
+    sched = _scheduler(max_num_seqs=max_num_seqs)
     sched.encoder_cache_manager = EncoderCacheManager(cache_size=CACHE_SIZE)
     sched.max_num_encoder_input_tokens = CACHE_SIZE
     return sched
+
+
+@pytest.fixture
+def scheduler(monkeypatch):
+    return _sliced_scheduler(monkeypatch)
 
 
 def _text(request_id: str) -> Request:
@@ -367,6 +371,43 @@ def test_a_request_holding_kv_blocks_waits_for_the_pass_of_its_image(scheduler):
     out, slices = _step(scheduler)
     assert slices.run == {"h": None}
     assert "session" in out.num_scheduled_tokens
+
+
+def test_a_hold_keeps_the_waiting_order(monkeypatch):
+    """A held request goes back behind an older one upstream didn't admit, not ahead of it."""
+    scheduler = _sliced_scheduler(monkeypatch, max_num_seqs=1)
+    _with_running_decode(scheduler)
+    scheduler.add_request(_text("t0"))
+    scheduler.add_request(_image("img"))
+
+    out, slices = _step(scheduler)
+    assert slices.run == {"h": 2}
+    assert not {"t0", "img"} & set(out.num_scheduled_tokens)
+    assert [r.request_id for r in scheduler.waiting] == ["t0", "img"]
+
+
+def test_reset_encoder_cache_cancels_the_pass_and_starts_it_again(scheduler):
+    _with_running_decode(scheduler)
+    scheduler.add_request(_image("img"))
+    _step(scheduler)
+
+    scheduler.reset_encoder_cache()
+    out, slices = _step(scheduler)
+    assert slices.cancel == ["h"]
+    assert [s.mm_hash for s in slices.start] == ["h"]
+    assert slices.run == {"h": 2}
+    assert "img" not in out.num_scheduled_tokens
+
+
+def test_no_pass_for_an_image_a_running_request_may_still_reach(scheduler):
+    """That request's prefill would find the image cached mid-pass, so upstream encodes it."""
+    _with_running_decode(scheduler)
+    scheduler.requests["t"].mm_features.append(_image("unused").mm_features[0])
+    scheduler.add_request(_image("img"))
+
+    out, slices = _step(scheduler)
+    assert slices is None
+    assert out.scheduled_encoder_inputs == {"img": [0]}
 
 
 def test_text_requests_are_not_held_behind_a_pass(scheduler):

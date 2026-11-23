@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import RequestQueue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
@@ -72,26 +73,32 @@ class TorchSpyreScheduler(Scheduler):
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         if self._vision_slicing is None:
             return self._schedule_capped(*args, **kwargs)
-        slices = self._plan_vision_slices()
+        # Images a running or KV-holding request may still reach (see _wants_vision_pass).
+        elsewhere = {
+            f.identifier
+            for other in (*self.running, *self.kv_holding_waiting)
+            for f in other.mm_features
+        }
+        slices = self._plan_vision_slices(elsewhere)
         # Upstream drains kv_holding_waiting first (e.g. a streaming session's next chunk),
         # and its requests never start a pass, so only an in-flight one holds them.
         held = [
-            (self.waiting, [r for r in self.waiting if self._held_for_vision(r)]),
+            (self.waiting, [r for r in self.waiting if self._held_for_vision(r, elsewhere)]),
             (
                 self.kv_holding_waiting,
                 [r for r in self.kv_holding_waiting if self._reads_vision_pass(r)],
             ),
         ]
+        positions = [{r.request_id: i for i, r in enumerate(queue)} for queue, _ in held]
         for queue, requests in held:
             if requests:
                 queue.remove_requests(requests)
         try:
             output = self._schedule_capped(*args, **kwargs)
         finally:
-            for queue, requests in held:
+            for (queue, requests), position in zip(held, positions):
                 if requests:
-                    # FCFS prepends in reverse, so reverse first to keep their order.
-                    queue.prepend_requests(reversed(requests))
+                    _put_back(queue, requests, position)
         if slices.cancel or slices.start or slices.run:
             setattr(output, VISION_SLICES_ATTR, slices)
         return output
@@ -140,14 +147,14 @@ class TorchSpyreScheduler(Scheduler):
         self._vision_passes.clear()
         self._vision_owners.clear()
 
-    def _plan_vision_slices(self) -> VisionSlices:
+    def _plan_vision_slices(self, elsewhere: set[str]) -> VisionSlices:
         """This step's slices: start a pass if none runs, then advance or finish the current."""
         assert self._vision_slicing is not None
         slices = VisionSlices(cancel=self._vision_cancelled)
         self._vision_cancelled = []
         if not self._vision_passes and self.running:
             for request in self.waiting:
-                if self._wants_vision_pass(request):
+                if self._wants_vision_pass(request, elsewhere):
                     # The head waits for cache space rather than letting later ones pass.
                     self._allocate_vision_passes(request)
                     break
@@ -172,20 +179,23 @@ class TorchSpyreScheduler(Scheduler):
             current.steps_left -= 1
         return slices
 
-    def _held_for_vision(self, request: Request) -> bool:
+    def _held_for_vision(self, request: Request, elsewhere: set[str]) -> bool:
         return self._reads_vision_pass(request) or (
-            bool(self.running) and self._wants_vision_pass(request)
+            bool(self.running) and self._wants_vision_pass(request, elsewhere)
         )
 
     def _reads_vision_pass(self, request: Request) -> bool:
         """Whether an image of the request is mid-pass: its entry already reads as cached."""
         return any(f.identifier in self._vision_passes for f in request.mm_features)
 
-    def _wants_vision_pass(self, request: Request) -> bool:
+    def _wants_vision_pass(self, request: Request, elsewhere: set[str]) -> bool:
         """A new request with an image to encode, that a pass can take.
 
-        Not one whose image a running request may still reach: that request's
-        prefill would find the image cached before its pass finished.
+        Not one whose image a running request may still reach (``elsewhere``): that
+        request's prefill would find the image cached before its pass finished.
+
+        A prefix-cache hit over the image doesn't count: if the image's encoder entry was
+        evicted, it gets a full pass, where upstream would skip the encoder.
         """
         if request.num_computed_tokens or request.status != RequestStatus.WAITING:
             return False
@@ -200,11 +210,6 @@ class TorchSpyreScheduler(Scheduler):
             or max(sizes) > self.max_num_encoder_input_tokens
         ):
             return False
-        elsewhere = {
-            f.identifier
-            for other in (*self.running, *self.kv_holding_waiting)
-            for f in other.mm_features
-        }
         return elsewhere.isdisjoint(new)
 
     def _new_vision_items(self, request: Request) -> dict[str, int]:
@@ -247,3 +252,12 @@ class TorchSpyreScheduler(Scheduler):
         del manager.cached[mm_hash]
         del manager.num_embeds_by_hash[mm_hash]
         manager.freed.append(mm_hash)
+
+
+def _put_back(queue: RequestQueue, held: list[Request], position: dict[str, int]) -> None:
+    """Return held requests to their places in ``queue``, so FCFS admission order survives a
+    hold. A request with no place (one upstream preempted this step) stays at the front."""
+    rest = list(queue)
+    queue.remove_requests(rest)
+    for request in sorted([*rest, *held], key=lambda r: position.get(r.request_id, -1)):
+        queue.add_request(request)

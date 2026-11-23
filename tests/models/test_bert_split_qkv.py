@@ -14,10 +14,14 @@
 
 """CPU-only."""
 
+import importlib
+
+import pytest
 import torch
 import torch.nn as nn
 
-from spyre_inference.custom_ops.bert_split_qkv import split_bert_qkv
+from spyre_inference.models import _ADAPTED_MODULES, spyre_models
+from spyre_inference.models.bert import SpyreSplitQKVMixin, split_bert_qkv
 
 
 class _Capture(nn.Module):
@@ -51,3 +55,16 @@ def test_split_matches_the_fused_projection(default_vllm_config, tp_group):
     assert attn.k_weight_t.is_contiguous() and attn.v_bias.is_contiguous()
     for got, want in zip(attn(x), fused):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "target",
+    sorted(
+        target
+        for target in set(spyre_models().values())
+        if target.partition(":")[0].rpartition(".")[2] in _ADAPTED_MODULES
+    ),
+)
+def test_every_bert_family_model_splits_qkv(target):
+    module, _, name = target.partition(":")
+    assert issubclass(getattr(importlib.import_module(module), name), SpyreSplitQKVMixin)

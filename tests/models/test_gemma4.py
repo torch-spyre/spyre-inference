@@ -248,6 +248,8 @@ def test_moe_recipe_reads_the_decoder_experts_and_router_scale(monkeypatch):
     torch.testing.assert_close(
         recipe.prepare_down_weight(torch.ones(1, 1, 1), slice(1, 2)).flatten(), scale[1:]
     )
+    assert recipe.expert_group == 4
+    assert recipe.expert_group_tokens == (128, 512)
 
 
 @pytest.mark.parametrize(

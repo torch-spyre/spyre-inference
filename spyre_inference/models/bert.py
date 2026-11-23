@@ -120,6 +120,7 @@ def split_bert_qkv(model: nn.Module) -> None:
 
 # Head groups: where torch-spyre's SDPA planner KV-tiles a rectangle's attention but runs half the
 # heads untiled, two groups with their own Q/K/V matmuls and out-proj rows keep Q, K, V out of HBM.
+# Remove once the planner picks the faster plan itself (torch-spyre/torch-spyre#6567).
 _GROUPS = 2
 
 

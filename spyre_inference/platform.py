@@ -310,10 +310,15 @@ class TorchSpyrePlatform(CpuPlatform):
             if not user_supplied and self.max_num_seqs is not None:
                 default = cls._DEFAULT_MAX_NUM_SEQS
                 if getattr(model_config, "runner_type", None) == "pooling":
+                    from spyre_inference.models.roberta import (
+                        cap_max_model_len_for_position_offset,
+                    )
                     from spyre_inference.v1.worker.spyre_shape_bucketer import (
                         pooling_default_max_num_seqs,
                     )
 
+                    # Derive from the capped length: 514 -> 512, not 1024.
+                    cap_max_model_len_for_position_offset(model_config)
                     default = pooling_default_max_num_seqs(model_config.max_model_len)
                 self.max_num_seqs = min(self.max_num_seqs, default)
 

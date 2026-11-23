@@ -131,8 +131,8 @@ def test_perf_tolerance_is_reasserted_after_the_ingest_steps():
     steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"]["ingest"]["steps"]
     names = [s.get("name") for s in steps]
     for arch in ("x86_64", "ppc64le", "s390x"):
-        ingest = next(i for i, n in enumerate(names) if n == f"Ingest XML into shared v2 ClickHouse tables ({arch})")
-        assert ingest < names.index("Verify the perf-tier ingest refusal"), arch
+        ingest_name = f"Ingest XML into shared v2 ClickHouse tables ({arch})"
+        assert names.index(ingest_name) < names.index("Verify the perf-tier ingest refusal"), arch
     step = next(s for s in steps if s.get("name") == "Verify the perf-tier ingest refusal")
     assert "steps.extract-tier.outputs.perf == 'true'" in step["if"]
     assert "exit 1" in step["run"], "the verify step must be able to fail the job"

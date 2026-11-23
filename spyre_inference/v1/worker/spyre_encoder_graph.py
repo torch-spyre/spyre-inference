@@ -58,15 +58,16 @@ class _Segment(NamedTuple):
 class SpyreEncoderGraphManager(EncoderCudaGraphManager):
     """Compiles the encoder at each token budget during warmup, then serves through it.
 
-    Inherited from upstream: budget selection and user overrides, packing items into budgets,
-    replay padding, and the per-item output split. Overridden: capture compiles the model's
-    graphs at that budget's static shape, replay copies the inputs into host staging
-    buffers, uploads them and runs those graphs, and the manager counts as captured
-    while those buffers are staged.
+    Inherited from upstream: budget selection, user overrides, replay padding, and the
+    per-item output split. Capture compiles the model's graphs at that budget's static
+    shape and keeps the upload as device slot 0. Packing is a copy of upstream's greedy
+    pack (``_plan_batches``), so the next batch is known before the current forward
+    returns. The manager counts as captured while the host staging buffers are live.
 
-    Packed batches do not depend on each other. While one forward is still on the device,
-    the next batch is padded on the host and its H2D is enqueued, so that work is done by
-    the time the device result is copied back.
+    Packed batches do not depend on each other. After the device forward, the next batch
+    at the same ``(path, budget)`` is padded into slot 1 and its upload is enqueued. The
+    download of the current result is what waits for that upload. A different path or
+    budget uses its own slot 0, which is not in flight.
     """
 
     def __init__(
@@ -149,6 +150,8 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         self._device_slots: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
         self._queue: list[_QueuedCall] | None = None
         self._armed: _Armed | None = None
+        # Slot in flight for one (path, budget). Another key's slot 0 is idle.
+        self._current_key: tuple[str, int] | None = None
         self._current_slot = 0
 
     def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
@@ -325,8 +328,10 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         ).values
         t0 = time.time()
         device_inputs = self._upload(values)
+        # Same entry as replay. ``encoder_cudagraph_forward`` only adds the host download.
+        model = cast("SpyreVisionEncoderMixin", self.model)
         with torch.inference_mode():
-            self.model.encoder_cudagraph_forward(device_inputs, path=path)
+            model._encoder_device_forward(device_inputs, path=path)
         logger.info("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
         self._staging.setdefault(path, {})[token_budget] = values
         self._device_slots[(path, token_budget, 0)] = device_inputs
@@ -347,8 +352,15 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         if self._queue is not None:
             if not self._queue:
                 raise RuntimeError("encoder batch queue underflow")
-            queued = self._queue.pop(0)
-            if queued != (mm_kwargs, token_budget, path, axis_keys):
+            queued_kwargs, queued_budget, queued_path, queued_axes = self._queue.pop(0)
+            # Identity, not equality: the kwargs hold tensors, and dict equality would
+            # raise "Boolean value of Tensor with more than one value is ambiguous".
+            if (
+                queued_kwargs is not mm_kwargs
+                or queued_budget != token_budget
+                or queued_path != path
+                or queued_axes != axis_keys
+            ):
                 raise RuntimeError("encoder batch queue does not match the call")
         staging = self._staging.get(path, {}).get(token_budget)
         num_items = len(self._get_item_specs(mm_kwargs))
@@ -364,6 +376,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             self._armed = None
             slot = 0
             device_inputs = self._fill_and_copy(mm_kwargs, token_budget, path, slot)
+        self._current_key = (path, token_budget)
         self._current_slot = slot
         model = cast("SpyreVisionEncoderMixin", self.model)
         with torch.inference_mode():
@@ -383,7 +396,12 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         mm_kwargs, token_budget, path, axis_keys = queue[0]
         if self._staging.get(path, {}).get(token_budget) is None:
             return
-        slot = 1 - self._current_slot
+        # Only the key this forward is reading needs the other slot. A different
+        # path or budget still has slot 0 free.
+        if self._current_key == (path, token_budget):
+            slot = 1 - self._current_slot
+        else:
+            slot = 0
         device_inputs = self._fill_and_copy(mm_kwargs, token_budget, path, slot)
         self._armed = (token_budget, path, axis_keys, slot, device_inputs)
 
@@ -424,7 +442,11 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             if dst.data_ptr() == buf.data_ptr() and dst.storage_offset() == buf.storage_offset():
                 # CPU replay keeps the host buffer as the device buffer.
                 continue
-            if dst.device.type == "spyre":
+            if dst.device.type == "spyre" and slot == 1:
+                # The current download syncs the stream before the next forward reads
+                # this slot. Slot 0 is read on the next line, so that copy stays blocking:
+                # a non_blocking H2D elsewhere in this repo must be followed by
+                # torch.spyre.synchronize before the tensors are consumed.
                 dst.copy_(buf, non_blocking=True)
             else:
                 dst.copy_(buf)
@@ -443,6 +465,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         self._device_slots.clear()
         self._queue = None
         self._armed = None
+        self._current_key = None
         self._current_slot = 0
 
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

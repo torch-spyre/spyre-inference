@@ -337,9 +337,15 @@ upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
 the output per image. The mixin caps the largest budget at `max_model_len`: an image's encoder
 tokens are among its prompt's, so a larger one never reaches the encoder (granite vision, whose
 padded tiles can outnumber its placeholders, keeps its own range). `SpyreEncoderGraphManager`
-(`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
-compiles the encoder at that static shape during warmup, and replay uploads the padded
-inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
+(`v1/worker/spyre_encoder_graph.py`) replaces capture, packing, and replay. Capturing a
+budget compiles the encoder at that static shape and keeps the upload as device slot 0.
+Packing is a copy of upstream's greedy pack, including the `vision_pack_tokens` split, run
+as one queue so the next batch is known before the current forward returns. Replay copies
+into the live slot with a blocking upload, runs the three graphs, then pads the next batch
+at the same `(path, budget)` into slot 1 and enqueues that upload. The download of the
+current result waits for the device, which completes the queued upload. A different path or
+budget uses its own idle slot 0, and slot 1 is allocated the first time a key overlaps
+itself. Warmup compiles every budget, largest first, after the attention
 kernels, so the compile guard covers the vision graphs. Upstream's
 `GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
 the embedding merge, encoder cache and decoder are unchanged.

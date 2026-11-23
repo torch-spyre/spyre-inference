@@ -292,20 +292,95 @@ def test_unstaged_next_budget_replays_the_following_batch_from_slot_0():
     assert slots == [0, 0]
 
 
-def test_plan_matches_upstream_execute_local():
-    """The copied packer stays in step with ``EncoderCudaGraphManager._execute_local``."""
+def _assert_plan_matches(manager, model, mixes: list[list[int]]) -> None:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
-    model = _FakeVisionModel(max_tokens=300)
-    manager = _manager(model)
-    manager.capture(graph_pool=None)
-    for tokens in ([10, 30], [15, 20], [20, 25]):
+    for tokens in mixes:
         model.forward_patches.clear()
         manager.execute({"tokens": tokens})
         ours = list(model.forward_patches)
         model.forward_patches.clear()
         EncoderCudaGraphManager._execute_local(manager, {"tokens": tokens})
         assert model.forward_patches == ours
+
+
+def test_plan_matches_upstream_execute_local():
+    """The copied packer stays in step with ``EncoderCudaGraphManager._execute_local``.
+
+    Covers the defer and merge branches, the ``max_batch_size`` cut, a two-path fit,
+    and the eager fallback when no budget holds the item.
+    """
+    from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphPathConfig, EncoderItemSpec
+
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    _assert_plan_matches(manager, model, [[10, 30], [15, 20], [20, 25]])
+
+    manager.max_batch_size = 1
+    _assert_plan_matches(manager, model, [[10, 10, 30]])
+
+    manager.path_token_budgets = {"default": [16]}
+    _assert_plan_matches(manager, model, [[30]])
+
+    two_path = _FakeVisionModel(max_tokens=300)
+    config = two_path.get_encoder_cudagraph_config()
+    paths = {"local": EncoderCudaGraphPathConfig(), "global": EncoderCudaGraphPathConfig()}
+    two_path.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, paths=paths)
+    two_path.get_encoder_cudagraph_item_specs = lambda mm_kwargs: [
+        EncoderItemSpec(t * MERGE_PATCHES, t, {"local": t, "global": t})
+        for t in mm_kwargs["tokens"]
+    ]
+    two_path.postprocess_encoder_output = lambda outputs, indices, tokens, dest, **kw: [
+        dest.__setitem__(i, outputs["local"][:t] + outputs["global"][:t])
+        for i, t in zip(indices, [tokens[i] for i in indices])
+    ]
+    two_path_manager = _manager(two_path)
+    two_path_manager.capture(graph_pool=None)
+    two_path_manager.max_batch_size = 1
+    _assert_plan_matches(two_path_manager, two_path, [[10, 30]])
+
+
+def test_queue_mismatch_does_not_compare_tensor_values():
+    """Distinct kwargs objects must raise the queue error, not a tensor-boolean error."""
+    manager = _manager(_FakeVisionModel())
+    other = {"tokens": [10], "patches": torch.ones(2, 2)}
+    manager._queue = [(other, 16, "default", ())]
+    with pytest.raises(RuntimeError, match="encoder batch queue does not match"):
+        manager._run_budget_graph({"tokens": [10]}, 16)
+
+
+def test_a_different_path_reuses_its_own_slot_0():
+    """Slot 1 is only for the (path, budget) the current forward is still reading."""
+    from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphPathConfig, EncoderItemSpec
+
+    model = _FakeVisionModel()
+    config = model.get_encoder_cudagraph_config()
+    paths = {"local": EncoderCudaGraphPathConfig(), "global": EncoderCudaGraphPathConfig()}
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(config, paths=paths)
+    model.get_encoder_cudagraph_item_specs = lambda mm_kwargs: [
+        EncoderItemSpec(t * MERGE_PATCHES, t, {"local": t, "global": t})
+        for t in mm_kwargs["tokens"]
+    ]
+    model.postprocess_encoder_output = lambda outputs, indices, tokens, dest, **kw: [
+        dest.__setitem__(i, outputs["local"][:t] + outputs["global"][:t])
+        for i, t in zip(indices, [tokens[i] for i in indices])
+    ]
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    slots: list[tuple[str, int]] = []
+    forward = model._encoder_device_forward
+
+    def recording_forward(inputs, path="default"):
+        slots.append((path, manager._current_slot))
+        return forward(inputs, path)
+
+    model._encoder_device_forward = recording_forward
+    manager.execute({"tokens": [10]})
+
+    assert {path for path, _ in slots} == {"local", "global"}
+    assert [slot for _, slot in slots] == [0, 0]
+    assert all(slot == 0 for _, _, slot in manager._device_slots)
 
 
 def test_execute_packs_pads_per_block_and_splits_per_item():

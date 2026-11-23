@@ -85,7 +85,7 @@ code: "Code layers" {
     grid-gap: 14
 
     mixin: "SpyreVisionEncoderMixin (models/_vision_encoder.py)\nprotocol: config (per-group padding) · budget_range · item_specs\ncapture_inputs · replay_buffers · encoder_cudagraph_forward\nencoder_eager_forward · postprocess_encoder_output · embed_multimodal\ncompile_vision_graphs" {class: spyre}
-    gm: "SpyreEncoderGraphManager (v1/worker/spyre_encoder_graph.py)\n__init__: budgets aligned to vision_patch_multiple,\nlargest-item coverage check, items-per-call cap\n_capture_budget_graph · _run_budget_graph · _upload" {class: spyre}
+    gm: "SpyreEncoderGraphManager (v1/worker/spyre_encoder_graph.py)\n__init__: budgets aligned to vision_patch_multiple,\nlargest-item coverage check, items-per-call cap\n_plan_batches (copy of upstream pack) · _execute_segments\n_capture_budget_graph · _run_budget_graph\nslot 0 kept from capture, slot 1 lazy per (path, budget)" {class: spyre}
     helpers: "VisionBuffer · GatherTable · offset_major" {class: spyre}
     runner: "TorchSpyreModelRunner · _SpyreModelWrapper\n_record_vision_graphs · _compiled_vision_model\n_create_encoder_cudagraph_manager · _warmup_input_embedding\nembed_multimodal · embed_input_ids" {class: spyre}
   }
@@ -130,8 +130,8 @@ warmup: "1. Warmup at boot (after the attention kernels)" {
   card: "Spyre card" {
     class: card
     direction: down
-    up: "_upload\none H2D" {class: device}
-    fwd: "encoder_cudagraph_forward\ncompiles the three graphs\nat this budget" {class: device}
+    up: "_upload\nslot 0, kept for replay" {class: device}
+    fwd: "_encoder_device_forward\ncompiles the three graphs\nat this budget" {class: device}
     up -> fwd
   }
 
@@ -150,20 +150,21 @@ serving: "2. Serving a step" {
     direction: right
     mm: "GPUModelRunner._execute_mm_encoder\nmm_kwargs -> manager.execute" {class: host}
     specs: "get_encoder_cudagraph_item_specs\nvision_item_tokens" {class: host}
-    pack: "upstream manager\ngreedy packing into budgets\nselect_encoder_cudagraph_items" {class: host}
+    pack: "Spyre _plan_batches\ncopy of upstream greedy pack\none queue, including lone large items" {class: host}
     inputs: "replay_buffers\nvision_inputs (model), validated, unpadded" {class: host}
     pad: "padding_logics\nper-group padding into staging" {class: host}
     mm -> specs -> pack -> inputs -> pad
   }
 
-  card: "Spyre card: encoder_cudagraph_forward" {
+  card: "Spyre card: _encoder_device_forward" {
     class: card
     direction: right
-    up: "_upload\none H2D" {class: device}
+    up: "live slot\nblocking H2D\n(or the slot armed earlier)" {class: device}
     embed: "vision_embed\npatches, mask, RoPE gather" {class: device}
     blocks: "vision_blocks ×N" {class: device}
     project: "vision_project\nmerge, adapter" {class: device}
-    up -> embed -> blocks -> project
+    arm: "stage the next batch\nasync H2D into the other slot\nsame (path, budget) only" {class: device}
+    up -> embed -> blocks -> project -> arm
   }
 
   back: "return (host)" {
@@ -178,7 +179,7 @@ serving: "2. Serving a step" {
   }
 
   prep.pad -> card.up
-  card.project -> back.d2h
+  card.arm -> back.d2h
 }
 
 legend: "Legend" {

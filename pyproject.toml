@@ -91,8 +91,8 @@ required-environments = [
 ]
 
 override-dependencies = [
-    # Any triton request resolves to triton-cpu, never PyPI's CUDA build. Only the dev group
-    # asks for it: the reference the MRV2 host kernels' parity tests run against.
+    # Any triton request resolves to triton-cpu, never PyPI's CUDA build. Only the triton-cpu
+    # group asks for it: the reference the MRV2 host kernels' parity tests run against.
     # `< '3.12'`, not `== '3.11'`: the latter leaves an x86_64 python<3.11 fork that fails `uv lock --upgrade`.
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version < '3.12'",
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version >= '3.12'",
@@ -174,7 +174,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.33.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "ef9133f8d36f9e4d9e641b82105a9dbd91df34c9" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "4787c100b4ff64a47113cbad2850bb535b3f69f6" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -230,7 +230,8 @@ provides-extras = ["optree", "opt-einsum", "pyyaml"]
 # Vendored static metadata for the source-built (ppc64le/s390x) torchvision, copied
 # from torchvision 0.29.1 on PyPI.
 # xgrammar 0.2.8's own metadata, without `triton; platform_machine == "x86_64"`: it
-# imports Triton lazily for an optional bitmask kernel, and Triton stays dev-only (#1238).
+# imports Triton lazily for an optional bitmask kernel, and only the opt-in triton-cpu group
+# installs Triton (#1238).
 [[tool.uv.dependency-metadata]]
 name = "xgrammar"
 version = "0.2.8"
@@ -409,6 +410,7 @@ markers = [
     "rmsnorm: RMSNorm and GemmaRMSNorm custom-op tests (tests/custom_ops/test_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
     "runtime: encoder inline-dispatch tests (tests/runtime/test_encoder_inline_dispatch.py); CPU-only",
+    "triton_cpu: MRV2 host-kernel parity against triton-cpu (tests/mrv2); opt-in, collected only when -m names it; skipped off x86, an error on x86 without the triton-cpu group",
 ]
 # --8<-- [end:test-markers-definition]
 
@@ -436,8 +438,8 @@ plugins.md007.indent = 4
 dev = [
     "spyre-testing-plugin",
     "coverage",
-    # SPYRE_MRV2_KERNELS=triton, the parity reference for the MRV2 host kernels (x86 only)
-    "triton; platform_machine == 'x86_64'",
     # pandas 3.1.0 fails to build from source on s390x (pandas-dev/pandas#71548)
     "pandas!=3.1.0; platform_machine == 's390x'",
 ]
+# Opt-in, x86 only: the MRV2 host kernels' parity reference. Not a default group.
+triton-cpu = ["triton; platform_machine == 'x86_64'"]

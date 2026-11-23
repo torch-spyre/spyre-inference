@@ -42,8 +42,9 @@ on:
         default: false
       clickhouse_env:
         description: >
-          ClickHouse instance to ingest into: "prod" (the CLICKHOUSE_* secret
-          set) or "dev" (the CLICKHOUSE_*_DEV set).
+          ClickHouse instance to ingest into (schema-v2 database only): "prod" (the
+          CLICKHOUSE_V2_* login, host and port falling back to CLICKHOUSE_HOST/_PORT)
+          or "dev" (the CLICKHOUSE_*_DEV set).
         required: false
         type: choice
         options: [prod, dev]
@@ -209,12 +210,14 @@ jobs:
       - name: Ingest benchmark results into ClickHouse
         if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
         env:
-          CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
-          CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
-          CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
-          CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
-          CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
-          CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+          # `prod && X || dev && Y || ''` so an empty secret never falls through to the other
+          # environment's value.
+          CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && (secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || inputs.clickhouse_env == 'dev' && secrets.CLICKHOUSE_HOST_DEV || '' }}
+          # The prod port follows whichever host is used.
+          CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT || !secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT) || inputs.clickhouse_env == 'dev' && secrets.CLICKHOUSE_PORT_DEV || '' }}
+          CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_V2_USER || inputs.clickhouse_env == 'dev' && secrets.CLICKHOUSE_USER_DEV || '' }}
+          CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_V2_PASSWORD || inputs.clickhouse_env == 'dev' && secrets.CLICKHOUSE_PASS_DEV || '' }}
+          CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'dev' && secrets.CLICKHOUSE_DB_V2_DEV || inputs.clickhouse_env != 'dev' && 'spyre_v2' || '' }}
           BENCHMARK_BRANCH: ${{ github.ref_name }}
           BENCHMARK_SHA: ${{ github.sha }}
           PR_NUMBER: "0"

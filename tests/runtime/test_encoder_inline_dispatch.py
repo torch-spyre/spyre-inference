@@ -223,7 +223,7 @@ class TestTracedForward:
         assert layer.forward(query, key, value, output_dtype=torch.float32) == "upstream"
 
     def test_an_extent_past_4096_stays_on_the_opaque_path(self, monkeypatch):
-        """The fused 8192 block graph scores a long rerank pair ~0.004 (#1723).
+        """The fused 8192 block graph scores a long rerank pair ~0.004.
 
         The opaque kernel matches the CPU score, so that extent must not be traced in.
         """

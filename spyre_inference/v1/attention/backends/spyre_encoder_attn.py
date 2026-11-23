@@ -72,7 +72,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 # cache and so no block walk -- this is alignment, not a block size.
 ENCODER_LEN_ALIGNMENT = 64
 # Longer than this, fusing attention into the block graph scores a relevant
-# bge-reranker pair ~0.004 instead of ~0.92 (#1723). The opaque kernel matches.
+# bge-reranker pair ~0.004 instead of ~0.92. The opaque kernel matches.
 # The cutoff is the mask's extent, so each rectangle's graph takes one side.
 _INLINE_MAX_EXTENT = 4096
 
@@ -960,7 +960,7 @@ def _spyre_encoder_attention_forward(
     mask = _encoder_grid.mask
     # The inline path returns [tokens, num_heads * head_size], so a caller asking for any
     # other output shape or dtype has to take the fallthrough. So does an extent past
-    # _INLINE_MAX_EXTENT: the fused graph scores that rectangle wrong (#1723).
+    # _INLINE_MAX_EXTENT: the fused graph scores that rectangle wrong.
     if (
         mask is None
         or mask.shape[-1] > _INLINE_MAX_EXTENT

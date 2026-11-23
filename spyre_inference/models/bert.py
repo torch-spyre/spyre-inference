@@ -53,11 +53,28 @@ _QKV = ("q", "k", "v")
 
 
 def _split_qkv_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    proj = self.qkv_proj
     q, k, v = (
-        spyre_linear_t(hidden_states, getattr(self, f"{n}_weight_t"), getattr(self, f"{n}_bias"))
+        spyre_linear_t(hidden_states, getattr(proj, f"{n}_weight_t"), getattr(proj, f"{n}_bias"))
         for n in _QKV
     )
     return self.attn(q, k, v)
+
+
+class _SplitQKVLinearMethod(SpyreUnquantizedLinearMethod):
+    def __init__(self, sizes: list[int]) -> None:
+        self.sizes = sizes
+
+    def build_weight_t(self, layer: nn.Module, w: torch.Tensor) -> None:
+        # Reload restores the original fused weight, then copies these processed
+        # parameters into their existing storage, including compiled graph references.
+        # The retained bias can still be on Spyre while the restored weight is on CPU.
+        bias = cast(torch.Tensor, layer.bias).data.to(w.device) if layer.bias is not None else None
+        biases = bias.split(self.sizes) if bias is not None else (None,) * 3
+        for n, shard, b in zip(_QKV, w.split(self.sizes, dim=0), biases):
+            layer.register_parameter(f"{n}_weight_t", _frozen(shard.t()))
+            layer.register_parameter(f"{n}_bias", None if b is None else _frozen(b))
+        del layer.weight
 
 
 def split_bert_qkv(model: nn.Module) -> None:
@@ -78,13 +95,10 @@ def split_bert_qkv(model: nn.Module) -> None:
         if proj.weight.device.type != "cpu":
             continue
         sizes = [module.q_size, module.kv_size, module.kv_size]
-        weight = cast(torch.Tensor, proj.weight).data  # stored transposed: [in, q + 2kv]
-        weights = torch.split(weight, sizes, dim=1)
-        biases = torch.split(proj.bias.data, sizes) if proj.bias is not None else (None,) * 3
-        for n, w, b in zip(_QKV, weights, biases):
-            module.register_parameter(f"{n}_weight_t", _frozen(w))
-            module.register_parameter(f"{n}_bias", None if b is None else _frozen(b))
-        del module.qkv_proj
+        proj.quant_method = _SplitQKVLinearMethod(sizes)
+        # Initial loading already transposed the weight. Retain the projection
+        # and its bias so vLLM's checkpoint mapper and reload metadata stay valid.
+        proj.quant_method.build_weight_t(proj, cast(torch.Tensor, proj.weight).data.t())
         module.forward = _split_qkv_forward.__get__(module)  # ty: ignore[invalid-assignment]
         count += 1
     if count:
@@ -101,6 +115,16 @@ class SpyreSplitQKVMixin:
 
     def process_weights_after_loading(self) -> None:
         split_bert_qkv(cast(nn.Module, self))
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        if loaded is not None:
+            for prefix, module in cast(nn.Module, self).named_modules():
+                if isinstance(getattr(module, "quant_method", None), _SplitQKVLinearMethod):
+                    for source, target in (("weight", "weight_t"), ("bias", "bias")):
+                        if f"{prefix}.{source}" in loaded:
+                            loaded.update(f"{prefix}.{n}_{target}" for n in _QKV)
+        return loaded
 
 
 class SpyreBertEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, BertEmbedding):

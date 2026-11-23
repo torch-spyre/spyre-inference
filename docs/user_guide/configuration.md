@@ -307,7 +307,14 @@ bucket pair, when any of these holds:
   `MAX_BUCKETS`; startup logs a warning;
 - the layer uses sliding-window attention.
 
-The batched decode kernel always uses the KV buckets.
+The batched decode kernel takes its chunk count at run time in the same way, and under the
+same conditions. The kernel reads the KV cache one *chunk* per loop step: the next
+`32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
+cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
+and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
+masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
+chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
+num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
 
 ## KV cache size
 
@@ -354,6 +361,24 @@ The scales are compiled into the graphs as constants. A checkpoint whose layers 
 different KV scales therefore compiles the transformer block and each recorded attention
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.
+
+## Model runner
+
+The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
+host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so no Triton install is
+needed on any architecture.
+
+Set `SPYRE_MODEL_RUNNER=v1` to fall back to the V1 model runner. The fallback is
+best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
+the V1 runner (#1245). The plugin sets `VLLM_USE_V2_MODEL_RUNNER` from
+`SPYRE_MODEL_RUNNER`, so don't set it yourself.
+
+Differences on V2:
+
+- Seeded sampling draws a different token sequence for the same seed, because MRV2
+  seeds each position rather than one generator per request. Greedy output is unchanged.
+- These are refused at startup: speculative decoding other than DFlash/XPress,
+  batch-sharded sampling, `cudagraph_mm_encoder`, and prefill context parallelism.
 
 ## Offline engine in the calling process
 

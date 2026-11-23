@@ -144,6 +144,20 @@ Three adaptations worth knowing:
   all-expert form whatever its size, since each row's storage offset has to span whole sticks
   for the compiled loop to address it; a single token is handed to the gathered form whole, so
   it never needs that.
+  Traced into a compiled block, the all-expert form is one `for_each_tile` loop over the
+  experts, one expert per trip on all cores. A model's recipe can run G experts per trip
+  (`SpyreMoERecipe.expert_group`, default 1) for the stick-aligned batch sizes in
+  `expert_group_tokens`, both ends included: the cores form G groups, each core takes a block
+  of tokens through one whole expert, each group adds into its own accumulator, and one sum
+  over the G accumulators follows the loop. Only fp16 rounding changes. The range is the
+  recipe's because the batch sizes where grouping pays depend on the model's expert shapes.
+  G must divide the expert count and the core count, and the cores must divide a stick of
+  tokens; a recipe group that does not fit runs one expert per trip, with a warning. The
+  accumulators stay in LX only on a torch-spyre that gives the sum after the loop a relayout
+  copy of the loop's carry; without it the values are the same and the accumulators live in
+  HBM. Batches outside the range, batches that are not whole sticks of tokens (the usual decode
+  sizes) and the eager forms are unchanged. The gemma-4 recipe runs G = 4 for 128 to 512
+  tokens. Device tests cover a grouped loop at TP 1, and at TP 2 on the nano checkpoint.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` stacks those forms contract on (see
   [MoE expert weights](#moe-expert-weights)), freeing each source stack as it goes,
@@ -447,9 +461,11 @@ compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
-declined at dispatch. A single step can carry a mix of prefill and decode sequences; each
-sequence is padded to its own query bucket (decodes use the length-1 bucket) before
-dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
+just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
+recorded at the chunk count of `max_model_len`, that runs every longer batch. A single step can carry a mix of prefill
+and decode sequences; each sequence is padded to its own query bucket (decodes use the
+length-1 bucket) before dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows

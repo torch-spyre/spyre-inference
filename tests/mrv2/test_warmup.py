@@ -45,6 +45,7 @@ def _runner(*, pooling=False, eager=False, buckets=(1, 2, 4, 64, 512), max_reqs=
         is_pooling_model=pooling,
         max_num_reqs=max_reqs,
         max_num_tokens=max_tokens,
+        num_speculative_steps=0,
         speculator=None,
     )
 
@@ -103,25 +104,72 @@ def test_a_decoder_dummy_publishes_null_slots_and_a_pooling_one_does_not(monkeyp
     assert seen == [(8, True, True), (16, False, True)]
 
 
-def test_a_pooling_dummy_hands_back_device_hidden_states(monkeypatch) -> None:
-    """Upstream gathers logits_indices on the host, so the wrapper is told to D2H for
-    the call; the pooler then reads the hidden states where it expects them."""
+class _DeviceOutput(nn.Module):
+    """Stands in for a Spyre model: its output layout is one a host copy doesn't keep."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.out = torch.arange(24, dtype=torch.float16).reshape(4, 6).t()
+
+    def forward(self, x):
+        return self.out
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_a_pooling_dummy_hands_the_pooler_the_raw_device_output(fail) -> None:
+    """Upstream gathers logits_indices on the host, so the wrapper D2Hs for the call; a
+    round trip would change the Spyre layout, so the pooler gets the model's own output."""
+    model = _DeviceOutput()
+    wrapper = _SpyreModelWrapper(
+        model, torch.device("cpu"), model_dtype=torch.float16, keep_outputs_on_device=True
+    )
     flags = []
-    wrapper = _wrapper(keep_outputs_on_device=True)
 
     def upstream(num_tokens, *, skip_attn, is_profile):
         flags.append(wrapper._keep_outputs_on_device)
-        return torch.zeros(num_tokens, 4), None
+        wrapper(torch.zeros(num_tokens))
+        if fail:
+            raise RuntimeError("dummy failed")
+        host = model.out.contiguous()
+        return host, host[-1:]
 
-    moved = []
-    monkeypatch.setattr(warmup, "convert", lambda t, device: moved.append(device) or t)
-    runner = SimpleNamespace(model=wrapper, _dummy_run=upstream, spyre_device="spyre")
+    runner = SimpleNamespace(model=wrapper, _dummy_run=upstream, spyre_device="cpu")
 
-    warmup._dummy_run(runner, 4, skip_attn=False)
-
+    if fail:
+        with pytest.raises(RuntimeError, match="dummy failed"):
+            warmup._dummy_run(runner, 6, skip_attn=False)
+    else:
+        hidden, last = warmup._dummy_run(runner, 6, skip_attn=False)
+        assert hidden is model.out
+        torch.testing.assert_close(last, model.out[-1:])
     assert flags == [False]
     assert wrapper._keep_outputs_on_device is True
-    assert moved == ["spyre"]
+    assert wrapper._model is model
+
+
+def test_a_pooling_warmup_warms_the_row_widths_on_the_recompacted_output(monkeypatch) -> None:
+    """LAST and token poolers read select_rows' output, whose layout can differ."""
+    hidden = torch.zeros(8, 4)
+    packed = torch.zeros(8, 4)
+    warmed = []
+    monkeypatch.setattr(
+        warmup, "encoder_shape_tables", lambda config: SimpleNamespace(rectangles=[(4, 2)])
+    )
+    monkeypatch.setattr(warmup, "select_rows", lambda source, rows: packed)
+    monkeypatch.setattr(
+        warmup, "warm_pooler_row_widths", lambda pooler, h, rects, n: warmed.append(h)
+    )
+    runner = SimpleNamespace(
+        pooling_runner=SimpleNamespace(dummy_pooler_run=lambda h: None),
+        pooling_on_spyre=True,
+        vllm_config=None,
+        get_model=lambda: SimpleNamespace(pooler=None),
+        max_num_reqs=2,
+    )
+
+    warmup._warm_pooling(runner, hidden)
+
+    assert len(warmed) == 2 and warmed[0] is hidden and warmed[1] is packed
 
 
 def _mm_runner(*, pooling=False, compiled_tower_blocks=0, encoder_only=False, mm=True):
@@ -259,6 +307,35 @@ def test_run_warms_every_logits_row_bucket_including_the_prompt_logprobs_chunk(
     assert dummies == [chunk, 1]
     assert sampled == [max_reqs, 1]
     assert projected == [chunk]
+
+
+def test_run_warms_the_sampled_row_gathers_at_every_draft_width(monkeypatch) -> None:
+    """A spec-decode step samples every draft position and the bonus row per request."""
+    monkeypatch.setattr(warmup, "allocate_staging_buffers", lambda *args: None)
+    monkeypatch.setattr(
+        warmup, "_set_spyre_compilation_settings", lambda config: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        warmup, "_dummy_run", lambda runner, n, skip: (torch.zeros(n, 4), torch.zeros(1, 4))
+    )
+    widths = []
+    monkeypatch.setattr(
+        warmup, "warm_sample_row_gathers", lambda model, hidden, rows: widths.append(rows)
+    )
+    runner = _runner(buckets=(1, 4, 16, 64), max_reqs=4, max_tokens=64)
+    runner.num_speculative_steps = 3
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.pooling_runner = None
+    runner.supports_mm_inputs = False
+    runner.get_model = lambda: None
+    runner.spyre_kv_caches = {}
+    runner.spyre_device = torch.device("cpu")
+    runner.model = SimpleNamespace(_logits_row_buckets=[], compute_logits=lambda h: None)
+    runner._dummy_sampler_run = lambda hidden: None
+
+    warmup.run(runner)
+
+    assert widths and all(rows == [1, 4, 16] for rows in widths)
 
 
 def _builder() -> SpyreAttentionMetadataBuilder:

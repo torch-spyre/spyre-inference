@@ -14,13 +14,14 @@
 
 """Tests for the Spyre GateLinear swap (custom_ops/gate_linear.py).
 
-``GateLinear`` is the router gate every MoE model builds, and adapters ask for
-fp32 router logits (``out_dtype=torch.float32``) so the routing softmax reduces
-in fp32. Spyre cannot restickify fp32, so ``SpyreGateLinear`` clears
-``out_dtype`` — keyword or positional — and ``moe._route_reduce_dtype``
-promotes the reduction instead. The transposed-weight mixin gives the gate the
+Models can request fp32 router logits (``out_dtype=torch.float32``). Spyre cannot
+restickify fp32, so ``SpyreGateLinear`` clears ``out_dtype`` for keyword and
+positional callers. MoE selects its reduction dtype separately, promoting only
+when the layout permits it. The transposed-weight mixin gives the gate the
 same Spyre-fast ``x @ Wᵀ`` GEMM as every other unquantized linear.
 """
+
+import warnings
 
 import pytest
 import torch
@@ -30,11 +31,11 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 HIDDEN, EXPERTS = 128, 32
 
 
-def _make_gate(out_dtype=None, bias=False):
+def _make_gate(out_dtype=None, bias=False, *, hidden=HIDDEN):
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
     return GateLinear(
-        HIDDEN,
+        hidden,
         EXPERTS,
         bias=bias,
         out_dtype=out_dtype,
@@ -86,24 +87,42 @@ def test_gate_linear_matches_reference(tp_group, num_tokens, use_bias):
     torch.testing.assert_close(out.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8])
-def test_gate_linear_matches_reference_on_spyre(tp_group, num_tokens):
+@pytest.mark.parametrize(
+    "num_tokens,hidden,compiled",
+    [
+        pytest.param(1, HIDDEN, False, id="1"),
+        pytest.param(8, HIDDEN, False, id="8"),
+        pytest.param(7, 2816, True, id="gemma4-compiled"),
+    ],
+)
+def test_gate_linear_matches_reference_on_spyre(tp_group, num_tokens, hidden, compiled):
     """The router-gate GEMM lowers on the card and the logits stay fp16 there:
     an out_dtype cast to fp32 would need a restickify the device cannot do."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
     torch.manual_seed(0)
-    gate = _make_gate(out_dtype=torch.float32)
+    gate = _make_gate(out_dtype=torch.float32, hidden=hidden)
     gate.weight.data.normal_(std=0.02)
 
     torch.manual_seed(1)
-    x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16)
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16)
     expected = F.linear(x.float(), gate.weight.data.float())
 
     gate.quant_method.process_weights_after_loading(gate)
     gate = gate.to("spyre")
-    out, _ = gate(x.to("spyre"))
+    if compiled:
+        gate = torch.compile(gate, fullgraph=True, dynamic=False, backend="inductor")
 
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        out, returned_bias = gate(x.to("spyre"))
+        assert out.device.type == "spyre"
+        actual = out.cpu()
+
+    assert returned_bias is None
     assert out.dtype == torch.float16
-    torch.testing.assert_close(out.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+    # Same atol as the other 2816-wide fp16 reductions (test_mlp.py).
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)

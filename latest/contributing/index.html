@@ -2570,7 +2570,7 @@ kinds of case:</p>
   marker expression pulls the cached checkout in automatically (no <code>--upstream</code> flag).</li>
 </ul>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>make<span class="w"> </span>test-quality<span class="w">              </span><span class="c1"># the whole gate, one card</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>make<span class="w"> </span>test-quality-shard-0<span class="w">      </span><span class="c1"># one CI shard (QUALITY_SHARDS=8)</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>make<span class="w"> </span>test-quality-shard-0<span class="w">      </span><span class="c1"># one CI shard (QUALITY_SHARDS=5)</span>
 </span></code></pre></div>
 <p>CI runs the gate as <code>QUALITY_SHARDS</code> parallel 1-card jobs, weighted by recorded runtime like
 the smoke and attention suites. The slowest single case bounds the useful shard count, so

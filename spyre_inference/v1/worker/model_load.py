@@ -69,12 +69,19 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
     fix_padded_qk_norm_eps(model, text_config, model_config)
 
 
+def keep_attention_buffers_on_host() -> None:
+    """Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
+
+    Note: This _apply cannot reside in SpyreAttentionImpl, as it is not an nn.Module,
+    but just the attention implementation. It patches the class for good, so every
+    path that loads or moves a model calls it.
+    """
+    Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+
+
 def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     """Move the layer weights to Spyre."""
-    # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-    # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
-    # an nn.Module, but just the attention implementation.
-    Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+    keep_attention_buffers_on_host()
     model.to(device=device)
 
 

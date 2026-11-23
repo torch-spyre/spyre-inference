@@ -26,9 +26,14 @@ uv sync --group dev            # dev install with test deps
 uv run pytest                  # local tests only
 uv run pytest -m upstream      # upstream vLLM compat tests (cached in ~/.cache/vllm-upstream-tests)
 uv run pytest --upstream       # local + upstream
+uv sync --group dev --group triton-cpu        # x86 only: add triton-cpu, the MRV2 parity reference
+uv run --group triton-cpu pytest -m triton_cpu  # MRV2 host kernels vs triton-cpu (opt-in, like upstream)
+uv sync --group dev                             # drop triton again before the rest of the suite
 bash format.sh                 # format (prek via uvx)
 uv run ty                      # type check
 ```
+
+triton is test-only and x86-only: only the `triton-cpu` group installs it, and only the CI parity job asks for it, so every other job runs triton-free like Power and Z. A later plain `uv sync` removes it again (a plain `uv run` doesn't), and `test_triton_is_not_installed` fails while it's installed.
 
 `uv sync` does not install the RPMs in `spyre-rpms.lock`. On a pod whose image runtime
 differs from the lock, use `scripts/install-pinned-rpms.sh --rebuild` and source the

@@ -18,11 +18,13 @@ save, cross-scope isolation, and GC. The tar roundtrip runs on real files.
 
 from __future__ import annotations
 
+import io
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 
 import pytest
@@ -450,6 +452,36 @@ def test_save_skips_when_prune_empties_cache(tmp_path, lockfiles):
 
     assert nuc.main(_args("save", nfs, local, lockfiles, uv=uv, **_push_main())) == 0
     assert not (nfs / "main" / "x86_64").exists()
+
+
+def test_extract_roundtrips_a_benign_tar(tmp_path):
+    src = tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    _write(src / "pkg" / "wheel.txt", "payload")
+    tar = tmp_path / "ok.tar"
+    subprocess.run(["tar", "-cf", str(tar), "-C", str(src), "."], check=True)
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    nuc._extract(tar, dest)
+    assert (dest / "pkg" / "wheel.txt").read_text() == "payload"
+
+
+def test_extract_keeps_a_parent_traversal_member_inside_dest(tmp_path):
+    """A poisoned cache tar with a ``..`` member must not write outside dest."""
+    outside = tmp_path / "outside.txt"
+    tar = tmp_path / "evil.tar"
+    with tarfile.open(tar, "w") as handle:
+        info = tarfile.TarInfo("../outside.txt")
+        data = b"pwned"
+        info.size = len(data)
+        handle.addfile(info, io.BytesIO(data))
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(subprocess.CalledProcessError):
+        nuc._extract(tar, dest)
+    assert not outside.exists()
 
 
 if __name__ == "__main__":

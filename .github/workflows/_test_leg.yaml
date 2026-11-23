@@ -54,6 +54,11 @@ on:
         required: false
         type: boolean
         default: false
+      extra_groups:
+        description: Dependency groups to sync on top of dev (matrix.extra_groups)
+        required: false
+        type: string
+        default: ''
       torch_spyre_ref:
         required: false
         type: string
@@ -161,6 +166,9 @@ jobs:
             *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
             *) selected=false ;;
           esac
+          if [[ "${{ inputs.use_prebaked_image }}" == "true" && -n "${{ inputs.extra_groups }}" ]]; then
+            selected=false
+          fi
           if [[ "$changed" == "true" && "$selected" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -187,6 +195,7 @@ jobs:
           runner_labels: ${{ env.RUNNER_LABELS }}
           job_slot: ${{ inputs.job_index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          extra_groups: ${{ inputs.extra_groups }}
           image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
@@ -233,6 +242,7 @@ jobs:
           job_slot: retry-${{ inputs.job_index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          extra_groups: ${{ inputs.extra_groups }}
           image_rpms: ${{ inputs.image_rpms }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile

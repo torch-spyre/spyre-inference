@@ -216,6 +216,13 @@ jobs:
           fi
           echo "Resolved test_type: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
+          # A perf run's benchmark rows never reach this workflow (the perf legs
+          # ingest them inline), so its perf-zero refusal is expected, not lost data.
+          if [[ "${TIER}" == "perf" ]]; then
+            echo "perf=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "perf=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       # Grouped by leg arch first since arch is a run_id hash input and the matrix dispatches non-x86_64 legs too.
       - name: Group XML files by leg arch
@@ -224,7 +231,11 @@ jobs:
           python3 .github/scripts/group_xml_by_arch.py --src-dir xml_artifacts --dest-dir xml_by_arch
 
       - name: Ingest XML into shared v2 ClickHouse tables (x86_64)
+        id: ingest-x86_64
         if: steps.group-by-arch.outputs.has_x86_64 == 'true'
+        # perf tier only: the perf-zero refusal is structural here (see extract-tier);
+        # the verify step below still reads this step's raw outcome.
+        continue-on-error: ${{ steps.extract-tier.outputs.perf == 'true' }}
         uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
         with:
           # Already holds the ingest library, so the action skips a second install.
@@ -256,7 +267,11 @@ jobs:
           clickhouse-db-v2: ${{ env.CH_DB_V2 }}
 
       - name: Ingest XML into shared v2 ClickHouse tables (ppc64le)
+        id: ingest-ppc64le
         if: steps.group-by-arch.outputs.has_ppc64le == 'true'
+        # perf tier only: the perf-zero refusal is structural here (see extract-tier);
+        # the verify step below still reads this step's raw outcome.
+        continue-on-error: ${{ steps.extract-tier.outputs.perf == 'true' }}
         uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
         with:
           venv: .venv-ingest
@@ -282,7 +297,11 @@ jobs:
           clickhouse-db-v2: ${{ env.CH_DB_V2 }}
 
       - name: Ingest XML into shared v2 ClickHouse tables (s390x)
+        id: ingest-s390x
         if: steps.group-by-arch.outputs.has_s390x == 'true'
+        # perf tier only: the perf-zero refusal is structural here (see extract-tier);
+        # the verify step below still reads this step's raw outcome.
+        continue-on-error: ${{ steps.extract-tier.outputs.perf == 'true' }}
         uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
         with:
           venv: .venv-ingest
@@ -306,6 +325,32 @@ jobs:
           clickhouse-pass: ${{ env.CH_PASS }}
           clickhouse-db: ${{ env.CH_DB_V2 }}
           clickhouse-db-v2: ${{ env.CH_DB_V2 }}
+
+      # .outcome keeps the raw result a continue-on-error step hid (.conclusion reads
+      # success). Exactly one red is the structural perf-zero refusal; more, or any
+      # red on another tier, must still fail the run.
+      - name: Verify the perf-tier ingest refusal
+        if: ${{ !cancelled() && steps.extract-tier.outputs.perf == 'true' }}
+        env:
+          X86_OUTCOME: ${{ steps.ingest-x86_64.outcome }}
+          PPC_OUTCOME: ${{ steps.ingest-ppc64le.outcome }}
+          S390_OUTCOME: ${{ steps.ingest-s390x.outcome }}
+        run: |
+          red=0
+          for o in "${X86_OUTCOME}" "${PPC_OUTCOME}" "${S390_OUTCOME}"; do
+            [[ "${o}" == "failure" ]] && red=$((red+1))
+          done
+          if [ "${red}" -eq 0 ]; then
+            echo "perf-tier XML ingests stayed green (no XML for this arch, or all rows written)"
+            exit 0
+          fi
+          # More than one red is not the single structural refusal.
+          if [ "${red}" -gt 1 ]; then
+            echo "::error title=ClickHouse::${red} perf-tier ingest steps failed; at most the single perf-zero refusal is expected"
+            exit 1
+          fi
+          echo "::warning title=ClickHouse::perf-tier ingest refused with 0 benchmark records (expected: the bench rows are ingested inline by the perf legs); per-leg verdict rows were written"
+          echo "perf-tier ingest completed: verdict rows written, benchmark rows ingested inline by the perf legs"
 
       - name: Summary
         if: always()

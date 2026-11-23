@@ -58,7 +58,10 @@ def test_tier_from_display_title(tmp_path, workflow, title, tier):
         "GITHUB_OUTPUT": str(out),
     }
     subprocess.run(["bash", "-e", "-c", _tier_script()], env=env, check=True, capture_output=True)
-    assert out.read_text().splitlines() == [f"tier={tier}"]
+    assert out.read_text().splitlines() == [
+        f"tier={tier}",
+        f"perf={'true' if tier == 'perf' else 'false'}",
+    ]
 
 
 def test_download_skips_non_ingest_artifacts(tmp_path):
@@ -96,3 +99,43 @@ def test_download_skips_non_ingest_artifacts(tmp_path):
     )
     fetched = [line.split("/")[-2] for line in log.read_text().splitlines()]
     assert fetched == ["1", "2", "5"]
+
+
+def test_perf_steps_carry_the_tolerant_continue_on_error():
+    """A perf tier's ingest steps tolerate exactly the perf-zero refusal.
+
+    The three arch ingest steps must set continue-on-error from the perf output
+    (the refusal is structural: benchmark rows are written inline by the perf
+    legs, never by this workflow), and only the perf tier arms it -- every other
+    tier keeps a red ingest red.
+    """
+    steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"]["ingest"]["steps"]
+    for arch in ("x86_64", "ppc64le", "s390x"):
+        step = next(s for s in steps if s.get("id") == f"ingest-{arch}")
+        assert step["continue-on-error"] == "${{ steps.extract-tier.outputs.perf == 'true' }}", arch
+    non_perf = [
+        s
+        for s in steps
+        if s.get("continue-on-error") and not str(s.get("id", "")).startswith("ingest-")
+    ]
+    assert not non_perf, "no other step may gain a blanket continue-on-error"
+
+
+def test_perf_tolerance_is_reasserted_after_the_ingest_steps():
+    """The verify step must still fail a perf-tier run whose ingest failed beyond perf-zero.
+
+    With continue-on-error set, a failed step reports conclusion=success; only its
+    .outcome keeps the raw failure. The verify step reads the three outcomes and may
+    fail the job, so the tolerance cannot swallow a real red.
+    """
+    steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"]["ingest"]["steps"]
+    names = [s.get("name") for s in steps]
+    for arch in ("x86_64", "ppc64le", "s390x"):
+        ingest = next(i for i, n in enumerate(names) if n == f"Ingest XML into shared v2 ClickHouse tables ({arch})")
+        assert ingest < names.index("Verify the perf-tier ingest refusal"), arch
+    step = next(s for s in steps if s.get("name") == "Verify the perf-tier ingest refusal")
+    assert "steps.extract-tier.outputs.perf == 'true'" in step["if"]
+    assert "exit 1" in step["run"], "the verify step must be able to fail the job"
+    env = step["env"]
+    for arch, var in (("x86_64", "X86"), ("ppc64le", "PPC"), ("s390x", "S390")):
+        assert env[f"{var}_OUTCOME"] == f"${{{{ steps.ingest-{arch}.outcome }}}}", arch

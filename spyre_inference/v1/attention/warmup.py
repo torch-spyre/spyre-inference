@@ -165,7 +165,10 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer, mar
     # At TP > 1 every rank precompiles, so stay within this rank's CPU share, which
     # vLLM's threading setup gives torch.
     workers = max(1, min(envs.SPYRE_PARALLEL_ATTN_PRECOMPILE, torch.get_num_threads()))
-    with fork_inner_compiles(workers) as pool:
+    # The stand-in graphs must not be kept by the attention AOT cache.
+    from spyre_inference.v1.attention.aot_kernel_cache import compile_only
+
+    with fork_inner_compiles(workers) as pool, compile_only():
         for layer, impl, kv_cache, builder, causal in layers:
             num_pages = kv_cache[0].shape[0]
             runs = [

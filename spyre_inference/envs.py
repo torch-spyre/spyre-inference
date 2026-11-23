@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
+    SPYRE_ATTN_AOT_CACHE: bool = False
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
@@ -123,6 +124,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    # When "1", keep each compiled attention kernel on disk (in the Inductor cache dir) and
+    # load it on the next start instead of tracing it again with Dynamo. "0" (default)
+    # traces every attention kernel on every start.
+    "SPYRE_ATTN_AOT_CACHE": lambda: bool(int(os.getenv("SPYRE_ATTN_AOT_CACHE", "0"))),
     # When "1" (default), enables the batched multi-sequence decode kernel.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1" (default), a decode batch spanning several KV buckets runs one batched

@@ -78,7 +78,10 @@ def precompile_in_workers(
     # The keyword lands with torch-spyre#6533 (checked by the signature test above); a dict
     # keeps the call type-checkable against a torch-spyre that predates it.
     options = {"placeholders": True}
-    with fork_inner_compiles(workers, timeout_s=1800.0, **options) as pool:
+    from spyre_inference.v1.attention.aot_kernel_cache import compile_only
+
+    # Stand-in graphs must not reach the attention AOT cache (SPYRE_ATTN_AOT_CACHE).
+    with fork_inner_compiles(workers, timeout_s=1800.0, **options) as pool, compile_only():
         warm = trace(pool)
         if not warm:
             warm_regions()

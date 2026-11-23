@@ -819,9 +819,10 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            "speculative decoding other than DFlash/XPress": (
+            "speculative decoding other than DFlash/XPress and suffix": (
                 vllm_config.speculative_config is not None
                 and not vllm_config.speculative_config.use_dflash()
+                and vllm_config.speculative_config.method != "suffix"
             ),
             # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
             "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),

@@ -241,8 +241,9 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
             if isinstance(builder, SpyreAttentionMetadataBuilder):
                 builders.update(dict.fromkeys(group.layer_names, builder))
     causal_by_layer = dict.fromkeys(builders, True)
-    if runner.speculator is not None:
-        draft = runner.speculator.model
+    # A model-free speculator (suffix) has no draft model and no draft layers.
+    draft = getattr(runner.speculator, "model", None)
+    if draft is not None:
         causal_by_layer.update(
             zip(draft.get_draft_kv_cache_layer_names(), draft.get_draft_attn_causal(), strict=True)
         )

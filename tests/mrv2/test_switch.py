@@ -82,9 +82,13 @@ def test_runner_switch(
     ("feature", "configure"),
     [
         pytest.param(
-            "speculative decoding other than DFlash/XPress",
-            lambda c: setattr(c, "speculative_config", SimpleNamespace(use_dflash=lambda: False)),
-            id="spec-decode-non-dflash",
+            "speculative decoding other than DFlash/XPress and suffix",
+            lambda c: setattr(
+                c,
+                "speculative_config",
+                SimpleNamespace(use_dflash=lambda: False, method="ngram"),
+            ),
+            id="spec-decode-ngram",
         ),
         pytest.param(
             "batch-sharded sampling",
@@ -117,6 +121,16 @@ def test_a_plain_v2_config_passes_the_feature_check(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:
     _set_runner(monkeypatch, "v2")
+    TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_suffix_decoding_passes_the_v2_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    vllm_config.speculative_config = SimpleNamespace(  # ty: ignore[invalid-assignment]
+        use_dflash=lambda: False, method="suffix"
+    )
     TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
 
 

@@ -202,6 +202,20 @@ def test_drafts_padded_to_k(drafts, expected):
     assert request.spec_token_ids == expected
 
 
+@pytest.mark.parametrize(
+    ("use_v2", "query_len", "expected"),
+    [(False, 4, True), (False, 1, False), (True, 4, False)],
+    ids=["v1-spec", "v1-no-spec", "v2-spec"],
+)
+def test_only_the_v1_runner_pads_drafts(monkeypatch, use_v2, query_len, expected):
+    """V2 sends k -1 placeholders per request; padding stats would void every draft."""
+    from spyre_inference.v1.core import scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "batched_decode_query_len", lambda config: query_len)
+    config = SimpleNamespace(use_v2_model_runner=use_v2)
+    assert scheduler_module.pads_drafts(config) is expected
+
+
 def test_drafts_left_alone_without_batched_spec_decode():
     scheduler = _speculative(_scheduler(), pad=False)
     request = _decoding(scheduler)

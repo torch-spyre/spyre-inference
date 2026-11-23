@@ -28,6 +28,17 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import batched_decode_quer
 _PAD_DRAFT_TOKEN_ID = -1
 
 
+def pads_drafts(vllm_config) -> bool:
+    """Whether the scheduler pads draft lists to k: on the V1 runner, where the batched
+    decode kernel serves one verification width and a proposer may draft fewer.
+
+    The V2 runner keeps its drafts on the worker and always verifies k of them, so the
+    scheduler only sees k ``-1`` placeholders per request. Counting those as padding
+    would report every draft as invalid.
+    """
+    return not vllm_config.use_v2_model_runner and batched_decode_query_len(vllm_config) > 1
+
+
 class TorchSpyreScheduler(Scheduler):
     """V1 scheduler that caps how many sequences may prefill in one batch.
 
@@ -35,8 +46,8 @@ class TorchSpyreScheduler(Scheduler):
     the short leftover chunk upstream uses to top up a batch costs a full-width
     prefill however few tokens it carries.
 
-    Under speculative decoding it also pads every draft list out to k, so each
-    verification has the single query width the batched decode kernel serves.
+    Under speculative decoding on the V1 runner it also pads every draft list out to k,
+    so each verification has the single query width the batched decode kernel serves.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -48,7 +59,7 @@ class TorchSpyreScheduler(Scheduler):
             if self.vllm_config.model_config.runner_type == "pooling"
             else envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
         )
-        self._pad_drafts = batched_decode_query_len(self.vllm_config) > 1
+        self._pad_drafts = pads_drafts(self.vllm_config)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         # After super(), so grammar validation has already cut the real drafts.

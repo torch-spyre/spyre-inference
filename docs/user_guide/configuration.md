@@ -377,7 +377,10 @@ Differences on V2:
 
 - Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.
-- These are refused at startup: speculative decoding other than DFlash/XPress,
+- Suffix decoding verifies all `num_speculative_tokens` drafts every step, as upstream's
+  ngram speculator does: when the suffix cache speculates fewer, the rest repeat the
+  last sampled token. V1 verifies only the drafts the cache returns.
+- These are refused at startup: speculative decoding other than DFlash/XPress and suffix,
   batch-sharded sampling, `cudagraph_mm_encoder`, and prefill context parallelism.
 
 ## Offline engine in the calling process

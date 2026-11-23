@@ -18,6 +18,7 @@ A thin coordinator: every method here delegates to the component module
 that owns the concern.
 """
 
+import contextlib
 from contextlib import AbstractContextManager
 from typing import Any
 
@@ -40,6 +41,11 @@ from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
+from spyre_inference.v1.worker.spyre.suffix_decode import (
+    SpyreSuffixSpeculator,
+    building_suffix_speculator,
+    uses_suffix_decoding,
+)
 from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
@@ -48,9 +54,22 @@ class SpyreModelRunnerV2(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         validate_dflash_config(vllm_config)
-        super().__init__(vllm_config, torch.device("cpu"))
+        suffix = uses_suffix_decoding(vllm_config)
+        # Upstream builds no suffix speculator; the swap has it build Spyre's.
+        with building_suffix_speculator() if suffix else contextlib.nullcontext():
+            super().__init__(vllm_config, torch.device("cpu"))
         self.spyre_device = device
-        if self.speculator is not None:
+        if suffix:
+            # Only the last PP rank builds a speculator.
+            if self.speculator is not None and not isinstance(
+                self.speculator, SpyreSuffixSpeculator
+            ):
+                raise RuntimeError(
+                    "Upstream GPUModelRunner.__init__ bypassed Spyre's swap of "
+                    "init_speculator; it no longer reads it as a module global of "
+                    "vllm/v1/worker/gpu/model_runner.py."
+                )
+        elif self.speculator is not None:
             self.speculator = SpyreDFlashSpeculator(vllm_config, self.device, device)
         # Filled by initialize_kv_cache; warmup records the attention kernels against them.
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}

@@ -539,6 +539,7 @@ class TorchSpyrePlatform(CpuPlatform):
         ``max_num_seqs`` is lowered to the widest short rectangle. ``compile_sizes`` is
         one entry when the model fits in the 2048-row body, and one entry per body when
         ``max_model_len`` is longer — a step pads to the smallest of those.
+        ``SPYRE_ENCODER_DENSE_LADDER`` adds one body per stick-step length instead.
 
         The scheduler token cap stays the largest body, so one max-length sequence can
         be scheduled. The ragged path still covers a batch no rectangle holds.

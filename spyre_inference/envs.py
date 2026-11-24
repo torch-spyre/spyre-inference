@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
+    SPYRE_ENCODER_RECT_ADMISSION: bool = True
+    SPYRE_ENCODER_DENSE_LADDER: bool = False
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_MOE_PREP_THREADS: int = 0
@@ -140,6 +142,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of topping itself up with a short chunk of the next. Any non-positive
     # value removes the cap, as does a pooling runner, which never decodes.
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
+    # When "1" (default), a pooling step admits only the requests that fill one
+    # encoder rectangle, always including the oldest waiting request. A mixed-length
+    # queue then stays on the inline rectangular path instead of the ragged one.
+    # Ignored when chunked prefill is on, and for a priority scheduler.
+    "SPYRE_ENCODER_RECT_ADMISSION": lambda: os.getenv("SPYRE_ENCODER_RECT_ADMISSION", "1") == "1",
+    # When "1", pooling lengths step by 64 tokens up to 2048 instead of powers of two,
+    # and each length gets its own body of L * B rows. A 384-token prompt then pads to
+    # 384, not 512. Off by default: extents such as 192 and bodies such as 1792 are not
+    # in the default warmup, so turn this on only after a parity check on device.
+    # SPYRE_ATTN_QUERY_BUCKETS still wins. Long-context models keep their power-of-two
+    # bodies either way.
+    "SPYRE_ENCODER_DENSE_LADDER": lambda: os.getenv("SPYRE_ENCODER_DENSE_LADDER", "0") == "1",
     # Largest packed-token count handled by a compiled loop of single-token gathered kernels.
     # Larger batches use one all-expert kernel because its fixed weight-read cost is amortized.
     # "8" (default) is measured on gemma-4-26B-A4B: gathered wins up to 8 at TP1 and TP4.

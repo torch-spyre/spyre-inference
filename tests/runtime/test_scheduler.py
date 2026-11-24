@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
+from spyre_inference import envs
 from spyre_inference.v1.core.scheduler import TorchSpyreScheduler
 
 # A 200-token prompt against a 256-token budget leaves 56 tokens over, which is
@@ -42,10 +43,17 @@ BLOCK_SIZE = 64
 NUM_BLOCKS = 512
 
 
-def _scheduler(runner_type: str = "generate", max_num_seqs: int = 4) -> TorchSpyreScheduler:
+def _scheduler(
+    runner_type: str = "generate",
+    max_num_seqs: int = 4,
+    *,
+    max_model_len: int = 2048,
+    max_num_batched_tokens: int = MAX_NUM_BATCHED_TOKENS,
+    enable_chunked_prefill: bool = True,
+) -> TorchSpyreScheduler:
     model_config = ModelConfig(
         model="Qwen/Qwen3-0.6B",
-        max_model_len=2048,
+        max_model_len=max_model_len,
         dtype=torch.float16,
         trust_remote_code=True,
     )
@@ -57,9 +65,9 @@ def _scheduler(runner_type: str = "generate", max_num_seqs: int = 4) -> TorchSpy
         cache_config=cache_config,
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-            max_model_len=2048,
-            enable_chunked_prefill=True,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
+            enable_chunked_prefill=enable_chunked_prefill,
             is_encoder_decoder=False,
         ),
     )
@@ -130,6 +138,60 @@ def test_pooling_runner_is_exempt():
     scheduler = _scheduler(runner_type="pooling")
     assert scheduler.max_num_partial_prefills == 0
     assert max(_prefills_per_step(scheduler)) > 1
+
+
+def _admit(lengths: list[int], *, chunked: bool) -> list[str]:
+    """Schedule one pooling step and return the admitted request ids, in order."""
+    envs.clear_env_cache()
+    scheduler = _scheduler(
+        runner_type="pooling",
+        max_num_seqs=32,
+        max_model_len=512,
+        max_num_batched_tokens=2048,
+        enable_chunked_prefill=chunked,
+    )
+    for index, length in enumerate(lengths):
+        scheduler.add_request(
+            Request(
+                request_id=f"r{index}",
+                prompt_token_ids=list(range(length)),
+                sampling_params=SamplingParams(max_tokens=1),
+                pooling_params=None,
+            )
+        )
+    admitted = list(scheduler.schedule().num_scheduled_tokens)
+    envs.clear_env_cache()
+    return admitted
+
+
+def test_rectangle_admission_stops_at_the_rectangle_width(monkeypatch):
+    """Five 400-token prompts fit the token budget and miss ``(512, 4)``."""
+    monkeypatch.setenv("SPYRE_ENCODER_RECT_ADMISSION", "1")
+    admitted = _admit([400, 400, 400, 400, 400], chunked=False)
+    assert admitted == ["r0", "r1", "r2", "r3"]
+
+
+def test_rectangle_admission_keeps_the_oldest_and_reorders(monkeypatch):
+    """A short head rides with the long prompts; FCFS would have ragged the mix."""
+    monkeypatch.setenv("SPYRE_ENCODER_RECT_ADMISSION", "1")
+    # 100 + three 400s fills (512, 4). The fourth 400 waits, ahead of nothing older.
+    admitted = _admit([100, 400, 400, 400, 400], chunked=False)
+    assert admitted[0] == "r0"
+    assert len(admitted) == 4
+    assert "r4" not in admitted
+
+
+def test_rectangle_admission_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SPYRE_ENCODER_RECT_ADMISSION", "0")
+    admitted = _admit([400, 400, 400, 400, 400], chunked=False)
+    assert admitted == ["r0", "r1", "r2", "r3", "r4"]
+
+
+def test_chunked_prefill_keeps_upstream_admission(monkeypatch):
+    """Chunked pooling is not the rectangle path, so the width cap stays off."""
+    monkeypatch.setenv("SPYRE_ENCODER_RECT_ADMISSION", "1")
+    admitted = _admit([400, 400, 400, 400, 400], chunked=True)
+    assert len(admitted) == 5
 
 
 def test_cap_never_admits_beyond_max_num_seqs():

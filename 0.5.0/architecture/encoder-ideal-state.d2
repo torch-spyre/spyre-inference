@@ -1,0 +1,832 @@
+# Encoder / embedding models on Spyre: target state
+#
+# Source for encoder-ideal-state.svg.
+#
+# Layout: explicit nested grids, as in system-overview.d2, so placement comes from
+# nesting rather than the auto-layout engine. Regions mirror the SVG:
+#
+#   upper : serving path (left)  |  sidebar of four panels (right)
+#   lower : dense vs flash strategies, then the summary note beside the legend
+#
+# Conventions worth knowing before editing:
+#
+#  * Alignment follows the SVG. Plain quoted labels are CENTRED, so every coloured
+#    box and inner box uses one, with `\n` for line breaks. `|md ... |` blocks are
+#    LEFT-aligned, so only the prose panels use markdown: the invariants, the
+#    compile-mode note, the A/B strategy panels and the summary. D2 offers no
+#    alignment control, so the label type is the alignment choice.
+#  * A plain label is a single weight, so a centred box cannot have a bold first
+#    line on its own. The workaround: put the bold title in a container's label
+#    (with `label.near: top-center`) and the lighter detail in a child whose
+#    `stroke` equals its `fill`, so the child's own border is invisible and the
+#    two read as one box. `body` uses this pattern.
+#  * Do NOT use markdown backticks. D2 renders inline code with its own pale
+#    background, which on a dark or blue fill leaves white text on a light chip.
+#    Identifiers are written plain; underscores inside a word are safe, because
+#    CommonMark does not treat intraword `_` as emphasis.
+#  * With `label.near: top-left` a container's label is drawn inside its fill, so a
+#    coloured container needs a light font-color. Without it the label lands on the
+#    parent's background and a white label becomes invisible.
+#  * dagre cannot set width/height on a container. A container that needs a fixed
+#    width must therefore declare a grid (`grid-rows`/`grid-columns`), which hands
+#    its layout to D2 instead of dagre. layer_stack and boundary use a 1x1 grid for
+#    exactly this reason.
+#  * Markdown reflows text: a single newline does not break a line. Lines that must
+#    break end with TWO TRAILING SPACES (a hard break), which keeps them in one
+#    paragraph and so avoids the paragraph margin. A blank line is used only where a
+#    real gap is wanted. Do not let an editor strip that trailing whitespace, or the
+#    prose blocks will reflow and widen.
+#  * A markdown-labelled shape gets neither a border nor a width from D2. Panels that
+#    need either put the border, the width and the bold title on a wrapping container
+#    and keep the prose in a blended child. dense / flash / simplifies do this.
+#  * Bullets use `·` rather than list syntax, to match the SVG.
+#
+# Render:
+#   d2 --pad 50 docs/architecture/encoder-ideal-state.d2 /tmp/encoder-ideal-state.svg
+
+grid-rows: 2
+grid-columns: 1
+grid-gap: 50
+
+upper: " " {
+  style.fill: "#FFFFFF"
+  style.stroke: "#FFFFFF"
+  grid-rows: 1
+  grid-columns: 2
+  grid-gap: 40
+
+  serving: "Per-step serving path" {
+    style.fill: "#EEF1F8"
+    style.stroke: "#CFD2DD"
+    style.font-color: "#212121"
+    style.font-size: 20
+    style.bold: true
+    style.border-radius: 10
+    label.near: top-left
+    direction: down
+
+    sched: "vLLM Scheduler, used as-is" {
+      style.fill: "#37474f"
+      style.stroke: "#263238"
+      style.font-color: "#ffffff"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-center
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 920
+
+      sched_d: "batches S requests carrying T tokens in total · chunked prefill off\nnever subclassed, its output never mutated" {
+        style.fill: "#37474f"
+        style.stroke: "#37474f"
+        style.font-color: "#CFD2DD"
+        style.font-size: 13
+        style.bold: false
+        width: 790
+        height: 56
+      }
+    }
+
+    dispatch: "Token-count bucket dispatch" {
+      style.fill: "#1565c0"
+      style.stroke: "#0d47a1"
+      style.font-color: "#ffffff"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-center
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 920
+
+      dispatch_d: "round T up to the next compiled bucket, giving T_padded\nupstream this hook pads to a captured CUDA graph; here to a compiled shape\npad rows zeroed · also cuts torch-spyre per-op recompiles" {
+        style.fill: "#1565c0"
+        style.stroke: "#1565c0"
+        style.font-color: "#D6E4F7"
+        style.font-size: 13
+        style.bold: false
+        width: 790
+        height: 74
+      }
+    }
+
+    body: "Compiled model body: one graph per token bucket  (fullgraph, dynamic=False)" {
+      style.fill: "#1565c0"
+      style.stroke: "#0d47a1"
+      style.font-color: "#ffffff"
+      style.font-size: 16
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-center
+      width: 920
+      grid-rows: 3
+      grid-columns: 1
+      grid-gap: 10
+
+      body_note: "sees only the flat token list [T_padded, hidden], with no request boundaries\nall layers share op shapes, so cost scales with distinct T, not with depth" {
+        style.fill: "#1565c0"
+        style.stroke: "#1565c0"
+        style.font-color: "#D6E4F7"
+        style.font-size: 13
+        style.bold: false
+        style.border-radius: 6
+        width: 870
+      }
+
+      layer_stack: "Embeddings → N × [ Q · K · V projections (un-fused) · output projection · FFN ×2 · LayerNorm ×2 ]" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 6
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 870
+
+        layer_stack_d: "N = 24 for multilingual-e5-large · 6 matrix multiplies per layer, 5 of them outside attention" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 740
+          height: 38
+        }
+      }
+
+      boundary: "torch.ops.vllm.unified_attention_with_output  ·  opaque boundary" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.stroke-dash: 4
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 6
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 870
+
+        boundary_d: "Dynamo does not trace inside. Selected by the platform's opaque_attention_op() → True,\nwhich TorchSpyrePlatform inherits from CpuPlatform" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#5c6bc0"
+          style.font-size: 12
+          style.bold: false
+          width: 740
+          height: 56
+        }
+      }
+    }
+
+    attention: "Encoder attention: the only request-aware stage" {
+      style.fill: "#1565c0"
+      style.stroke: "#0d47a1"
+      style.font-color: "#ffffff"
+      style.font-size: 16
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-center
+      width: 920
+      grid-rows: 4
+      grid-columns: 1
+      grid-gap: 10
+
+      attn_note: "per-extent groups: requests sharing a padded length are served by one batched SDPA\ngather, attend and store are one compiled graph, so a plan costs one launch per layer" {
+        style.fill: "#1565c0"
+        style.stroke: "#1565c0"
+        style.font-color: "#D6E4F7"
+        style.font-size: 13
+        style.bold: false
+        style.border-radius: 6
+        width: 870
+      }
+
+      tables: "Row tables and masks, built once per step and carried on the attention metadata" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 6
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 870
+
+        tables_d: "one int32 row table and one [group, 1, 1, extent] mask per plan · derived from the per-request lengths, so identical for every layer" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 740
+          height: 38
+        }
+      }
+
+      fused: "Fused kernel: gather → SDPA → store, one compiled graph" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 6
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 870
+
+        fused_d: "index_select the plan's rows into [group * extent, H, D] · batched SDPA · index_copy_ the result back\nkeyed on (buffer_rows, group, extent) · pad lanes clamp to the sequence's last real row, so no zero row is needed" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 740
+          height: 56
+        }
+      }
+
+      barriers: "tables on the metadata instead of rebuilt per layer · one launch per plan per layer, where the three-stage split cost three" {
+        style.fill: "#1565c0"
+        style.stroke: "#1565c0"
+        style.font-color: "#D6E4F7"
+        style.font-size: 13
+        style.bold: false
+        style.border-radius: 6
+        width: 870
+      }
+    }
+
+    pooler: "Pooler on device: CLS / LAST / MEAN" {
+      style.fill: "#1565c0"
+      style.stroke: "#0d47a1"
+      style.font-color: "#ffffff"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-center
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 920
+
+      pooler_d: "row gather via index_select · L2 normalize via rsqrt · reads only real rows, using the per-request offsets\neager today · compiling the pooler is its own work item, not a warmup" {
+        style.fill: "#1565c0"
+        style.stroke: "#1565c0"
+        style.font-color: "#D6E4F7"
+        style.font-size: 13
+        style.bold: false
+        width: 790
+        height: 56
+      }
+    }
+
+    mean_dep: "MEAN copies packed [T, H] as fp16 and reduces with MeanPool on the host.\nDestagger of a device fp32 sum (to(fp16) then convert) is garbage (torch-spyre#2971). index_add_ (#3507) would let the reduce stay on the card." {
+      style.fill: "#FFF8E1"
+      style.stroke: "#F9A825"
+      style.font-color: "#5d4037"
+      style.font-size: 13
+      style.bold: false
+      style.border-radius: 6
+      width: 920
+    }
+
+    output: "Pooled vectors → host" {
+      style.fill: "#37474f"
+      style.stroke: "#263238"
+      style.font-color: "#ffffff"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-center
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 920
+
+      output_d: "only [num_reqs, hidden] crosses the boundary · padded rows are discarded, never pooled" {
+        style.fill: "#37474f"
+        style.stroke: "#37474f"
+        style.font-color: "#CFD2DD"
+        style.font-size: 13
+        style.bold: false
+        width: 790
+        height: 38
+      }
+    }
+
+    sched -> dispatch -> body -> attention -> pooler -> mean_dep -> output
+  }
+
+  sidebar: " " {
+    style.fill: "#FFFFFF"
+    style.stroke: "#FFFFFF"
+    grid-rows: 4
+    grid-columns: 1
+    grid-gap: 26
+
+    shapes: "Shape vocabulary" {
+      style.fill: "#EEF1F8"
+      style.stroke: "#CFD2DD"
+      style.font-color: "#212121"
+      style.font-size: 20
+      style.bold: true
+      style.border-radius: 10
+      label.near: top-left
+      grid-rows: 4
+      grid-columns: 1
+      grid-gap: 12
+
+      T_tokens: "T · tokens in the step" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        T_tokens_d: "sum of the batched prompt lengths · bucketed to 256 / 512 / 1024 / 2048 tokens\nthe floor sits above one stick because each body bucket multiplies the attention sweep" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+
+      S_reqs: "group · requests in one attention call" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        S_reqs_d: "requests that share an extent, in powers of two, capped by max_num_seqs\na remainder becomes its own smaller plan rather than padding up to phantom sequences" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+
+      L_width: "extent · one request's padded length" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        L_width_d: "per request, not per step: its own length in 64-token units, rounded to a power of two\nso a 260-token request attends over 512 · requests sharing an extent can be grouped" {
+          style.fill: "#E3E9FD"
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+
+      example: "Worked example, prompts of 40, 12 and 58 tokens" {
+        style.fill: "#FFF8E1"
+        style.stroke: "#F9A825"
+        style.font-color: "#5d4037"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 6
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        example_d: "T = 110 → T_padded = 256 · every extent = 64, so all three share one · group 3 chunks to 2 + 1,\ngiving two plans and two launches per layer. Note group × extent ≠ T." {
+          style.fill: "#FFF8E1"
+          style.stroke: "#FFF8E1"
+          style.font-color: "#5d4037"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+    }
+
+    compile_mode: "Compilation mode" {
+      style.fill: "#EEF1F8"
+      style.stroke: "#CFD2DD"
+      style.font-color: "#212121"
+      style.font-size: 20
+      style.bold: true
+      style.border-radius: 10
+      label.near: top-left
+      grid-rows: 2
+      grid-columns: 1
+      grid-gap: 12
+
+      mode: "CompilationMode.STOCK_TORCH_COMPILE" {
+        style.fill: "#1565c0"
+        style.stroke: "#0d47a1"
+        style.font-color: "#ffffff"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        mode_d: "torch.compile(model, backend='inductor',\nfullgraph=True, dynamic=False)" {
+          style.fill: "#1565c0"
+          style.stroke: "#1565c0"
+          style.font-color: "#D6E4F7"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+
+static_shapes: |md
+        dynamic=False → sizes are baked in as constants.  
+        A graph built for 128 tokens works only for 128.  
+        A new count means a new compile.
+      | {
+  style.fill: "#EEF1F8"
+  style.stroke: "#CFD2DD"
+  style.font-color: "#37474f"
+  style.font-size: 14
+  style.border-radius: 6
+  width: 580
+}
+    }
+
+    warmup: "Startup: warmup walks every bucket set" {
+      style.fill: "#EEF1F8"
+      style.stroke: "#CFD2DD"
+      style.font-color: "#212121"
+      style.font-size: 20
+      style.bold: true
+      style.border-radius: 10
+      label.near: top-left
+      grid-rows: 3
+      grid-columns: 1
+      grid-gap: 12
+
+      bodies: "for T in token buckets: _dummy_run(T)" {
+        style.fill: "#1565c0"
+        style.stroke: "#0d47a1"
+        style.font-color: "#ffffff"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        bodies_d: "one compiled body graph per bucket" {
+          style.fill: "#1565c0"
+          style.stroke: "#1565c0"
+          style.font-color: "#D6E4F7"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 38
+        }
+      }
+
+      attn: "_warm_kernels, called from forward" {
+        style.fill: "#1565c0"
+        style.stroke: "#0d47a1"
+        style.font-color: "#ffffff"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        attn_d: "sweeps (extent, group) on the first call per buffer_rows\nthe dummy runs cannot span it: a request's extent follows its own length, not the body bucket" {
+          style.fill: "#1565c0"
+          style.stroke: "#1565c0"
+          style.font-color: "#D6E4F7"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+
+      pool: "_dummy_pooler_run + _warm_pooler_row_widths" {
+        style.fill: "#1565c0"
+        style.stroke: "#0d47a1"
+        style.font-color: "#ffffff"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 8
+        label.near: top-center
+        grid-rows: 1
+        grid-columns: 1
+        grid-gap: 0
+        width: 580
+
+        pool_d: "pooler cost follows the request count, so row widths are swept too\nupstream's dummy pooler run is only a memory probe" {
+          style.fill: "#1565c0"
+          style.stroke: "#1565c0"
+          style.font-color: "#D6E4F7"
+          style.font-size: 12
+          style.bold: false
+          width: 450
+          height: 56
+        }
+      }
+
+    }
+
+    invariants: "Design invariants" {
+      style.fill: "#EEF1F8"
+      style.stroke: "#CFD2DD"
+      style.font-color: "#212121"
+      style.font-size: 20
+      style.bold: true
+      style.border-radius: 10
+      label.near: top-left
+
+rules: |md
+        · The metadata always describes the real batch, so no  
+        padded row is ever pooled.
+
+        · Padding the body is safe: each layer treats every  
+        token row on its own.
+      | {
+  style.fill: "#EEF1F8"
+  style.stroke: "#EEF1F8"
+  style.font-color: "#37474f"
+  style.font-size: 14
+  width: 580
+}
+    }
+  }
+}
+
+lower: "Attention shape strategy: per-extent groups today, and planned flash attention" {
+  style.fill: "#EEF1F8"
+  style.stroke: "#CFD2DD"
+  style.font-color: "#212121"
+  style.font-size: 20
+  style.bold: true
+  style.border-radius: 10
+  label.near: top-left
+  grid-rows: 2
+  grid-columns: 1
+  grid-gap: 26
+
+  strategies: " " {
+    style.fill: "#EEF1F8"
+    style.stroke: "#EEF1F8"
+    grid-rows: 1
+    grid-columns: 2
+    grid-gap: 26
+
+    # A markdown-labelled shape gets neither a border nor a width from D2, so the
+    # border and the width live on a wrapping container and the prose sits inside
+    # it as a blended child.
+    dense: "A · Per-extent groups, the strategy shown above" {
+      style.fill: "#E3E9FD"
+      style.stroke: "#0d47a1"
+      style.stroke-width: 2
+      style.font-color: "#0A0F25"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-left
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 700
+
+      dense_body: |md
+        Gather each group's rows out of the flat list into a  
+        dense batch, so every shape is fixed at compile time.  
+        Needed because an offset computed from data does not  
+        lower under compilation (torch-spyre#3508) — exactly  
+        the arithmetic that flash relies on.
+
+        · group the step's requests by padded length (extent)  
+        · one compiled graph per plan does gather, SDPA and  
+        store together  
+        · the mask is [group, 1, 1, extent]: head and query axes  
+        broadcast, since an encoder mask depends only on the  
+        KV column
+
+        **Shape axes: T for the body, (buffer_rows, group, extent)  
+        for attention.**
+
+        Costs: the pack is still paid, and fusion put buffer_rows  
+        into the attention key, so warmup covers more variants.  
+        Cheaper than a block-diagonal mask over the flat list,  
+        which would compute every cross-request block and then  
+        throw it away.
+      | {
+        style.fill: "#E3E9FD"
+        style.stroke: "#E3E9FD"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        width: 620
+      }
+    }
+
+    flash: "B · Flash-style attention, planned" {
+      style.fill: "#E8F5E9"
+      style.stroke: "#2e7d32"
+      style.stroke-width: 2
+      style.font-color: "#0A0F25"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-left
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 700
+
+      flash_body: |md
+        Never materialise the batch.  
+        Each block of queries reads its request's offset from  
+        the metadata at runtime and works on the flat list,  
+        carrying a running softmax maximum and sum — the  
+        online-softmax structure the decoder already uses over  
+        KV pages.
+
+        · no [group, 1, 1, extent] mask; boundaries are offsets  
+        · no gather or store; the kernel reads the flat list  
+        · extent disappears, replaced by a block count
+
+        **Two separate prerequisites, often conflated:**  
+        · torch-spyre#3508, data-dependent offsets → flat-list  
+        attention, extent becomes a coarse block count  
+        · symbolic shapes (the backend rejects SymInt today) →  
+        no bucketing on any axis
+
+        With #3508 alone the block count is still bucketed, as  
+        the decoder's page loop is. buffer_rows also survives:  
+        attention still writes into the body-sized output buffer.
+      | {
+        style.fill: "#E8F5E9"
+        style.stroke: "#E8F5E9"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        width: 620
+      }
+    }
+  }
+
+  footer: " " {
+    style.fill: "#EEF1F8"
+    style.stroke: "#EEF1F8"
+    grid-rows: 1
+    grid-columns: 2
+    grid-gap: 26
+
+    simplifies: "If flash attention lands, what changes and what fusion already changed" {
+      style.fill: "#FFF8E1"
+      style.stroke: "#F9A825"
+      style.stroke-width: 2
+      style.font-color: "#5d4037"
+      style.font-size: 15
+      style.bold: true
+      style.border-radius: 8
+      label.near: top-left
+      grid-rows: 1
+      grid-columns: 1
+      grid-gap: 0
+      width: 1000
+
+      simplifies_body: |md
+        · attention stops gathering, so the pack and its launch go away  
+        · extent collapses to a block count, coarser and cheaper to warm  
+        · the mask disappears entirely; boundaries become offsets
+
+        **What fusion already did, and what it cost:** collapsing gather,  
+        SDPA and store into one graph removed two launches per plan per  
+        layer, but pulled buffer_rows into the attention key. So the branch  
+        moved toward flash's shape while moving away from its single axis.  
+        Flash would not remove buffer_rows either — that needs attention to  
+        stop writing into the body-sized buffer, or the body to stop being  
+        bucketed.
+
+        **Unchanged either way:** the padding seam, metadata that always  
+        describes the real batch, warmup covering every reachable shape,  
+        and the compilation mode.
+      | {
+        style.fill: "#FFF8E1"
+        style.stroke: "#FFF8E1"
+        style.font-color: "#5d4037"
+        style.font-size: 14
+        width: 920
+      }
+    }
+
+    legend: "Legend" {
+      style.fill: "#FFFFFF"
+      style.stroke: "#CFD2DD"
+      style.font-color: "#212121"
+      style.font-size: 20
+      style.bold: true
+      style.border-radius: 10
+      label.near: top-left
+      grid-rows: 5
+      grid-columns: 1
+      grid-gap: 6
+
+      L1: "Upstream vLLM, used as-is" {
+        style.fill: "#37474f"
+        style.stroke: "#263238"
+        style.font-color: "#ffffff"
+        style.font-size: 14
+        style.bold: false
+        style.border-radius: 6
+        width: 340
+      }
+
+      L2: "spyre-inference component" {
+        style.fill: "#1565c0"
+        style.stroke: "#0d47a1"
+        style.font-color: "#ffffff"
+        style.font-size: 14
+        style.bold: false
+        style.border-radius: 6
+        width: 340
+      }
+
+      L3: "Internal step · current path" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: false
+        style.border-radius: 6
+        width: 340
+      }
+
+      L4: "Planned flash-attention path" {
+        style.fill: "#E8F5E9"
+        style.stroke: "#2e7d32"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: false
+        style.border-radius: 6
+        width: 340
+      }
+
+      L5: "Note or upstream dependency" {
+        style.fill: "#FFF8E1"
+        style.stroke: "#F9A825"
+        style.font-color: "#5d4037"
+        style.font-size: 14
+        style.bold: false
+        style.border-radius: 6
+        width: 340
+      }
+
+    }
+  }
+}

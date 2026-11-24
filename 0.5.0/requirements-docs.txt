@@ -1,0 +1,7 @@
+mkdocs>=1.6.0
+mike>=2.0.0
+mkdocs-material>=9.5.0
+mkdocs-awesome-nav>=1.0.0
+mkdocstrings[python]>=0.25.0
+pymdown-extensions>=10.0
+regex>=2024.0.0

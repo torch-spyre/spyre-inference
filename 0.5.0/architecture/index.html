@@ -1,0 +1,3119 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+        <link rel="canonical" href="https://torch-spyre.github.io/spyre-inference/0.5.0/architecture/index.html">
+      
+      
+        <link rel="prev" href="../getting_started/installation.html">
+      
+      
+        <link rel="next" href="../user_guide/configuration.html">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.2">
+    
+    
+      
+        <title>Plugin Overview - Spyre Inference</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#plugin-architecture" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <p id="dev-banner" style="display:none">
+    You are viewing development docs. <a href="https://torch-spyre.github.io/spyre-inference/0.5.0stable/">Click here</a> to view docs for the latest stable release.
+  </p>
+  <script>
+    if (globalThis.location.pathname.includes('/latest/')) {
+      document.getElementById('dev-banner').style.display = '';
+    }
+  </script>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Spyre Inference" class="md-header__button md-logo" aria-label="Spyre Inference" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Spyre Inference
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Plugin Overview
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="black" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 2c-1.82 0-3.53.5-5 1.35C8 5.08 10 8.3 10 12s-2 6.92-5 8.65C6.47 21.5 8.18 22 10 22a10 10 0 0 0 10-10A10 10 0 0 0 10 2"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/torch-spyre/spyre-inference" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../index.html" class="md-tabs__link">
+          
+  
+  
+  Home
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../getting_started/installation.html" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="index.html" class="md-tabs__link">
+          
+  
+  
+  Architecture
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Examples
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../user_guide/configuration.html" class="md-tabs__link">
+          
+  
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../contributing/index.html" class="md-tabs__link">
+          
+  
+  
+  Developer Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Spyre Inference" class="md-nav__button md-logo" aria-label="Spyre Inference" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Spyre Inference
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/torch-spyre/spyre-inference" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_1" id="__nav_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Home
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Spyre Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_2" id="__nav_1_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting_started/installation.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_3" id="__nav_1_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="index.html" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#system-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#component-view-of-a-granite-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Component view of a Granite model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-op-replacement" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom Op Replacement
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom Op Replacement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#transposed-linear-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transposed linear weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#model-adaptations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model adaptations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Model adaptations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#moe-expert-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MoE expert weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compilation-granularity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compilation Granularity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Attention Backend
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Attention Backend">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#head-major-kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Head-major KV cache
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Head-major KV cache">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lx-resident-pages" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LX-resident pages
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#encoder-only-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder-only attention
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#encoder-embedding-models-compile-shape-axes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder / embedding models: compile shape axes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#device-placement-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Device Placement Strategy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#host-side-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-side sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#transformers-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transformers backend
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#distributed-tp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distributed (TP)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4" id="__nav_1_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Examples
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_1" id="__nav_1_4_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Offline Inference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Offline Inference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../examples/offline_inference/profile_spyre_inference.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Profile Spyre Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../examples/offline_inference/setup_profile_env.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Setup Profile Env
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../examples/offline_inference/torch_spyre_inference.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Torch Spyre Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../examples/offline_inference/torch_spyre_multimodal_inference.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Torch Spyre Multimodal Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_5" id="__nav_1_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/configuration.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/env_vars.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Environment Variables
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/kineto_profiling.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Kineto Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_6" id="__nav_1_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../contributing/index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../contributing/vllm-upgrade-procedure.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    vLLM Upgrade Procedure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting_started/installation.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="index.html" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#system-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#component-view-of-a-granite-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Component view of a Granite model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-op-replacement" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom Op Replacement
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom Op Replacement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#transposed-linear-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transposed linear weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#model-adaptations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model adaptations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Model adaptations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#moe-expert-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MoE expert weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compilation-granularity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compilation Granularity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Attention Backend
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Attention Backend">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#head-major-kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Head-major KV cache
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Head-major KV cache">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lx-resident-pages" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LX-resident pages
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#encoder-only-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder-only attention
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#encoder-embedding-models-compile-shape-axes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder / embedding models: compile shape axes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#device-placement-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Device Placement Strategy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#host-side-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-side sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#transformers-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transformers backend
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#distributed-tp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distributed (TP)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/configuration.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/env_vars.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Environment Variables
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user_guide/kineto_profiling.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Kineto Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../contributing/index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../contributing/vllm-upgrade-procedure.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    vLLM Upgrade Procedure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#system-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#component-view-of-a-granite-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Component view of a Granite model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#custom-op-replacement" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom Op Replacement
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom Op Replacement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#transposed-linear-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transposed linear weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#model-adaptations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model adaptations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Model adaptations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#moe-expert-weights" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MoE expert weights
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compilation-granularity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compilation Granularity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Attention Backend
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Attention Backend">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#head-major-kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Head-major KV cache
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Head-major KV cache">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lx-resident-pages" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LX-resident pages
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#encoder-only-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder-only attention
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#encoder-embedding-models-compile-shape-axes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder / embedding models: compile shape axes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#device-placement-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Device Placement Strategy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#host-side-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-side sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#transformers-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transformers backend
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#distributed-tp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distributed (TP)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="plugin-architecture">Plugin Architecture<a class="headerlink" href="#plugin-architecture" title="Permanent link">&para;</a></h1>
+<p><code>spyre-inference</code> is a vLLM out-of-tree (OOT) platform plugin that enables inference on
+IBM's Spyre AI accelerator. It integrates with vLLM's plugin system to replace key
+compute layers with Spyre-optimized implementations while preserving the rest of the
+vLLM execution pipeline.</p>
+<h2 id="system-overview">System Overview<a class="headerlink" href="#system-overview" title="Permanent link">&para;</a></h2>
+<p>The diagram below shows how <code>spyre-inference</code> fits into vLLM's process architecture.
+Blue boxes are Spyre-specific classes provided by this plugin; dark boxes are vLLM base
+classes; the gold box is the model loaded from vLLM's model registry with Spyre custom
+ops injected via OOT registration.</p>
+<figure>
+  <img alt="System Overview" src="system-overview.svg" style="width: 140%; max-width: 1200px; margin-left: -20%;" />
+<br />
+<figcaption>
+    Process-level view of vLLM with the spyre-inference plugin. Dashed arrows (▷)
+    indicate inheritance; solid arrows indicate composition or dependency.
+  </figcaption>
+</figure>
+<p>The plugin registers via two entry points:</p>
+<table>
+<thead>
+<tr>
+<th>Entry Point</th>
+<th>Target</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vllm.platform_plugins</code></td>
+<td><code>spyre_inference:register</code></td>
+<td>Registers <code>TorchSpyrePlatform</code> — sets dtype, worker class, attention backend, and distributed backend</td>
+</tr>
+<tr>
+<td><code>vllm.general_plugins</code></td>
+<td><code>spyre_inference:register_ops</code></td>
+<td>Calls <code>register_all()</code> — importing the ops package triggers every <code>@register_oot()</code> layer swap, and <code>register_all()</code> additionally registers the <code>spyre_convert</code> custom op (RoPE registers no op — its rotation runs in-graph). Also overrides vLLM's <code>TransformersForCausalLM</code> with <code>SpyreTransformersForCausalLM</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>vLLM</code> is built from source with <code>VLLM_TARGET_DEVICE=empty</code> (no device-specific C
+kernels), so the platform overrides a few CPU-backend assumptions: <code>import_kernels()</code> is
+a no-op (there is no <code>vllm._C</code>), and the model runner reimplements the slot-mapping
+kernel in pure PyTorch. The host-side sampling kernels vLLM's CPU backend would supply
+are built by the plugin itself, as <code>spyre_inference._C</code> (see
+<a href="#host-side-sampling">Host-side sampling</a>).</p>
+<h2 id="component-view-of-a-granite-model">Component view of a Granite model<a class="headerlink" href="#component-view-of-a-granite-model" title="Permanent link">&para;</a></h2>
+<figure>
+  <img alt="Plugin Architecture" src="plugin-architecture.svg" style="width: 140%; max-width: 1000px; margin-left: -20%" />
+<br />
+<figcaption>
+    Static architecture of the spyre-inference plugin showing how it integrates with
+    vLLM and which model layers are replaced for Spyre execution.
+  </figcaption>
+</figure>
+<h2 id="custom-op-replacement">Custom Op Replacement<a class="headerlink" href="#custom-op-replacement" title="Permanent link">&para;</a></h2>
+<p>Most layers that require Spyre-specific handling are replaced via vLLM's
+<code>@ClassName.register_oot()</code> decorator (a few, like <code>SiluAndMul</code>, need no replacement and
+run upstream in the compiled graph). Most replacements are pure class swaps that run
+when the ops package is imported. <code>register_all()</code> additionally registers the <code>spyre_convert</code>
+custom op — the <code>convert</code> helper keeps device transfers invisible to <code>torch.compile</code>.
+RoPE registers no op — its rotation-cache gather and rotation (2×2, or split-free for a
+sub-stick half) run directly in the compiled graph (see below).</p>
+<table>
+<thead>
+<tr>
+<th>vLLM Layer</th>
+<th>Spyre Replacement</th>
+<th>Device</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GemmaRMSNorm</code></td>
+<td><code>SpyreGemmaRMSNorm</code></td>
+<td>Spyre</td>
+<td>A <code>maybe_compile(force=True)</code> <code>forward_native</code>, so the fp32 promotion is kept. Plain <code>RMSNorm</code> needs no replacement — upstream's fp32 <code>forward_native</code> lowers eagerly — but Gemma's trailing fp32 <code>weight</code> multiply does not: a STANDARD <code>[hidden]</code> operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger, so the kernel has to be compiled even under <code>enforce_eager</code>.</td>
+</tr>
+<tr>
+<td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code>, <code>YaRNScalingRotaryEmbedding</code>, <code>Gemma4RotaryEmbedding</code></td>
+<td><code>SpyreRotaryEmbedding</code>, <code>SpyreLlama3RotaryEmbedding</code>, <code>SpyreYaRNScalingRotaryEmbedding</code>, <code>SpyreGemma4RotaryEmbedding</code></td>
+<td>Spyre</td>
+<td>Fully on-device, no opaque op. A <code>[max_pos, 2, 2, rotary_dim//2]</code> rotation cache is built from <code>cos_sin_cache</code>, flattened to 2-D with the position axis outermost, and <strong>primed on-device in <code>_apply</code> before <code>torch.compile</code></strong>; <code>forward_oot</code> then gathers this pass's per-token slice with <code>index_select</code> and applies the 2×2 rotation-matrix formulation (<code>_rotate_neox_2x2</code>) — both traced directly into the enclosing block graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise <code>NotImplementedError</code> at construction. The 2×2 form views a head as two halves, so it needs a stick-aligned <code>rotary_dim//2</code>. A head whose half is sub-stick (<code>head_size=64</code>) takes <code>_rotate_neox_split_free</code> instead: <code>x * cos + rotate_half(x) * sin</code>, with <code>rotate_half</code> as a matmul by a fixed signed permutation, so every view is a whole head. Its cache is <code>[max_pos, 2 * head_size]</code>, laid out <code>[cos \| cos \| sin \| sin]</code>. Head-dim padding then only has to make a head stick-aligned, so the native path pads to the next 64-multiple</td>
+</tr>
+<tr>
+<td><code>VocabParallelEmbedding</code></td>
+<td><code>SpyreVocabParallelEmbedding</code></td>
+<td>Spyre (TP tables built on CPU at load)</td>
+<td>The weight moves to Spyre with the model and the embedding gather runs on-device (<code>aten.embedding</code> now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP&gt;1, the per-vocab reindex/keep tables are built once on CPU at load and registered as device buffers; <code>forward</code> derives <code>masked_input</code>/<code>keep</code> from them on-device (<code>index_select</code>/<code>F.embedding</code>), applies the keep mask, and <code>all_reduce</code>s — no per-step CPU round-trip</td>
+</tr>
+<tr>
+<td><code>ColumnParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code>, <code>RowParallelLinear</code>, <code>ReplicatedLinear</code></td>
+<td><code>SpyreColumnParallelLinear</code>, <code>SpyreMergedColumnParallelLinear</code>, <code>SpyreQKVParallelLinear</code>, <code>SpyreRowParallelLinear</code>, <code>SpyreReplicatedLinear</code></td>
+<td>Spyre</td>
+<td>All five swap in <code>SpyreUnquantizedLinearMethod</code> (the transposed-weight fast path below). <code>SpyreQKVParallelLinear</code> additionally asserts <code>gather_output=False</code>; <code>SpyreRowParallelLinear</code> (<code>o_proj</code>, <code>down_proj</code>) inherits upstream's <code>all_reduce</code> when <code>reduce_results=True</code> under TP&gt;1</td>
+</tr>
+<tr>
+<td><code>SiluAndMul</code></td>
+<td>— (not replaced)</td>
+<td>Spyre</td>
+<td>No OOT class: vLLM's own <code>SiluAndMul</code> is traced into the compiled graph, so <code>silu(gate)·up</code> runs on Spyre and slices the fused <code>[..., 2*d]</code> on-device. The Spyre-specific piece is <code>mlp_pad.py</code>, which zero-pads <code>intermediate_size</code> to the 64-element stick at load time so that slice lands at a lowerable offset (inert since <code>silu(0) = 0</code>)</td>
+</tr>
+<tr>
+<td><code>NewGELU</code></td>
+<td>— (not replaced)</td>
+<td>Spyre</td>
+<td>No OOT class: vLLM's own <code>gelu_new</code> is traced into the compiled graph, cube term included — torch-spyre decomposes its <code>torch.pow(x, 3.0)</code> into a chain of <code>mul</code> ops (torch-spyre#4479)</td>
+</tr>
+<tr>
+<td><code>ParallelLMHead</code></td>
+<td><code>SpyreParallelLMHead</code></td>
+<td>Spyre</td>
+<td>TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; <code>apply</code> runs <code>x @ Wᵀ</code> then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP <code>all_gather</code></td>
+</tr>
+<tr>
+<td><code>LogitsProcessor</code></td>
+<td><code>SpyreLogitsProcessor</code></td>
+<td>Spyre → CPU</td>
+<td>Moves logits to CPU so all downstream sampling runs on the host. <code>_apply_head</code> D2Hs on the single-card path; when TP&gt;1 <code>_gather_logits</code> runs the <code>all_gather</code> on Spyre and then converts the result. Either way the sampler's <code>logits.to(torch.float32)</code> never runs on Spyre, where it would crash torch-spyre's <code>copy_from_d2d</code></td>
+</tr>
+<tr>
+<td><code>GateLinear</code></td>
+<td><code>SpyreGateLinear</code></td>
+<td>Spyre</td>
+<td>Clears <code>out_dtype</code> so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (<code>spyre::ReStickifyOpHBM</code> is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype</td>
+</tr>
+<tr>
+<td>FP8 <code>ColumnParallelLinear</code> / fused QKV / <code>MergedColumnParallelLinear</code> / <code>RowParallelLinear</code></td>
+<td><code>SpyreFp8LinearKernel</code></td>
+<td>Spyre</td>
+<td>Checkpoint FP8 is dequanted to CPU fp16 at load so <code>model.to("spyre")</code> is a legal H2D. First Spyre forward eager-quantizes each SuperDSC N-tile to <code>qfp8wt</code> and caches it; later forwards compile <code>quantscalepertokenfp8</code> + <code>qfp8ch</code> + <code>aten._scaled_mm</code>. LM head stays FP16</td>
+</tr>
+</tbody>
+</table>
+<h3 id="transposed-linear-weights">Transposed linear weights<a class="headerlink" href="#transposed-linear-weights" title="Permanent link">&para;</a></h3>
+<p><code>F.linear(x, W)</code> computes <code>x @ Wᵀ</code> however <code>W</code> is laid out, and on Spyre that transposed
+matmul is ~3.5× slower than a plain <code>x @ A</code>
+(<a href="https://github.com/torch-spyre/torch-spyre/issues/3512">torch-spyre#3512</a>).
+<code>SpyreTransposedWeightMethod</code> (<code>custom_ops/linear.py</code>) is the shared base that closes that gap
+in two overrides:</p>
+<ul>
+<li><code>process_weights_after_loading</code> replaces the loaded <code>[out, in]</code> weight with a contiguous
+  <code>[in, out]</code> <code>Wᵀ</code> (optionally padding the output rows first), so the transpose is paid once at
+  load time rather than every forward.</li>
+<li><code>apply</code> runs <code>spyre_linear_t</code> — <code>torch.matmul(x, Wᵀ)</code> plus optional bias — instead of
+  <code>F.linear</code>, dropping any trailing pad columns with an eager on-device un-pad slice.</li>
+</ul>
+<p><code>SpyreUnquantizedLinearMethod</code> uses the base defaults (transpose in place, no padding); the five
+linear subclasses install it in <code>__init__</code>, but only when <code>quant_method</code> is an
+<code>UnquantizedLinearMethod</code>; quantized layers keep their own method. This is the
+pure-PyTorch equivalent of torch-spyre's <code>[1,0]</code> weight layout, which only fires
+for <code>nn.Linear</code> and so misses every vLLM parallel-linear. FP8 checkpoints use
+<code>SpyreFp8LinearKernel</code> (<code>custom_ops/fp8_linear_kernel.py</code>) rather than <code>F.linear</code>:
+load dequants to fp16, the first Spyre forward caches <code>qfp8wt</code> per N-tile, and
+the compiled GEMM is <code>qfp8ch</code> + <code>aten._scaled_mm</code>.
+<code>SpyreUnquantizedLMHeadMethod</code> reuses the same base with <code>WEIGHT_T_ATTR="padded_weight_t"</code> and
+<code>ROW_ALIGN=64*32</code>, so the fast path and the padding/un-pad logic are defined once.</p>
+<p>Fused projections stay fused. <code>SpyreQKVParallelLinear</code> returns the whole <code>[..., q+k+v]</code>
+tensor and the unmodified upstream idiom <code>q, k, v = qkv.split(...)</code> slices it, exactly as
+<code>SpyreMergedColumnParallelLinear</code>'s <code>[..., 2*d]</code> output feeds the upstream <code>SiluAndMul</code>,
+which slices gate/up on-device. Earlier revisions instead split the QKV weight on CPU at load
+time into three per-part GEMMs — a <code>SplitQKV</code> container built by an <code>analyze_and_unfuse</code>
+pass — so that no fused output ever had to be sliced; one fused GEMM is faster than three,
+so that pass is gone. The remaining slicing constraint is narrower than it was and lives
+in the attention backend, where offset &gt; 0 views still corrupt on transfer (see
+<a href="#attention-backend">Attention Backend</a>).</p>
+<h2 id="model-adaptations">Model adaptations<a class="headerlink" href="#model-adaptations" title="Permanent link">&para;</a></h2>
+<p>Some models need more than a swapped-out layer: a different transport for an input, a buffer
+that has to follow <code>.to("spyre")</code>, an expert dispatch Spyre can lower. Those live in
+<code>spyre_inference/models/</code>, one module per architecture, as <strong>subclasses of the upstream vLLM
+class</strong> rather than runtime monkey-patches. <code>models/__init__.py</code> holds <code>spyre_models()</code>
+(architecture string → Spyre class, built from the <code>_ADAPTED_MODULES</code> and <code>_ADAPTED_ARCHS</code>
+tables) and <code>register_models()</code>, which points vLLM's <code>ModelRegistry</code> at them; <code>_</code>-prefixed
+modules hold machinery those subclasses share or delegate to and register no architecture of
+their own. Registration is lazy — nothing is imported until vLLM resolves the architecture —
+and <code>register_models()</code> first checks every key against vLLM's own registry, so an upstream
+rename fails loudly instead of silently falling through to the unadapted class.</p>
+<p>Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
+<code>embedding_class</code>), the already-built instance is <strong>retyped</strong> to its Spyre subclass — same
+<code>__init__</code>, same parameters, same module tree, only <code>forward</code> differs. Prefer a documented
+upstream extension point where one exists: <code>CustomOp.register_oot</code> /
+<code>PluggableLayer.register_oot</code> for a layer, and — for a MoE — the quant-method seam the
+unquantized oracle leaves open for an out-of-tree platform.</p>
+<p>Two adaptations worth knowing:</p>
+<ul>
+<li><strong>BERT / RoBERTa</strong> (<code>models/_token_type.py</code>) carry <code>token_type_ids</code> in a side buffer
+  owned by the embedding instead of vLLM's bit-pack into the high bits of <code>input_ids</code>,
+  which Spyre cannot unpack (<a href="https://github.com/torch-spyre/torch-spyre/issues/3509">torch-spyre#3509</a>).</li>
+<li><strong>MoE</strong> (<code>moe.py</code>) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
+  for an out-of-tree platform (it selects <code>UnquantizedMoeBackend.OOT</code> — no kernel — and
+  leaves <code>process_weights_after_loading</code> to the plugin). A <code>CustomOp.register_oot</code>
+  replacement for <code>UnquantizedFusedMoEMethod</code> computes the experts in two Spyre forms —
+  gathered, which reads only a token's routed experts but lowers one token at a time, and
+  all-expert persistent. Dispatch looks only at the packed token count: up to
+  <code>SPYRE_MOE_GATHERED_MAX_TOKENS</code> — a decode batch, or a prompt that buckets that short — the
+  gathered form is driven once per token, and above it the all-expert form takes the whole
+  batch in one call. A batch whose rows are not stick-addressable takes the all-expert form
+  whatever its size, since each row's storage offset has to span whole sticks for the compiled
+  loop to address it.
+  In the post-load hook it also rebuilds each layer's <code>w13 [E,2M,H]</code> / <code>w2 [E,H,M]</code> stacks into
+  the <code>[E,H,M]</code> / <code>[E,M,H]</code> stacks those forms contract on (see
+  <a href="#moe-expert-weights">MoE expert weights</a>), freeing each source stack as it goes,
+  since the device cannot hold both layouts at once. Tensor parallelism needs nothing
+  further: upstream shards each expert's intermediate dim, so the forms just see a
+  narrower <code>M</code> — zero-widened to whole sticks where a shard lands mid-stick — and
+  <code>MoERunner</code> all-reduces the per-rank partial sums. Each model's own adaptation module
+  supplies its recipe and any model-owned scaling (<code>configure_gemma4_moe_layers</code> in
+  <code>models/gemma4.py</code>). <code>Gemma4DecoderLayer.forward</code> is untouched. <code>SpyreMoERunner</code>, an OOT
+  <code>MoERunner</code>, takes vLLM's direct <code>_moe_forward</code> entry — as upstream does on CPU and TPU —
+  instead of the opaque <code>torch.ops.vllm.moe_forward</code> custom op, so a compiled block traces
+  the expert forms into its own graph; an eager run dispatches them to compiled regions.</li>
+</ul>
+<h3 id="moe-expert-weights">MoE expert weights<a class="headerlink" href="#moe-expert-weights" title="Permanent link">&para;</a></h3>
+<p><code>_prepare_layer</code> moves each layer's experts to the device once, as three stacks, and hands
+the gathered form its own view of each: a <code>reinterpret_tensor_with_layout</code> alias over the
+same storage. Prefill and decode therefore share every byte of expert memory; there is no
+second weight pool.</p>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Shape</th>
+<th>Device layout</th>
+<th>Read by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>spyre_moe_gate</code>, <code>spyre_moe_up</code></td>
+<td><code>[E, H, M]</code></td>
+<td><code>[E, H, M/s, s]</code> (gather)</td>
+<td>persistent</td>
+</tr>
+<tr>
+<td><code>spyre_moe_gate_alias</code>, <code>spyre_moe_up_alias</code></td>
+<td><code>[E·C, H/C, M]</code></td>
+<td><code>[E·C, H/C, M/s, s]</code></td>
+<td>gathered</td>
+</tr>
+<tr>
+<td><code>spyre_moe_down</code></td>
+<td><code>[E, M, H]</code></td>
+<td><code>[E, H/s, M, s]</code> (<code>nn.Linear</code> order)</td>
+<td>persistent</td>
+</tr>
+<tr>
+<td><code>spyre_moe_down_alias</code></td>
+<td><code>[E·C, M, H/C]</code></td>
+<td><code>[E·C, H/(C·s), M, s]</code></td>
+<td>gathered</td>
+</tr>
+</tbody>
+</table>
+<p><code>s</code> is the stick (64 fp16 elements), <code>M</code> the intermediate dim zero-widened to whole sticks,
+and <code>C</code> is selected once during load by <code>_derive_moe_chunks</code>: the smallest divisor of <code>H/s</code>
+that spreads the <code>top_k·C</code> entries over the most cores. A core then holds
+<code>top_k·H·M / cores</code> weight elements whatever <code>C</code> is, so that split also has the smallest
+per-core working set. For Gemma 4 with <code>top_k=8</code> and 32 cores this selects <code>C=4</code>.
+<code>SPYRE_MOE_CHUNKS</code> overrides the derived value; the override must still split <code>H</code> into
+whole-stick chunks. Alias entry <code>e·C + c</code> is chunk <code>c</code> of expert <code>e</code>. TP narrows only <code>M</code>, so
+the slicing is unchanged at every TP degree.</p>
+<p>Decode orders the <code>top_k·C</code> entries row-major (row, then chunk): the entry index is the widened
+expert index times <code>C</code> plus a <code>[1, C, 1]</code> offset, both device tensors made at load, so the input
+is one broadcast, the gate/up chunk sum reduces a contiguous axis and the down parts reshape
+straight into <code>H</code>. Built from per-chunk <code>torch.cat</code>s instead, the region splits into four
+kernels plus per-call constants, whose launch cost outweighs the narrower slices at TP4.</p>
+<p>The gathered form slices the hidden dim because a gather divides work only along its entries.
+Gate/up slice their contraction dim (rows of <code>H</code>); down slices its output dim (columns of <code>H</code>).
+Persistent dispatch remains available for token batches above the gathered bound.</p>
+<p>An alias is only valid when the sliced axis sits directly inside the expert axis in device
+order, so that each slice is one contiguous block and slicing merely relabels the flat order.
+That is what fixes each stack's layout. Gate/up keep <code>H</code> outer to the <code>M</code> sticks (the gather
+layout); down keeps the <code>H</code> sticks outer to <code>M</code> (the <code>nn.Linear</code> order its persistent matmul
+wants anyway — in the gather layout its long <code>H</code> rows would stream in short transfers). The
+other layout would not alias for either stack. The selected <code>C</code> guarantees <code>H % (C·s) == 0</code>
+before any weights move, and each alias checks the pool's actual device layout before
+reinterpreting it.</p>
+<p>The two forms differ numerically in one place: the gathered form sums gate/up over <code>C</code> fp16
+partial products before the activation, so decode rounds up to three more times there than the
+persistent form. Down's output slices are concatenated, not summed.</p>
+<h2 id="compilation-granularity">Compilation Granularity<a class="headerlink" href="#compilation-granularity" title="Permanent link">&para;</a></h2>
+<p>Under <code>CompilationMode.STOCK_TORCH_COMPILE</code>, <code>_compile_for_spyre</code> compiles each entry of
+the model's block <code>ModuleList</code> in place via <code>block.compile(backend="inductor",
+fullgraph=True, dynamic=False)</code>. In place matters: rebinding the list entry to the
+<code>OptimizedModule</code> that <code>torch.compile</code> returns would re-parent the block under an
+<code>_orig_mod</code> child and rename every parameter, breaking weight save/reload.</p>
+<p>Every graph is compiled <code>dynamic=False</code> because torch-spyre's Inductor backend rejects
+<code>SymInt</code> shapes: a compiled graph is specialized to one concrete input shape. This is the
+root reason the plugin buckets shapes everywhere — variable request shapes are padded up
+to a small fixed set of compiled shapes (the padding masked out), and warmup pre-compiles
+every reachable bucket so no request pays an Inductor compile mid-serving. Two shape axes
+are bucketed independently: the packed <code>num_tokens</code> for the block graph (below) and
+<code>(num_blocks, query_len)</code> for attention (see <a href="#attention-backend">Attention Backend</a>).</p>
+<p>Blocks are found structurally — a <code>ModuleList</code> whose non-<code>PPMissingLayer</code> entries own an
+<code>Attention</code> somewhere, and are not themselves <code>Attention</code> layers — so decoder stacks
+(<code>model.layers</code>) and encoder stacks (<code>bert.encoder.layer</code>) are both covered, as are
+hybrid Mamba+attention stacks that mix layer classes in one list. A <code>ModuleList</code> of bare
+<code>Attention</code> layers (Zamba2's shared <code>dpa_list</code>) is skipped: it is not a block stack. So is any list under a vision tower
+(<code>vision_encoder</code>, <code>vision_tower</code>, <code>vision_model</code>, <code>visual</code>), which stays eager unless
+marked (below). Models whose
+attention is not a vLLM <code>Attention</code> — MLA (DeepSeek, Kimi) — match nothing and fall back to a
+whole-model graph.</p>
+<p>A vision tower opts in. A block cannot assemble a constant
+on the host: a CPU-resident buffer has no device layout, and layout propagation rejects
+the graph. So a tower qualifies only once its block body builds nothing there: a
+load-time constant such as a rope permutation becomes a non-persistent buffer on the
+layer, lifted as a graph input, and a per-image one such as the attention mask is built
+once in the encoder forward and passed to each layer as an argument. A multimodal patch
+that has done that marks the layers with <code>mark_blocks_compilable</code> (<code>multimodal/utils.py</code>),
+and they are discovered like any other block stack; every other tower stays eager. CLIP's
+tower is marked (<code>multimodal/clip.py</code>): its attention is vLLM's <code>MMEncoderAttention</code>,
+which Spyre replaces out of tree (<code>custom_ops/vit_attn.py</code>) with a <code>padded_sdpa</code> call that
+traces into the block rather than running behind upstream's opaque SDPA wrapper, and its
+only mask is the key-padding row, which <code>padded_sdpa</code> keeps a graph input. Marked tower
+blocks compile beside the decoder blocks but never stand in for them, so a model with no
+decoder blocks still falls back to the whole-model graph. Warmup runs a marked tower at
+every image-batch width up to <code>mm_max_items_per_batch</code>, for pooling and generative models
+alike, and the compile guard watches its blocks like the decoder's: a tower compile after
+warmup is a shape warmup missed. A tower whose per-image shape varies beyond the batch
+width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
+marked.</p>
+<p>Blocks of one class share one <code>forward</code> code object, so Dynamo traces the first and the
+rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
+backend compile count is independent of depth, but it is not 1: layer 0 specializes
+separately because <code>residual is None</code> there, so a Llama-shaped stack yields two
+artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
+and full attention, giving four. A fresh <code>num_tokens</code> bucket then costs one block recompile
+rather than a whole-model one. Note that <code>num_tokens</code> is the block graph's <em>only</em> shape
+dependence: kv-cache length and its block-count buckets live inside
+<code>unified_attention_with_output</code>, which is opaque to this graph and compiles its own
+kernels (see <a href="../user_guide/kineto_profiling.html">Kineto profiling</a>).</p>
+<p>Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
+which needs torch &gt;= 2.11 and <code>VLLM_USE_LAYERNAME=1</code>. Without it each block bakes in its
+own layer name and compiles separately, which is worse than the whole-model graph; the
+runner logs a warning when it detects this. Inductor freezing (enabled by <code>max_autotune</code>)
+defeats sharing the same way, by folding each block's weights into its own graph.</p>
+<p>Embeddings and the final norm sit outside the block list, so no enclosing block graph
+covers them. Both stay eager when compilation is off, except a Gemma final norm:
+<code>SpyreGemmaRMSNorm</code> passes <code>force=True</code>, so it compiles as its own one-op graph
+in every mode, including <code>enforce_eager</code>, because its fp32 weight multiply has no working
+eager form. <code>lm_head</code> was never in the compiled region; <code>compute_logits</code> is a separate
+call on the wrapper.</p>
+<p><code>SPYRE_COMPILE_GRANULARITY=model</code> restores the whole-model fullgraph, whose compile cost
+grows with layer count.</p>
+<h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
+<p>Decoder attention has two backends, which differ only in how a page is laid out; the
+default is the head-major one described below. <code>SpyreAttentionBackend</code> is the token-major
+layout (<code>SPYRE_ATTN_KV_LAYOUT=token_major</code>) and the structure both share, so it is
+described first. It implements paged attention using pure PyTorch operations
+(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
+<code>[num_blocks, block_size, num_kv_heads, head_size]</code> — the shape
+<code>SpyreAttentionBackend.get_kv_cache_shape</code> advertises. It runs a FlashAttention-style
+online softmax that iterates over pages without any compact-gather step, reading each
+page by indexing the dense tensor with a one-element int32 device tensor (an indirect
+access, so the compiled bundle carries a real index rather than a constant slice) and
+permuting the token-major page to head-major on device before the matmuls. The cache is
+allocated with the slot axis outermost in the device layout (<code>slot_major_kv_layout</code>) so
+the write can scatter through a slot-major view of it:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Device</th>
+<th>Operation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. Build metadata &amp; masks</td>
+<td>CPU → Spyre</td>
+<td>The metadata builder reads <code>query_start_loc</code>/<code>seq_lens</code>, pads each <code>query_len</code> and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device</td>
+</tr>
+<tr>
+<td>2. Write new K/V to cache</td>
+<td>Spyre</td>
+<td>Compiled <code>index_copy_</code> scatter through a slot-major view of the paged cache (one per tensor, fused); only the slot-index vector is computed host-side and copied over</td>
+</tr>
+<tr>
+<td>3. Per-sequence page attention</td>
+<td>Spyre</td>
+<td>A host-driven loop dispatches one compiled kernel per sequence — the query rows are gathered on-device (never copied to CPU): <code>Q @ Kᵀ · scale</code> → optional soft-cap → <code>+ tile_mask</code> → online softmax → <code>@ V</code></td>
+</tr>
+<tr>
+<td>4. Write-back</td>
+<td>Spyre</td>
+<td>Each sequence's result is written into the Spyre output buffer with a device-to-device copy</td>
+</tr>
+</tbody>
+</table>
+<p>The compiled kernels themselves — the per-sequence page attention, the batched decode
+path, the KV store, and the cache's device layout — live under
+<code>spyre_inference/v1/attention/ops/</code>; the backend module holds the metadata builder and
+the host-side orchestration that calls them.</p>
+<p>Because attention kernels are <code>dynamic=False</code> too, they are pre-compiled during warmup
+rather than lazily on first use: by default (<code>SPYRE_ATTN_RECORD=1</code>) warmup traces every
+variant <code>SpyreAttnBucketer</code> can produce — the product of the KV-length and query-length
+buckets below — so a served request always lands on an already-compiled kernel. When the
+batched-decode kernel is enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default, which under the
+default tiled walk means the head-major layout) warmup also records its variants, the
+product of the KV-length (<code>num_blocks</code>) and num-sequences buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
+padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
+<code>SPYRE_ATTN_RECORD=0</code> restores lazy per-variant compilation.</p>
+<p>Under <code>dynamic=False</code> the Python loop over a sequence's KV pages is unrolled at trace
+time, so a graph holds one copy of the attention body per page and compile time grows
+with KV length. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> walks that axis with torch-spyre's
+<code>for_each_tile</code> instead, leaving one body plus a tile spec, and the same applies to the
+batched-decode kernel's walk over block chunks. Both kernels carry the online softmax as
+a <code>(tile_max, tile_sum, tile_output)</code> triple either way; <code>walk_tiles</code> picks the walk and
+is the only place that reads the variable. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> is the default;
+setting it to <code>0</code> runs the identical bodies under Python loops as a rollback path. The switch is
+read once at import, because it decides the <code>fullgraph</code> setting the tiled walk needs —
+setting it after <code>spyre_inference</code> is imported has no effect.</p>
+<h3 id="head-major-kv-cache">Head-major KV cache<a class="headerlink" href="#head-major-kv-cache" title="Permanent link">&para;</a></h3>
+<p><code>SpyreHeadMajorAttentionBackend</code> is the default decoder backend
+(<code>SPYRE_ATTN_KV_LAYOUT=head_major</code>). It stores a page as
+<code>[num_blocks, num_kv_heads, block_size, head_size]</code> instead. The page then arrives in the
+shape the matmuls want, so the per-page permute in step 3 disappears — that is the whole
+point of the layout. It moves the transpose to the write: a token's KV heads are
+<code>block_size</code> rows apart, so step 2 becomes one <code>index_copy_</code> per KV head (<code>kv_write_index</code>
+publishes one index per head) over a source materialized contiguously first, rather than a
+single store of one contiguous run per token.</p>
+<p>Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
+warmup recording and dispatch — is shared with the token-major backend. What differs is
+duplicated rather than parameterised: the advertised shape, the allocation
+(<code>head_major_kv_layout</code>), and the three kernels that touch a page. The worker follows the
+layer's impl (<code>allocate_pages</code>) rather than a hardcoded shape, so the two cannot disagree.</p>
+<h4 id="lx-resident-pages">LX-resident pages<a class="headerlink" href="#lx-resident-pages" title="Permanent link">&para;</a></h4>
+<p>The head-major per-sequence kernel keeps a gathered page in the LX scratchpad from its
+gather to its last use instead of round-tripping through HBM. Two shape choices get it
+there. The page is gathered on (page, kv_head) with a <code>[num_kv_heads, 1]</code> index, so the
+gather's split lands per KV head — an output axis of <code>probs @ V</code> the consumer can mirror;
+behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
+groups fold into the query's row axis — a reshape, since heads are KV-major — so each
+matmul carries a single batch dim: the batched GQA form leaves the page with two batch dims
+and Inductor clones it out to a query-group axis it does not have (torch-spyre#4123). The
+cache fold is free too — <code>[num_blocks, KV, block_size, D]</code> reshapes to
+<code>[num_blocks * KV, block_size, D]</code> — but the cache is allocated with that folded axis at
+device dim 0, which is where an indexed axis has to sit for the gather to cost one page
+rather than the whole tensor.</p>
+<p>Three things follow from those choices. The gather is a 2-D subscript, which lowers to
+<code>aten.index</code> and fails eager by upcasting its int32 index, so this backend always compiles
+attention even under <code>--enforce-eager</code> — attention compiles in its own domain, so the rest
+of the model still runs eager. Because the bmm's output axes
+(<code>num_kv_heads * padded_query_len</code>) cannot fill 32 cores at decode, and filling them would
+mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
+at 8 cores; <code>SPYRE_ATTN_MAX_CORES</code> overrides that. And the layout carries no ALiBi (which
+needs a bias tile per query group), so an ALiBi model needs <code>token_major</code>. Batched decode
+runs the other way round: its page index is uploaded one entry per stick here, which is
+what the tiled walk needs, so the batched kernel is reached on this layout and declined on
+token-major until that port lands.</p>
+<p>Residency is a property of the layout plan, not of a result, so it is measured off the
+planner's own verdicts. K's residency needs torch-spyre#4153: <code>q @ Kᵀ</code> lowers the
+transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
+that PR's local-read proof. V is read directly by <code>probs @ V</code> and stays resident either
+way.</p>
+<p>Key constraints:</p>
+<ul>
+<li><strong>KV length bucketing</strong>: padded block count on power-of-two buckets from <code>block_size</code>
+  to <code>max_model_len</code> (avoids per-step recompilation on Spyre)</li>
+<li><strong>Query length bucketing</strong>: <code>[1] + multiples of min(512, max_num_batched_tokens)</code>
+  (consistent tensor shapes for compilation)</li>
+<li><strong>Num-sequences bucketing</strong> (batched-decode kernel only, <code>SPYRE_BATCHED_DECODE=1</code>, the
+  default; under the default tiled walk, the head-major layout only):
+  powers of two from 1 to <code>max_num_seqs</code> (<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>); the decode-batch
+  kernel is recorded over the <code>(num_blocks, num_seqs)</code> grid</li>
+<li><strong>Head size</strong>: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)</li>
+<li><strong>Block size</strong>: Must be a multiple of 64. The default is 128, and a user-supplied
+  <code>block_size</code> is rounded up to the next multiple of 64</li>
+<li><strong>GQA only</strong>: MHA (<code>num_queries_per_kv = 1</code>) currently fails in the Spyre compiler's
+  layout-propagation pass; only GQA configurations are exercised today</li>
+<li><strong>Supported</strong>: sliding-window masking (per layer, so a hybrid stack's full-attention
+  layers stay unwindowed) and logits soft-capping are both handled; ALiBi slopes are not</li>
+</ul>
+<h3 id="encoder-only-attention">Encoder-only attention<a class="headerlink" href="#encoder-only-attention" title="Permanent link">&para;</a></h3>
+<p>Encoder-only (embedding) models take a separate path. For <code>ENCODER</code>/<code>ENCODER_ONLY</code>
+layers, <code>TorchSpyrePlatform.get_attn_backend_cls</code> selects <code>SpyreEncoderAttentionBackend</code>
+→ <code>SpyreEncoderAttentionImpl</code> (both subclass the decoder backend/impl in
+<code>spyre_encoder_attn.py</code>). This path has <strong>no KV cache</strong> — attention is bidirectional over
+the full sequence — so it skips the paged-cache machinery. There is no online-softmax
+loop either: a sequence's whole K/V fits one tensor, so nothing forces the block-wise walk
+the decoder needs.</p>
+<p>Everything hangs off one number, <code>R = encoder_budget_rows(...)</code>: the token budget, capped
+at 2048, floored at <code>max_model_len</code> rounded up to a power-of-two multiple of 64, capped at
+what <code>max_num_seqs</code> sequences of that length could carry, and finally floored to a whole
+multiple of that longest length — which is what makes every declared length divide <code>R</code>. <strong>The pooling body is always <code>R</code> rows.</strong> Fixing it
+is what reduces the attention kernels' cache keys to the sequence shapes alone — both
+kernels take the body buffer as an argument, so a varying buffer size would multiply every
+attention graph.</p>
+<p>On top of that one buffer sit two paths over a single power-of-two length ladder
+(<code>ENCODER_LEN_ALIGNMENT = 64</code> doubling up to <code>max_model_len</code>, rounded up to a power-of-two
+multiple of 64 — the same rounding a request's own extent gets, so the ladder declares
+exactly the extents a request can be assigned):</p>
+<ol>
+<li><strong>Rectangular path</strong> — one rectangle per length, <code>B = R / L</code>, so a rectangle is exactly the
+   body buffer. The runner pads each sequence to <code>L</code> and the batch to <code>B</code> in <code>_preprocess</code>
+   (host-side, integer tensors only), so Q/K/V <em>are</em> the grid: <code>_encoder_rect_kernel</code>
+   reshapes, runs one <code>F.scaled_dot_product_attention</code>, and stores — no data movement
+   inside the layer. <code>_unpad_encoder_hidden</code> compacts the grid back before the pooler, at a
+   fixed row count so the gather does not specialise per token total.</li>
+<li><strong>Ragged path</strong> — for a batch too wide for any rectangle. Q/K/V stay packed and requests
+   are grouped by their own padded extent; <code>_encoder_fused_kernel</code> does gather, attend and
+   scatter for one group in a single graph, keyed on <code>(width, extent)</code>. Request boundaries
+   ride in int32 row-index tables, so a card never does offset arithmetic on <em>shapes</em> —
+   offsets are data. A group wider than the widest declared width is chunked into
+   descending powers of two, so every dispatch lands on a warmed pair.</li>
+</ol>
+<p>The runner picks between them once per step in <code>_build_attention_metadata</code> and records the
+choice as the <em>type</em> of <code>attn_metadata.encoder_plan</code> (<code>EncoderRectPlan</code> versus a list of
+<code>EncoderGroupPlan</code>). It has to run there rather than in <code>forward</code>: the builder does a D2H
+read and an H2D convert, which inside a traced region become graph nodes. Because both
+paths stay behind the opaque <code>unified_attention_with_output</code>, the enclosing block graph is
+identical for either — one shape, shared — so path selection is never a branch inside a
+compiled region nor a dynamo guard.</p>
+<p>Three torch-spyre constraints shape the rest: a compile input's <code>storage_offset</code> is a
+Dynamo guard (torch-spyre#4449, which closed #3770) and for int32 is still dropped
+outright, so rows are gathered with <code>index_select</code> rather than sliced — a slice would
+either recompile per offset or read the wrong rows; there is no on-device <code>arange</code> or <code>full</code>, so every index and mask
+tensor is host-built and reaches the device in one <code>convert</code> per plan; and SDPA's
+decomposition does <code>amax</code> then <code>exp(scores - max)</code>, which NaNs a fully masked row — hence
+the <code>finfo.min / 2</code> mask fill and the single attendable key a batch-pad lane gets.</p>
+<h2 id="encoder-embedding-models-compile-shape-axes">Encoder / embedding models: compile shape axes<a class="headerlink" href="#encoder-embedding-models-compile-shape-axes" title="Permanent link">&para;</a></h2>
+<p>The body is compiled once, at <code>R</code> rows. Attention is shape-managed separately behind the
+opaque custom-op boundary: one rectangle per declared length on the rectangular path, one
+<code>(width, extent)</code> pair per group on the ragged one (a <em>group</em> being the requests that
+share one padded extent, attended together in one call). With <code>max_model_len=512</code>,
+<code>max_num_seqs=32</code> and a 2048-token budget that is 23 shapes — one body, four rectangles,
+18 group pairs — and at <code>max_num_seqs=4</code> only five, since no batch that narrow can miss
+the rectangular path.</p>
+<figure>
+  <img alt="Encoder target state" src="encoder-ideal-state.svg" style="width: 140%; max-width: 1400px; margin-left: -20%" />
+<br />
+<figcaption>
+    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>ragged path
+    only</strong>: attention over the packed list, grouped by each request's padded
+    extent. Predates the rectangular path and the single <code>R</code>-row body, so read the
+    body bucketing and the warmup sweep as historical; the grouping and the row-index
+    tables are still current. Regenerating it needs the <code>d2</code> toolchain.
+  </figcaption>
+</figure>
+<h2 id="device-placement-strategy">Device Placement Strategy<a class="headerlink" href="#device-placement-strategy" title="Permanent link">&para;</a></h2>
+<p><code>TorchSpyreModelRunner</code> inherits from vLLM's <code>GPUModelRunner</code> and treats Spyre as the
+"GPU" in the <code>CpuGpuBuffer</code> pattern. Buffers are created via a <code>SpyreCpuGpuBuffer</code>
+override:</p>
+<ul>
+<li><strong>Float dtypes</strong>: <code>.cpu</code> on CPU (numpy staging for the scheduler), <code>.gpu</code> on Spyre as
+  <code>float16</code></li>
+<li><strong>Int / bool dtypes</strong>: <code>.gpu</code> aliased to <code>.cpu</code> (Spyre doesn't natively support these)</li>
+</ul>
+<p><code>self.device</code> stays <code>cpu</code> so that scatter, indexing, and block-table ops run on CPU, but
+float compute tensors land on Spyre via <code>self._spyre_device</code>. Because there is no
+<code>vllm._C</code> under <code>VLLM_TARGET_DEVICE=empty</code>, the runner also swaps in a pure-PyTorch
+<code>_compute_slot_mapping</code> implementation for the paged-cache slot mapping.</p>
+<p>At load time, <code>load_model</code> moves every module except <code>Attention</code> scale buffers onto Spyre.
+The weight transposes happen before that, in each layer's
+<code>process_weights_after_loading</code>, while the weights are still on CPU.</p>
+<p><code>_SpyreModelWrapper</code> sits between the model runner and the model and converts at the
+call boundary:</p>
+<ul>
+<li><strong>Input</strong>: CPU <code>int32</code>/<code>int64</code> tensors → Spyre <code>int64</code> (for embedding lookup)</li>
+<li><strong>Output</strong>: Spyre <code>float16</code> tensors → CPU (for logits indexing and sampling)</li>
+<li><strong><code>compute_logits</code></strong>: moves the CPU-sliced <code>hidden_states[logits_indices]</code> back onto
+  Spyre for the <code>SpyreParallelLMHead</code> matmul, which returns logits on Spyre</li>
+</ul>
+<p><code>SpyreVocabParallelEmbedding</code> inherits weight loading and shard arithmetic from upstream
+and overrides <code>forward</code>. The weight moves to Spyre with the rest of the model, and the
+embedding gather runs on-device now that <code>aten.embedding</code> has a Spyre kernel
+(<a href="https://github.com/torch-spyre/torch-spyre/issues/420">torch-spyre#420</a>) — this
+replaces the earlier silent D2H/H2D CPU fallback that copied the full <code>[vocab, hidden]</code>
+weight on every decode step. When TP&gt;1 the shard mask is applied <strong>on-device</strong>:
+<code>get_masked_input_and_mask</code> runs once at load to build per-vocab reindex/keep lookup
+tables (its int64 comparisons against Python constants cannot lower on Spyre), registered
+as device buffers; <code>forward</code> then gathers through them with <code>index_select</code>/<code>F.embedding</code>,
+applies the keep mask, and <code>all_reduce</code>s — all on Spyre, no per-step CPU round-trip.</p>
+<p>Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
+work that stays host-side: logits indexing for sampling, and the attention metadata the
+builder prepares on CPU (slot mapping, the per-sequence index tables and additive mask).
+The per-sequence attention loop is host-driven control flow, but its query-row gather and
+kernels run on Spyre; the KV-cache write and the write-back are device-to-device. RoPE's
+rotation-cache gather and the embedding gather also run on-device.</p>
+<h2 id="host-side-sampling">Host-side sampling<a class="headerlink" href="#host-side-sampling" title="Permanent link">&para;</a></h2>
+<p><code>SpyreLogitsProcessor</code> hands the sampler CPU logits, so every sampling step runs on the
+host, serially between device forwards. vLLM picks its sampler path by platform:
+<code>TorchSpyrePlatform</code> is <code>PlatformEnum.OOT</code>, so <code>is_cpu()</code> is <code>False</code>, and
+<code>TopKTopPSampler</code> falls through to <code>forward_native</code> — eager PyTorch, with none of the
+fused kernels upstream reserves for <code>forward_cpu</code>. Left as is, that path sorts the full
+<code>[batch, vocab]</code> logits for top-k/top-p and generates a fresh <code>[batch, vocab]</code> noise tensor
+for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
+large share of each decode step.</p>
+<p><code>SpyreModelRunner</code> patches upstream's <code>Sampler</code> in place after construction, pointing its
+greedy draw at <code>greedy_sample</code> (<code>v1/sample/sampler.py</code>) and its random draw at
+<code>SpyreTopKTopPSampler</code>, so every holder of it, the rejection sampler included, samples the
+same way. That brings back the CPU kernels and drops the full-vocabulary sort:</p>
+<ul>
+<li><strong>Random draw</strong> — <code>SpyreTopKTopPSampler.forward_native</code> calls
+  <code>torch.ops._spyre_C.fused_gumbel_argmax</code>: one pass of <code>argmax(logits + g)</code>, with the
+  Gumbel noise <code>g</code> hashed per element from a per-row seed (splitmix64 of <code>(seed, i)</code>), so
+  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
+  running best (including every <code>-inf</code> left by top-k/top-p) are skipped exactly, and most
+  others are rejected with one <code>exp</code> before the two <code>log</code>s of the Gumbel transform. A
+  seeded request draws its row seed from its own <code>torch.Generator</code>, so it stays
+  reproducible. <code>use_fp64_gumbel</code> keeps fresh fp64 noise, drawn in log space
+  (<code>argmax(x - log q)</code>, <code>q ~ Exp(1)</code>). vLLM's kernel reads its noise from a fixed 2^20-entry
+  table instead, which limits each row to 2^20 noise windows and leaves much of a large
+  vocabulary unreachable.</li>
+<li><strong>Greedy</strong> — <code>greedy_sample</code> calls <code>torch.ops._spyre_C.greedy_argmax</code>, a
+  vectorized max followed by a first-match scan, so ties break like <code>torch.argmax</code>. A
+  single row falls back to <code>torch.argmax</code>, where OpenMP fork/join would cost more than the
+  scan.</li>
+<li><strong>Top-k + top-p</strong> — <code>apply_top_k_top_p_sort_free</code> takes a <code>topk</code> window of <code>2 × max_k</code>
+  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
+  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
+  exact tie count when ties run past it. Top-p without top-k still sorts.</li>
+</ul>
+<p>The kernels live in <code>csrc/cpu/sampling_kernels.cpp</code> and are built with CMake from
+<code>setup.py</code>, over the <code>cpu_types_{x86,vsx,vxe}.hpp</code> SIMD headers copied unchanged from vLLM,
+so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (<code>_C</code>) and an
+AVX2 fallback (<code>_C_AVX2</code>), and <code>v1/sample/sampling_kernels.py</code> imports whichever the host
+supports, as vLLM's CPU backend does. The ops register under the fixed <code>_spyre_C</code>
+namespace rather than <code>TORCH_EXTENSION_NAME</code>, so the two builds share one op name and
+cannot collide with a vLLM <code>_C</code> in the same environment. If the extension
+is missing or fails to import (a failed build, or a dev checkout that never built it), the
+import logs a warning and the samplers fall back to <code>torch.argmax</code> and a fresh-noise
+log-space draw. Because the sampler reimplements
+the tail of upstream <code>TopKTopPSampler.forward_native</code>, it has to be re-synced on a vLLM
+bump.</p>
+<h2 id="transformers-backend">Transformers backend<a class="headerlink" href="#transformers-backend" title="Permanent link">&para;</a></h2>
+<p>When <code>model_impl="transformers"</code>, <code>register_ops</code> swaps vLLM's <code>TransformersForCausalLM</code>
+for <code>SpyreTransformersForCausalLM</code> (<code>spyre_inference/transformers_backend.py</code>). vLLM's
+stock Transformers backend still handles model creation, weight loading, attention
+routing, the KV cache, and scheduling, and its fusers replace HF's linear/norm/GLU
+modules with vLLM layers — which the OOT registrations above then pick up automatically.</p>
+<p>The subclass covers what upstream leaves to HF's module code. There is no RoPE fuser, so
+HF's <code>rotary_emb</code> survives and would derive cos/sin inside the forward from int64
+<code>position_ids</code>, a cast torch-spyre cannot lower. It is replaced with a precomputed
+<code>[max_model_len, 2, 2, head_dim/2]</code> rotation cache — built on the host and moved to the
+device before compile, leaving only an <code>index_select</code> in the graph — plus an
+<code>apply_rotary_pos_emb</code> that applies the 2×2 rotation by multiply-and-reduce rather than
+HF's <code>rotate_half</code> slicing. That rotation still views a head as two halves, so here the
+platform widens <code>head_dim</code> to the next 128-multiple, not the native path's 64-multiple. The
+weight passes in <code>head_pad.py</code> are shared with the native path and pad Q/K interleaved, so
+this backend only has to rebuild the rotation cache at the pre-pad frequencies.</p>
+<p><code>RMSNorm</code> registers no OOT op: upstream <code>forward_native</code> lowers its fp16→fp32 upcast
+into the compiled graph. <code>GemmaRMSNorm</code> still needs one, because its trailing fp32
+<code>weight</code> multiply hits a torch-spyre gap — a STANDARD <code>[hidden]</code> operand that can
+neither broadcast against nor de-stagger the staggered-EA activation. Because the
+fusers key on class names, the OOT registry covers the fused Gemma norm
+(<code>SpyreTPAwareGemmaRMSNorm</code>) too.</p>
+<h2 id="distributed-tp">Distributed (TP)<a class="headerlink" href="#distributed-tp" title="Permanent link">&para;</a></h2>
+<p><code>TorchSpyrePlatform.get_device_communicator_cls</code> returns <code>SpyreCommunicator</code>, a
+<code>DeviceCommunicatorBase</code> override in
+<code>spyre_inference/distributed/spyre_communicator.py</code>. The installed <code>libspyre_comms.so</code>
+now implements <code>barrier</code>, <code>broadcast</code>, <code>send</code>/<code>recv</code>, list-form <code>allgather</code>, <code>gather</code>,
+and <code>allreduce</code>; only <code>reduce</code> remains a throw-stub, and torch-spyre's spyreccl
+backend still stubs <code>_allgather_base</code> (so <code>dist.all_gather_into_tensor</code> doesn't work).</p>
+<p><code>SpyreCommunicator</code> therefore overrides:</p>
+<ul>
+<li><strong><code>all_reduce</code></strong> — uses the functional <code>_c10d_functional.all_reduce</code>, which torch-spyre
+  lowers to <code>spyre::all_reduce_async</code> inside a compiled graph and which runs eagerly via
+  <code>libspyre_comms</code> outside one, so one code path serves both modes.</li>
+<li><strong><code>all_gather</code></strong> — inside a compiled graph the functional collective lowers to
+  <code>spyre::all_gather_async</code> and stays on device; eager keeps native list-form
+  <code>dist.all_gather</code>, because the functional entry point (<code>allgather_into_tensor_coalesced</code>)
+  is rejected outside a graph. CPU tensors route through the gloo half of the multi-backend
+  <code>cpu:gloo,spyre:spyreccl</code> group.</li>
+<li><strong><code>reduce_scatter</code></strong> — raises; it is not on the TP forward path.</li>
+</ul>
+<p><code>gather</code> is not overridden — it works natively via <code>libspyre_comms</code>. The
+<code>tests/probes/test_spyre_comms_native_probes.py</code> xfail-strict suite is the canonical
+signal: when a probe flips green, delete the corresponding override or workaround.</p>
+<p>The worker (<code>TorchSpyreWorker</code>) inherits directly from vLLM's <code>Worker</code> (gpu_worker), not
+<code>CPUWorker</code> — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
+profiling). Data parallelism (<code>data_parallel_size &gt; 1</code>) is rejected in
+<code>check_and_update_config</code>.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.tabs.link", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.top", "search.highlight", "search.share", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.a5f9d56c.min.js"></script>
+      
+    
+  </body>
+</html>

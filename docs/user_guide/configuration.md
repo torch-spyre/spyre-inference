@@ -314,11 +314,11 @@ need; with prefix caching on, the spare blocks keep earlier prompts' KV for reus
 
 Spyre turns vLLM's hybrid KV cache manager off by default, so every layer allocates its own
 page per block and the budget is converted into blocks at the device cost of all layers' pages.
-On the V2 model runner `--no-disable-hybrid-kv-cache-manager` turns it on: a model that mixes
+`--no-disable-hybrid-kv-cache-manager` turns it on: a model that mixes
 sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets one KV cache group per
 kind, sliding-window groups return blocks that fall out of the window, and the groups overlay
 one another as upstream lays them out, each layer reading the shared pages in its own shape, so
-a block costs what vLLM's pool counts. The V1 runner rejects the flag. Either way the pages are
+a block costs what vLLM's pool counts. Either way the pages are
 laid out layer-outer, so `VLLM_KV_CACHE_LAYOUT` accepts only `LBNHC` (the default) or `LBHNC`,
 and a block-outer value fails at startup. Every K and V page allocation is one tensor, and the
 Spyre allocator never splits a tensor across its 16 GiB memory regions, so a model with few
@@ -358,21 +358,19 @@ compiles them once, as an fp16 cache does.
 
 ## Model runner
 
-The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
-host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so no Triton install is
-needed on any architecture.
+The plugin runs vLLM's Model Runner V2 (MRV2), its only model runner: the V1 runner was
+removed (#1245), and `SPYRE_MODEL_RUNNER=v1` is refused at startup. MRV2's Triton
+kernels are replaced by host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so
+no Triton install is needed on any architecture. The plugin pins
+`VLLM_USE_V2_MODEL_RUNNER=1`, so don't set it yourself.
 
-Set `SPYRE_MODEL_RUNNER=v1` to fall back to the V1 model runner. The fallback is
-best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
-the V1 runner (#1245). The plugin sets `VLLM_USE_V2_MODEL_RUNNER` from
-`SPYRE_MODEL_RUNNER`, so don't set it yourself.
-
-Differences on V2:
+Differences from the removed V1 runner:
 
 - Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.
 - These are refused at startup: speculative decoding other than DFlash/XPress,
-  batch-sharded sampling, `cudagraph_mm_encoder`, and prefill context parallelism.
+  batch-sharded sampling, `cudagraph_mm_encoder`, prefill context parallelism, and,
+  untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).
 
 ## Offline engine in the calling process
 

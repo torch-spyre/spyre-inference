@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: V2 warmup driver (vllm/v1/worker/gpu_worker.py:Worker.compile_or_warm_up_model,
-TorchSpyreModelRunner.warming_up_model).
+"""MRV2: V2 warmup driver (vllm/v1/worker/gpu_worker.py:Worker.compile_or_warm_up_model).
 
 Decoder dummies skip attention and publish null KV slots; pooling dummies keep
 attention on; a separate pass then records attention over attn_groups and runs the
@@ -26,11 +25,12 @@ already-bucketed token counts itself.
 """
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
-from vllm.config import CompilationMode
+from vllm.config import CompilationMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -47,13 +47,13 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inl
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
-from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
-from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
-from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
-    _set_spyre_compilation_settings,
+from spyre_inference.v1.worker.compile_granularity import compile_granularity
+from spyre_inference.v1.worker.spyre.model_wrapper import (
     _SpyreModelWrapper,
     warm_sample_row_gathers,
 )
+from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
+from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_shape_tables,
@@ -160,8 +160,7 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
-    """The input embedding at every body size, and the encoder at every batch width
-    (V1's _warmup_input_embedding / _warmup_multimodal_encoder).
+    """The input embedding at every body size, and the encoder at every batch width.
 
     A dummy run hands the model the staging buffer instead of producing it through
     embed_input_ids, and no dummy run reaches the encoder. A generative model's tower is
@@ -194,7 +193,7 @@ def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
 
 def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
     """A SpyreVisionEncoderMixin tower compiles per token budget, then serves through the
-    encoder runner's graph manager (V1's _record_vision_graphs / _warmup_vision_merge).
+    encoder runner's graph manager.
 
     Not keyed on cudagraph_mm_encoder, which also gates GPU-only memory profiling.
     """
@@ -254,6 +253,29 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
     )
 
 
+@contextmanager
+def _set_spyre_compilation_settings(config: VllmConfig):
+    """Spyre's Inductor settings for the duration of warmup."""
+    import torch._inductor.config as torch_inductor_config
+
+    inductor_config = config.compilation_config.inductor_compile_config
+    freezing_value = torch_inductor_config.freezing
+    try:
+        if inductor_config.get("max_autotune", False):
+            # Freezing folds per-block weights into each block's graph, defeating
+            # artifact sharing. Warn rather than override an explicit max_autotune.
+            if compile_granularity() == "block" and not config.model_config.enforce_eager:
+                logger.warning(
+                    "max_autotune enables Inductor freezing, which folds per-block "
+                    "weights into each block's graph and defeats per-block artifact "
+                    "sharing. Compile time will grow with layer count."
+                )
+            torch_inductor_config.freezing = True
+        yield
+    finally:
+        torch_inductor_config.freezing = freezing_value
+
+
 def run(runner: "SpyreModelRunnerV2") -> None:
     """Execute plan(runner), then record attention and the sampler dummy."""
     allocate_staging_buffers(runner.compilation_config.static_forward_context, runner.spyre_device)
@@ -301,6 +323,8 @@ def run(runner: "SpyreModelRunnerV2") -> None:
                     # Wider than any sampled batch: the prompt-logprobs chunk, which
                     # only goes through compute_logits, never the sampler.
                     wrapper.compute_logits(widest.new_zeros(rows, widest.shape[1]))
+        # The bench tooling (vllm-bench-serve's collect.py) parses this line.
+        logger.info("Warmup complete in %.3fs for %d buckets.", time.time() - t0, len(calls))
         if runner.spyre_kv_caches:
             _record_attention(runner)
         if not runner.model_config.enforce_eager:

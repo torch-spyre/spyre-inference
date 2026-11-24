@@ -51,11 +51,8 @@ from spyre_inference.v1.worker.model_load import (
     resolve_kv_scales,
 )
 from spyre_inference.v1.worker.spyre.model_states import resolve_spyre_model_state
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper, model_dtype
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
-from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
-    _SpyreModelWrapper,
-    model_dtype,
-)
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_len_ladder,
@@ -143,7 +140,7 @@ class _SpyreModelLoaderWrapper:
             logits_row_buckets=row_buckets,
             shape_bucketer=bucketer,
             model_dtype=model_dtype(model_config),
-            # As V1: without a bucketer the body is unpadded, so every prompt length
+            # Without a bucketer the body is unpadded, so every prompt length
             # would compile a fresh gather.
             sample_rows_on_device=model_config.runner_type == "generate" and bucketer is not None,
             keep_aux_hidden_states_on_device=runner.use_aux_hidden_state_outputs,

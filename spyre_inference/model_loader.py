@@ -117,7 +117,7 @@ class SpyreModelLoader(BaseModelLoader):
         if hasattr(torch, "spyre") and hasattr(torch.spyre, "is_initialized"):
             assert torch.spyre.is_initialized(), (
                 "SpyreModelLoader called before torch_spyre initialization. "
-                "Ensure TorchSpyreWorker.init_device() runs first."
+                "Ensure SpyreWorkerV2.init_device() runs first."
             )
 
         # Delegate to model.load_weights() so fused parameters are scattered

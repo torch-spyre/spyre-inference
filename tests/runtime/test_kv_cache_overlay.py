@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.worker import kv_cache_setup
-from spyre_inference.v1.worker.spyre_worker import _kv_block_layout
+from spyre_inference.v1.worker.spyre.worker import _kv_block_layout
 
 MiB = 1 << 20
 

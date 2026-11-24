@@ -43,6 +43,7 @@ defaults:
 
 tests:
   - test_name: serve_granite33-8b_tp1_cics
+    tier: core
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct
       tensor-parallel-size: 1
@@ -51,6 +52,7 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
 
   - test_name: serve_granite33-8b_tp4_cics
+    tier: core
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct
@@ -60,6 +62,7 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
 
   - test_name: serve_granite41-8b_tp1_cics
+    tier: core
     server_parameters:
       model: ibm-granite/granite-4.1-8b
       tensor-parallel-size: 1
@@ -68,6 +71,7 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
 
   - test_name: serve_granite41-8b_tp4_cics
+    tier: core
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-4.1-8b
@@ -77,6 +81,7 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
 
   - test_name: serve_granite33-8b-fp8_tp4_aiops
+    tier: extended
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct-FP8
@@ -87,6 +92,7 @@ tests:
       num-prompts: 50
 
   - test_name: serve_granite41-8b-fp8_tp4_aiops
+    tier: extended
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-4.1-8b-fp8
@@ -97,6 +103,7 @@ tests:
       num-prompts: 50
 
   - test_name: serve_gemma4-26b-a4b_tp1_cics
+    tier: extended
     server_health_timeout: 3600
     server_parameters:
       model: google/gemma-4-26B-A4B
@@ -107,6 +114,7 @@ tests:
       num-prompts: 50
 
   - test_name: serve_gemma4-26b-a4b_tp4_cics
+    tier: extended
     server_health_timeout: 3600
     server_parameters:
       model: google/gemma-4-26B-A4B
@@ -117,6 +125,7 @@ tests:
       num-prompts: 50
 
   - test_name: serve_granite-embedding-125m-english_tp1_in64
+    tier: extended
     server_parameters:
       model: ibm-granite/granite-embedding-125m-english
       tensor-parallel-size: 1
@@ -137,6 +146,7 @@ tests:
       request-rate: inf
 
   - test_name: serve_granite-embedding-278m-multilingual_tp1_in64
+    tier: extended
     server_parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
       tensor-parallel-size: 1
@@ -157,6 +167,7 @@ tests:
       request-rate: inf
 
   - test_name: serve_multilingual-e5-large_tp1_in64
+    tier: extended
     server_parameters:
       model: intfloat/multilingual-e5-large
       tensor-parallel-size: 1
@@ -177,6 +188,7 @@ tests:
       request-rate: inf
 
   - test_name: serve_all-roberta-large-v1_tp1_in64
+    tier: extended
     server_parameters:
       model: sentence-transformers/all-roberta-large-v1
       tensor-parallel-size: 1
@@ -197,6 +209,7 @@ tests:
       request-rate: inf
 
   - test_name: serve_bge-reranker-v2-m3_tp1_in64
+    tier: extended
     server_parameters:
       model: BAAI/bge-reranker-v2-m3
       tensor-parallel-size: 1
@@ -217,6 +230,7 @@ tests:
       request-rate: inf
 
   - test_name: serve_bge-reranker-large_tp1_in64
+    tier: extended
     server_parameters:
       model: BAAI/bge-reranker-large
       tensor-parallel-size: 1

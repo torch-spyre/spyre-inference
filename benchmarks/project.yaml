@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+# The vLLM benchmark catalog of spyre-inference. See README.md for what belongs here and what stays
+# in vllm-benchmarks/.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: spyre-inference, owner: spyre-inference}
+spec:
+  component: spyre-inference
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [decoder, pooling, multimodal]
+  default_environment: spyre-1card
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core, extended]}
+    - {name: suite, ordered: false, cardinality: many}
+  # A one-card and a four-card run of the same benchmark are different series, not noise in one.
+  series_labels: [env.label.device.count]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: decoder, description: "decoder models: offline latency and throughput, and trace replay"}
+spec: {type: perf, pr_selectable: true}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: pooling, description: embedding and reranker models over random prompts}
+spec: {type: perf, pr_selectable: true}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: multimodal, description: image-and-text serving}
+spec: {type: perf, pr_selectable: true}
+---
+# The Selections the scheduled legs name. Cadence is not declared here: a Selection says what to
+# run, and the job that invokes it says when (its `purpose` is recorded on the rows).
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke, description: "one short case on the small model; a fast signal that needs no long compile"}
+spec:
+  cases: [latency_granite8b_tp1_in64_out64]
+  run: {repeats_min: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: nightly-f1, description: "the nightly set: the offline pair plus the granite trace replays"}
+spec:
+  selector: {types: [perf], suites: [decoder], groupings: {tier: {at_most: core}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: perf-core, description: the default perf set across every suite}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: core}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: weekly-full, description: "every declared case, including the quantized, MoE, pooling and image ones"}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: extended}}}

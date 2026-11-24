@@ -1,5 +1,15 @@
 # Spyre vLLM benchmarks
 
+These configs are the operational source of truth for *how* a benchmark runs: server flags, bench
+flags, datasets and environment variables. `run_vllm_benchmarks.py` reads them, and that stays true
+whether a run comes from `make perf-tests` or from the catalog described below.
+
+[`benchmarks/`](../benchmarks/README.md) is **generated from these files** and adds the layer they
+do not have: a named set to run (`nightly-f1`, `perf-core`) and the stored series a case reports
+into. Every case runs back through this same runner. Edit the configs here — including each test's
+`tier:` — then `make bench-generate`; `make bench-check-catalog` fails in CI if the generated
+catalog is stale.
+
 Benchmark configs for the `vLLM Benchmark` CI workflow and for local runs on
 Spyre hardware. Each config file under `benchmarks/spyre/` is either a YAML list
 of test entries or a `defaults` mapping plus a `tests` list, where each test

@@ -512,3 +512,9 @@ perf-legs: ## Print the CI perf legs (one per selected model and TP, with the ca
 		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)" \
 		--suite "$(BENCH_SUITE)"
+
+# The bench-* targets drive the benchmarks/ catalog through the spyre-bench engine: named
+# Selections, reuse, identity and verdicts. They run the SAME benchmarks through the SAME
+# run_vllm_benchmarks.py as perf-tests above; the catalog only decides which cases and records what
+# series they belong to. See benchmarks/README.md.
+include mk/bench.mk

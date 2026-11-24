@@ -30,7 +30,12 @@ from vllm.v1.core.kv_cache_planning import (
     _pool_bytes_per_block_from_builder,
     get_kv_cache_groups_from_builder,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.worker_base import CompilationTimes
@@ -58,7 +63,8 @@ def _kv_block_layout(
     request)``, or None without a KV cache.
 
     The tensors are one K and one V per byte range of upstream's placement, as
-    ``allocate_spyre_kv_caches`` allocates them.
+    ``allocate_spyre_kv_caches`` allocates them. A model with Mamba layers is sized per
+    layer instead, each layer's own unpadded page, the Mamba state as one tensor.
     """
     if not kv_cache_spec:
         return None
@@ -74,20 +80,36 @@ def _kv_block_layout(
     if not groups:
         return None
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
-    # Offsets scale with the block count, which num_gpu_blocks_override may set.
-    placement = builder.get_kv_cache_config_from_groups(
-        vllm_config=vllm_config, kv_cache_groups=groups, num_blocks=1
-    )
-    page_bytes_by_offset: dict[int, int] = {}
-    for tensor in placement.kv_cache_tensors:
-        for index in range(len(tensor.layers)):
-            offset = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
-            if offset not in page_bytes_by_offset:
-                page_bytes_by_offset[offset] = tensor.block_stride
-    # An attention page holds K and V, which allocate_pages allocates apart.
-    tensors = [page // 2 for page in page_bytes_by_offset.values() for _ in range(2)]
+    layer_specs = [_layer_spec(group, name) for group in groups for name in group.layer_names]
+    if all(isinstance(spec, AttentionSpec) for spec in layer_specs):
+        # Offsets scale with the block count, which num_gpu_blocks_override may set.
+        placement = builder.get_kv_cache_config_from_groups(
+            vllm_config=vllm_config, kv_cache_groups=groups, num_blocks=1
+        )
+        page_bytes_by_offset: dict[int, int] = {}
+        for tensor in placement.kv_cache_tensors:
+            for index in range(len(tensor.layers)):
+                offset = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
+                if offset not in page_bytes_by_offset:
+                    page_bytes_by_offset[offset] = tensor.block_stride
+        # An attention page holds K and V, which allocate_pages allocates apart.
+        tensors = [page // 2 for page in page_bytes_by_offset.values() for _ in range(2)]
+    else:
+        # Attention and Mamba specs pad their page to a shared size; Spyre's pages do not.
+        tensors = []
+        for spec in layer_specs:
+            page = getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
+            # An attention page holds K and V, which allocate_pages allocates apart.
+            tensors += [page // 2] * 2 if isinstance(spec, AttentionSpec) else [page]
     per_request = _max_memory_usage_bytes_from_groups(builder, vllm_config, groups) // pool_bytes
     return pool_bytes, tensors, per_request
+
+
+def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.kv_cache_specs[layer_name]
+    return spec
 
 
 def _get_spyre_pcie_address(local_rank: int) -> str:

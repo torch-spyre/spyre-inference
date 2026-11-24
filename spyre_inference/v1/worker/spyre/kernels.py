@@ -91,6 +91,14 @@ HOST_KERNELS: dict[str, str] = {
     "gpu.spec_decode.dflash.speculator._prepare_dflash_inputs_kernel": (
         "mrv2_prepare_dflash_inputs"
     ),
+    # LiLiCorr's candidate walk and realized-proposal cache. The Spyre speculator
+    # runs upstream's CandidateSampler, so these bind like any other MRV2 kernel.
+    "gpu.spec_decode.dflash2.speculator._selector_walk_kernel": (
+        "mrv2_lilicorr_selector_walk"
+    ),
+    "gpu.spec_decode.dflash2.speculator._cache_draft_logits_kernel": (
+        "mrv2_lilicorr_cache_draft_logits"
+    ),
 }
 
 # Launch sites behind a feature the platform rejects -> that feature.

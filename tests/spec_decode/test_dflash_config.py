@@ -141,6 +141,15 @@ def test_published_contract_is_accepted(config, batch):
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
 
+def test_plain_dflash_block_size_ignores_dflash_config(config):
+    """Only LiLiCorr reads block_size from dflash_config; DFlash keeps its own."""
+    draft = config.speculative_config.draft_model_config.hf_config
+    draft.xpress_block_size = None
+    draft.block_size = 16
+    draft.dflash_config["block_size"] = 4
+    validate_dflash_config(config)
+
+
 @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text"])
 def test_gemma4_xpress_contract_is_accepted(config, model_type):
     target = config.model_config.hf_text_config
@@ -241,7 +250,16 @@ def test_plain_dflash_is_not_given_refiner_defaults(config):
 def test_unsupported_draft_architecture_fails_before_model_loading(config, architecture):
     config.speculative_config.draft_model_config.architecture = architecture
     config.speculative_config.draft_model_config.hf_config = NS()
-    with pytest.raises(ValueError, match="Unsupported Spyre DFlash/XPress draft architecture"):
+    with pytest.raises(
+        ValueError, match="Unsupported Spyre DFlash/XPress/LiLiCorr draft architecture"
+    ):
+        validate_dflash_config(config)
+
+
+def test_probabilistic_proposals_need_lilicorr(config):
+    """DFlash/XPress keep their greedy path; LiLiCorr opts in separately."""
+    config.speculative_config.draft_sample_method = "probabilistic"
+    with pytest.raises(ValueError, match="greedy proposals"):
         validate_dflash_config(config)
 
 

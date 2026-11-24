@@ -13,7 +13,8 @@
 # limitations under the License.
 
 """Parity cases for the spec-decode host kernels: the rejection sampler XPress
-verifies with and DFlash's input prep. Registered into parity_cases.CASES."""
+verifies with, DFlash's input prep, and LiLiCorr's candidate walk and
+realized-proposal cache. Registered into parity_cases.CASES."""
 
 import types
 
@@ -280,3 +281,121 @@ def prepare_dflash_inputs(g):
 @case("gpu.spec_decode.dflash.speculator._prepare_dflash_inputs_kernel")
 def prepare_dflash_inputs_chunked_prefill(g):
     return _prepare_dflash(g, 3, chunked=True)
+
+
+_D2 = "gpu.spec_decode.dflash2.speculator"
+_SELECTOR = f"{_D2}._selector_walk_kernel"
+_CACHE = f"{_D2}._cache_draft_logits_kernel"
+
+
+def _lilicorr_walk(
+    g, *, num_reqs: int, steps: int, topk: int, probabilistic: bool, fp64: bool, invalid: bool
+):
+    """Scores for a padded request batch, shaped like CandidateSampler's inputs."""
+    max_reqs = num_reqs + 2
+    vocab = 64
+    req_index = torch.randperm(max_reqs, generator=g)[:num_reqs].to(torch.int64)
+    mapping = torch.full((max_reqs * steps,), -1, dtype=torch.int64)
+    sample_pos = torch.zeros(max_reqs * steps, dtype=torch.int64)
+    for row in range(num_reqs):
+        for step in range(steps):
+            flat = row * steps + step
+            mapping[flat] = req_index[row]
+            sample_pos[flat] = 40 + 7 * int(req_index[row]) + step
+    if invalid:
+        mapping[0] = -1
+
+    temperature = torch.rand(max_reqs, generator=g) * 1.5 + 0.2
+    if not probabilistic:
+        temperature.zero_()
+    else:
+        # A zero-temperature request stays greedy inside the probabilistic path.
+        temperature[int(req_index[0])] = 0.0
+    seeds = torch.randint(-(2**62), 2**62, (max_reqs,), generator=g)
+
+    scores = torch.randn(num_reqs, steps, topk, topk, generator=g)
+    candidates = torch.randint(0, vocab, (num_reqs, steps, topk), generator=g)
+    tokens = torch.zeros(max_reqs * steps, dtype=torch.int64)
+    realized = torch.zeros(num_reqs * steps, topk, dtype=torch.float32)
+    draft_logits = (
+        torch.full((max_reqs, steps, vocab), -float("inf"), generator=g)
+        if probabilistic
+        else None
+    )
+    cached = torch.zeros(max_reqs * steps, topk, dtype=torch.int64)
+    block_k = 1 << (topk - 1).bit_length()
+
+    def run(s):
+        d2 = _m("spec_decode.dflash2.speculator")
+        d2._selector_walk_kernel[(s["num_reqs"],)](
+            s["scores"],
+            s["candidates"],
+            s["sample_pos"],
+            s["mapping"],
+            s["temperature"],
+            s["seeds"],
+            s["tokens"],
+            s["realized"],
+            num_steps=s["steps"],
+            top_k=s["topk"],
+            BLOCK_K=s["block_k"],
+            SAMPLE_PROBABILISTIC=s["probabilistic"],
+            USE_FP64=s["fp64"],
+            num_warps=1,
+        )
+        if s["probabilistic"]:
+            d2._cache_draft_logits_kernel[(s["num_reqs"] * s["steps"],)](
+                s["draft_logits"],
+                s["cached"],
+                s["candidates"],
+                s["realized"],
+                s["mapping"],
+                s["draft_logits"].stride(0),
+                s["draft_logits"].stride(1),
+                num_steps=s["steps"],
+                top_k=s["topk"],
+                BLOCK_K=s["block_k"],
+                num_warps=1,
+            )
+
+    return run, dict(
+        num_reqs=num_reqs,
+        steps=steps,
+        topk=topk,
+        block_k=block_k,
+        probabilistic=probabilistic,
+        fp64=fp64,
+        mapping=mapping,
+        sample_pos=sample_pos,
+        temperature=temperature,
+        seeds=seeds,
+        scores=scores,
+        candidates=candidates,
+        tokens=tokens,
+        realized=realized,
+        draft_logits=draft_logits,
+        cached=cached,
+    )
+
+
+@case(_SELECTOR)
+def lilicorr_selector_walk_greedy(g):
+    return _lilicorr_walk(
+        g, num_reqs=4, steps=5, topk=4, probabilistic=False, fp64=False, invalid=True
+    )
+
+
+@case(_SELECTOR, _CACHE)
+def lilicorr_selector_walk_probabilistic(g):
+    return _lilicorr_walk(
+        g, num_reqs=3, steps=5, topk=16, probabilistic=True, fp64=False, invalid=True
+    )
+
+
+@case(_SELECTOR, _CACHE)
+def lilicorr_selector_walk_probabilistic_fp64(g):
+    # topk > 1: with topk=1 the argmax is index 0 regardless of fp rounding,
+    # which would hide the fp64-vs-fp32 temperature divide.
+    return _lilicorr_walk(
+        g, num_reqs=2, steps=3, topk=8, probabilistic=True, fp64=True, invalid=False
+    )

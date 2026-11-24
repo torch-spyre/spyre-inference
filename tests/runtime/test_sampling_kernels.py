@@ -228,6 +228,90 @@ def test_topp_filter_close_to_pytorch(rows: int, vocab: int, ties: str) -> None:
     _assert_topp_close(x, actual, expected, p)
 
 
+@pytest.mark.parametrize("vocab, start", [(41, 0), (32771, 100)])
+@pytest.mark.parametrize("shift", [-3.125, 0.0, 2.5])
+@pytest.mark.parametrize("mixed_k", [False, True])
+def test_topp_limits_flat_boundary_ties(
+    vocab: int, start: int, shift: float, mixed_k: bool
+) -> None:
+    p = torch.tensor([0.05, 0.5, 0.9, 0.99, 1.0])
+    x = torch.full((len(p), vocab), float("-inf"))
+    x[:, start : start + 41] = shift
+    k = None
+    if mixed_k:
+        k = torch.full((len(p),), vocab, dtype=torch.int32)
+        k[-1] = 1  # top-k alone must still keep all 41 equal logits
+    actual = apply_top_k_top_p_kernels(x.clone(), k, p)
+    kept = torch.isfinite(actual)
+    assert torch.equal(kept.sum(-1), torch.tensor([3, 21, 37, 41, 41]))
+    assert torch.equal(actual[kept], x[kept])
+    assert not kept[~torch.isfinite(x)].any()
+
+
+@pytest.mark.parametrize("vocab", [65, 67, 49155])
+@pytest.mark.parametrize("shift", [-2.7, -11.3])
+def test_topp_boundary_ties_cross_simd_tail(vocab: int, shift: float) -> None:
+    # A tie group ending in the last vocab % 16 ids must get one probability.
+    x = torch.full((1, vocab), float("-inf"))
+    x[0, 0] = 0.0
+    x[0, vocab - 20 :] = shift
+    probs = x.softmax(-1).double()[0]
+    for quota in [0.5, 5.5, 10.5, 19.5]:
+        p = (probs[0] + probs[-1] * quota).float().reshape(1)
+        kept = torch.isfinite(apply_top_k_top_p_kernels(x.clone(), None, p))[0]
+        ties = kept[vocab - 20 :]
+        n = int(ties.sum())
+        assert n == int(quota) + 1
+        assert ties[:n].all()
+        assert kept[0]
+
+
+@pytest.mark.parametrize("gap", [5e-6, 0.25, 2.0])
+@pytest.mark.parametrize("shift", [-3.125, 0.0, 2.5])
+@pytest.mark.parametrize("mixed_k", [False, True])
+def test_topp_boundary_keeps_strictly_higher_logits(
+    gap: float, shift: float, mixed_k: bool
+) -> None:
+    p = torch.tensor([0.05, 0.5, 0.9, 0.99, 0.99999, 0.9])
+    x = torch.full((len(p), 67), float("-inf"))
+    x[:, 5:46] = shift
+    x[:, 4] = shift - gap
+    # The higher logit must survive even after the row-ordered tie quota fills.
+    x[:, 63] = shift + gap
+    k = None
+    if mixed_k:
+        k = torch.full((len(p),), 67, dtype=torch.int32)
+        k[-1] = 2
+    actual = apply_top_k_top_p_kernels(x.clone(), k, p)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    assert torch.equal(actual.sort(dim=-1).values, expected.sort(dim=-1).values)
+    assert torch.equal(actual[:, 63], x[:, 63])
+    assert torch.isneginf(actual[p <= 0.9, 4]).all()
+
+
+@pytest.mark.parametrize("disabled_k", [False, True])
+def test_topp_search_cap_keeps_requested_mass(disabled_k: bool) -> None:
+    x = torch.full((1, 32771), -20.0)
+    x[0, -1] = 0.0
+    p = torch.tensor([0.99999])
+    k = torch.tensor([32771], dtype=torch.int32) if disabled_k else None
+    actual = apply_top_k_top_p_kernels(x.clone(), k, p)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    _assert_topp_close(x, actual, expected, p)
+    assert actual[0, -1] == 0.0
+
+
+@pytest.mark.parametrize("disabled_k", [False, True])
+def test_topp_leaves_degenerate_softmax_unchanged(disabled_k: bool) -> None:
+    x = torch.full((3, 67), float("-inf"))
+    x[1] = torch.nan
+    x[2, :5] = torch.arange(5, dtype=torch.float32)
+    x[2, -1] = torch.nan  # scalar tail makes the softmax sum NaN on every ISA
+    k = torch.full((3,), 67, dtype=torch.int32) if disabled_k else None
+    actual = apply_top_k_top_p_kernels(x.clone(), k, torch.full((3,), 0.5))
+    torch.testing.assert_close(actual, x, rtol=0, atol=0, equal_nan=True)
+
+
 def test_p_one_with_top_k_disabled_is_unchanged() -> None:
     """k == vocab and p == 1 is the no-op skip. A top-k row with p == 1 is exact."""
     vocab = 64
@@ -376,6 +460,12 @@ def test_avx2_build_filters_match_pytorch() -> None:
         "assert (kept(actual).sum(-1) > 0).all()\n"
         "mass = torch.where(kept(actual), x.softmax(-1).double(), 0.0).sum(-1)\n"
         "assert (mass >= p.double() - 1e-6).all()\n"
+        "x = torch.full((2, 32771), -torch.inf)\n"
+        "x[:, 100:141] = 0\n"
+        "p = torch.tensor([0.5, 1.0])\n"
+        "for k in (None, torch.tensor([32771, 1], dtype=torch.int32)):\n"
+        "    actual = apply_top_k_top_p_kernels(x.clone(), k, p)\n"
+        "    assert torch.equal(kept(actual).sum(-1), torch.tensor([21, 41]))\n"
     )
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

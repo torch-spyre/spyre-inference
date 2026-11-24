@@ -230,7 +230,7 @@ def join_after_weight_read(worker: Any) -> Iterator[None]:
         card.join()
         return original(*args, **kwargs)
 
-    base_loader.process_weights_after_loading = join_first
+    base_loader.process_weights_after_loading = join_first  # ty: ignore[invalid-assignment]
     try:
         yield
     finally:

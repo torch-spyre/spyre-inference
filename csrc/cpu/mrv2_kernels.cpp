@@ -145,7 +145,12 @@ inline float murmur3_uniform32(uint32_t bits) {
   return hi16 * 1.52587890625e-05f + (lo16 + 0.5f) * 2.3283064365386963e-10f;
 }
 
-inline float log1p_neg_stable(float v) {
+inline float std_logf(float x) { return std::log(x); }
+
+// One coefficient set for every caller; only the log implementation varies
+// (libm for the vocab sampler, SLEEF for the walk, which must match Triton).
+template <typename LogFn>
+inline float log1p_neg_stable(float v, LogFn logf) {
   // Coefficients rounded from double, as Triton rounds the Python literals.
   float p = float(1.0 / 8.0);
   p = float(1.0 / 7.0) + v * p;
@@ -156,7 +161,7 @@ inline float log1p_neg_stable(float v) {
   p = float(1.0 / 2.0) + v * p;
   p = 1.0f + v * p;
   const float series = -v * p;
-  const float direct = std::log(std::max(1.0f - v, 5.960464477539063e-08f));
+  const float direct = logf(std::max(1.0f - v, 5.960464477539063e-08f));
   return v < 0.25f ? series : direct;
 }
 
@@ -642,7 +647,7 @@ std::pair<int64_t, acc_t> gumbel_row(const scalar_t* row, int64_t begin, int64_t
       } else {
         if (x + kGumbelMax32 <= best) continue;
         const float u = murmur3_uniform32(murmur3_finish(lo_prefix, uint32_t(v)));
-        value = x + -std::log(-log1p_neg_stable(u));
+        value = x + -std::log(-log1p_neg_stable(u, std_logf));
       }
     }
     if (value > best) {
@@ -723,6 +728,133 @@ void mrv2_gumbel_sample(
     else
       run(ptr<float>(local_max_ptr));
   });
+}
+
+// DFlash2/LiLiCorr candidate walk (spec_decode/dflash2/speculator.py).
+//
+// The Triton kernel draws one candidate's noise from its *token id* (the keys
+// argument), unlike the vocab sampler above, which keys by token position. The
+// scalar helpers are shared, so seeded proposals stay identical to upstream.
+//
+// On x86 triton-cpu lowers tl.log to SLEEF. The runtime exports SLEEF's AVX512
+// vector entry points (used by gumbel_noised16) but not the scalar ones, so
+// evaluate the scalar value in lane 0 of the vector function. Non-AVX512 builds
+// keep std::log, matching the existing scalar gumbel path.
+inline float walk_logf(float x) {
+#if defined(__AVX512F__)
+  return _mm512_cvtss_f32(Sleef_logf16_u10(_mm512_set1_ps(x)));
+#else
+  return std::log(x);
+#endif
+}
+
+void mrv2_lilicorr_selector_walk(
+    std::vector<int64_t> grid, const torch::Tensor& scores_ptr,
+    const torch::Tensor& candidate_ptr, const torch::Tensor& sample_pos_ptr,
+    const torch::Tensor& req_state_ptr, const torch::Tensor& temperature_ptr,
+    const torch::Tensor& seeds_ptr, const torch::Tensor& tokens_ptr,
+    const torch::Tensor& realized_scores_ptr, int64_t num_steps, int64_t top_k,
+    int64_t BLOCK_K, bool SAMPLE_PROBABILISTIC, bool USE_FP64) {
+  TORCH_CHECK(top_k <= BLOCK_K, "top_k must fit in BLOCK_K");
+  TORCH_CHECK(scores_ptr.scalar_type() == at::kFloat, "scores must be float32");
+  TORCH_CHECK(candidate_ptr.scalar_type() == at::kLong,
+              "candidate ids must be int64");
+  const float* scores = ptr<float>(scores_ptr);
+  const int64_t* candidates = ptr<int64_t>(candidate_ptr);
+  const Ints sample_pos(sample_pos_ptr), req_state(req_state_ptr), seeds(seeds_ptr);
+  int64_t* tokens = ptr<int64_t>(tokens_ptr);
+  float* realized = ptr<float>(realized_scores_ptr);
+  const float* temps = ptr<float>(temperature_ptr);
+  for (int64_t row = 0; row < grid[0]; ++row) {
+    // A padded request maps to -1; upstream masks every store on such a row.
+    const int64_t req = req_state[row * num_steps];
+    if (req < 0) continue;
+    const float temp = SAMPLE_PROBABILISTIC ? temps[req] : 0.0f;
+    const bool noisy = temp != 0.0f;
+    const int64_t seed = seeds[req];
+    int64_t previous = 0;
+    for (int64_t step = 0; step < num_steps; ++step) {
+      const int64_t flat = row * num_steps + step;
+      const int64_t candidate_base = flat * top_k;
+      const int64_t score_base = (flat * top_k + previous) * top_k;
+      const int64_t step_seed = seed ^ (step << 32);
+      // gumbel_noised_argmax subtracts one from the predicted position and, for
+      // drafting, offsets the stream with the draft noise salt.
+      const int64_t pos = sample_pos[flat] - 1 + (noisy ? kDraftNoiseSalt : 0);
+      const uint32_t lo_prefix = murmur3_prefix(step_seed, pos, 0);
+      const uint32_t hi_prefix = murmur3_prefix(step_seed, pos, 0x9E3779B9u);
+      int64_t best_index = 0;
+      double best = -std::numeric_limits<double>::infinity();
+      float best32 = kNegInf;
+      for (int64_t j = 0; j < top_k; ++j) {
+        const float x = scores[score_base + j];
+        // The cache stores the realized (un-noised, un-scaled) score.
+        realized[candidate_base + j] = x;
+        const uint32_t key =
+            static_cast<uint32_t>(static_cast<uint64_t>(candidates[candidate_base + j]));
+        if (USE_FP64) {
+          // _selector_walk_kernel loads the scores as fp64 when USE_FP64, so
+          // gumbel_noised_argmax divides in fp64. Widen before dividing.
+          double value = noisy
+                             ? static_cast<double>(x) / static_cast<double>(temp)
+                             : static_cast<double>(x);
+          if (noisy) {
+            const double u = murmur3_uniform64(lo_prefix, hi_prefix, key);
+            value += -std::log(-std::log(u));
+          }
+          if (value > best) {
+            best = value;
+            best_index = j;
+          }
+        } else {
+          float value = noisy ? x / temp : x;
+          if (noisy) {
+            const float u = murmur3_uniform32(murmur3_finish(lo_prefix, key));
+            value += -walk_logf(-log1p_neg_stable(u, walk_logf));
+          }
+          if (value > best32) {
+            best32 = value;
+            best_index = j;
+          }
+        }
+      }
+      tokens[flat] = candidates[candidate_base + best_index];
+      previous = best_index;
+    }
+  }
+}
+
+void mrv2_lilicorr_cache_draft_logits(
+    std::vector<int64_t> grid, const torch::Tensor& draft_logits_ptr,
+    const torch::Tensor& cached_candidate_ptr, const torch::Tensor& candidate_ptr,
+    const torch::Tensor& scores_ptr, const torch::Tensor& req_state_ptr,
+    int64_t draft_logits_stride_0, int64_t draft_logits_stride_1, int64_t num_steps,
+    int64_t top_k, int64_t BLOCK_K) {
+  TORCH_CHECK(top_k <= BLOCK_K, "top_k must fit in BLOCK_K");
+  TORCH_CHECK(draft_logits_ptr.scalar_type() == at::kFloat,
+              "draft logits must be float32");
+  TORCH_CHECK(cached_candidate_ptr.scalar_type() == at::kLong,
+              "cached candidates must be int64");
+  float* logits = ptr<float>(draft_logits_ptr);
+  int64_t* cached = ptr<int64_t>(cached_candidate_ptr);
+  const int64_t* candidates = ptr<int64_t>(candidate_ptr);
+  const float* scores = ptr<float>(scores_ptr);
+  const Ints req_state(req_state_ptr);
+  for (int64_t flat = 0; flat < grid[0]; ++flat) {
+    const int64_t req = req_state[flat];
+    if (req < 0) continue;
+    const int64_t step = flat % num_steps;
+    float* row = logits + req * draft_logits_stride_0 + step * draft_logits_stride_1;
+    const int64_t cache_base = (req * num_steps + step) * top_k;
+    const int64_t candidate_base = flat * top_k;
+    // Clear the previous realized support before publishing this step's.
+    for (int64_t j = 0; j < top_k; ++j) row[cached[cache_base + j]] = kNegInf;
+    for (int64_t j = 0; j < top_k; ++j) {
+      const int64_t token = candidates[candidate_base + j];
+      row[token] = scores[candidate_base + j];
+      cached[cache_base + j] = token;
+    }
+  }
 }
 
 void mrv2_min_p(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
@@ -1768,6 +1900,10 @@ TORCH_LIBRARY_FRAGMENT(_spyre_C, ops) {
   ops.impl("mrv2_temperature", torch::kCPU, &mrv2_temperature);
   ops.def("mrv2_gumbel_sample(int[] grid, Tensor local_argmax_ptr, int local_argmax_stride, Tensor local_max_ptr, int local_max_stride, Tensor? logits_cache_ptr, int logits_cache_stride_0, int logits_cache_stride_1, Tensor? logits_cache_col_ptr, Tensor? logits_cache_source_ptr, int logits_cache_source_stride, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor seeds_ptr, Tensor pos_ptr, Tensor temp_ptr, int vocab_size, int BLOCK_SIZE, bool IS_DRAFTING, bool APPLY_TEMPERATURE, bool USE_FP64, bool PER_TOKEN_COL) -> ()");
   ops.impl("mrv2_gumbel_sample", torch::kCPU, &mrv2_gumbel_sample);
+  ops.def("mrv2_lilicorr_selector_walk(int[] grid, Tensor scores_ptr, Tensor candidate_ptr, Tensor sample_pos_ptr, Tensor req_state_ptr, Tensor temperature_ptr, Tensor seeds_ptr, Tensor tokens_ptr, Tensor realized_scores_ptr, int num_steps, int top_k, int BLOCK_K, bool SAMPLE_PROBABILISTIC, bool USE_FP64) -> ()");
+  ops.impl("mrv2_lilicorr_selector_walk", torch::kCPU, &mrv2_lilicorr_selector_walk);
+  ops.def("mrv2_lilicorr_cache_draft_logits(int[] grid, Tensor draft_logits_ptr, Tensor cached_candidate_ptr, Tensor candidate_ptr, Tensor scores_ptr, Tensor req_state_ptr, int draft_logits_stride_0, int draft_logits_stride_1, int num_steps, int top_k, int BLOCK_K) -> ()");
+  ops.impl("mrv2_lilicorr_cache_draft_logits", torch::kCPU, &mrv2_lilicorr_cache_draft_logits);
   ops.def("mrv2_min_p(int[] grid, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor min_p_ptr, int vocab_size, int BLOCK_SIZE) -> ()");
   ops.impl("mrv2_min_p", torch::kCPU, &mrv2_min_p);
   ops.def("mrv2_penalties(int[] grid, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor token_ids_ptr, Tensor expanded_local_pos_ptr, Tensor repetition_penalty_ptr, Tensor frequency_penalty_ptr, Tensor presence_penalty_ptr, Tensor prompt_bin_mask_ptr, int prompt_bin_mask_stride, Tensor output_bin_counts_ptr, int output_bin_counts_stride, int vocab_size, int BLOCK_SIZE) -> ()");

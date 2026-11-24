@@ -664,6 +664,29 @@ def test_fly_rejection_sampling_is_rejected(monkeypatch):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def test_lilicorr_is_rejected_on_the_v1_runner(monkeypatch):
+    """Upstream ships LiLiCorr only on the V2 model runner."""
+    from types import SimpleNamespace
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.load_config.load_format = "auto"
+    monkeypatch.setattr(
+        vllm_config,
+        "speculative_config",
+        SimpleNamespace(
+            rejection_sample_method="standard",
+            draft_model_config=SimpleNamespace(architectures=["LiLiCorrDraftModel"]),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="LiLiCorr on the V1 model runner"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_rejected_under_tensor_parallelism():
     """torch-spyre's all_reduce is fp16-only on both the eager (SpyreCCLBackend) and
     compiled (`spyre.allreduce_plan`) paths, so bf16 + TP>1 must fail at startup rather

@@ -807,7 +807,7 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            "speculative decoding other than DFlash/XPress": (
+            "speculative decoding other than DFlash/XPress/LiLiCorr": (
                 vllm_config.speculative_config is not None
                 and not vllm_config.speculative_config.use_dflash()
             ),
@@ -1079,6 +1079,15 @@ class TorchSpyrePlatform(CpuPlatform):
                     "Spyre does not support AuxOutput (e.g. returning routed experts): it "
                     "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
                     "runner."
+                )
+            # Upstream ships LiLiCorr only on the V2 runner; the legacy proposer
+            # would silently run the unadapted DFlash path.
+            from spyre_inference.v1.spec_decode.config import is_lilicorr
+
+            if is_lilicorr(vllm_config.speculative_config):
+                raise ValueError(
+                    "Spyre does not support LiLiCorr on the V1 model runner: upstream's "
+                    "LiLiCorr speculator exists only on V2. Use SPYRE_MODEL_RUNNER=v2."
                 )
 
         spec_config = vllm_config.speculative_config

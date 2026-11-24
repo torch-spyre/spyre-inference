@@ -1,4 +1,9 @@
-# XPress speculative decoding
+# Speculative decoding
+
+Spyre supports upstream's DFlash, XPress and LiLiCorr drafters. XPress is
+described first; LiLiCorr has its own section below.
+
+## XPress speculative decoding
 
 XPress runs a DFlash backbone once, refines a block of draft tokens, and lets
 the target model verify the proposals. The experimental Spyre integration loads
@@ -119,10 +124,56 @@ On the V2 runner, upstream's DFlash speculator does the draft bookkeeping, and
 its Triton kernels run through triton-cpu, so V2 speculative decoding is x86-only
 for now ([#1238](https://github.com/torch-spyre/spyre-inference/issues/1238)).
 
+## LiLiCorr
+
+LiLiCorr pairs a DFlash backbone with a learned candidate-lattice correlator.
+It is served through the same `method: dflash` and requires the **V2 model
+runner**; upstream has no LiLiCorr proposer on V1, so a V1 run is rejected at
+startup.
+
+Supported configuration: compiled FP16, unquantized weights, PP=1, up to four
+active requests, prefix caching disabled, plain DFlash backbones only, and
+`draft_sample_method` `greedy` or `probabilistic`. Tensor parallelism is
+supported for LiLiCorr (DFlash/XPress still require TP=1): set
+`--tensor-parallel-size N` to run one engine across N cards. Set
+`num_speculative_tokens` to the checkpoint's `block_size - 1` (the trained block
+includes the anchor position). Grouped convolution checkpoints
+(`conv_kernel_size` / `conv_group_size`), adaptive verification and
+`rejection_sample_method` `block` are rejected.
+
+```bash
+export SPYRE_MODEL_RUNNER=v2
+uv run --no-sync vllm serve Qwen/Qwen3-8B \
+  --dtype float16 --tensor-parallel-size 1 \
+  --max-num-seqs 1 --max-model-len 512 --max-num-batched-tokens 64 \
+  --no-enable-prefix-caching \
+  --speculative-config '{"method":"dflash","model":"<lilicorr-checkpoint>","num_speculative_tokens":15}'
+```
+
+`draft_sample_method` defaults to `greedy`. Add
+`"draft_sample_method":"probabilistic"` to sample proposals from the
+correlator's conditional scores instead of taking their argmax; both feed the
+same target verification.
+
+The candidate features and the 5-wide feature MLP run on the host; the
+hidden-width lattice stays on Spyre. Upstream's candidate walk and draft-logits
+cache are bound to csrc host ops, so LiLiCorr needs no Triton at runtime. Under
+TP each rank all-gathers the candidate logits to the host for the full-vocabulary
+top-k and `logsumexp`, and the host feature-MLP weights are all-gathered once at
+load; the lattice therefore produces identical scores on every rank, and the
+walk runs the same proposal path regardless of TP.
+Probabilistic proposals also allocate the realized-proposal cache on the host,
+fp32 `[max_num_seqs, num_speculative_tokens, vocab_size]` (about 36 MB for four
+requests, 15 steps and a 152k vocabulary). Target input embeddings and the
+selected LM head must be available on the draft rank, as upstream requires.
+Device qualification is still pending: run this configuration only after a Spyre
+device test with the checkpoint.
+
 ## Validation
 
 ```bash
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
+uv run --group triton-cpu pytest -m triton_cpu tests/mrv2   # host-kernel parity
 uv run --no-sync pytest tests/e2e/test_xpress_feedback.py -m 'not upstream' -s
 uv run --no-sync pytest tests/e2e/test_xpress_v2.py -m model_quality -s
 ```

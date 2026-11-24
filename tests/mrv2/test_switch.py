@@ -82,7 +82,7 @@ def test_runner_switch(
     ("feature", "configure"),
     [
         pytest.param(
-            "speculative decoding other than DFlash/XPress",
+            "speculative decoding other than DFlash/XPress/LiLiCorr",
             lambda c: setattr(c, "speculative_config", SimpleNamespace(use_dflash=lambda: False)),
             id="spec-decode-non-dflash",
         ),

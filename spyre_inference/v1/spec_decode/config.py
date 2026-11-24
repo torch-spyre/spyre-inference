@@ -44,7 +44,11 @@ def normalize_speculative_config(engine_args) -> None:
     if method is None:
         model = str(spec.get("model", "")).lower()
         # Match vLLM's name-based detection before it applies cache defaults.
-        if "dflash" in model and "eagle-" not in model and "eagle3" not in model:
+        if (
+            ("dflash" in model or "lilicorr" in model)
+            and "eagle-" not in model
+            and "eagle3" not in model
+        ):
             method = "dflash"
     if method != "dflash":
         return
@@ -57,18 +61,68 @@ def normalize_speculative_config(engine_args) -> None:
         engine_args.enable_prefix_caching = False
 
 
+def is_lilicorr(spec) -> bool:
+    """Whether the draft is LiLiCorr. Mirrors upstream ``init_speculator``'s check."""
+    draft = getattr(spec, "draft_model_config", None) if spec is not None else None
+    if draft is None:
+        return False
+    architectures = getattr(draft, "architectures", None)
+    if architectures:
+        return "LiLiCorrDraftModel" in architectures
+    return getattr(draft, "architecture", None) == "LiLiCorrDraftModel"
+
+
 def validate_dflash_config(config) -> None:
     spec = config.speculative_config
     if spec is None or not spec.use_dflash():
         return
     draft = spec.draft_model_config.hf_config
     architecture = spec.draft_model_config.architecture
-    supported_drafts = {"DFlashDraftModel", "Qwen3XPressModel", "DFlashQwen3XPressModel"}
+    supported_drafts = {
+        "DFlashDraftModel",
+        "LiLiCorrDraftModel",
+        "Qwen3XPressModel",
+        "DFlashQwen3XPressModel",
+    }
     if architecture not in supported_drafts:
         raise ValueError(
-            f"Unsupported Spyre DFlash/XPress draft architecture: {architecture}. "
+            f"Unsupported Spyre DFlash/XPress/LiLiCorr draft architecture: {architecture}. "
             f"Supported architectures: {', '.join(sorted(supported_drafts))}"
         )
+    # Spyre's _generate_draft overrides bypass upstream's acceptance estimator, so
+    # adaptive verification would be accepted and silently do nothing.
+    if getattr(spec, "enable_adaptive_verification", False):
+        raise ValueError("Spyre speculative decoding does not implement adaptive verification")
+    if getattr(spec, "draft_lm_head_quantization", None) is not None:
+        raise ValueError("Spyre speculative decoding requires an unquantized draft LM head")
+    # LiLiCorr adds a learned lattice head. Reject what Spyre cannot run before
+    # model loading: grouped-convolution backbones (no Spyre conv layer), the
+    # adaptive/block-sampling paths (not implemented for Spyre's host walk), and
+    # geometry the lattice SDPA cannot serve.
+    lilicorr = architecture == "LiLiCorrDraftModel"
+    if lilicorr:
+        draft_config = draft.dflash_config
+        if not draft_config.get("lilicorr_enabled", True):
+            raise ValueError("LiLiCorr requires lilicorr_enabled=True")
+        topk = draft_config.get("lilicorr_candidate_topk")
+        if type(topk) is not int or not 1 <= topk <= 16 or topk & (topk - 1):
+            raise ValueError(
+                "LiLiCorr requires lilicorr_candidate_topk to be a power of two in 1..16"
+            )
+        hidden = draft_config.get("lilicorr_hidden_size") or draft.hidden_size
+        heads = draft_config.get("lilicorr_num_heads")
+        if type(heads) is not int or heads <= 0 or hidden % heads:
+            raise ValueError("LiLiCorr requires lilicorr_num_heads to divide lilicorr_hidden_size")
+        head_dim = hidden // heads
+        if head_dim % 64 or not 64 <= head_dim <= 512:
+            raise ValueError(
+                "LiLiCorr lattice attention needs a head size that is a multiple of 64 "
+                f"in 64..512 (got {head_dim})"
+            )
+        if draft_config.get("conv_kernel_size") or draft_config.get("conv_group_size"):
+            raise ValueError("Spyre does not yet support LiLiCorr grouped-convolution checkpoints")
+        if spec.rejection_sample_method != "standard":
+            raise ValueError("Spyre LiLiCorr supports only rejection_sample_method='standard'")
     target = config.model_config.hf_text_config
     if spec.max_model_len is None and spec.draft_shares_target_positions():
         # The platform's default length cap must not stop drafts inside the target context.
@@ -85,15 +139,16 @@ def validate_dflash_config(config) -> None:
         raise ValueError(
             "Spyre DFlash/XPress currently requires unquantized target and draft weights"
         )
-    if (
-        parallel.tensor_parallel_size != 1
-        or parallel.pipeline_parallel_size != 1
-        or not 1 <= config.scheduler_config.max_num_seqs <= MAX_DFLASH_BATCH_SIZE
+    if parallel.pipeline_parallel_size != 1 or not (
+        1 <= config.scheduler_config.max_num_seqs <= MAX_DFLASH_BATCH_SIZE
     ):
         raise ValueError(
-            "Spyre DFlash/XPress currently requires TP=1, PP=1 and "
-            f"max_num_seqs<={MAX_DFLASH_BATCH_SIZE}"
+            f"Spyre speculative decoding requires PP=1 and max_num_seqs<={MAX_DFLASH_BATCH_SIZE}"
         )
+    # LiLiCorr all-gathers the candidate logits and the host feature-MLP weights,
+    # so it runs under TP; DFlash/XPress still assume a single rank.
+    if parallel.tensor_parallel_size != 1 and not lilicorr:
+        raise ValueError("Spyre DFlash/XPress requires TP=1")
     if config.cache_config.enable_prefix_caching:
         raise ValueError(
             "Disable prefix caching for Spyre DFlash/XPress: draft context needs every target state"
@@ -102,8 +157,14 @@ def validate_dflash_config(config) -> None:
         config.model_config.is_multimodal_model
     ):
         raise ValueError("Spyre DFlash/XPress supports Qwen3 and Gemma 4 text targets")
-    if spec.draft_sample_method != "greedy":
-        raise ValueError("Spyre DFlash/XPress currently uses greedy proposals")
+    # LiLiCorr's walk and draft-logits cache are host kernels, so upstream's
+    # probabilistic proposals work; DFlash/XPress still use their greedy path.
+    sample_methods = {"greedy", "probabilistic"} if lilicorr else {"greedy"}
+    if spec.draft_sample_method not in sample_methods:
+        raise ValueError(
+            "Spyre DFlash/XPress uses greedy proposals; LiLiCorr also accepts "
+            f"probabilistic (got {spec.draft_sample_method!r})"
+        )
     max_batch = config.scheduler_config.max_num_seqs
     block = spec.num_speculative_tokens + 1
     minimum_budget = max_batch * (block + spec.max_num_new_slots_for_drafting)
@@ -138,7 +199,13 @@ def validate_dflash_config(config) -> None:
         or not all(0 <= i < target.num_hidden_layers for i in layers)
     ):
         raise ValueError("The draft checkpoint must identify ordered, distinct target layers")
-    block_size = getattr(draft, "xpress_block_size", getattr(draft, "block_size", None))
+    if lilicorr:
+        # Upstream's LiLiCorr constructor reads the trained block from dflash_config.
+        block_size = draft.dflash_config.get("block_size") or getattr(draft, "block_size", None)
+    else:
+        # XPress stores it at the top level; plain DFlash only has `block_size`.
+        # `or`, not getattr's default: a present-but-null xpress_block_size is absent.
+        block_size = getattr(draft, "xpress_block_size", None) or getattr(draft, "block_size", None)
     if block_size != spec.num_speculative_tokens + 1:
         raise ValueError("num_speculative_tokens must equal the checkpoint block size minus one")
     if architecture in ("Qwen3XPressModel", "DFlashQwen3XPressModel"):

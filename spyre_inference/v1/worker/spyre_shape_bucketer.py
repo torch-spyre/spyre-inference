@@ -65,6 +65,12 @@ ENCODER_SEQ_ALIGNMENT = 64
 POOLING_FAST_BODY_ROWS = 2048
 
 
+def pooling_default_max_num_seqs(max_model_len: int) -> int:
+    """The max-length sequences the fast body holds: a full step fills the body and always
+    fits the rectangle at the longest extent, so the ragged path is unreachable."""
+    return max(1, POOLING_FAST_BODY_ROWS // _align_up_pow2(max_model_len))
+
+
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
     return max(align, (n + align - 1) // align * align)
 

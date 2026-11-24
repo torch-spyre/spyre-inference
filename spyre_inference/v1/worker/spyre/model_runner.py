@@ -22,6 +22,7 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -29,23 +30,41 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyrePagedKVCache,
+    allocate_staging_buffers,
+)
+from spyre_inference.v1.spec_decode.config import validate_dflash_config
+from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
+from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
+from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
 class SpyreModelRunnerV2(GPUModelRunner):
     """MRV2: vllm/v1/worker/gpu/model_runner.py:GPUModelRunner, on device=cpu."""
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+        validate_dflash_config(vllm_config)
         super().__init__(vllm_config, torch.device("cpu"))
         self.spyre_device = device
+        if self.speculator is not None:
+            self.speculator = SpyreDFlashSpeculator(vllm_config, self.device, device)
         # Filled by initialize_kv_cache; warmup records the attention kernels against them.
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+        # Set by load_model.
+        self.pooling_on_spyre = False
+        self.compiled_tower_blocks = 0
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
+
+    def get_model(self) -> nn.Module:
+        model = unwrap_model(self.model)
+        assert isinstance(model, nn.Module), type(model)
+        return model
 
     def initialize_kv_cache(
         self,
@@ -60,6 +79,10 @@ class SpyreModelRunnerV2(GPUModelRunner):
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
         self.cudagraph_manager = bucketing.SpyreBucketManager.from_runner(self)
+
+    def reload_weights(self, *args: Any, **kwargs: Any) -> None:
+        super().reload_weights(*args, **kwargs)
+        rewarm_after_reload(self)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         # Upstream asks PoolingRunner about self.model, the wrapper, which fails
@@ -84,3 +107,7 @@ class SpyreModelRunnerV2(GPUModelRunner):
 
     def warming_up_model(self) -> None:
         warmup.run(self)
+
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        # No forward, only the staging buffers, as TorchSpyreModelRunner.profile_run.
+        allocate_staging_buffers(self.compilation_config.static_forward_context, self.spyre_device)

@@ -23,6 +23,8 @@ All device tests run against the real Spyre device when available; otherwise
 they skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -197,6 +199,31 @@ def test_spyre_single_row_index_select(spyre_device):
 # It is intentionally not duplicated here.
 
 
+@pytest.mark.parametrize("num_tokens", [4, 40])
+def test_spyre_compiled_lookup_returns_fresh_layout(spyre_device, num_tokens):
+    """A compiled embedding lookup returns the layout of a fresh tensor of its shape.
+
+    Decoder blocks compile on fresh tensors at warmup and guard on input layout, so
+    layer 0 shares their graph only if the TP=1 lookup matches it.
+
+    Was strict-xfail until torch-spyre#6539: a multi-core compile padded the gather
+    output's entry dim to the index stick multiple (device_size [2, 32, 64] for 4 rows
+    where a fresh tensor has [2, 4, 64]), which SpyreVocabParallelEmbedding worked
+    around with a TP=1 multiply by a ones row.
+    """
+    from torch_spyre._C import get_spyre_tensor_layout
+    from torch_spyre._inductor import config
+
+    if config.sencores == 1:
+        pytest.skip("a single-core compile never pads the gather output")
+    table = torch.randn(1024, 128, dtype=torch.float16, device=spyre_device)
+    ids = torch.randint(0, 1024, (num_tokens,), dtype=torch.int64)
+    out = torch.compile(lambda t, i: F.embedding(i, t), dynamic=False)(table, ids.to(spyre_device))
+    fresh = torch.zeros(num_tokens, 128, dtype=torch.float16).to(spyre_device)
+    torch.testing.assert_close(out.cpu(), table.cpu()[ids], atol=0, rtol=0)
+    assert get_spyre_tensor_layout(out) == get_spyre_tensor_layout(fresh)
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -226,23 +253,12 @@ def test_spyre_index_add_for_mean_pooling(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Fancy indexing (aten::index.Tensor) is unreliable on Spyre for the "
-        "shapes pooling / logits selection need. Related gather bugs: "
-        "torch-spyre#3499 (L3_ADDEARIMM overflow), #3502 (fused two gathers, "
-        "different indices), #3503 (fused two gathers, shared index). "
-        "spyre-inference works around this with host-built indices + "
-        "index_select (CLS/LAST) and CPU D2H before hidden_states[logits_indices]. "
-        "When this probe passes, revisit those workarounds."
-    ),
-)
 def test_spyre_fancy_index_tensor(spyre_device):
     """Row gather via advanced indexing ``hs[idx]`` (aten::index.Tensor).
 
-    Upstream CLSPool / logits selection use this form; we use index_select
-    instead. Probe uses a flat [T, H] activation and 1-D int64 row indices.
+    Upstream CLSPool / logits selection use this form. torch-spyre#5978 runs it
+    eagerly for a single 1-D int32/int64 index on dim 0; other index forms still
+    raise. Probe uses a flat [T, H] activation and 1-D int64 row indices.
     """
     hidden_states = torch.randn(32, 128, dtype=torch.float16, device=spyre_device)
     # CLS-style first-token indices for a few sequences (not a simple arange).
@@ -324,7 +340,7 @@ def test_spyre_topk_scatter_dense_routing(spyre_device):
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
-    Mirrors the page gather in page_attn_kernel, but with a 0-dim
+    Mirrors the paged attention page gather, but with a 0-dim
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
@@ -333,9 +349,7 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
 
     Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
     f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
-    reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
-    (int32 index upcast under aten.index) and test_spyre_scatter_index_row_of_2d_table
-    (torch-spyre#3851).
+    reasons still probed by test_spyre_scatter_index_row_of_2d_table (torch-spyre#3851).
     """
     num_kv_heads = 2
     block_size = 64
@@ -410,29 +424,13 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "compile",
-        pytest.param(
-            "eager",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Subscripting a dense Spyre tensor with an int32 index lowers "
-                    "to aten.index, which upcasts to int64: eager fails with "
-                    "'type conversion from torch.int32 to torch.int64'. Inductor "
-                    "folds the conversion away, so the compiled path is fine."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
-    """`k_pages[idx]` for the page gather: works compiled, fails eager.
+    """`k_pages[idx]` for the page gather with a one-element int32 index.
 
-    This asymmetry is why page_attn_kernel gathers with index_select,
-    which works in both modes.
+    Was strict-xfail in eager: aten.index upcast the int32 index to int64 and failed.
+    torch-spyre#5978 runs a 1-D integer row index eagerly, so both modes work now. The
+    paged attention kernels subscript with a 2-D index instead; see the probe below.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
     int32_elems_per_stick = 32
@@ -458,6 +456,50 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
         q.cpu(), k_pages_cpu[page].permute(1, 0, 2).unsqueeze(1).transpose(-2, -1)
     )
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "compile",
+        pytest.param(
+            "eager",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=NotImplementedError,
+                reason=(
+                    "torch-spyre#4334: eager aten::index takes only a single 1-D index on "
+                    "dim 0; the compiled path lowers the 2-D one."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_indirect_page_gather_2d_index(spyre_device, mode):
+    """`k_pages[kv_rows]` with a [KV, 1] int32 index, the page gather of page_attn_decode.
+
+    This is why SpyreAttentionImpl compiles attention on Spyre even under --enforce-eager.
+    When the eager case XPASSes, attention can honor --enforce-eager on Spyre.
+    """
+    num_kv_heads, block_size, head_size, num_pages = 8, 64, 128, 16
+    page = 5
+
+    k_pages_cpu, k_pages = _stacked_index_pages(
+        num_pages, num_kv_heads, block_size, head_size, spyre_device
+    )
+    kv_rows_cpu = (page * num_kv_heads + torch.arange(num_kv_heads, dtype=torch.int32)).reshape(
+        num_kv_heads, 1
+    )
+    kv_rows = kv_rows_cpu.to(spyre_device)
+
+    def gather(k_pages, kv_rows):
+        return k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+
+    if mode == "compile":
+        gather = torch.compile(gather, dynamic=False)
+
+    expected = k_pages_cpu[kv_rows_cpu.to(torch.int64)].reshape(num_kv_heads, block_size, head_size)
+    torch.testing.assert_close(gather(k_pages, kv_rows).cpu(), expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +946,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     An index that is a row of a 2-D table argument loses all but its first stick
     (test_spyre_scatter_index_row_of_2d_table); an in-graph slice of a
     stacked table is a different mechanism and holds at this shape, which is what
-    ``page_attn_head_major_prefill`` reads.
+    ``page_attn_prefill`` reads.
     """
     blocks, block_size, head_size = 4, 64, 64
     pages_cpu, pages = _stacked_index_pages(blocks, 1, block_size, head_size, spyre_device)
@@ -932,7 +974,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     ),
 )
 def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
-    """The same idea at the [KV, 1] entry shape ``page_attn_head_major`` gathers with.
+    """The same idea at the [KV, 1] entry shape ``page_attn_decode`` gathers with.
 
     A 2-D entry cannot go through index_select, hence the subscript.
     """
@@ -966,7 +1008,7 @@ def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
 def test_spyre_scatter_index_row_of_2d_table(spyre_device):
     """index_copy_ with row 0 of a [2, 64] table, the form a [KV, T] head-major write index takes.
 
-    When this XPASS-es, SpyreHeadMajorAttentionImpl.kv_write_index can upload one [KV, T]
+    When this XPASS-es, SpyreAttentionImpl.kv_write_index can upload one [KV, T]
     tensor and hand the store its rows, instead of one allocation and H2D copy per KV head.
     """
     rows, entries, width = 128, 64, 128
@@ -1035,17 +1077,21 @@ def test_spyre_slot_major_scatter_hits_exact_slots(spyre_device):
             "eager",
             marks=pytest.mark.xfail(
                 strict=True,
+                raises=RuntimeError,
                 reason=(
-                    "index_copy_ has no eager on-device path: an int32 index is "
-                    "rejected, an int64 one falls back to CPU. This is why "
-                    "SpyreAttentionImpl compiles the write kernel unconditionally."
+                    "Eager index_copy_ rejects an int32 index ('Expected a long tensor "
+                    "for index'), and the index uploaded to Spyre is int32. This is why "
+                    "SpyreAttentionImpl compiles the write kernel and the grouped decode "
+                    "store unconditionally."
                 ),
             ),
         ),
     ],
 )
 def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
-    """The write kernel must be compiled; eager either raises or leaves the device."""
+    """The write kernel must be compiled: eager rejects the int32 index Spyre carries."""
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
     num_slots, num_kv_heads, head_size = 512, 8, 128
     slots = torch.arange(64, 96, dtype=torch.int32)
     kv_cpu = torch.randn(slots.numel(), num_kv_heads, head_size, dtype=torch.float16)
@@ -1057,7 +1103,9 @@ def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
         scatter = torch.compile(scatter, dynamic=False)
 
     pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device)
-    scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
 
     assert pages.device.type == "spyre", "scatter left the device"
     expected = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
@@ -1125,10 +1173,10 @@ def test_spyre_scalar_pow_cube(spyre_device, exponent):
 # 10. FP32 reduce then D2H (MEAN destagger)
 # ---------------------------------------------------------------------------
 #
-# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
-# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
-# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
-# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
+# Device fp32 is staggered inside sticks (torch-spyre#2971). A reduction over a
+# non-stick dim keeps that element arrangement in its output (torch-spyre#5598), and
+# the copy to host restores it (torch-spyre#5484), so both reads below match the CPU
+# sum. SpyreMeanPool reduces its rectangle lanes on device.
 
 
 def _fp32_mean_reduction(spyre_device):
@@ -1144,16 +1192,11 @@ def _destagger_fp32_to_host(tensor):
     return convert(tensor.to(dtype=torch.float16), "cpu").to(dtype=torch.float32)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Device fp32 is staggered inside sticks (torch-spyre#2971). convert() of "
-        "that layout is interleaved garbage. MEAN copies packed fp16 instead. "
-        "When this XPASS-es, MEAN can convert a device fp32 sum."
-    ),
-)
 def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
-    """Raw convert of a device fp32 sum."""
+    """Raw convert of a device fp32 sum.
+
+    Was strict-xfail on torch-spyre#2971: the copy returned the staggered order.
+    """
     from spyre_inference.custom_ops.utils import convert
 
     acc, ref = _fp32_mean_reduction(spyre_device)
@@ -1161,7 +1204,11 @@ def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
 
 
 def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
-    """to(fp16) before convert un-staggers a device fp32 sum."""
+    """to(fp16) before convert un-staggers a device fp32 sum.
+
+    Was strict-xfail on torch-spyre#5553: the sum was tagged STANDARD, so its fp16 cast
+    was tagged staggered and the copy to host permuted it.
+    """
     acc, ref = _fp32_mean_reduction(spyre_device)
     torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
 
@@ -1289,3 +1336,23 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 14. Parameter identity across model.to("spyre")
+# ---------------------------------------------------------------------------
+
+
+def test_spyre_module_to_keeps_parameter_objects(spyre_device):
+    """A holder of a parameter (an attention impl's sinks, the MoE quant config's biases)
+    must see the device tensor after the move, and a reload's in-place write."""
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    held = model.sinks
+
+    model.to(spyre_device)
+
+    assert model.sinks is held
+    new = torch.full((8,), 3.0, dtype=torch.float16)
+    model.sinks.data.copy_(new.to(spyre_device))
+    torch.testing.assert_close(held.cpu(), new)

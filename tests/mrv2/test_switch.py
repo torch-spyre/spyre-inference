@@ -16,6 +16,7 @@
 
 import copy
 import os
+from types import SimpleNamespace
 
 import pytest
 import vllm.logger
@@ -51,13 +52,13 @@ def _set_runner(monkeypatch: pytest.MonkeyPatch, runner: str | None) -> None:
     else:
         monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
     envs.clear_env_cache()
-    monkeypatch.setattr(triton_gate, "check", lambda runner: None)
+    monkeypatch.setattr(triton_gate, "check", lambda runner, mrv2_kernels: None)
 
 
 @pytest.mark.parametrize(
     ("runner", "worker_cls", "use_v2"),
     [
-        (None, "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0"),
+        (None, "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2", "1"),
         ("v1", "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker", "0"),
         ("v2", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2", "1"),
     ],
@@ -77,6 +78,69 @@ def test_runner_switch(
     assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == use_v2
 
 
+@pytest.mark.parametrize(
+    ("feature", "configure"),
+    [
+        pytest.param(
+            "speculative decoding other than DFlash/XPress",
+            lambda c: setattr(c, "speculative_config", SimpleNamespace(use_dflash=lambda: False)),
+            id="spec-decode-non-dflash",
+        ),
+        pytest.param(
+            "batch-sharded sampling",
+            lambda c: setattr(c.parallel_config, "enable_batch_sharded_sampling", True),
+            id="batch-sharded-sampling",
+        ),
+        pytest.param(
+            "cudagraph_mm_encoder",
+            lambda c: setattr(c.compilation_config, "cudagraph_mm_encoder", True),
+            id="cudagraph-mm-encoder",
+        ),
+        pytest.param(
+            "prefill context parallelism",
+            lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
+            id="pcp",
+        ),
+    ],
+)
+def test_unsupported_v2_features_fail_at_startup(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig, feature: str, configure
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    configure(vllm_config)
+
+    with pytest.raises(ValueError, match=f"V2 model runner does not support {feature}"):
+        TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_a_plain_v2_config_passes_the_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_v2_check_and_update_config_runs_the_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    vllm_config.compilation_config.cudagraph_mm_encoder = True
+
+    with pytest.raises(ValueError, match="does not support cudagraph_mm_encoder"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_v1_skips_the_v2_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v1")
+    calls = []
+    record = classmethod(lambda cls, config: calls.append(config))
+    monkeypatch.setattr(TorchSpyrePlatform, "_reject_unsupported_v2_features", record)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert calls == []
+
+
 def test_unknown_runner_is_rejected(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:
@@ -87,29 +151,45 @@ def test_unknown_runner_is_rejected(
 
 
 @pytest.mark.parametrize(
-    ("runner", "has_triton", "triton_cpu"),
+    ("runner", "kernels", "has_triton"),
     [
-        pytest.param("v2", False, True, id="v2_got_placeholders"),
+        pytest.param("v2", "triton", False, id="v2_triton_got_placeholders"),
+        pytest.param("v2", "host", True, id="v2_host_got_triton"),
         # The bug the gate fixes: V1 with Triton on.
-        pytest.param("v1", True, True, id="v1_got_triton"),
+        pytest.param("v1", "host", True, id="v1_got_triton"),
     ],
 )
 def test_gate_must_match_the_runner(
     monkeypatch: pytest.MonkeyPatch,
     vllm_config: VllmConfig,
     runner: str,
+    kernels: str,
     has_triton: bool,
-    triton_cpu: bool,
 ) -> None:
     """E.g. SPYRE_MODEL_RUNNER set after `import vllm`, or a gate error at plugin load."""
     monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
+    monkeypatch.setenv("SPYRE_MRV2_KERNELS", kernels)
     envs.clear_env_cache()
     monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", has_triton)
-    monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: triton_cpu)
+    monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: True)
 
     with pytest.raises(
-        ValueError, match=f"SPYRE_MODEL_RUNNER={runner} needs HAS_TRITON={not has_triton}"
+        ValueError,
+        match=f"SPYRE_MODEL_RUNNER={runner} SPYRE_MRV2_KERNELS={kernels} needs "
+        f"HAS_TRITON={not has_triton}",
     ):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_v2_on_triton_needs_triton_cpu(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
+    monkeypatch.setenv("SPYRE_MRV2_KERNELS", "triton")
+    envs.clear_env_cache()
+    monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: False)
+
+    with pytest.raises(ValueError, match="needs triton-cpu"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
@@ -135,12 +215,13 @@ def test_runner_changed_after_import_is_rejected(
 ) -> None:
     """The env cache still holds the value register() saw; the check must not trust it."""
     monkeypatch.delenv("SPYRE_MODEL_RUNNER", raising=False)
+    monkeypatch.delenv("SPYRE_MRV2_KERNELS", raising=False)
     envs.clear_env_cache()
-    assert envs.SPYRE_MODEL_RUNNER == "v1"
+    assert (envs.SPYRE_MODEL_RUNNER, envs.SPYRE_MRV2_KERNELS) == ("v2", "host")
     monkeypatch.setattr(triton_gate, "has_triton_cpu", lambda: True)
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v2")
+    monkeypatch.setenv("SPYRE_MRV2_KERNELS", "triton")
 
-    with pytest.raises(ValueError, match="SPYRE_MODEL_RUNNER=v2 needs HAS_TRITON=True"):
+    with pytest.raises(ValueError, match="SPYRE_MRV2_KERNELS=triton needs HAS_TRITON=True"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
@@ -167,7 +248,7 @@ def test_register_logs_a_gate_error_and_keeps_the_platform(
     assert logged == ["Spyre Triton gate could not be applied"]
 
 
-@pytest.mark.parametrize(("runner", "pinned"), [(None, "0"), ("v2", "1")])
+@pytest.mark.parametrize(("runner", "pinned"), [(None, "1"), ("v1", "0"), ("v2", "1")])
 def test_register_pins_the_runner_before_any_config(
     monkeypatch: pytest.MonkeyPatch, runner: str | None, pinned: str
 ) -> None:

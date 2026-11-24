@@ -253,6 +253,82 @@ def test_item_tokens_count_valid_patches_only():
     assert model.vision_item_tokens(_mm_kwargs(_images())) == [6, 2]
 
 
+def _manager(model, budgets=()):
+    from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
+
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_max_vision_items_per_batch=0,
+            encoder_cudagraph_max_frames_per_batch=None,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=4096,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda modality: 0 if modality == "video" else 2,
+                mm_encoder_tp_mode="weights",
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+    return SpyreEncoderGraphManager(vllm_config, torch.device("cpu"), torch.float16, model)
+
+
+@pytest.mark.parametrize(
+    ("budgets", "larger"),
+    [((), []), ((64, 128, 256, 280, 576), [576]), ((64, 128, 256, 280, 576, 1152), [576, 1152])],
+)
+def test_user_budgets_round_up_to_whole_patch_groups(budgets, larger):
+    model = _spyre_model(_tower_config(num_layers=1))
+    model.max_tokens_per_item = 280
+    assert _manager(model, budgets).token_budgets == [64, 128, 256, 320, *larger]
+
+
+def test_every_max_soft_tokens_has_a_budget_once_opted_in():
+    """A request's own ``max_soft_tokens`` lands on a compiled budget, not the eager path."""
+    model = _spyre_model(_tower_config(num_layers=1))
+    model.max_tokens_per_item = 280  # the engine's default; a request may ask for up to 1120
+    manager = _manager(model, (64, 128, 256, 280, 576, 1152))
+
+    for tokens in (70, 140, 280, 560, 1120):
+        assert manager._path_fitting_budget("default", tokens) is not None
+    # A square image at the default 280 comes out at 256 tokens and pads nothing.
+    assert manager._path_fitting_budget("default", 256) == 256
+    # Several images pack only up to the budget covering the engine's own largest item.
+    assert manager._pack_budgets == {"default": [64, 128, 256, 320]}
+
+
+def test_a_large_image_runs_alone_and_the_small_ones_pack():
+    """Gemma 4's own item selection splits a mixed batch, and every item replays a budget."""
+    config = _tower_config(num_layers=1)
+    config.position_embedding_size = 64  # room for the 42x42 grid
+    model = _spyre_model(config)
+    model.max_tokens_per_item = 192  # three items per call, packed up to 192 tokens
+    manager = _manager(model, (64, 128, 192, 280))
+    assert manager.token_budgets == [64, 128, 192, 320]
+    for budget in (64, 320):
+        manager._capture_budget_graph(budget)
+    ran = []
+    run = manager._run_budget_graph
+
+    def recording_run(mm_kwargs, budget, **kwargs):
+        ran.append(budget)
+        return run(mm_kwargs, budget, **kwargs)
+
+    manager._run_budget_graph = recording_run
+    mm_kwargs = _mm_kwargs([*_images(), _image(42, 42, pad=0, seed=3)])  # 6, 2 and 196 tokens
+
+    with torch.inference_mode():
+        outputs = manager.execute(mm_kwargs)
+        expected = model.embed_multimodal(**mm_kwargs)
+
+    # Unlimited, upstream packs all three into the 320 budget.
+    assert sorted(ran) == [64, 320]
+    assert (manager.graph_hits, manager.graph_misses) == (3, 0)
+    for got, want in zip(outputs, expected, strict=True):
+        assert _cosine(got, want) > 0.995
+
+
 def test_a_grid_the_kernel_does_not_divide_is_rejected():
     model = _spyre_model(_tower_config(num_layers=1))
     with pytest.raises(ValueError, match="pooling kernel"):
@@ -403,6 +479,89 @@ def test_tower_is_built_in_the_model_dtype(monkeypatch):
 
     tower = AutoModel.from_config(config=config)
     assert {p.dtype for p in tower.parameters()} == {torch.float16}
+
+
+def test_per_layer_embedding_cache_follows_the_model(monkeypatch):
+    """Upstream allocates the PLE cache as a plain attribute, so `.to()` would leave it behind."""
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+
+    def upstream_init(self, *, vllm_config, prefix=""):
+        nn.Module.__init__(self)
+        self.per_layer_embeddings = torch.zeros(3, 2, 4)
+
+    monkeypatch.setattr(gemma4_mm.Gemma4ForConditionalGeneration, "__init__", upstream_init)
+    monkeypatch.setattr(
+        SpyreGemma4ForConditionalGeneration, "_init_spyre_vision", lambda self: None
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float16, hf_config=SimpleNamespace(vision_config=SimpleNamespace())
+        )
+    )
+    model = SpyreGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+    assert "per_layer_embeddings" in dict(model.named_buffers())
+    assert "per_layer_embeddings" not in model.state_dict()
+    assert model.to(torch.float16).per_layer_embeddings.dtype == torch.float16
+
+
+@pytest.mark.parametrize("has_image", [True, False])
+def test_ple_lookup_sees_image_tokens_as_token_zero(has_image):
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+
+    layers, width = 2, 3
+    looked_up, embedded = [], []
+
+    def get_per_layer_inputs(ids):
+        looked_up.append(ids.clone())
+        return ids[:, None, None].expand(-1, layers, width).half()
+
+    def embed(ids):
+        embedded.append(ids.clone())
+        return ids[:, None].half()
+
+    model = SpyreGemma4ForConditionalGeneration.__new__(SpyreGemma4ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.register_buffer("per_layer_embeddings", torch.full((6, layers, width), -1.0).half())
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(num_hidden_layers=layers, hidden_size_per_layer_input=width)
+    )
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(get_per_layer_inputs=get_per_layer_inputs)
+    )
+    model.get_language_model = lambda: SimpleNamespace(embed_input_ids=embed)
+
+    input_ids = torch.tensor([5, 7, 9, 11])
+    is_multimodal = torch.tensor([False, has_image, has_image, False])
+    text = model.vision_embed_text(input_ids, is_multimodal)
+
+    ple_ids = torch.tensor([5, 0, 0, 11]) if has_image else input_ids
+    assert torch.equal(looked_up[0], ple_ids)
+    assert torch.equal(embedded[0], ple_ids)
+    assert torch.equal(text, ple_ids[:, None].half())
+    assert torch.equal(model.per_layer_embeddings[:4, 0, 0], ple_ids.half())
+    assert (model.per_layer_embeddings[4:] == -1).all()
+
+
+@pytest.mark.parametrize("num_tokens", [33, 64, 2048])
+def test_ids_outside_mask_on_spyre(num_tokens):
+    """The PLE image-token mask on the card, as ``vision_embed_text`` calls it: an unaligned,
+    a stick-aligned and a serving-bucket length, and a second mask through the same kernels."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.models.gemma4_mm import _ids_outside_mask
+
+    # Nonzero ids up to the top of the 262144-entry vocab, so a dropped mask shows.
+    ids = (torch.arange(num_tokens) * 104729 + 258880) % 262144
+    ids[0], ids[-1] = 0, 262143
+    device_ids = convert(ids, device="spyre")
+    with torch.inference_mode():
+        for modulus in (2, 17):
+            mask = torch.arange(num_tokens) % modulus == 1
+            device_mask = convert(mask, device=device_ids.device, dtype=device_ids.dtype)
+            got = convert(_ids_outside_mask(device_ids, device_mask), device="cpu")
+            assert torch.equal(got, torch.where(mask, 0, ids))
 
 
 def test_upstream_tower_contract_is_unchanged():

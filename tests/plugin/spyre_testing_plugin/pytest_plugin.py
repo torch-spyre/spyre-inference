@@ -64,6 +64,7 @@ import atexit
 import fnmatch
 import math
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -483,15 +484,16 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
 # ---------------------------------------------------------------------------
 
 _UPSTREAM_MARKER = "upstream"
+_TRITON_CPU_MARKER = "triton_cpu"
 # Satisfiability is brute-forced over the other markers (2**N evaluations); past this, fail open.
 _MAX_FREE_MARKERS = 12
 
 
-def _markexpr_selects_upstream(markexpr: str) -> bool:
-    """True when `markexpr` names `upstream` and is satisfiable with it set. Every marker
+def _markexpr_selects(markexpr: str, marker: str) -> bool:
+    """True when `markexpr` names `marker` and is satisfiable with it set. Every marker
     combo in the Makefile mentions `upstream`, most of them negatively, so a substring check
     would be wrong. An expression that doesn't name it (`-m attention`) is not a request even
-    where it could match upstream tests; `--upstream` is the override for those.
+    where it could match `marker`'s tests; `--upstream` is the override for upstream.
     """
     try:
         expr = Expression.compile(markexpr)
@@ -501,10 +503,10 @@ def _markexpr_selects_upstream(markexpr: str) -> bool:
 
     # co_names is exactly the idents the evaluator will query, hyphens and dots included.
     names = {n.removeprefix(IDENT_PREFIX) for n in expr._code.co_names}
-    if _UPSTREAM_MARKER not in names:
+    if marker not in names:
         return False
 
-    free = sorted(names - {_UPSTREAM_MARKER})
+    free = sorted(names - {marker})
     if len(free) > _MAX_FREE_MARKERS:
         return True
 
@@ -515,7 +517,7 @@ def _markexpr_selects_upstream(markexpr: str) -> bool:
 
     for bits in range(1 << len(free)):
         assignment = {name: bool(bits >> i & 1) for i, name in enumerate(free)}
-        assignment[_UPSTREAM_MARKER] = True
+        assignment[marker] = True
         if expr.evaluate(matcher):
             return True
     return False
@@ -527,7 +529,7 @@ def _upstream_requested(config) -> bool:
         return False
     if config.getoption("upstream"):
         return True
-    if _markexpr_selects_upstream(config.option.markexpr):
+    if _markexpr_selects(config.option.markexpr, _UPSTREAM_MARKER):
         return True
     _log(
         "[vllm-upstream] no `upstream` in the -m expression, skipping upstream test collection"
@@ -650,6 +652,30 @@ def _find_allow_entry(test_name: str, allow_list: tuple[AllowEntry, ...]) -> All
     return None
 
 
+# Architecture-specific model family exclusions
+_UNSUPPORTED_ARCH_MODELS: dict[str, tuple[str, ...]] = {
+    "ppc64le": ("qwen",),
+}
+
+
+def _is_unsupported_on_current_platform(item: pytest.Item) -> bool:
+    """Return True if the test item matches unsupported model families for the host architecture."""
+    arch = platform.machine()
+    patterns = _UNSUPPORTED_ARCH_MODELS.get(arch)
+    if not patterns:
+        return False
+    path_str = str(item.fspath).lower()
+    nodeid = item.nodeid.lower()
+    if any(pat in path_str or pat in nodeid for pat in patterns):
+        return True
+    params = getattr(getattr(item, "callspec", None), "params", {})
+    # Deliberately sweep all param values, not just a "model" key. The GSM8K gate
+    # (test_gsm8k_correctness.py) has no "qwen" in its file path; the match comes
+    # from its config_filename param ("qwen2.5-0.5b-instruct.yaml"). Narrowing this
+    # to params["model"] would silently re-enable that gate on ppc64le.
+    return any(any(pat in str(v).lower() for pat in patterns) for v in params.values())
+
+
 def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
     """Check if test should be skipped based on param_skips or param_allows.
 
@@ -681,6 +707,27 @@ def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Apply YAML-based filtering to upstream tests and reorder tests."""
+    arch_deselected: list[pytest.Item] = []
+    kept: list[pytest.Item] = []
+    for item in items:
+        if _is_unsupported_on_current_platform(item):
+            arch_deselected.append(item)
+        else:
+            kept.append(item)
+    if arch_deselected:
+        items[:] = kept
+        config.hook.pytest_deselected(items=arch_deselected)
+
+    if not _markexpr_selects(config.option.markexpr, _TRITON_CPU_MARKER):
+        triton_cpu = [item for item in items if item.get_closest_marker(_TRITON_CPU_MARKER)]
+        if triton_cpu:
+            items[:] = [item for item in items if not item.get_closest_marker(_TRITON_CPU_MARKER)]
+            config.hook.pytest_deselected(items=triton_cpu)
+            _log(
+                f"[triton-cpu] deselected {len(triton_cpu)} triton_cpu tests: "
+                "pass -m triton_cpu to run them"
+            )
+
     upstream_tests_base = getattr(config, "_upstream_tests_base", None)
     if upstream_tests_base:
         upstream_tests_base = Path(upstream_tests_base).resolve()
@@ -1156,11 +1203,8 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view; the physical layout underneath is token-major, which vLLM
-    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
-    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
-    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
-    # physical layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view, which is SpyreAttentionBackend's page shape with K and V
+    # concatenated on the last dim, so only the split and the device layout are ours.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -1181,24 +1225,25 @@ def patch_backend_list(request, monkeypatch):
         # defaulted parameters (use_cuda_graph in 0.30, layer_k/v_scale in 0.31).
         if backend == AttentionBackendEnum.CUSTOM:
 
-            def pin_slot_major(blocks):
-                # The KV write needs the slot-outermost layout, not the default.
+            def pin_head_major(blocks):
+                # The kernels gather a page along device dim 0, not the default layout's.
                 if blocks.device.type != "spyre":
                     return blocks
-                from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
+                from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
 
-                nb, bs, nkvh, hs = blocks.shape
+                nb, nkvh, bs, hs = blocks.shape
                 return blocks.cpu().to(
                     blocks.device,
-                    device_layout=slot_major_kv_layout(nb * bs, nkvh, hs, blocks.dtype),
+                    device_layout=head_major_kv_layout(nb * nkvh, bs, hs, blocks.dtype),
                 )
 
-            # K and V are concatenated on the last dim.
+            # Upstream hands an fp8 cache over as its uint8 bytes.
+            if kv_cache.dtype == torch.uint8:
+                kv_cache = kv_cache.view(torch.float8_e4m3fn)
             head_size = kv_cache.shape[-1] // 2
-            kv_cache = kv_cache.transpose(1, 2)
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (pin_slot_major(k_blocks), pin_slot_major(v_blocks))
+            kv_cache = (pin_head_major(k_blocks), pin_head_major(v_blocks))
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,
@@ -1215,6 +1260,26 @@ def patch_backend_list(request, monkeypatch):
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
+
+    # Upstream hands the store its raw slot mapping; attn_layer publishes the impl's own
+    # write index instead, one tensor per KV head. It also skips the load-time read of
+    # the layer's fp8 KV scales (resolve_kv_scales), which the store needs first.
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+
+    orig_update = SpyreAttentionImpl.do_kv_cache_update
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self.kv_cache_fp8 and self._kv_scales is None:
+            self.prepare_kv_scales(layer)
+        if isinstance(slot_mapping, torch.Tensor):
+            slot_mapping = self.kv_write_index(slot_mapping.cpu(), kv_cache[0].device)
+        return orig_update(self, layer, key, value, kv_cache, slot_mapping)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "do_kv_cache_update", do_kv_cache_update)
+
+    from spyre_testing_plugin.attn_helpers import drop_cpu_device_layouts
+
+    drop_cpu_device_layouts(monkeypatch)
 
     yield
 
@@ -1253,6 +1318,23 @@ def pytest_runtest_makereport(item, call):
         item._spyre_reap_card = True
 
 
+# tryfirst: the skip / fail must land before the parity module's fixture starts its subprocess.
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    if item.get_closest_marker(_TRITON_CPU_MARKER) is None:
+        return
+    if platform.machine() != "x86_64":
+        pytest.skip("triton-cpu, the parity reference, is x86-only")
+    from spyre_inference.v1.worker.spyre.triton_gate import has_triton_cpu
+
+    # An error, not a skip: a parity job that lost triton-cpu would otherwise pass empty.
+    if not has_triton_cpu():
+        pytest.fail(
+            "`-m triton_cpu` needs triton-cpu: `uv sync --group dev --group triton-cpu`",
+            pytrace=False,
+        )
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item, nextitem):
     """Free the Spyre card at each test boundary on a Spyre host.
@@ -1273,7 +1355,10 @@ def pytest_runtest_teardown(item, nextitem):
     if not spyre_hardware_present():
         return
     if getattr(item, "_spyre_reap_card", False):
-        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
+        # An xfail engine crash leaves a holder to kill, and the card needs a moment
+        # after the kill before the next test can open it.
+        settle = 3.0 if item.get_closest_marker("xfail") else 0.0
+        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log, settle=settle)
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)

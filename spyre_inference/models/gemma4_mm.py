@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from transformers.models.gemma4 import modeling_gemma4
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.model_executor.models.utils import scatter_output_slices
+from vllm.v1.worker.encoder_cudagraph_defs import ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG
 
 from spyre_inference.custom_ops.head_pad import pad_input_end, pad_output_end
 from spyre_inference.custom_ops.utils import convert
@@ -421,6 +422,12 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         model_config = vllm_config.model_config
         model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Upstream allocates the PLE cache (E2B/E4B) on the host as a plain attribute, which
+        # does not follow the model to Spyre; a buffer does.
+        ple = getattr(self, "per_layer_embeddings", None)
+        if ple is not None:
+            del self.per_layer_embeddings
+            self.register_buffer("per_layer_embeddings", ple, persistent=False)
         self._init_spyre_vision()
 
     def _init_spyre_vision(self) -> None:
@@ -486,6 +493,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         del embedder.position_embedding_table
 
         standardize = getattr(config, "standardize", False)
+        assert self.embed_vision is not None, "a vision tower always has its embedder"
         projection = self.embed_vision.embedding_projection
         self._spyre_vision_tail = _VisionTail(
             # vision_project sums the k*k patches; the pooler averages and scales them.
@@ -506,6 +514,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             )
         return super().embed_multimodal(**kwargs)
 
+    @property
+    def vision_pack_tokens(self) -> int:
+        return self.max_tokens_per_item
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],
@@ -525,6 +537,14 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
         tokens = (x @ tail.weight.t()).to(tail.dtype)
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
+
+    def select_encoder_cudagraph_items(
+        self, mm_kwargs: dict[str, Any], indices: list[int]
+    ) -> dict[str, Any]:
+        # Upstream tags the selection with its row-width capture axis; Spyre declares none.
+        selected = super().select_encoder_cudagraph_items(mm_kwargs, indices)
+        selected.pop(ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG, None)
+        return selected
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
         return [
@@ -584,3 +604,23 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         """The pool only: the tail runs in ``postprocess_encoder_output``."""
         x = x.squeeze(0)
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).sum(dim=0)
+
+    def vision_embed_text(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor | None
+    ) -> torch.Tensor:
+        # Upstream masks the image ids for the PLE lookup with a `where` on the host's bool
+        # mask, which does not lower on Spyre; an integer mask compared on the card does, so
+        # mask them here and hand upstream text only.
+        # The merge overwrites the image rows, so their token-0 text embedding never shows.
+        if (
+            self.per_layer_embeddings is not None
+            and is_multimodal is not None
+            and is_multimodal.any()
+        ):
+            mask = convert(is_multimodal, device=input_ids.device, dtype=input_ids.dtype)
+            input_ids = _ids_outside_mask(input_ids, mask)
+        return super().vision_embed_text(input_ids, None)
+
+
+def _ids_outside_mask(input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return torch.where(mask != 0, torch.zeros_like(input_ids), input_ids)

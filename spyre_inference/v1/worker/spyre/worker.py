@@ -29,8 +29,10 @@ own gpu_worker.py carries the same ``# type: ignore`` for its V2 one.
 import os
 
 import torch
+from vllm.utils.mem_utils import MemorySnapshot
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.utils import request_memory
 
 from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
@@ -38,7 +40,7 @@ from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.spyre import device_shims, kernels
+from spyre_inference.v1.worker.spyre import device_shims, kernels, triton_gate
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 from spyre_inference.v1.worker.spyre_worker import (  # shared with V1; moves at the flip
     TorchSpyreWorker,
@@ -49,6 +51,10 @@ from spyre_inference.v1.worker.spyre_worker import (  # shared with V1; moves at
 
 class SpyreWorkerV2(TorchSpyreWorker):
     """MRV2: vllm/v1/worker/gpu_worker.py:Worker, via TorchSpyreWorker."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        with triton_gate.v2_worker_init():
+            super().__init__(*args, **kwargs)
 
     def init_device(self) -> None:
         apply_in_process_threading(self.parallel_config)
@@ -103,6 +109,11 @@ class SpyreWorkerV2(TorchSpyreWorker):
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
 
+        # Register `--load-format spyre`. Only workers call get_model_loader(), and
+        # init_device runs regardless of `VLLM_PLUGINS`. SpyreWorkerV2.init_device copies
+        # this method: keep both in sync.
+        import spyre_inference.model_loader  # noqa: F401
+
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
@@ -114,8 +125,14 @@ class SpyreWorkerV2(TorchSpyreWorker):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
+        # As Worker.init_device does, after the distributed init. The platform reports
+        # device_type "cpu", so the snapshot is given the Spyre device explicitly.
+        self.init_snapshot = MemorySnapshot(device=self._spyre_memory_device())
+        self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+
         device_shims.install()  # MRV2-only: torch.cuda Stream/Event placeholders
-        kernels.bind_or_raise()  # MRV2-only: the kernel seam (DEFAULT_PATH_KERNELS)
+        kernels.bind_or_raise()  # MRV2-only: host ops in place of MRV2's Triton kernels
 
         # Construct the model runner directly — no monkey-patching needed.
         self.model_runner = SpyreModelRunnerV2(  # ty: ignore[invalid-assignment]

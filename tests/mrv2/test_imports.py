@@ -49,6 +49,8 @@ def test_importing_the_package_has_no_side_effects() -> None:
         import importlib
         import torch
         from vllm import triton_utils
+        # vLLM's own set_stream patch lands on first import of this module.
+        import vllm.utils.torch_utils  # noqa: F401
 
         # device_shims.install() is the only thing allowed to touch these.
         _cuda_names = ("Stream", "Event", "stream", "current_stream", "set_stream")

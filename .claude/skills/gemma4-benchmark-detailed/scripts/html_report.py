@@ -173,6 +173,16 @@ def metrics(runs: list[dict]) -> list[dict]:
     return out
 
 
+def charts_js(data: dict) -> str:
+    """JSON for the inline <script>, with `</` escaped so a label can't close it.
+
+    json.dumps leaves `</` intact, so a label carrying a closing-script tag
+    would break out of the script element. Labels come from branch names and
+    commit subjects, which a fork-PR author controls.
+    """
+    return json.dumps(data).replace("</", "<\\/")
+
+
 def chart_data(ms: list[dict], plain: dict, ids: list[str]) -> list[dict]:
     return [
         {
@@ -672,7 +682,7 @@ def page(top: Path, narrative: dict) -> str:
 </div>
 <div id="tip" hidden></div>
 <script>
-var CHARTS = {json.dumps(data)};
+var CHARTS = {charts_js(data)};
 {js}
 </script>
 </body>

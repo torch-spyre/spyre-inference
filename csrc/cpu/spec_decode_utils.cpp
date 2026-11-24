@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// VENDORED ADAPTATION: vLLM v0.32.0, commit
+// VENDORED ADAPTATION: vLLM v0.32.0 (unchanged through v0.33.0), commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be. Source:
 // https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/csrc/cpu/spec_decode_utils.cpp
 // Copyright contributors to the vLLM project, Apache-2.0.

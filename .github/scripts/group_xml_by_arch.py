@@ -16,15 +16,20 @@
 
 import argparse
 import os
+import re
 from pathlib import Path
 
 DEFAULT_ARCH = "x86_64"
 KNOWN_ARCHES = ("x86_64", "ppc64le", "s390x")
 
+# The arch comes from an untrusted artifact sidecar and becomes a path segment.
+_SAFE_ARCH = re.compile(r"[a-z0-9_]+")
+
 
 def canonical(arch: str) -> str:
     a = arch.strip().lower()
-    return "x86_64" if a in ("amd64", "x86", "x86-64", "x86_64") else a
+    a = "x86_64" if a in ("amd64", "x86", "x86-64", "x86_64") else a
+    return a if _SAFE_ARCH.fullmatch(a) else DEFAULT_ARCH
 
 
 def leg_arch(xml_path: Path) -> str:

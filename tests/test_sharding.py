@@ -566,6 +566,9 @@ def _makefile_shard_counts() -> dict[str, int]:
     counts = {}
     for suite, var in (
         ("smoke", "SMOKE_SHARDS"),
+        ("smoke-unit", "SMOKE_UNIT_SHARDS"),
+        ("e2e-smoke", "E2E_SMOKE_SHARDS"),
+        ("e2e-smoke-dist", "E2E_SMOKE_DIST_SHARDS"),
         ("attention", "ATTN_SHARDS"),
         ("upstream", "UPSTREAM_SHARDS"),
         ("distributed", "DIST_SHARDS"),
@@ -584,6 +587,9 @@ def _matrix_shard_ids() -> dict[str, list[int]]:
         suite: sorted({int(n) for n in re.findall(rf"test-{suite}-shard-(\d+)\b", text)})
         for suite in (
             "smoke",
+            "smoke-unit",
+            "e2e-smoke",
+            "e2e-smoke-dist",
             "attention",
             "upstream",
             "distributed",

@@ -1,8 +1,8 @@
 name: Run matrix test config
 description: >-
   Builds spyre-inference and runs one _test_matrix.yaml matrix leg (RPM
-  install through JUnit upload). Shared by the `test` and `test_retry`
-  jobs so the pod-level retry doesn't need its own copy of every step.
+  install through JUnit upload). Shared by _test_leg.yaml's `attempt` and
+  `retry` jobs so the pod-level retry doesn't need its own copy of every step.
 
 inputs:
   cfg:
@@ -42,7 +42,7 @@ inputs:
     description: JSON array string of the runs-on labels the caller resolved to, forwarded to gather-runner-info
     required: true
   job_slot:
-    description: Unique per-job-attempt slot (e.g. strategy.job-index, or retry-<index>) used to scope the inductor cache dir and the coverage-data artifact name
+    description: Unique per-job-attempt slot (the leg's matrix index, or retry-<index> for its pod-level retry) used to scope the inductor cache dir and the coverage-data artifact name
     required: true
   retry:
     description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact, keeping its failures as result.prior_* properties
@@ -51,6 +51,16 @@ inputs:
   use_prebaked_image:
     description: When 'true', skip the RPM install + spyre-inference build and use the runner image's stack as-is
     required: true
+  extra_groups:
+    description: >-
+      Space-separated dependency groups to sync on top of dev (matrix.extra_groups), e.g.
+      triton-cpu for the parity job. Empty for every other job, which then runs triton-free.
+    required: false
+    default: ''
+  image_rpms:
+    description: When 'true', skip the baseline RPM install and use the runner image's Spyre RPMs; spyre-inference and torch-spyre are still built from source
+    required: false
+    default: 'false'
   storage_root:
     description: Repo-scoped uv-cache root on the shared mount, forwarded to the uv-nfs-cache action (e.g. $STORAGE_1_DIR/.cache/uv)
     required: true
@@ -90,9 +100,16 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Reject image_rpms with override RPMs
+      if: ${{ inputs.image_rpms == 'true' && inputs.rpm_names != '' }}
+      shell: bash
+      run: |
+        echo "::error::image_rpms cannot be combined with rpm_names: override RPMs layer onto the baseline install, which image_rpms skips."
+        exit 1
+
     # Install the baseline RPMs from spyre-rpms.lock; skipped when use_prebaked_image is true, so the run uses the image's Spyre stack as-is (see issue #543).
     - name: Install Spyre RPMs
-      if: ${{ inputs.use_prebaked_image != 'true' }}
+      if: ${{ inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' }}
       uses: ./.github/actions/spyre-rpm-install
 
     # Install the uv binary only. The cache itself is shipped from the shared
@@ -108,7 +125,7 @@ runs:
     # action's post step writes the main scope on push-to-main and an isolated
     # pr-<N> scope on PRs). Merge queue needs no gate: it is not a writer.
     - name: uv cache (NFS)
-      if: ${{ inputs.use_prebaked_image != 'true' }}
+      if: ${{ inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' }}
       uses: ./.github/actions/uv-nfs-cache
       with:
         storage-root: ${{ inputs.storage_root }}
@@ -152,17 +169,25 @@ runs:
       shell: bash
       env:
         TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        IMAGE_RPMS: ${{ inputs.image_rpms }}
         SPYRE_KERNELS_WHEEL_DIR: ${{ runner.temp }}/kernels-wheel
+        EXTRA_GROUPS: ${{ inputs.extra_groups }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
+        # uv keys a git-built wheel on the rev alone, so a wheel built against other RPMs would be reused; force a rebuild against the image's.
+        if [[ "$IMAGE_RPMS" == "true" ]]; then
+          uv cache clean torch-spyre
+        fi
+        groups=(--group dev)
+        for group in $EXTRA_GROUPS; do groups+=(--group "$group"); done
         if [[ -n "$TORCH_SPYRE_REF" ]]; then
           # Build torch-spyre from the dispatched ref straight from GitHub; --frozen skips resolution during add, the non-frozen sync below resolves everything.
           uv add --frozen \
             "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
-          uv sync --verbose --group dev
+          uv sync --verbose "${groups[@]}"
         else
-          uv sync --frozen --verbose --group dev
+          uv sync --frozen --verbose "${groups[@]}"
         fi
         # Print the resolved torch install for log visibility.
         uv pip show torch
@@ -201,7 +226,7 @@ runs:
     # RPMs are overridden, since the lockfiles then no longer describe the stack.
     - name: Restore compile cache (NFS)
       id: compile-cache
-      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
+      if: ${{ inputs.compile_cache_root != '' && inputs.use_prebaked_image != 'true' && inputs.image_rpms != 'true' && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
       continue-on-error: true
       shell: bash
       env:
@@ -266,6 +291,8 @@ runs:
       env:
         RAW_TEST_TYPE: ${{ inputs.test_type }}
         RAW_TEST_TYPES: ${{ inputs.test_types }}
+        # test_triton_is_not_installed skips on it: we don't build those images.
+        SPYRE_PREBAKED_IMAGE: ${{ inputs.use_prebaked_image == 'true' && '1' || '' }}
       run: |
         echo "Running tests for config: ${{ inputs.cfg }}${{ inputs.retry == 'true' && ' (pod-level retry)' || '' }}..."
         # An empty TEST_TYPE fails the Makefile's validation, so omit the arg and

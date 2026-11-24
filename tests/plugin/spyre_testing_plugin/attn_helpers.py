@@ -20,6 +20,7 @@
 from unittest.mock import Mock
 
 import torch
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
@@ -42,6 +43,36 @@ def _fused_qkv_kv_views(
         k_view.view(num_tokens, key.shape[1], key.shape[2]),
         v_view.view(num_tokens, value.shape[1], value.shape[2]),
     )
+
+
+def random_block_tables(
+    kv_lens: list[int], width: int, block_size: int, num_blocks: int
+) -> torch.Tensor:
+    """Random block tables whose real blocks are distinct across all sequences.
+
+    Padding points only at pages no sequence owns, so it never aliases live KV. The
+    global stream sees only the plain ``randint`` table the tests drew before, so the
+    K/V data drawn after this call is unchanged.
+    """
+    real = [cdiv(kv_len, block_size) for kv_len in kv_lens]
+    assert all(n <= width for n in real), (
+        f"a sequence needs {max(real)} blocks, more than the table width {width}"
+    )
+    num_real = sum(real)
+    needs_spare = any(n < width for n in real)
+    assert num_real + needs_spare <= num_blocks, (
+        f"{num_real} real blocks{' plus a padding page' if needs_spare else ''} "
+        f"do not fit in {num_blocks} pages"
+    )
+    draw = torch.randint(0, num_blocks, (len(kv_lens), width), dtype=torch.int32)
+    pages = torch.randperm(
+        num_blocks, generator=torch.Generator().manual_seed(0), dtype=torch.int32
+    )
+    spare = pages[num_real:] if needs_spare else pages
+    block_tables = spare[draw % spare.numel()]
+    for row, own in zip(block_tables, torch.split(pages[:num_real], real)):
+        row[: own.numel()] = own
+    return block_tables
 
 
 def _build_metadata(
@@ -212,9 +243,13 @@ def ref_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
-    alibi_slopes: list[float] | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reference implementation of attention for validation."""
+    """Reference implementation of attention for validation.
+
+    ``sinks`` ([num_query_heads]) adds one logit per head to the softmax denominator, as
+    an extra column that contributes no value (gpt-oss, upstream ``sinks``).
+    """
     num_seqs = len(query_lens)
     block_tables_np = block_tables.cpu().numpy()
 
@@ -229,7 +264,8 @@ def ref_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables_np[i, :num_kv_blocks]
 
-        # Pages are token-major, so dim 0 of the concat is the token axis.
+        # ref_attn takes [num_blocks, block_size, KV, D] pages, so dim 0 of the concat is
+        # the token axis.
         k_blocks = [key_cache[idx] for idx in block_indices]
         v_blocks = [value_cache[idx] for idx in block_indices]
         k = torch.cat(k_blocks, dim=0)[:kv_len]  # [kv_len, num_kv_heads, head_size]
@@ -251,20 +287,13 @@ def ref_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
-        if alibi_slopes is not None:
-            # bias[h, q, k] = slope[h] * (k_abs_pos - q_abs_pos), applied before mask.
-            # Under strict causal decoding the q_abs_pos term cancels through
-            # softmax, so any per-row-constant simplification is equivalent —
-            # keep the full form here for clarity in the reference.
-            slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
-            context_len = kv_len - query_len
-            q_abs = torch.arange(query_len, dtype=torch.float32) + context_len
-            kv_abs = torch.arange(kv_len, dtype=torch.float32)
-            rel = kv_abs.unsqueeze(0) - q_abs.unsqueeze(1)  # [query_len, kv_len]
-            bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
-            attn = attn + bias
         attn.masked_fill_(mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        if sinks is not None:
+            sink_col = sinks.float().view(-1, 1, 1).expand(-1, query_len, 1)
+            attn = torch.softmax(torch.cat([attn, sink_col], dim=-1), dim=-1)[..., :-1]
+        else:
+            attn = torch.softmax(attn, dim=-1)
+        attn = attn.to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
 
         outputs.append(out)
@@ -313,4 +342,71 @@ def _padded_mask_metadata(
         block_table=block_table,
         slot_mapping=slot_mapping,
         sliding_window=sliding_window,
+    )
+
+
+def python_for_each_tile(body, operands, *, dims, tile_size, init):
+    """`for_each_tile`'s reduction form as a plain Python loop over the same tiles.
+
+    Outside a compile the real op still traces its body through Dynamo into a `scan`,
+    which adds graphs to the compile counters and hides per-trip calls from tests.
+    """
+    (extent,) = {o.shape[d] for o, d in zip(operands, dims, strict=True) if d is not None}
+    assert extent % tile_size == 0, f"extent {extent} is not a multiple of {tile_size}"
+    carry = init
+    for start in range(0, extent, tile_size):
+        tiles = tuple(
+            o if d is None else o.narrow(d, start, tile_size)
+            for o, d in zip(operands, dims, strict=True)
+        )
+        carry, _ = body(carry, tiles)
+    return carry, None
+
+
+def use_python_for_each_tile(monkeypatch) -> None:
+    """Run the attention kernels' tile walks as `python_for_each_tile` for one test."""
+    from torch_spyre._inductor import wsr
+
+    monkeypatch.setattr(wsr, "for_each_tile", python_for_each_tile)
+
+
+def split_by_chunk(chunk_page_ids, mask_by_chunk, blocks_per_chunk):
+    """The builder's [C*J, B] batched-decode metadata in the kernel's per-chunk layout.
+
+    The reshape `_mirror_batched_decode_indices` uploads, without the device layout.
+    """
+    num_chunks, num_seqs = chunk_page_ids.shape[0] // blocks_per_chunk, chunk_page_ids.shape[1]
+    return (
+        chunk_page_ids.reshape(num_chunks, blocks_per_chunk * num_seqs, 1),
+        mask_by_chunk.reshape(num_chunks, blocks_per_chunk, *mask_by_chunk.shape[1:]),
+    )
+
+
+def drop_cpu_device_layouts(monkeypatch) -> None:
+    """Transfer to CPU without the Spyre device layout, which only Spyre can build.
+
+    The batched decode index upload places one; the plain transfer carries the same values.
+    """
+    orig_to = torch.Tensor.to
+
+    def to(tensor, *args, device_layout=None, **kwargs):
+        if device_layout is None:
+            return orig_to(tensor, *args, **kwargs)
+        target = kwargs.get("device", args[0] if args else None)
+        if not isinstance(target, (str, torch.device)):
+            target = tensor.device
+        if torch.device(target).type != "spyre":
+            return orig_to(tensor, *args, **kwargs)
+        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
+
+
+def use_kv_buckets(monkeypatch) -> None:
+    """Make metadata builders use the KV buckets rather than a page range."""
+    from spyre_inference.v1.attention.backends import spyre_attn
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
+    monkeypatch.setattr(
+        spyre_attn, "SpyreAttnBucketer", lambda vllm_config, **_: SpyreAttnBucketer(vllm_config)
     )

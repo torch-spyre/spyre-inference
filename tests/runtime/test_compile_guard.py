@@ -111,7 +111,8 @@ class TestLevelParsing:
         envs.clear_env_cache()
         assert compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD) is CompileGuardLevel.ERROR
 
-    def test_the_worker_parses_the_level_before_it_loads_the_model(self):
+    @pytest.mark.parametrize("runner", ["v1", "v2"])
+    def test_the_worker_parses_the_level_before_it_loads_the_model(self, runner):
         """A typo must fail in ``init_device``, not at the ``arm`` call after warmup.
 
         Parsing only where the guard is armed means ``SPYRE_COMPILE_GUARD=error`` kills
@@ -120,10 +121,12 @@ class TestLevelParsing:
         """
         import inspect
 
+        from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
         from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
-        init_source = inspect.getsource(TorchSpyreWorker.init_device)
-        warmup_source = inspect.getsource(TorchSpyreWorker.compile_or_warm_up_model)
+        worker = TorchSpyreWorker if runner == "v1" else SpyreWorkerV2
+        init_source = inspect.getsource(worker.init_device)
+        warmup_source = inspect.getsource(worker.compile_or_warm_up_model)
 
         assert "parse_level" in init_source, "init_device no longer validates the level"
         assert "parse_level" not in warmup_source, (

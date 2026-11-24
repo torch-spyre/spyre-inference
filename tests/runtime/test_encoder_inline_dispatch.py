@@ -77,7 +77,6 @@ def _impl(config, *, head_size=64, num_heads=4, num_kv_heads=1, compiled=True):
             head_size=head_size,
             scale=head_size**-0.5,
             num_kv_heads=num_kv_heads,
-            alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="auto",
             logits_soft_cap=None,

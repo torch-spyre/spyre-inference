@@ -25,6 +25,11 @@ torch::Tensor fused_gumbel_argmax(const torch::Tensor& logits,
 
 torch::Tensor greedy_argmax(const torch::Tensor& logits);
 
+void cpu_topp_sampling(torch::Tensor& logits, const torch::Tensor& p);
+void cpu_topk_sampling(torch::Tensor& logits, const torch::Tensor& k);
+void cpu_topk_topp_sampling(torch::Tensor& logits, const torch::Tensor& k,
+                            const torch::Tensor& p);
+
 namespace cpu_utils {
 void rejection_greedy_sample_kernel_impl(
     torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
@@ -63,6 +68,15 @@ TORCH_LIBRARY(_spyre_C, ops) {
 
   ops.def("greedy_argmax(Tensor logits) -> Tensor");
   ops.impl("greedy_argmax", torch::kCPU, &greedy_argmax);
+
+  // Top-k / top-p logit filters; mask in place to -inf.
+  ops.def("cpu_topp_sampling(Tensor(a!) logits, Tensor p) -> ()");
+  ops.impl("cpu_topp_sampling", torch::kCPU, &cpu_topp_sampling);
+  ops.def("cpu_topk_sampling(Tensor(a!) logits, Tensor k) -> ()");
+  ops.impl("cpu_topk_sampling", torch::kCPU, &cpu_topk_sampling);
+  ops.def(
+      "cpu_topk_topp_sampling(Tensor(a!) logits, Tensor k, Tensor p) -> ()");
+  ops.impl("cpu_topk_topp_sampling", torch::kCPU, &cpu_topk_topp_sampling);
 
   ops.def(
       "rejection_greedy_sample_kernel_impl("

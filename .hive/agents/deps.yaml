@@ -1,0 +1,32 @@
+# Portable AgentDefinition for the hive "deps" agent that already exists on
+# this repo's hive. Optional: link it with agents.deps.definition_source.
+# The hive re-reads it on every config reload and restart and merges only
+# presentation and a few behavior fields over the existing agent.
+#
+# Deliberately NOT set here. They stay in the hive config, owner-controlled,
+# and setting them here would override the owner's values:
+#   spec.backend, spec.model, spec.mode, spec.tools, spec.connections,
+#   spec.promptTemplate (the prompt comes from .hive/agents/deps.md through
+#   prompt_source, fetched fresh on every kick).
+# Not settable from here at all (the hive ignores them in a linked file):
+#   spec.cadences (set them in the agent's Cadences tab), sandbox,
+#   enabled/paused, prompt_source/definition_source.
+#
+# Repo agent discovery: the hive lists .hive/agents/ and shows this file
+# under "Declared in your repos" in the agent Import tab. Leave it pending or
+# Reject it there: the existing deps agent already uses this prompt, and
+# approving would register a second agent from the same file.
+apiVersion: hive.kubestellar.io/v1
+kind: AgentDefinition
+metadata:
+  name: deps
+  displayName: "Deps"
+  description: "Keeps spyre-inference building on the newest torch-spyre (and, when enabled, vLLM and torch): one bump PR per dependency group, pushes the repo-side fix for red CI to that PR, and files dependency bugs upstream."
+  emoji: "\U0001F4E6"
+  color: "#16a085"
+spec:
+  role: deps          # same as the live agent; do not change to custom
+  clearOnKick: true   # same as the live agent
+  includeRepos: true
+  # No laneKeywords/detectKeywords: deps works from releases and CI, not
+  # from the issue queue, so routing issues to this lane would only park them.

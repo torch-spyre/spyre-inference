@@ -153,18 +153,25 @@ def configure_threading(worker_count: int) -> None:
         )
 
 
+def runs_in_caller(parallel_config) -> bool:
+    """Whether the worker runs in the caller's process: VLLM_ENABLE_V1_MULTIPROCESSING=0
+    with the uni executor runs the offline engine there instead of in an EngineCore."""
+    import vllm.envs as vllm_envs
+
+    return (
+        not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING
+        and parallel_config.distributed_executor_backend == "uni"
+    )
+
+
 def apply_in_process_threading(parallel_config) -> None:
     """Give an engine that runs in this process the thread settings a spawned EngineCore
     reads at its torch import. VLLM_ENABLE_V1_MULTIPROCESSING=0 with the uni executor
     runs the offline engine here, where torch was imported before they were set."""
     import torch
     import torch._inductor.config as inductor_config
-    import vllm.envs as vllm_envs
 
-    if (
-        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING
-        or parallel_config.distributed_executor_backend != "uni"
-    ):
+    if not runs_in_caller(parallel_config):
         return
     # Part of the FX graph cache key, so it has to match the engine that wrote the cache.
     if os.environ.get("TORCHINDUCTOR_CPP_DYNAMIC_THREADS") == "1":

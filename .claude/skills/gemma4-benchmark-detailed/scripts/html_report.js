@@ -3,11 +3,16 @@
   var tip = document.getElementById("tip");
   var MINUS = "−";
   function num(v, d) { return v.toFixed(d); }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
   function pill(r) {
     if (r.change == null) return "";
     var text, flat = r.overlap;
-    if (r.vs_hf) text = r.ratio.toFixed(2) + "× " + r.vs;
-    else text = (r.change >= 0 ? "+" : MINUS) + Math.abs(r.change).toFixed(1) + "% vs " + r.vs;
+    if (r.vs_hf) text = r.ratio.toFixed(2) + "× " + esc(r.vs);
+    else text = (r.change >= 0 ? "+" : MINUS) + Math.abs(r.change).toFixed(1) + "% vs " + esc(r.vs);
     return '<span class="delta' + (flat ? " flat" : "") + '">' + text + "</span>";
   }
   function layout(bars, rows) {
@@ -25,7 +30,7 @@
     data.forEach(function (d) {
       var panel = document.createElement("div");
       panel.className = "panel";
-      panel.innerHTML = '<div class="pl">' + d.label + "<small>" + d.unit + " · " + d.sub + "</small></div>";
+      panel.innerHTML = '<div class="pl">' + esc(d.label) + "<small>" + esc(d.unit) + " · " + esc(d.sub) + "</small></div>";
       var bars = document.createElement("div");
       bars.className = "bars";
       d.rows.forEach(function (r) {
@@ -41,8 +46,8 @@
         }
         row.dataset.tip = r.name + ": " + val + " " + d.unit + "\nreplicates: " + (reps || "-") + change;
         row.setAttribute("aria-label", r.name + " " + val + " " + d.unit);
-        row.innerHTML = '<span class="name">' + r.short + '</span><div class="bar" style="background:' + r.color + '"></div>' +
-          '<span class="val"><b>' + val + "</b> " + d.unit.split(" ")[0] + pill(r) + "</span>";
+        row.innerHTML = '<span class="name">' + esc(r.short) + '</span><div class="bar" style="background:' + esc(r.color) + '"></div>' +
+          '<span class="val"><b>' + val + "</b> " + esc(d.unit.split(" ")[0]) + pill(r) + "</span>";
         bars.appendChild(row);
       });
       panel.appendChild(bars);

@@ -1,8 +1,8 @@
 name: push-to-clickhouse
 
-# Ingests JUnit XML results from spyre-inference's own pytest matrix into
-# ClickHouse via .github/scripts/ingest_xml_si.py, writing to
-# si_test_runs / si_test_cases / si_run_properties. Triggered by both
+# Ingests JUnit XML results from spyre-inference's own pytest matrix into the
+# schema-v2 database (spyre_v2) via torch-spyre's ingest-xml-to-clickhouse action,
+# using the repo-scoped CLICKHOUSE_V2_* login. Triggered by both
 # workflows that produce that matrix (both call the same reusable
 # _test_matrix.yaml, so they emit the exact same suite shape):
 #   - test_each_commit.yaml (push / PR / merge_group entrypoint)
@@ -56,19 +56,14 @@ jobs:
       github.event.workflow_run.conclusion != 'cancelled'
 
     env:
-      # ---------------------------------------------------------------------------
-      # Set these secrets in your repo / org settings:
-      #   CLICKHOUSE_HOST   e.g. clickhouse.internal.example.com
-      #   CLICKHOUSE_PORT   e.g. 8123  (HTTP interface)
-      #   CLICKHOUSE_USER   e.g. spyre_writer
-      #   CLICKHOUSE_PASS   the password
-      #   CLICKHOUSE_DB     e.g. spyre
-      # ---------------------------------------------------------------------------
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      # Repo secrets CLICKHOUSE_V2_USER / CLICKHOUSE_V2_PASSWORD are the v2 writer login (no
+      # fallback to a shared login). CLICKHOUSE_V2_HOST / _PORT are optional and fall back to
+      # CLICKHOUSE_HOST / CLICKHOUSE_PORT, the port following whichever host is used.
+      CH_HOST: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+      CH_PORT: ${{ secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT || !secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT || '' }}
+      CH_USER: ${{ secrets.CLICKHOUSE_V2_USER }}
+      CH_PASS: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
+      CH_DB_V2: spyre_v2
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -85,6 +80,14 @@ jobs:
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
     steps:
+      # A host without the v2 login must fail loudly (fork PRs have no host and skip).
+      - name: Require the v2 login
+        run: |
+          if [ -n "${CH_HOST}" ] && { [ -z "${CH_USER}" ] || [ -z "${CH_PASS}" ]; }; then
+            echo "::error::ClickHouse host is set but CLICKHOUSE_V2_USER/CLICKHOUSE_V2_PASSWORD is empty; results would be lost."
+            exit 1
+          fi
+
       # workflow_run always executes this file as it exists on the default
       # branch, so a plain checkout (no ref:) here pulls the canonical copy
       # of the ingest scripts regardless of which ref triggered the run.
@@ -95,7 +98,6 @@ jobs:
             .github/scripts/list_run_artifacts.py
             .github/scripts/download_xml_artifacts.py
             .github/scripts/group_xml_by_arch.py
-            .github/scripts/ingest_xml_si.py
           sparse-checkout-cone-mode: false
 
       - name: Install uv
@@ -108,13 +110,13 @@ jobs:
       - name: setup venv
         run: |
           # Not .venv: the shared ingest action builds one there when it is not handed this venv.
-          uv venv .venv-v1
-          source .venv-v1/bin/activate
+          uv venv .venv-ingest
+          source .venv-ingest/bin/activate
           echo "VIRTUAL_ENV $VIRTUAL_ENV"
 
       - name: Install Python dependencies
         run: |
-          source .venv-v1/bin/activate
+          source .venv-ingest/bin/activate
           uv pip install requests clickhouse-driver clickhouse-connect lxml regex
           # The v2 schema and write path live in torch-spyre's extensions/ so all three
           # product repos share ONE definition of run_id and test_case_id.
@@ -215,36 +217,7 @@ jobs:
           echo "Resolved test_type: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
 
-      # ---------------------------------------------------------------------------
-      # Parse each XML file and insert rows into ClickHouse via
-      # ingest_xml_si.py (checked out above), into
-      # si_test_runs / si_test_cases / si_run_properties.
-      - name: Ingest XML files into ClickHouse
-        env:
-          # Fallback only: each leg uploads its own arch beside its JUnit XML, which the
-          # ingest prefers per file. Used when that sidecar is absent (a re-ingest of an
-          # older run), since arch is hashed into run_id and this job is pinned to x86_64.
-          LEG_ARCH: x86_64
-          # Routed through env rather than interpolated into the script: this job runs on
-          # workflow_run, a privileged trigger, and the value comes from a downloaded artifact.
-          THREADED_RUN_ID: ${{ steps.resolve-run-id.outputs.run_id }}
-          PR_NUMBER: ${{ steps.resolve-pr.outputs.pr_number }}
-          TIER: ${{ steps.extract-tier.outputs.tier }}
-        run: |
-          source .venv-v1/bin/activate
-          python3 .github/scripts/ingest_xml_si.py \
-            --xml-dir xml_artifacts \
-            --workflow "${TRIGGERING_WORKFLOW}" \
-            --branch   "${TRIGGERING_BRANCH}" \
-            --sha      "${TRIGGERING_SHA}" \
-            --gha-run-id "${TRIGGERING_RUN_ID}" \
-            --run-id   "${THREADED_RUN_ID}" \
-            --triggered-at "${TRIGGERING_AT}" \
-            --pr-number    "${PR_NUMBER}" \
-            --trigger-type "${TIER}" \
-            --platform "${LEG_ARCH}"
-
-      # Schema-v2 via torch-spyre's reusable action, grouped by leg arch first since arch is a run_id hash input and the matrix dispatches non-x86_64 legs too.
+      # Grouped by leg arch first since arch is a run_id hash input and the matrix dispatches non-x86_64 legs too.
       - name: Group XML files by leg arch
         id: group-by-arch
         run: |
@@ -252,10 +225,10 @@ jobs:
 
       - name: Ingest XML into shared v2 ClickHouse tables (x86_64)
         if: steps.group-by-arch.outputs.has_x86_64 == 'true'
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726 # main pinned 2026-11-22
         with:
           # Already holds the ingest library, so the action skips a second install.
-          venv: .venv-v1
+          venv: .venv-ingest
           xml-dir: xml_by_arch/x86_64
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
@@ -273,18 +246,20 @@ jobs:
           platform: x86_64
           component: spyre-inference
           schema: v2
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
+          clickhouse-host: ${{ env.CH_HOST }}
+          clickhouse-port: ${{ env.CH_PORT }}
+          clickhouse-user: ${{ env.CH_USER }}
+          clickhouse-pass: ${{ env.CH_PASS }}
+          clickhouse-db: ${{ env.CH_DB_V2 }}
+          clickhouse-db-v2: ${{ env.CH_DB_V2 }}
 
       - name: Ingest XML into shared v2 ClickHouse tables (ppc64le)
         if: steps.group-by-arch.outputs.has_ppc64le == 'true'
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726 # main pinned 2026-11-22
         with:
-          venv: .venv-v1
+          venv: .venv-ingest
           xml-dir: xml_by_arch/ppc64le
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
@@ -297,18 +272,20 @@ jobs:
           platform: ppc64le
           component: spyre-inference
           schema: v2
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
+          clickhouse-host: ${{ env.CH_HOST }}
+          clickhouse-port: ${{ env.CH_PORT }}
+          clickhouse-user: ${{ env.CH_USER }}
+          clickhouse-pass: ${{ env.CH_PASS }}
+          clickhouse-db: ${{ env.CH_DB_V2 }}
+          clickhouse-db-v2: ${{ env.CH_DB_V2 }}
 
       - name: Ingest XML into shared v2 ClickHouse tables (s390x)
         if: steps.group-by-arch.outputs.has_s390x == 'true'
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726 # main pinned 2026-11-22
         with:
-          venv: .venv-v1
+          venv: .venv-ingest
           xml-dir: xml_by_arch/s390x
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
@@ -321,12 +298,14 @@ jobs:
           platform: s390x
           component: spyre-inference
           schema: v2
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
+          clickhouse-host: ${{ env.CH_HOST }}
+          clickhouse-port: ${{ env.CH_PORT }}
+          clickhouse-user: ${{ env.CH_USER }}
+          clickhouse-pass: ${{ env.CH_PASS }}
+          clickhouse-db: ${{ env.CH_DB_V2 }}
+          clickhouse-db-v2: ${{ env.CH_DB_V2 }}
 
       - name: Summary
         if: always()

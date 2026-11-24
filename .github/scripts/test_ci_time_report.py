@@ -161,11 +161,10 @@ def test_leg_delta_by_suite_survives_a_reshard():
     assert ctr.leg_delta({"A": 2}, {"A": 2}) == {}
 
 
-def test_slot_suites_recovers_retry_legs_in_sorted_descriptor_order():
+def test_slot_suites_maps_retry_slots_to_their_own_leg():
     legs = [{"cfg": f"Suite {i} (shard 1/1)"} for i in range(12)]
-    # Sorted as strings: failed-suite-1-10 precedes failed-suite-1-2.
-    suites = ctr.slot_suites(legs, ["failed-suite-1-2", "failed-suite-1-10"])
-    assert suites["retry-0"] == "Suite 10" and suites["retry-1"] == "Suite 2"
+    suites = ctr.slot_suites(legs)
+    assert suites["retry-10"] == "Suite 10" and suites["retry-2"] == "Suite 2"
     assert suites["3"] == "Suite 3"
 
 

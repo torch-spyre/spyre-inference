@@ -139,6 +139,17 @@ class _SpyreRotaryMixin:
             else None
         )
 
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        # Build the table on one thread. torch's CPU cos goes through MKL's vector math,
+        # and its first call on a worker thread can take another code path: a
+        # multi-threaded build then gives one thread's rows 1 ulp off, at random.
+        num_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            return super()._compute_cos_sin_cache()
+        finally:
+            torch.set_num_threads(num_threads)
+
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
         # holds no other movable tensor, so there is nothing to relocate. We instead prime

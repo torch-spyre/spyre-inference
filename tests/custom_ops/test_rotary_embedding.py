@@ -16,6 +16,9 @@
 Test Spyre RoPE custom op correctness against upstream CPU reference implementations.
 """
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -715,3 +718,64 @@ def test_fp32_requested_rope_forward_oot_on_spyre(default_vllm_config, head_size
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+def test_cos_sin_cache_is_built_on_one_thread(default_vllm_config, monkeypatch):
+    """The table is built with one torch thread, and the thread count comes back after,
+    also when the build raises."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    build = RotaryEmbedding._compute_cos_sin_cache
+    seen = []
+
+    def counting_build(self):
+        seen.append(torch.get_num_threads())
+        return build(self)
+
+    monkeypatch.setattr(RotaryEmbedding, "_compute_cos_sin_cache", counting_build)
+    num_threads = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        get_rope(128, 2048, is_neox_style=True, dtype=torch.float16)
+        assert seen == [1]
+        assert torch.get_num_threads() == 4
+
+        def failing_build(self):
+            raise RuntimeError("build failed")
+
+        monkeypatch.setattr(RotaryEmbedding, "_compute_cos_sin_cache", failing_build)
+        with pytest.raises(RuntimeError, match="build failed"):
+            get_rope(256, 2048, is_neox_style=True, dtype=torch.float16)
+        assert torch.get_num_threads() == 4
+    finally:
+        torch.set_num_threads(num_threads)
+
+
+_BUILD_IN_A_FRESH_PROCESS = """
+import hashlib, torch
+torch.set_num_threads(8)
+from vllm.config import VllmConfig, set_current_vllm_config
+from spyre_inference.custom_ops.rotary_embedding import SpyreRotaryEmbedding
+with set_current_vllm_config(VllmConfig()):
+    rope = SpyreRotaryEmbedding(256, 256, 65536, 10000.0, True, torch.float16)
+print(hashlib.md5(rope.cos_sin_cache.contiguous().numpy().tobytes()).hexdigest())
+"""
+
+
+@pytest.mark.rotary
+def test_cos_sin_cache_is_the_same_in_every_fresh_process():
+    """A multi-threaded first cos of a process can give one thread's rows 1 ulp off on
+    some CPUs, so the table is built in fresh processes and compared."""
+    digests = set()
+    for _ in range(3):
+        out = subprocess.run(
+            [sys.executable, "-c", _BUILD_IN_A_FRESH_PROCESS],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=True,
+        )
+        digests.add(out.stdout.strip().splitlines()[-1])
+    assert len(digests) == 1, digests

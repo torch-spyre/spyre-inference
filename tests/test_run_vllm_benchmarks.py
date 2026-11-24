@@ -150,6 +150,27 @@ def test_malformed_file_returns_none(tmp_path, raw):
     assert runner._load_configs(_write(tmp_path, raw)) is None
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["../escape", "a/b", "a\\b", "..", ".", ".hidden", "", None],
+)
+def test_unsafe_test_name_fails_to_load(tmp_path, name):
+    """test_name is joined into the results dir for .json/.cmd/.log files, so
+    anything but a single path-safe segment must fail the whole file."""
+    config = {"test_name": name, "parameters": {"model": "m", "tensor_parallel_size": 1}}
+    assert runner._load_configs(_write(tmp_path, [config])) is None
+
+
+def test_safe_test_name_still_loads(tmp_path):
+    (config,) = runner._load_configs(
+        _write(
+            tmp_path,
+            [{"test_name": "serve_granite41-8b_tp1", "parameters": {"model": "m"}}],
+        )
+    )
+    assert config["test_name"] == "serve_granite41-8b_tp1"
+
+
 # ── derived values ──
 
 
@@ -876,3 +897,32 @@ def test_sampler_thread_survives_an_unparsable_sample(monkeypatch):
     sampler.stop()
 
     assert sampler._cpu_samples and sampler._mem_samples == [2.0] * len(sampler._cpu_samples)
+
+
+def test_remote_code_models_are_pinned():
+    """trust-remote-code runs the model repo's own Python, so only a pinned
+    revision may carry it: an unpinned model whose main moves (or is taken
+    over) would run unvetted code on the CI runners."""
+    pins = runner._pinned_revisions()
+    offenders = []
+    for config_file in _CONFIGS.rglob("*.yaml"):
+        try:
+            configs = runner._load_configs(config_file)
+        except AttributeError:
+            # The pooling suites carry a null `environment_variables` default that
+            # _derive_config trips over; they never enable trust-remote-code, and
+            # their load failure is tracked separately.
+            continue
+        if not configs:
+            continue
+        for merged in configs:
+            engine = merged.get("server_parameters") or {}
+            if str(engine.get("trust-remote-code", "")).lower() != "true":
+                continue
+            model = runner._config_model(merged)
+            if model and not pins.get(model.lower()):
+                offenders.append(f"{config_file.name}:{merged.get('test_name')} -> {model}")
+    assert not offenders, (
+        "trust-remote-code on a model with no pinned revision in "
+        ".github/cache_config/hf_models_and_datasets.yaml:\n" + "\n".join(offenders)
+    )

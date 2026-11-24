@@ -25,7 +25,6 @@ does not have (torch-spyre#4123).
 import torch
 
 from spyre_inference.v1.attention.ops.sinks import normalize
-from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
 def page_attn_decode_kernel(
@@ -52,8 +51,8 @@ def page_attn_decode_kernel(
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
     Heads are kv-major, so the fold is a reshape, and it needs no head gather. The page
-    walk goes through `walk_tiles`, which holds one block body rather than an unrolled
-    copy per page when SPYRE_ATTN_FOR_EACH_TILE is set.
+    walk is a `for_each_tile`, which holds one block body rather than an unrolled copy
+    per page.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
@@ -75,6 +74,8 @@ def page_attn_decode_kernel(
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
+    from torch_spyre._inductor.wsr import for_each_tile
+
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
     num_queries_per_kv = num_heads // num_kv_heads
 
@@ -105,15 +106,6 @@ def page_attn_decode_kernel(
         scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
-        if carry is None:
-            probs = torch.exp(scores - scores_max)
-            return (
-                scores_max,
-                probs.sum(dim=-1, keepdim=True),
-                torch.matmul(probs, v_page),
-            ), None
-
         tile_max, tile_sum, tile_output = carry
         # Read tile_max before the maximum that supersedes it, or the tiled lowering
         # copies the whole carry every trip. Identical to exp(tile_max - new_max).
@@ -128,7 +120,7 @@ def page_attn_decode_kernel(
 
     state_shape = (num_kv_heads, num_queries_per_kv, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (tile_max, tile_sum, tile_output), _ = walk_tiles(
+    (tile_max, tile_sum, tile_output), _ = for_each_tile(
         block_body,
         (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q, kv_row_pool),
         dims=(0, None, None, 0, None, None),

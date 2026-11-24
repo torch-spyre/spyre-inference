@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 import pytest
-from spyre_testing_plugin.pytest_plugin import _markexpr_selects_upstream
+from spyre_testing_plugin.pytest_plugin import _markexpr_selects
 
 REQUESTS_UPSTREAM = [
     "upstream",
@@ -45,12 +45,12 @@ DOES_NOT_REQUEST_UPSTREAM = [
 
 @pytest.mark.parametrize("markexpr", REQUESTS_UPSTREAM)
 def test_markexpr_requests_upstream(markexpr):
-    assert _markexpr_selects_upstream(markexpr)
+    assert _markexpr_selects(markexpr, "upstream")
 
 
 @pytest.mark.parametrize("markexpr", DOES_NOT_REQUEST_UPSTREAM)
 def test_markexpr_does_not_request_upstream(markexpr):
-    assert not _markexpr_selects_upstream(markexpr)
+    assert not _markexpr_selects(markexpr, "upstream")
 
 
 # Target families whose suites live in the upstream vLLM tree and so must trigger a clone.
@@ -63,14 +63,27 @@ def test_makefile_upstream_targets_are_classified_correctly(pytestconfig):
     """The Makefile's combos all mention `upstream`, most negatively; only the
     test-upstream* and test-quality* targets should trigger a clone.
     """
+    for target, markexpr in _makefile_overrides(pytestconfig).items():
+        assert _markexpr_selects(markexpr, "upstream") == target.startswith(
+            UPSTREAM_TARGET_PREFIXES
+        ), f"{target} ({markexpr!r}) is on the wrong side of the upstream gate"
+
+
+def test_only_the_parity_target_selects_triton_cpu(pytestconfig):
+    """test-triton-cpu runs in the one CI job that installs the triton-cpu group."""
+    selecting = {
+        target
+        for target, markexpr in _makefile_overrides(pytestconfig).items()
+        if _markexpr_selects(markexpr, "triton_cpu")
+    }
+    assert selecting == {"test-triton-cpu"}
+
+
+def _makefile_overrides(pytestconfig) -> dict[str, str]:
     makefile = (Path(pytestconfig.rootpath) / "Makefile").read_text()
     overrides = dict(re.findall(r"^(test-[\w-]+):.*\n\t.*MARK_OVERRIDE='([^']*)'", makefile, re.M))
     assert len(overrides) >= 8, f"failed to parse MARK_OVERRIDEs out of the Makefile: {overrides}"
-
-    for target, markexpr in overrides.items():
-        assert _markexpr_selects_upstream(markexpr) == target.startswith(
-            UPSTREAM_TARGET_PREFIXES
-        ), f"{target} ({markexpr!r}) is on the wrong side of the upstream gate"
+    return overrides
 
 
 def test_plugin_is_loaded_via_addopts(pytestconfig):

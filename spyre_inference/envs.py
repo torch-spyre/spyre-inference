@@ -28,13 +28,12 @@ if TYPE_CHECKING:
     # Declarations so type checkers and IDEs resolve the lazily-provided
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
-    SPYRE_MODEL_RUNNER: str = "v1"
+    SPYRE_MODEL_RUNNER: str = "v2"
     SPYRE_MRV2_KERNELS: str = "host"
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
-    SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
@@ -63,13 +62,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
     # Which model runner the worker uses:
-    #  - "v1": the V1 runner (default)
-    #  - "v2": the Model Runner V2 port (#906), in bring-up
-    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v1",
+    #  - "v2": vLLM's Model Runner V2 (default)
+    #  - "v1": the V1 runner, a best-effort fallback until it is removed (#1245)
+    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v2",
     # What runs MRV2's Triton kernels under SPYRE_MODEL_RUNNER=v2:
     #  - "host": the csrc/ host ops kernels.bind() puts in their place; vLLM never
     #    sees Triton (default, every arch)
-    #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference)
+    #  - "triton": upstream's kernels on triton-cpu (x86 only; the parity reference,
+    #    installed by the opt-in triton-cpu dependency group)
     "SPYRE_MRV2_KERNELS": lambda: os.getenv("SPYRE_MRV2_KERNELS") or "host",
     # Granularity of the decoder's torch.compile graph:
     #  - "block": compile one transformer block at a time (default)
@@ -94,10 +94,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
     # compiling each variant lazily on first use.
     "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
-    # When "1", paged attention walks KV pages and batched decode walks logical
-    # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
-    # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
-    "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.

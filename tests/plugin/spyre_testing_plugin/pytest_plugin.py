@@ -484,15 +484,16 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
 # ---------------------------------------------------------------------------
 
 _UPSTREAM_MARKER = "upstream"
+_TRITON_CPU_MARKER = "triton_cpu"
 # Satisfiability is brute-forced over the other markers (2**N evaluations); past this, fail open.
 _MAX_FREE_MARKERS = 12
 
 
-def _markexpr_selects_upstream(markexpr: str) -> bool:
-    """True when `markexpr` names `upstream` and is satisfiable with it set. Every marker
+def _markexpr_selects(markexpr: str, marker: str) -> bool:
+    """True when `markexpr` names `marker` and is satisfiable with it set. Every marker
     combo in the Makefile mentions `upstream`, most of them negatively, so a substring check
     would be wrong. An expression that doesn't name it (`-m attention`) is not a request even
-    where it could match upstream tests; `--upstream` is the override for those.
+    where it could match `marker`'s tests; `--upstream` is the override for upstream.
     """
     try:
         expr = Expression.compile(markexpr)
@@ -502,10 +503,10 @@ def _markexpr_selects_upstream(markexpr: str) -> bool:
 
     # co_names is exactly the idents the evaluator will query, hyphens and dots included.
     names = {n.removeprefix(IDENT_PREFIX) for n in expr._code.co_names}
-    if _UPSTREAM_MARKER not in names:
+    if marker not in names:
         return False
 
-    free = sorted(names - {_UPSTREAM_MARKER})
+    free = sorted(names - {marker})
     if len(free) > _MAX_FREE_MARKERS:
         return True
 
@@ -516,7 +517,7 @@ def _markexpr_selects_upstream(markexpr: str) -> bool:
 
     for bits in range(1 << len(free)):
         assignment = {name: bool(bits >> i & 1) for i, name in enumerate(free)}
-        assignment[_UPSTREAM_MARKER] = True
+        assignment[marker] = True
         if expr.evaluate(matcher):
             return True
     return False
@@ -528,7 +529,7 @@ def _upstream_requested(config) -> bool:
         return False
     if config.getoption("upstream"):
         return True
-    if _markexpr_selects_upstream(config.option.markexpr):
+    if _markexpr_selects(config.option.markexpr, _UPSTREAM_MARKER):
         return True
     _log(
         "[vllm-upstream] no `upstream` in the -m expression, skipping upstream test collection"
@@ -716,6 +717,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     if arch_deselected:
         items[:] = kept
         config.hook.pytest_deselected(items=arch_deselected)
+
+    if not _markexpr_selects(config.option.markexpr, _TRITON_CPU_MARKER):
+        triton_cpu = [item for item in items if item.get_closest_marker(_TRITON_CPU_MARKER)]
+        if triton_cpu:
+            items[:] = [item for item in items if not item.get_closest_marker(_TRITON_CPU_MARKER)]
+            config.hook.pytest_deselected(items=triton_cpu)
+            _log(
+                f"[triton-cpu] deselected {len(triton_cpu)} triton_cpu tests: "
+                "pass -m triton_cpu to run them"
+            )
 
     upstream_tests_base = getattr(config, "_upstream_tests_base", None)
     if upstream_tests_base:
@@ -1266,21 +1277,9 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(SpyreAttentionImpl, "do_kv_cache_update", do_kv_cache_update)
 
-    # The test runs on CPU, where a Spyre device layout (the batched decode index's stick
-    # layout) cannot be built; the plain transfer carries the same values.
-    orig_to = torch.Tensor.to
+    from spyre_testing_plugin.attn_helpers import drop_cpu_device_layouts
 
-    def to(tensor, *args, device_layout=None, **kwargs):
-        if device_layout is None:
-            return orig_to(tensor, *args, **kwargs)
-        target = kwargs.get("device", args[0] if args else None)
-        if not isinstance(target, (str, torch.device)):
-            target = tensor.device
-        if torch.device(target).type != "spyre":
-            return orig_to(tensor, *args, **kwargs)
-        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", to)
+    drop_cpu_device_layouts(monkeypatch)
 
     yield
 
@@ -1317,6 +1316,23 @@ def pytest_runtest_makereport(item, call):
     yield
     if any(m.name == "uses_subprocess" for m in item.iter_markers()):
         item._spyre_reap_card = True
+
+
+# tryfirst: the skip / fail must land before the parity module's fixture starts its subprocess.
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    if item.get_closest_marker(_TRITON_CPU_MARKER) is None:
+        return
+    if platform.machine() != "x86_64":
+        pytest.skip("triton-cpu, the parity reference, is x86-only")
+    from spyre_inference.v1.worker.spyre.triton_gate import has_triton_cpu
+
+    # An error, not a skip: a parity job that lost triton-cpu would otherwise pass empty.
+    if not has_triton_cpu():
+        pytest.fail(
+            "`-m triton_cpu` needs triton-cpu: `uv sync --group dev --group triton-cpu`",
+            pytrace=False,
+        )
 
 
 @pytest.hookimpl(trylast=True)

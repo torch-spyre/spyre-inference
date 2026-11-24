@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The warm-up's first pass in forked compile workers, shared by the V1 and V2 runners.
+"""The warm-up's first pass in forked compile workers.
 
 ``SPYRE_PARALLEL_WARMUP_PRECOMPILE=N`` traces the warm-up once with every graph's Spyre
 inner compile forked into one of ``N`` processes (torch-spyre's ``fork_inner_compiles``
 with stand-in graphs), then forgets the stand-ins so the runner's normal warm-up pass
-retraces the same graphs into cache hits. Each runner supplies its own trace of the
-buckets; this module owns the pool, its guards and the accounting.
+retraces the same graphs into cache hits. The runner supplies its trace of the
+buckets, and this module owns the pool, its guards and the accounting.
 """
 
 from __future__ import annotations

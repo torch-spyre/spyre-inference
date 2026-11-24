@@ -153,7 +153,7 @@ class SpyrePagedKVCache(NamedTuple):
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
     attribute access on a custom object.
 
-    Allocated by `TorchSpyreModelRunner.initialize_kv_cache_tensors` and
+    Allocated by the runner's KV cache init (`v1/worker/spyre/kv_cache.py`) and
     consumed by `SpyreAttentionImpl.forward`. vLLM's `bind_kv_cache` types
     the relay path as `dict[str, torch.Tensor]`; see the suppression at the
     `bind_kv_cache(...)` call site for why that type-hole is benign.
@@ -1706,7 +1706,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk < kv_pages.shape[0]
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
-    # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
+    # which the runner's KV cache init (`v1/worker/spyre/kv_cache.py`) allocates
     # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
@@ -2319,8 +2319,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 device, dynamic=dynamic, device_layout=mask_layout
             )
             return
-        attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
-            device, device_layout=temporary_chunk_major_page_index_layout(c, e)
+        attn_metadata.chunk_page_ids_dev = convert(
+            idx, device=device, device_layout=temporary_chunk_major_page_index_layout(c, e)
         )
         attn_metadata.mask_by_chunk_dev = convert(mask, device=device)
 

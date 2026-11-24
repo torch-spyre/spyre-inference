@@ -16,7 +16,7 @@
 
 RoBERTa reuses BERT's ``token_type_ids`` bit-pack transport, so these mirror
 ``spyre_inference.models.bert``. The position offset (``padding_idx + 1``) is
-applied on the host in ``TorchSpyreModelRunner._preprocess``, before the ids
+applied on the host in ``SpyreEncoderOnlyModelState.prepare_inputs``, before the ids
 are copied up. The embedding forward gathers those positions in one program.
 """
 
@@ -40,6 +40,7 @@ from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
 )
+from spyre_inference.models.bert import SpyreSplitQKVMixin
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -148,19 +149,25 @@ class SpyreRobertaEmbeddingMixin:
         )
 
 
-class SpyreRobertaEmbeddingModel(SpyreRobertaEmbeddingMixin, RobertaEmbeddingModel):
+class SpyreRobertaEmbeddingModel(
+    SpyreSplitQKVMixin, SpyreRobertaEmbeddingMixin, RobertaEmbeddingModel
+):
     pass
 
 
-class SpyreBgeM3EmbeddingModel(SpyreRobertaEmbeddingMixin, BgeM3EmbeddingModel):
+class SpyreBgeM3EmbeddingModel(SpyreSplitQKVMixin, SpyreRobertaEmbeddingMixin, BgeM3EmbeddingModel):
     """BGE-M3 keeps its own ``__init__``/``_build_pooler`` (sparse + colbert heads)."""
 
 
-class SpyreRobertaForSequenceClassification(SpyreTokenTypeModel, RobertaForSequenceClassification):
+class SpyreRobertaForSequenceClassification(
+    SpyreSplitQKVMixin, SpyreTokenTypeModel, RobertaForSequenceClassification
+):
     spyre_embedding_class = SpyreRobertaEmbedding
     spyre_encoder_attr = "roberta"
 
 
-class SpyreRobertaForTokenClassification(SpyreTokenTypeModel, RobertaForTokenClassification):
+class SpyreRobertaForTokenClassification(
+    SpyreSplitQKVMixin, SpyreTokenTypeModel, RobertaForTokenClassification
+):
     spyre_embedding_class = SpyreRobertaEmbedding
     spyre_encoder_attr = "roberta"

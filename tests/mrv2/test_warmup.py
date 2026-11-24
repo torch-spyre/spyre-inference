@@ -24,8 +24,8 @@ from vllm.config import CompilationMode
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 from spyre_inference.v1.worker.spyre import warmup
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
-from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 
 
 def _wrapper(**kwargs) -> _SpyreModelWrapper:
@@ -307,6 +307,34 @@ def test_run_warms_every_logits_row_bucket_including_the_prompt_logprobs_chunk(
     assert dummies == [chunk, 1]
     assert sampled == [max_reqs, 1]
     assert projected == [chunk]
+
+
+def test_run_logs_the_warmup_line_the_bench_tooling_parses(monkeypatch) -> None:
+    """vllm-bench-serve's collect.py reads the model-graph warmup time from this line."""
+    import re
+
+    monkeypatch.setattr(warmup, "allocate_staging_buffers", lambda *args: None)
+    monkeypatch.setattr(
+        warmup, "_set_spyre_compilation_settings", lambda config: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        warmup, "_dummy_run", lambda runner, n, skip: (torch.zeros(n, 4), torch.zeros(1, 4))
+    )
+    lines = []
+    monkeypatch.setattr(warmup.logger, "info", lambda msg, *args: lines.append(msg % args))
+    runner = _runner(buckets=(1, 8), max_reqs=2, max_tokens=8)
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.pooling_runner = None
+    runner.supports_mm_inputs = False
+    runner.get_model = lambda: None
+    runner.spyre_kv_caches = {}
+    runner.spyre_device = torch.device("cpu")
+    runner.model = SimpleNamespace(_logits_row_buckets=[], compute_logits=lambda hidden: None)
+
+    warmup.run(runner)
+
+    pattern = re.compile(r"Warmup complete in ([\d.]+)s for (\d+) buckets")
+    assert [m.group(2) for line in lines if (m := pattern.search(line))] == ["2"]
 
 
 def test_run_warms_the_sampled_row_gathers_at_every_draft_width(monkeypatch) -> None:

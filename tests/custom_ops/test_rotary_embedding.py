@@ -723,9 +723,10 @@ def test_fp32_requested_rope_forward_oot_on_spyre(default_vllm_config, head_size
 @pytest.mark.rotary
 def test_cos_sin_cache_is_built_on_one_thread(default_vllm_config, monkeypatch):
     """The table is built with one torch thread, and the thread count comes back after,
-    also when the build raises."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
+    also when the build raises. Built without get_rope, which returns a cached module."""
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    from spyre_inference.custom_ops.rotary_embedding import SpyreRotaryEmbedding
 
     build = RotaryEmbedding._compute_cos_sin_cache
     seen = []
@@ -738,7 +739,7 @@ def test_cos_sin_cache_is_built_on_one_thread(default_vllm_config, monkeypatch):
     num_threads = torch.get_num_threads()
     torch.set_num_threads(4)
     try:
-        get_rope(128, 2048, is_neox_style=True, dtype=torch.float16)
+        SpyreRotaryEmbedding(128, 128, 2048, 10000.0, True, torch.float16)
         assert seen == [1]
         assert torch.get_num_threads() == 4
 
@@ -747,7 +748,7 @@ def test_cos_sin_cache_is_built_on_one_thread(default_vllm_config, monkeypatch):
 
         monkeypatch.setattr(RotaryEmbedding, "_compute_cos_sin_cache", failing_build)
         with pytest.raises(RuntimeError, match="build failed"):
-            get_rope(256, 2048, is_neox_style=True, dtype=torch.float16)
+            SpyreRotaryEmbedding(256, 256, 2048, 10000.0, True, torch.float16)
         assert torch.get_num_threads() == 4
     finally:
         torch.set_num_threads(num_threads)

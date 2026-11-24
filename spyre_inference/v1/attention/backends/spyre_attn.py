@@ -49,6 +49,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
@@ -1438,6 +1439,12 @@ class SpyreAttentionBackend(AttentionBackend):
         if config is None:
             return [MultipleOf(64)]
         return [config.cache_config.block_size]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # allocate_spyre_kv_caches and the sizing replay take a KVCacheTensor's block
+        # stride as one layer's page, which holds only for a layer-outer layout.
+        return (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC)
 
     @staticmethod
     def get_name() -> str:

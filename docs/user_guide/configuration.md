@@ -311,7 +311,9 @@ On the V2 model runner `--no-disable-hybrid-kv-cache-manager` turns it on: a mod
 sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets one KV cache group per
 kind, sliding-window groups return blocks that fall out of the window, and the groups overlay
 one another as upstream lays them out, each layer reading the shared pages in its own shape, so
-a block costs what vLLM's pool counts. The V1 runner rejects the flag. Every K and V page
+a block costs what vLLM's pool counts. The V1 runner rejects the flag. Either way the pages are
+laid out layer-outer, so `VLLM_KV_CACHE_LAYOUT` accepts only `LBNHC` (the default) or `LBHNC`,
+and a block-outer value fails at startup. Every K and V page
 allocation is one tensor, and the Spyre allocator never splits a tensor across its 16 GiB
 memory regions, so a model with few layers gets fewer blocks than its budget: they must still
 pack into the regions. When memory runs out before a full batch fits, a warning names the

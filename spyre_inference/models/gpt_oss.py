@@ -16,7 +16,8 @@
 
 gpt-oss takes a softmax over its top-k router logits, the ``topk_softmax`` recipe. Its experts
 are ``swigluoai`` with gate/up and down biases, and the checkpoint interleaves gate and up rows
-in ``w13``.
+in ``w13``. Traced prefill of 128 to 512 tokens runs four experts per trip; other batches
+keep one. At 1024 tokens a group of four was slower on the card.
 """
 
 from __future__ import annotations
@@ -36,7 +37,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-GPT_OSS_MOE_RECIPE = SpyreMoERecipe(activation="swigluoai", routing="topk_softmax")
+GPT_OSS_MOE_RECIPE = SpyreMoERecipe(
+    activation="swigluoai",
+    routing="topk_softmax",
+    # Four experts per trip for 128 to 512 tokens. One gpt-oss-120b layer was about 3x
+    # faster on the card; at 1024 tokens the group was slower, so the window stops at 512.
+    expert_group=4,
+    expert_group_tokens=(128, 512),
+)
 
 
 def configure_gpt_oss_moe_layers(layers: Iterable[nn.Module]) -> int:

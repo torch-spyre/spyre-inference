@@ -50,7 +50,7 @@ on:
         type: string
         default: ''
       run_id:
-        description: UUID the dispatching orchestrator minted for this test run, threaded through so ingest can stamp si_test_runs.run_id with it. Leave empty for a standalone/manual dispatch.
+        description: UUID the dispatching orchestrator minted for this test run, threaded through so ingest can stamp the v2 run_id with it. Leave empty for a standalone/manual dispatch.
         required: false
         type: string
         default: ''

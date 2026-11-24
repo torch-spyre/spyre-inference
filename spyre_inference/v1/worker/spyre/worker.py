@@ -206,6 +206,10 @@ class SpyreWorkerV2(Worker):
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
 
+        # Register `--load-format spyre`. Only workers call get_model_loader(), and
+        # init_device runs regardless of `VLLM_PLUGINS`.
+        import spyre_inference.model_loader  # noqa: F401
+
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,

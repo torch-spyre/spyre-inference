@@ -30,6 +30,8 @@
 #if defined(__AVX512F__)
   #include <immintrin.h>
   #include <sleef.h>
+#elif defined(__s390x__)
+  #include "mrv2_s390x.hpp"
 #endif
 
 #include <torch/all.h>
@@ -173,12 +175,19 @@ inline double murmur3_uniform64(uint32_t lo_prefix, uint32_t hi_prefix,
 // 2^-54), so a token whose logit plus the bound cannot beat the best is
 // skipped without hashing. Rounding is monotone, so the skip is exact.
 constexpr float kGumbelMax32 = 24.0f;
+#if defined(__s390x__)
+constexpr float kGumbelRejectMargin = 1e-3f;
+#endif
 constexpr double kGumbelMax64 = 38.0;
 constexpr int64_t kDraftNoiseSalt = int64_t(1) << 30;
 
 // Elementwise vocab kernels split each row into chunks of this many tokens, so a
 // small batch over a 262k vocab still spreads across the cores.
 constexpr int64_t kVocabChunk = 16384;
+
+#if defined(__s390x__)
+using namespace mrv2_vx;  // NOLINT: z15 helpers, mrv2_s390x.hpp
+#endif
 
 }  // namespace
 
@@ -518,7 +527,15 @@ void mrv2_temperature(std::vector<int64_t> grid, const torch::Tensor& logits_ptr
         const float temp = temperature[req];
         if (temp == 0.0f || temp == 1.0f) continue;
         scalar_t* row = logits + t * logits_stride;
-        for (int64_t v = c * kVocabChunk; v < std::min(vocab_size, (c + 1) * kVocabChunk); ++v)
+        const int64_t hi = std::min(vocab_size, (c + 1) * kVocabChunk);
+        int64_t v = c * kVocabChunk;
+#if defined(__s390x__)
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          const vf32 vt = vec_splats(temp);
+          for (; v + 4 <= hi; v += 4) vec_xst(vec_xl(0, row + v) / vt, 0, row + v);
+        }
+#endif
+        for (; v < hi; ++v)
           row[v] = static_cast<scalar_t>(static_cast<float>(row[v]) / temp);
       }
     }
@@ -626,6 +643,51 @@ std::pair<int64_t, acc_t> gumbel_row(const scalar_t* row, int64_t begin, int64_t
         }
       }
       v = w;
+    }
+  }
+#elif defined(__s390x__)
+  if constexpr (!fp64 && std::is_same_v<scalar_t, float>) {
+    if (noisy) {
+      // 16 tokens a step, as the AVX512 path: a step none of whose tokens could beat
+      // the best is not hashed, then the scalar loop's own update over the 16 values.
+      const vf32 vt = vec_splats(temp);
+      alignas(16) float value[16];
+      for (; v + 16 <= end; v += 16) {
+        vf32 x[4];
+        vf32 xmax = vec_splats(kNegInf);
+        for (int i = 0; i < 4; ++i) {
+          x[i] = vec_xl(0, row + v + 4 * i);
+          if (divide) x[i] = x[i] / vt;
+          xmax = max_skip_nan(xmax, x[i]);
+        }
+        const float step_max = lane_max(xmax);
+        if (step_max + kGumbelMax32 <= best) continue;
+        // -log1p(-u) >= u, so the noise is at most -log(u): a token whose u is at least
+        // exp(step_max - best) cannot beat best, and four such tokens skip both logs.
+        // The margin covers the rounding of the exp, the logs and the subtraction.
+        const vf32 reject = vec_splats(std::exp(step_max - best + kGumbelRejectMargin));
+        for (int i = 0; i < 4; ++i) {
+          const vf32 u = murmur3_uniform4(lo_prefix, v + 4 * i);
+          const vf32 y = vec_all_ge(u, reject) ? vec_splats(kNegInf)
+                                               : x[i] + gumbel_from_uniform4(u);
+          vec_xst(y, 0, value + 4 * i);
+        }
+        for (int i = 0; i < 16; ++i) {
+          if (value[i] > best) {
+            best = value[i];
+            best_idx = v + i;
+          }
+        }
+      }
+    } else {
+      // Greedy: the first index of the largest non-NaN value, as the scalar loop picks.
+      const float m = row_max(row, v, end);
+      if (m > best) {
+        v = first_equal(row, v, end, m);
+        best = row[v];
+        best_idx = v;
+      }
+      v = end;
     }
   }
 #endif
@@ -798,6 +860,11 @@ void mrv2_min_p(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
           for (; v + 16 <= hi; v += 16) vm = _mm512_max_ps(_mm512_loadu_ps(row + v), vm);
           m = _mm512_reduce_max_ps(vm);
         }
+#elif defined(__s390x__)
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          m = row_max(row, v, hi);
+          v = hi;
+        }
 #endif
         for (; v < hi; ++v) m = std::max(m, static_cast<float>(row[v]));
         chunk_max[t * chunks + c] = m;
@@ -821,6 +888,14 @@ void mrv2_min_p(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
             const __m512 x = _mm512_loadu_ps(row + v);
             _mm512_storeu_ps(row + v,
                              _mm512_mask_blend_ps(_mm512_cmp_ps_mask(x, th, _CMP_LT_OQ), x, ninf));
+          }
+        }
+#elif defined(__s390x__)
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          const vf32 th = vec_splats(threshold), ninf = vec_splats(kNegInf);
+          for (; v + 4 <= hi; v += 4) {
+            const vf32 x = vec_xl(0, row + v);
+            vec_xst(vec_sel(x, ninf, vec_cmplt(x, th)), 0, row + v);
           }
         }
 #endif
@@ -896,6 +971,28 @@ void mrv2_penalties(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
           x = _mm512_sub_ps(x, _mm512_mul_ps(vfreq, _mm512_cvtepi32_ps(cnt)));
           x = _mm512_sub_ps(x, _mm512_maskz_mov_ps(nz, vpres));
           _mm512_storeu_ps(row + v, x);
+        }
+      }
+#elif defined(__s390x__)
+      // lo is a multiple of 32, so each 4-token step reads 4 bits of one mask word.
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        const vf32 vrep = vec_splats(rep), vinv = vec_splats(1.0f / rep);
+        const vf32 vfreq = vec_splats(freq), vpres = vec_splats(pres);
+        const vf32 zero = vec_splats(0.0f), one = vec_splats(1.0f);
+        for (; v + 4 <= hi; v += 4) {
+          const vi32 cnt = vec_xl(0, base + v);
+          const __vector __bool int counted = vec_cmpgt(cnt, vec_splats(0));
+          vf32 x = vec_xl(0, row + v);
+          if (rep != 1.0f) {
+            const __vector __bool int seen =
+                lane_bits_set(uint32_t(mask[v / 32]) >> (v % 32)) | counted;
+            const vf32 f = vec_sel(vrep, vinv, vec_cmpgt(x, zero));
+            x = vec_sel(x, x * f, seen);
+          }
+          x = x - vfreq * vec_float(cnt);
+          // pres * float(count > 0), not a select: a negative pres times 0 is -0.
+          x = x - vpres * vec_sel(zero, one, counted);
+          vec_xst(x, 0, row + v);
         }
       }
 #endif
@@ -1002,8 +1099,15 @@ void mrv2_logit_bias(
         for (int64_t j = 0; j < num_stop; ++j)
           row[stop_ids[base + j]] = static_cast<scalar_t>(kNegInf);
         float row_max = kNegInf;
-        for (int64_t v = 0; v < vocab_size; ++v)
-          row_max = std::max(row_max, static_cast<float>(row[v]));
+#if defined(__s390x__)
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          row_max = mrv2_vx::row_max(row, 0, vocab_size);
+        } else
+#endif
+        {
+          for (int64_t v = 0; v < vocab_size; ++v)
+            row_max = std::max(row_max, static_cast<float>(row[v]));
+        }
         if (row_max == kNegInf)
           for (int64_t j = 0; j < num_stop; ++j)
             if (std::isfinite(saved[j]))
@@ -1104,6 +1208,16 @@ void mrv2_topk_log_softmax(std::vector<int64_t> grid, const torch::Tensor& outpu
         }
         se = _mm512_reduce_add_pd(_mm512_add_pd(lo, hi));
       } else
+#elif defined(__s390x__)
+      // The exp of 4 tokens a step, added to the double sum in the scalar loop's order.
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        max_val = row_max(row, 0, vocab_size);
+        const vf32 m = vec_splats(max_val);
+        for (; v + 4 <= vocab_size; v += 4) {
+          const vf32 e = exp4(vec_xl(0, row + v) - m);
+          for (int i = 0; i < 4; ++i) se += e[i];
+        }
+      } else
 #endif
       {
         for (int64_t i = 0; i < vocab_size; ++i)
@@ -1138,6 +1252,15 @@ void mrv2_ranks(std::vector<int64_t> grid, const torch::Tensor& output_ptr,
         const __m512 vx = _mm512_set1_ps(x);
         for (; v + 16 <= vocab_size; v += 16)
           n += __builtin_popcount(_mm512_cmp_ps_mask(_mm512_loadu_ps(row + v), vx, _CMP_GE_OQ));
+      }
+#elif defined(__s390x__)
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        const vf32 vx = vec_splats(x);
+        // A true lane is all ones, so subtracting it counts one.
+        vu32 hits = vec_splats(0u);
+        for (; v + 4 <= vocab_size; v += 4)
+          hits -= reinterpret_cast<vu32>(vec_cmpge(vec_xl(0, row + v), vx));
+        n = int64_t(hits[0]) + hits[1] + hits[2] + hits[3];
       }
 #endif
       for (; v < vocab_size; ++v) n += static_cast<float>(row[v]) >= x;
@@ -1217,7 +1340,20 @@ void mrv2_apply_grammar_bitmask(std::vector<int64_t> grid, const torch::Tensor& 
       if (position >= cu[req + 1] - cu[req]) continue;
       scalar_t* row = logits + (cu[req] + position) * logits_stride;
       const int32_t* words = bitmask + m * bitmask_stride;
-      for (int64_t v = 0; v < vocab_size; ++v) {
+      int64_t v = 0;
+#if defined(__s390x__)
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        const vf32 ninf = vec_splats(kNegInf);
+        for (; v + 32 <= vocab_size; v += 32) {
+          const uint32_t word = v / 32 < bitmask_stride ? uint32_t(words[v / 32]) : 0;
+          if (word == 0xFFFFFFFFu) continue;
+          for (int i = 0; i < 32; i += 4)
+            vec_xst(vec_sel(ninf, vec_xl(0, row + v + i), lane_bits_set(word >> i)), 0,
+                    row + v + i);
+        }
+      }
+#endif
+      for (; v < vocab_size; ++v) {
         // Tokens past the bitmask's width (a padded vocab) are disallowed.
         const uint32_t word = v / 32 < bitmask_stride ? uint32_t(words[v / 32]) : 0;
         if (!((word >> (v % 32)) & 1u)) row[v] = static_cast<scalar_t>(kNegInf);
@@ -1234,9 +1370,21 @@ void mrv2_num_nans(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
     using scalar_t = decltype(tag);
     const scalar_t* logits = ptr<scalar_t>(logits_ptr);
     for (int64_t r = 0; r < grid[0]; ++r) {
+      const scalar_t* row = logits + r * logits_stride;
       int64_t n = 0;
-      for (int64_t v = 0; v < vocab_size; ++v)
-        n += std::isnan(static_cast<float>(logits[r * logits_stride + v]));
+      int64_t v = 0;
+#if defined(__s390x__)
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        // x == x is false only for NaN, so the lanes that compare equal are the others.
+        vu32 others = vec_splats(0u);
+        for (; v + 4 <= vocab_size; v += 4) {
+          const vf32 x = vec_xl(0, row + v);
+          others -= reinterpret_cast<vu32>(vec_cmpeq(x, x));
+        }
+        n = v - (int64_t(others[0]) + others[1] + others[2] + others[3]);
+      }
+#endif
+      for (; v < vocab_size; ++v) n += std::isnan(static_cast<float>(row[v]));
       out.set(r, n);
     }
   });
@@ -1267,14 +1415,28 @@ void mrv2_compact_sampling_mask(
       uint8_t* bytes = packed + r * packed_mask_row_stride;
       std::memset(bytes, 0, (vocab_size + 7) / 8);
       int64_t count = 0;
-      for (int64_t v = 0; v < vocab_size; ++v) {
+      auto keep = [&](int64_t v) {
         if (!std::isfinite(
                 static_cast<float>(logits[source * logits_row_stride + v * logits_col_stride])))
-          continue;
+          return;
         if (count < max_num_kept) token_ids.set(r * token_ids_row_stride + count, v);
         ++count;
         bytes[v / 8] |= uint8_t(1u << (v % 8));
+      };
+      int64_t v = 0;
+#if defined(__s390x__)
+      // Masked rows are mostly -inf: skip 8 tokens at a time while none is finite.
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        if (logits_col_stride == 1) {
+          const float* row = logits + source * logits_row_stride;
+          for (; v + 8 <= vocab_size; v += 8) {
+            if (none_finite(vec_xl(0, row + v)) && none_finite(vec_xl(0, row + v + 4))) continue;
+            for (int64_t i = v; i < v + 8; ++i) keep(i);
+          }
+        }
       }
+#endif
+      for (; v < vocab_size; ++v) keep(v);
       counts.set(r, count);
     }
   });
@@ -1592,6 +1754,43 @@ inline float philox_uniform(uint32_t value) {
   return u;
 }
 
+#if defined(__s390x__)
+// philox4x32_10 on four counters at once, lane j of c[i] being counter j's word i.
+void philox4x32_10_x4(vu32 c[4], uint32_t k0, uint32_t k1) {
+  const vu32 m0 = vec_splats(kPhiloxM0), m1 = vec_splats(kPhiloxM1);
+  for (int round = 0; round < 10; ++round) {
+    const vu32 hi0 = vec_mulh(m0, c[0]), lo0 = m0 * c[0];
+    const vu32 hi1 = vec_mulh(m1, c[2]), lo1 = m1 * c[2];
+    const vu32 n0 = hi1 ^ c[1] ^ vec_splats(k0);
+    const vu32 n2 = hi0 ^ c[3] ^ vec_splats(k1);
+    c[0] = n0;
+    c[1] = lo1;
+    c[2] = n2;
+    c[3] = lo0;
+    if (round != 9) {
+      k0 += kPhiloxW0;
+      k1 += kPhiloxW1;
+    }
+  }
+}
+
+// Transposes the 4x4 words, so lane i of c[j] becomes counter j's word i.
+void transpose4(vu32 c[4]) {
+  const vu32 t0 = vec_mergeh(c[0], c[2]), t1 = vec_mergeh(c[1], c[3]);
+  const vu32 t2 = vec_mergel(c[0], c[2]), t3 = vec_mergel(c[1], c[3]);
+  c[0] = vec_mergeh(t0, t1);
+  c[1] = vec_mergel(t0, t1);
+  c[2] = vec_mergeh(t2, t3);
+  c[3] = vec_mergel(t2, t3);
+}
+
+inline vf32 philox_uniform4(vu32 value) {
+  const vu32 top24 = (value >> vec_splats(8u)) + vec_splats(1u);
+  const vf32 scaled = vec_float(top24) * vec_splats(0x1.0p-24f);
+  return reinterpret_cast<vf32>(reinterpret_cast<vu32>(scaled) - vec_splats(1u));
+}
+#endif
+
 }  // namespace
 
 void mrv2_philox_gumbel(
@@ -1688,7 +1887,33 @@ void mrv2_philox_gumbel(
             philox4x32_10(state, k0 ^ uint32_t(off), k1);
           }
           float best32 = kNegInf;
-          for (int64_t g = 0; g * 4 < vocab_size; ++g) {
+          int64_t g = 0;
+#if defined(__s390x__)
+          // Four counters (16 tokens) a step, then the scalar loop's own update.
+          if constexpr (std::is_same_v<scalar_t, float>) {
+            const vf32 vt = vec_splats(row_temp);
+            alignas(16) float value[16];
+            for (; (g + 4) * 4 <= vocab_size; g += 4) {
+              vu32 w[4] = {vec_splats(uint32_t(g)) + vu32{0u, 1u, 2u, 3u},
+                           vec_splats(state[0]), vec_splats(state[1]), vec_splats(state[2])};
+              philox4x32_10_x4(w, k0 ^ state[3], k1 ^ kTokenDomain);
+              transpose4(w);
+              for (int j = 0; j < 4; ++j) {
+                vf32 x = vec_xl(0, row + (g + j) * 4);
+                if (APPLY_TEMPERATURE) x = x / vt;
+                x = nan_to_neg_inf(x);
+                vec_xst(x - log4(-log4(philox_uniform4(w[j]))), 0, value + 4 * j);
+              }
+              for (int i = 0; i < 16; ++i) {
+                if (value[i] > best32) {
+                  best32 = value[i];
+                  token = g * 4 + i;
+                }
+              }
+            }
+          }
+#endif
+          for (; g * 4 < vocab_size; ++g) {
             uint32_t words[4] = {uint32_t(g), state[0], state[1], state[2]};
             philox4x32_10(words, k0 ^ state[3], k1 ^ kTokenDomain);
             for (int64_t i = 0; i < 4 && g * 4 + i < vocab_size; ++i) {

@@ -111,8 +111,8 @@ def check(mrv2_kernels: str) -> None:
     triton = wants_triton(mrv2_kernels)
     if triton and not has_triton_cpu():
         raise ValueError(
-            "SPYRE_MRV2_KERNELS=triton needs triton-cpu, an x86-only dev dependency "
-            "(`uv sync --group dev`); unset it to run MRV2 on the host kernels."
+            "SPYRE_MRV2_KERNELS=triton needs triton-cpu, an x86-only test dependency "
+            "(`uv sync --group dev --group triton-cpu`); unset it to run MRV2 on the host kernels."
         )
     if triton != HAS_TRITON:
         raise ValueError(

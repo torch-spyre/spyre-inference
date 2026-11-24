@@ -277,6 +277,41 @@ def test_vocab_table_crosses_to_device_once(tp_group):
 
 
 @pytest.mark.vocab_parallel_embedding
+@pytest.mark.parametrize("num_tokens", [2, 4])
+def test_tp1_compiled_output_has_block_input_layout(tp_group, monkeypatch, num_tokens):
+    """The compiled lookup returns the layout decoder blocks take, so layer 0 shares their graph."""
+    import types
+
+    from torch_spyre._C import get_spyre_tensor_layout
+    from vllm.config import CompilationMode
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops import lazy_compile
+
+    monkeypatch.setattr(
+        lazy_compile,
+        "get_cached_compilation_config",
+        lambda: types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    )
+    vocab_size, embedding_dim = 1024, 128
+    layer = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    layer.weight.data.normal_(std=0.02)
+    layer = layer.to("spyre")
+
+    input_ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int64)
+    actual = layer(input_ids.to("spyre"))
+    standard = torch.zeros(num_tokens, embedding_dim, dtype=torch.float16).to("spyre")
+
+    assert layer.spyre_compiled_kernels, "lookup did not compile"
+    assert get_spyre_tensor_layout(actual) == get_spyre_tensor_layout(standard), (
+        f"lookup returned device_size={list(get_spyre_tensor_layout(actual).device_size)}, "
+        f"blocks take {list(get_spyre_tensor_layout(standard).device_size)}"
+    )
+
+
+@pytest.mark.vocab_parallel_embedding
 def test_unaligned_row_width_keeps_default_device_layout(tp_group, monkeypatch):
     """Unaligned rows keep the default layout: still on device, still correct."""
     from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout

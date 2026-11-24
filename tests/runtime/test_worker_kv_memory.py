@@ -26,7 +26,7 @@ import pytest
 import torch
 from vllm.config import VllmConfig
 from vllm.utils.mem_utils import MemorySnapshot
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import request_memory
 
@@ -158,6 +158,36 @@ def test_a_shallow_models_kv_tensors_fit_the_16_gib_regions(monkeypatch, weights
 
     assert blocks * 4 * BLOCK_BYTES < worker.requested_memory - 1 * GiB
     assert _pack([blocks * BLOCK_BYTES // 2] * 8, regions)
+
+
+def _mamba_hybrid(num_mamba: int = 6) -> dict:
+    page = _full().page_size_bytes
+    mamba = MambaSpec(
+        shapes=((3, 1024), (8, 64, 128)),
+        dtypes=(torch.float16, torch.float16),
+        block_size=8192,
+        page_size_padded=page,
+        mamba_cache_mode="none",
+    )
+    return {**{f"layers.{i}.mixer": mamba for i in range(num_mamba)}, "layers.99.attn": _full()}
+
+
+def test_a_mamba_hybrid_is_sized_by_its_per_layer_device_cost(monkeypatch):
+    """vLLM's pool needs one shared page per block for all groups, but Spyre gives every
+    layer its own page: the budget converts the measured device bytes into blocks at
+    Spyre's cost, so they fit on the card."""
+    specs = _mamba_hybrid()
+    worker = _worker(
+        monkeypatch, free_after_load=20 * GiB, kv_cache_spec=specs, hybrid_kv_cache_manager=True
+    )
+    mamba_bytes = specs["layers.0.mixer"].real_page_size_bytes
+    spyre_bytes_per_block = 6 * mamba_bytes + BLOCK_BYTES
+
+    blocks = worker.determine_available_memory() // BLOCK_BYTES
+
+    measured = worker.requested_memory - (TOTAL - 20 * GiB)
+    assert blocks == measured // spyre_bytes_per_block
+    assert blocks * spyre_bytes_per_block <= measured
 
 
 def test_a_hybrid_model_is_sized_at_upstreams_bytes_per_block(monkeypatch):

@@ -2821,13 +2821,19 @@ card's free memory (<code>torch.accelerator.get_memory_info</code>) and gives th
 left of <code>--gpu-memory-utilization</code> (default 0.92) × total. The cache keeps every block
 that memory pays for, usually far more than <code>--max-num-seqs</code> requests at <code>--max-model-len</code>
 need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.</p>
-<p>Each Spyre layer allocates its own page per block, so the budget is converted into blocks
-at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
-groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
-one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
-regions, so a model with few layers gets fewer blocks than its budget: they must still pack
-into the regions. When memory runs out before a full batch fits, a warning names the knobs,
-and requests wait for pages instead of all running at full length.</p>
+<p>Spyre turns vLLM's hybrid KV cache manager off by default, so every layer allocates its own
+page per block and the budget is converted into blocks at the device cost of all layers' pages.
+<code>--no-disable-hybrid-kv-cache-manager</code> turns it on: a model that mixes
+sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets one KV cache group per
+kind, sliding-window groups return blocks that fall out of the window, and the groups overlay
+one another as upstream lays them out, each layer reading the shared pages in its own shape, so
+a block costs what vLLM's pool counts. Either way the pages are
+laid out layer-outer, so <code>VLLM_KV_CACHE_LAYOUT</code> accepts only <code>LBNHC</code> (the default) or <code>LBHNC</code>,
+and a block-outer value fails at startup. Every K and V page allocation is one tensor, and the
+Spyre allocator never splits a tensor across its 16 GiB memory regions, so a model with few
+layers gets fewer blocks than its budget: they must still pack into the regions. When memory
+runs out before a full batch fits, a warning names the knobs, and requests wait for pages
+instead of all running at full length.</p>
 <p>The profile run is skipped, as the first forward on Spyre would trace the model before
 the KV cache exists: a forward's activations come out of the <code>1 - --gpu-memory-utilization</code>
 headroom. Lower it if a forward fails to allocate. <code>--kv-cache-memory-bytes</code> skips the

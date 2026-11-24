@@ -193,11 +193,9 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         grid = self.encoder_plan.grid
         if grid is None:
             return embeds
-        # The gather specialises on its source rows: read only the warmed body.
-        body = embeds[: input_batch.num_tokens_after_padding]
         _, grid_embeds, _ = expand_body_to_grid(
             None,
-            body,
+            embeds,
             input_batch.positions,
             grid,
             pad_token_id=self._pad_token_id,
@@ -205,7 +203,7 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         )
         assert grid_embeds is not None
         # The gather returns an inference tensor; the blocks were traced on the buffer.
-        body.copy_(grid_embeds)
+        embeds.copy_(grid_embeds)
         return embeds
 
     def prepare_inputs(

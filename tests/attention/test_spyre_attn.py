@@ -560,37 +560,34 @@ def test_spyre_attn_bfloat16(
     )
 
 
-def test_kernel_block_sizes_accept_the_layer_spec():
-    """vLLM's attention layer passes its `kv_cache_spec` positionally (sliding-window
-    layers included); a spec whose blocks were not grown gets the stick-aligned constraint."""
-    from vllm.v1.attention.backend import MultipleOf
-    from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
-    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
-
-    spec = SlidingWindowSpec(
-        block_size=64, num_kv_heads=2, head_size=64, dtype=torch.float16, sliding_window=128
-    )
-    for sizes in (
-        SpyreAttentionBackend.get_supported_kernel_block_sizes(spec),
-        SpyreAttentionBackend.get_supported_kernel_block_sizes(),
-    ):
-        assert [s.base for s in sizes if isinstance(s, MultipleOf)] == [64]
-
-
-def test_a_block_the_hybrid_manager_grew_is_read_as_cache_block_size_kernel_blocks():
-    """Page-size unification gives gemma-4's global group 256-token blocks; the kernels,
-    buckets and warmup run at cache_config.block_size, so upstream splits them."""
+def test_kernel_blocks_are_cache_block_size(monkeypatch):
+    """The kernels run at cache_config.block_size only: upstream keeps a block of that size
+    whole and splits a block the hybrid manager grew (gemma-4's 256-token global group)
+    into it, without padding either one's page."""
     from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backend import MultipleOf
     from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.worker.utils import customize_attention_spec, select_common_block_size
 
+    from spyre_inference.v1.attention.backends import spyre_attn
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
 
+    backend = SpyreAttentionBackend
     vllm_config = VllmConfig()
     vllm_config.cache_config.block_size = 128
-    grown = FullAttentionSpec(block_size=256, num_kv_heads=2, head_size=512, dtype=torch.float16)
     with set_current_vllm_config(vllm_config):
-        assert SpyreAttentionBackend.get_supported_kernel_block_sizes(grown) == [128]
+        for block_size in (128, 256):
+            spec = customize_attention_spec(
+                backend,
+                FullAttentionSpec(
+                    block_size=block_size, num_kv_heads=2, head_size=512, dtype=torch.float16
+                ),
+            )
+            assert select_common_block_size(block_size, [backend], [spec]) == 128
+            assert spec.page_size_bytes % spec.get_block_stride_alignment() == 0
+    # Without a config only the stick constrains the block size.
+    monkeypatch.setattr(spyre_attn, "get_current_vllm_config_or_none", lambda: None)
+    assert backend.get_supported_kernel_block_sizes() == [MultipleOf(64)]
 
 
 def test_block_size_validation():

@@ -49,6 +49,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
@@ -1431,20 +1432,19 @@ class SpyreAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
-        # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
-        # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
-        # This matches the constraint on head_size in supports_head_size().
-        # The metadata builder, impl and bucketer run at cache_config.block_size. The hybrid
-        # KV cache manager grows a group's blocks past it to unify page sizes, which
-        # MultipleOf(64) would accept unsplit. Returning the base size makes
-        # select_common_block_size split them into base-sized kernel blocks: for gemma-4's
-        # global layers this returns [128], so the manager allocates 256-token blocks and the
-        # kernels read each as two 128-token pages.
+        # Pages, buckets and recorded kernels exist for cache_config.block_size only;
+        # upstream splits a larger manager block into it. Without a config, the 128-byte
+        # stick (64 fp16 elements) is the only constraint.
         config = get_current_vllm_config_or_none()
-        base = config.cache_config.block_size if config is not None else None
-        if kv_cache_spec is not None and base and kv_cache_spec.block_size > base:
-            return [base]
-        return [MultipleOf(64)]
+        if config is None:
+            return [MultipleOf(64)]
+        return [config.cache_config.block_size]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # allocate_spyre_kv_caches and the sizing replay take a KVCacheTensor's block
+        # stride as one layer's page, which holds only for a layer-outer layout.
+        return (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC)
 
     @staticmethod
     def get_name() -> str:

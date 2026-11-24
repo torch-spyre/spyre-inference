@@ -148,3 +148,23 @@ def test_sizing_counts_one_k_v_pair_per_slot():
     pool_bytes, tensor_bytes, _ = layout
     assert pool_bytes == 5 * MiB
     assert sorted(tensor_bytes) == [MiB // 2] * 10
+
+
+def test_a_block_outer_kv_cache_layout_is_rejected_at_startup(monkeypatch):
+    """The allocator reads a KVCacheTensor's block stride as one layer's page, so only a
+    layer-outer layout resolves; a block-outer one would pack a block's layers together."""
+    from vllm.v1.attention.backends.utils import (
+        get_supported_kv_cache_layouts,
+        resolve_kv_cache_layout,
+    )
+
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+
+    supported = [
+        [layout.name for layout in get_supported_kv_cache_layouts([SpyreAttentionBackend])]
+    ]
+    assert resolve_kv_cache_layout(VllmConfig(), supported).name == "LBNHC"
+
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "BLHNC")
+    with pytest.raises(ValueError, match="VLLM_KV_CACHE_LAYOUT=BLHNC"):
+        resolve_kv_cache_layout(VllmConfig(), supported)

@@ -2319,8 +2319,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 device, dynamic=dynamic, device_layout=mask_layout
             )
             return
-        attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
-            device, device_layout=temporary_chunk_major_page_index_layout(c, e)
+        attn_metadata.chunk_page_ids_dev = convert(
+            idx, device=device, device_layout=temporary_chunk_major_page_index_layout(c, e)
         )
         attn_metadata.mask_by_chunk_dev = convert(mask, device=device)
 

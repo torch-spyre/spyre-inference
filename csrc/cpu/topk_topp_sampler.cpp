@@ -44,7 +44,7 @@
 
 namespace {
 constexpr float kPadSentinel = -1e30f;      // logits below this are PAD
-constexpr float kBoundaryTol = 1e-5f;       // tie tolerance for top-p cut
+constexpr float kBoundaryTol = 1e-5f;       // near-max tolerance for p <= 0
 constexpr int kMeanStdSampleN = 8192;       // mean/std sample cap
 constexpr int kBsearchMaxIters = 32;        // binary-search iteration cap
 constexpr int kTernarySearchMaxIters = 18;  // matches Triton
@@ -508,19 +508,17 @@ static inline void compute_mean_std(const float* row, int V, float* avg_out,
   *std_out = sqrtf(var > 0.f ? var : 0.f);
 }
 
-// Apply boundary-tie resolution in row order. Keeps all v > pivot, plus up to
-// n_keep_at_boundary values within tol of dup_value. Rare path: called only
-// when binary/ternary search lands exactly on a duplicate boundary value.
-static inline void apply_boundary_tie_loop(float* row, int V, float pivot,
-                                           float dup_value, float tol,
+// Use the same probabilities as the search: converting the boundary back to
+// a logit can round to either side of a tie and bypass its quota.
+static inline void apply_boundary_tie_loop(float* row, const float* probs,
+                                           int V, float boundary_prob,
                                            int n_keep_at_boundary) {
   const float neg_inf = -std::numeric_limits<float>::infinity();
   int kept_boundary = 0;
   for (int i = 0; i < V; ++i) {
-    float v = row[i];
-    bool keep = v > pivot;
-    if (!keep && fabsf(v - dup_value) < tol &&
-        kept_boundary < n_keep_at_boundary) {
+    float prob = probs[i];
+    bool keep = prob > boundary_prob;
+    if (prob == boundary_prob && kept_boundary < n_keep_at_boundary) {
       keep = true;
       ++kept_boundary;
     }
@@ -610,8 +608,14 @@ static float binary_search_buffer(const float* buf, int n, float p_val,
       s_hi = s;
     }
   }
+  // At the iteration cap, hi can still lie between stored probabilities.
+  // The least value above lo keeps at least p mass, with a disjoint tie group.
+  float boundary = hi;
+  for_each_above(buf, n, lo,
+                 [&](int, float v) { boundary = std::min(boundary, v); });
+  if (boundary != hi) s_hi = sum_gt_to_double(buf, n, boundary);
   *sum_above_out = s_hi;
-  return hi;
+  return boundary;
 }
 
 static void scan_pivot_stats(const float* buf, int n, float pivot, float tol,
@@ -846,7 +850,6 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
 
   float outlier_prob = expf(outlier_logit - st.max_l) / sum_exp;
   float max_prob = 1.0f / sum_exp;
-  float min_prob = expf(st.min_l - st.max_l) / sum_exp;
 
   double sum_out_d = 0.0;
   {
@@ -881,40 +884,27 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
     sbuf = scratch;
     sn = V;
     buf_hi = max_prob;
-    buf_lo = min_prob;
+    // A near-one p may need the minimum group, so lo must be below it.
+    buf_lo = 0.0f;
   }
 
   double sum_above;
   float boundary_prob =
       binary_search_buffer(sbuf, sn, p_val, buf_lo, buf_hi, &sum_above);
 
-  float dup_logit = logf(boundary_prob * sum_exp) + st.max_l;
-
-  // NaN or overflow above max_l means binary search degenerated; skip masking.
-  if (!(dup_logit <= st.max_l)) {
+  // Degenerate softmax (e.g. an all-masked row): leave the logits untouched.
+  if (!(boundary_prob > 0.0f) || !std::isfinite(boundary_prob)) {
     return;
   }
 
-  int n_at_boundary = count_within_tol(row, V, dup_logit, kBoundaryTol);
-
   int n_keep_at_boundary = 0;
-  if (n_at_boundary > 0) {
-    double remaining = (double)p_val - sum_above;
-    if (remaining > 0.0 && (double)boundary_prob > 0.0) {
-      double needed_d = ceil(remaining / (double)boundary_prob);
-      if (needed_d >= (double)n_at_boundary)
-        n_keep_at_boundary = n_at_boundary;
-      else if (needed_d > 0.0)
-        n_keep_at_boundary = (int)needed_d;
-    }
+  double remaining = (double)p_val - sum_above;
+  if (remaining > 0.0) {
+    double needed_d = ceil(remaining / (double)boundary_prob);
+    n_keep_at_boundary = (int)std::min(needed_d, (double)V);
   }
 
-  if (n_keep_at_boundary == 0) {
-    mask_write_below(row, V, dup_logit, neg_inf);
-  } else {
-    apply_boundary_tie_loop(row, V, dup_logit, dup_logit, kBoundaryTol,
-                            n_keep_at_boundary);
-  }
+  apply_boundary_tie_loop(row, scratch, V, boundary_prob, n_keep_at_boundary);
 }
 
 static void top_k_row(float* __restrict__ row, int V, int k_val,

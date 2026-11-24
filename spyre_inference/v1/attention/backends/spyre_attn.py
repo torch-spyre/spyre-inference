@@ -1183,6 +1183,18 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         active_block_indices,
                         attention_mask_stacks,
                     )
+                split = envs.SPYRE_DECODE_SPLIT
+                if envs.SPYRE_JAGGED_DECODE and split and num_decode_seqs > split:
+                    decode_groups = self._split_decode_groups(
+                        split,
+                        decode_groups,
+                        decode_blocks,
+                        blocks_per_seq,
+                        block_table,
+                        query_start_loc,
+                        active_block_indices,
+                        attention_mask_stacks,
+                    )
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -1367,6 +1379,62 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     chunk_range=plan.chunk_range,
                 )
             )
+        return out
+
+    def _split_decode_groups(
+        self,
+        split: int,
+        groups: "list[BatchedDecodeGroup] | None",
+        decode_blocks: list[int],
+        blocks_per_seq: list[int],
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        active_block_indices: list | None,
+        attention_mask_stacks: list[torch.Tensor],
+    ) -> "list[BatchedDecodeGroup] | None":
+        """Cut every decode group of more than ``split`` sequences into consecutive groups
+        of at most ``split``. Above 32 sequences the batched kernel puts two entries on a
+        core, which costs far more than one more grouped call."""
+        if groups is None:
+            member_lists = [list(range(len(decode_blocks)))]
+        else:
+            member_lists = [g.rows_cpu.tolist() for g in groups]
+        if all(len(m) <= split for m in member_lists):
+            return groups
+        bucketer = self._attn_bucketer
+        out = []
+        for group, members in zip(groups or [None], member_lists):
+            if group is not None and len(members) <= split:
+                out.append(group)
+                continue
+            for start in range(0, len(members), split):
+                part = members[start : start + split]
+                b_seqs = bucketer.find_sequence_bucket(len(part))
+                plan = (
+                    None
+                    if b_seqs is None
+                    else bucketer.batched_decode_plan(b_seqs, max(decode_blocks[m] for m in part))
+                )
+                if b_seqs is None or plan is None:
+                    return groups
+                fields = self._batched_decode_tensors(
+                    part,
+                    b_seqs,
+                    plan,
+                    blocks_per_seq,
+                    block_table,
+                    query_start_loc,
+                    active_block_indices,
+                    attention_mask_stacks,
+                )
+                out.append(
+                    BatchedDecodeGroup(
+                        len(part),
+                        torch.tensor(part, dtype=torch.int32),
+                        *fields,
+                        chunk_range=plan.chunk_range,
+                    )
+                )
         return out
 
     def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:

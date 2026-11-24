@@ -271,6 +271,11 @@ records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+Above 32 decode sequences the batched kernel puts two entries on each of the card's 32
+cores, and a decode step gets far slower (Gemma-4 26B-A4B: 593 ms at 32 users, 1084 ms
+at 33). `SPYRE_DECODE_SPLIT=32` runs such a batch as consecutive groups of 32 through the
+grouped dispatch (needs `SPYRE_JAGGED_DECODE=1`, the default). It is off by default.
+
 #### One per-sequence kernel for every page count
 
 The per-sequence kernels (prefill, and any decode that batched decode does not take) do not

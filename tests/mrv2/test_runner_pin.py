@@ -41,6 +41,8 @@ def vllm_config(monkeypatch: pytest.MonkeyPatch, _base_config: VllmConfig) -> Vl
     """Built under this process's real gate."""
     config = copy.deepcopy(_base_config)
     config.parallel_config.worker_cls = "auto"
+    # __post_init__ resolved it; the platform hook sees the user's value or None.
+    config.scheduler_config.disable_hybrid_kv_cache_manager = None
     # setenv first, so teardown also removes a value the platform hook adds.
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "")
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER")
@@ -79,6 +81,41 @@ def test_any_other_runner_is_rejected(
 
     with pytest.raises(ValueError, match=f"SPYRE_MODEL_RUNNER='{runner}': the V1 model runner"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(("requested", "disabled"), [(None, True), (True, True), (False, False)])
+def test_hybrid_kv_cache_manager_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config: VllmConfig,
+    requested: bool | None,
+    disabled: bool,
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = requested
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is disabled
+
+
+@pytest.mark.usefixtures("vllm_config")
+@pytest.mark.parametrize(("requested", "disabled"), [(None, True), (False, False)])
+def test_hybrid_kv_cache_manager_setting_survives_config_init(
+    monkeypatch: pytest.MonkeyPatch, requested: bool | None, disabled: bool
+) -> None:
+    """Through VllmConfig.__post_init__: the default-off rule relies on vLLM resolving its
+    unset default after the platform hook."""
+    from vllm.config import SchedulerConfig
+    from vllm.platforms import current_platform
+
+    assert isinstance(current_platform, TorchSpyrePlatform)
+    _set_runner(monkeypatch, "v2")
+
+    config = VllmConfig(
+        scheduler_config=SchedulerConfig.default_factory(disable_hybrid_kv_cache_manager=requested)
+    )
+
+    assert config.scheduler_config.disable_hybrid_kv_cache_manager is disabled
 
 
 @pytest.mark.parametrize(

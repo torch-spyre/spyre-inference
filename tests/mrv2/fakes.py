@@ -72,12 +72,13 @@ def make_fake_kv_cache_config(
         num_blocks=num_blocks,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=num_blocks * spec.page_size_bytes,
+                size=num_layers * num_blocks * spec.page_size_bytes,
                 layers=[name],
                 layer_stride=num_blocks * spec.page_size_bytes,
                 block_stride=spec.page_size_bytes,
+                offset=i * num_blocks * spec.page_size_bytes,
             )
-            for name in layer_names
+            for i, name in enumerate(layer_names)
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec) for name in layer_names

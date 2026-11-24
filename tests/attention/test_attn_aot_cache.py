@@ -215,6 +215,18 @@ def test_fresh_kernel_that_raises_falls_back(monkeypatch):
     assert _files(k) == []
 
 
+def test_a_file_that_cannot_be_saved_keeps_the_kernel_in_memory(monkeypatch, tmp_path):
+    a, b = _dyn(4, 8), _dyn(4, 8)
+    plain = _Plain(kernel)
+    k = akc.AotKernel(kernel, plain)
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("")  # a file, so no path below it can be created or opened
+    monkeypatch.setattr(k, "_path", lambda key: str(blocked / "kernel.bin"))
+    assert torch.equal(k(a=a, b=b), a + b)
+    assert torch.equal(k(a=a, b=b), a + b)
+    assert plain.calls == 0
+
+
 def test_nothing_compiled_while_a_pool_is_open_in_another_thread():
     a, b = torch.randn(4, 8), torch.randn(4, 8)
     plain = _Plain(kernel)

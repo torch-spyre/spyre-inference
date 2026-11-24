@@ -287,11 +287,12 @@ class AotKernel:
             path = self._path(key)
             fn.save_compiled_function(path)
             return path
-        except Exception:
+        except Exception as e:
+            # warning_once takes no exc_info: the error type keeps the line useful.
             logger.warning_once(
-                "Attention AOT cache: could not save a compiled kernel; it stays in memory "
-                "for this run only.",
-                exc_info=True,
+                "Attention AOT cache: could not save a compiled kernel (%s), it stays in "
+                "memory for this run only.",
+                type(e).__name__,
             )
             return None
 

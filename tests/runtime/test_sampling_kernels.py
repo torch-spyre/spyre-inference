@@ -248,6 +248,24 @@ def test_topp_limits_flat_boundary_ties(
     assert not kept[~torch.isfinite(x)].any()
 
 
+@pytest.mark.parametrize("vocab", [65, 67, 49155])
+@pytest.mark.parametrize("shift", [-2.7, -11.3])
+def test_topp_boundary_ties_cross_simd_tail(vocab: int, shift: float) -> None:
+    # A tie group ending in the last vocab % 16 ids must get one probability.
+    x = torch.full((1, vocab), float("-inf"))
+    x[0, 0] = 0.0
+    x[0, vocab - 20 :] = shift
+    probs = x.softmax(-1).double()[0]
+    for quota in [0.5, 5.5, 10.5, 19.5]:
+        p = (probs[0] + probs[-1] * quota).float().reshape(1)
+        kept = torch.isfinite(apply_top_k_top_p_kernels(x.clone(), None, p))[0]
+        ties = kept[vocab - 20 :]
+        n = int(ties.sum())
+        assert n == int(quota) + 1
+        assert ties[:n].all()
+        assert kept[0]
+
+
 @pytest.mark.parametrize("gap", [5e-6, 0.25, 2.0])
 @pytest.mark.parametrize("shift", [-3.125, 0.0, 2.5])
 @pytest.mark.parametrize("mixed_k", [False, True])

@@ -2409,7 +2409,7 @@
 <p>Read this before doing anything else — this pitfall can appear in any test category.</p>
 <p>Our platform sets <code>_enum = PlatformEnum.OOT</code>. This means <code>current_platform.is_cpu()</code> returns <code>False</code>, even though we inherit from <code>CpuPlatform</code> and set <code>device_type = "cpu"</code>. Every release, upstream adds new wrappers to <code>Worker</code> or <code>Platform</code> methods that call <code>is_cpu()</code> (or <code>is_cuda_alike()</code>, or similar predicates) to short-circuit to a no-op, and raise <code>RuntimeError</code> for anything else. We fall through to the raise.</p>
 <p><strong>Don't</strong> fix this by overriding <code>is_cpu()</code> to return <code>True</code>. <code>vllm/model_executor/custom_op.py</code> checks <code>is_cpu()</code> <em>before</em> <code>is_out_of_tree()</code> in its <code>forward_*</code> dispatch, and we rely on <code>forward_oot</code> for our custom-op overrides. Forcing <code>is_cpu()</code> reroutes every <code>CustomOp</code> to <code>forward_cpu</code>.</p>
-<p><strong>Do</strong> add a surgical override on <code>TorchSpyreWorker</code> (or <code>TorchSpyrePlatform</code> if the wrapper is on <code>Platform</code>). The fix is always the same shape: return whatever no-op the CPU branch would have returned (usually <code>nullcontext()</code> or <code>None</code>), and leave a comment explaining why you're not fixing <code>is_cpu()</code>. For example, the v0.23.0 bump introduced a memory-pool context wrapper in <code>Worker.load_model</code>:</p>
+<p><strong>Do</strong> add a surgical override on <code>SpyreWorkerV2</code> (or <code>TorchSpyrePlatform</code> if the wrapper is on <code>Platform</code>). The fix is always the same shape: return whatever no-op the CPU branch would have returned (usually <code>nullcontext()</code> or <code>None</code>), and leave a comment explaining why you're not fixing <code>is_cpu()</code>. For example, the v0.23.0 bump introduced a memory-pool context wrapper in <code>Worker.load_model</code>:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">_maybe_get_memory_pool_context</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tag</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AbstractContextManager</span><span class="p">:</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    <span class="c1"># gpu_worker.Worker wraps weight loading in a memory-pool context that</span>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="c1"># short-circuits to nullcontext() when current_platform.is_cpu() is True.</span>
@@ -2478,7 +2478,7 @@
 <p>If this fails with <code>ImportError</code> from inside vLLM, the upstream API moved out from under one of our imports — <code>grep -rn "&lt;missing-symbol&gt;" .venv/lib64/python3.12/site-packages/vllm/</code> to find where it went, then update our import.</p>
 <h2 id="step-2b-re-sync-the-vendored-host-sampling-code">Step 2b: Re-sync the Vendored Host-Sampling Code<a class="headerlink" href="#step-2b-re-sync-the-vendored-host-sampling-code" title="Permanent link">&para;</a></h2>
 <p>Spyre copies logits to the host for sampling, and spyre-inference vendors vLLM's CPU
-sampling code to do it fast. Every bump must re-check that code against the new upstream,
+top-k/top-p code to do it fast. Every bump must re-check that code against the new upstream,
 even when nothing fails: the build and the tests only catch breakage, not upstream fixes we
 are missing.</p>
 <table>
@@ -2496,11 +2496,6 @@ are missing.</p>
 <td>Trimmed to <code>FP32Vec8</code>/<code>FP32Vec16</code>; every kept line is unchanged. Port fixes to those two types only.</td>
 </tr>
 <tr>
-<td><code>csrc/cpu/sampling_kernels.cpp</code></td>
-<td>same path (added in vllm#53913, after v0.28.0)</td>
-<td>Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); <code>greedy_argmax</code> matches <code>torch.argmax</code> on NaN; inputs are checked. Port performance and correctness changes, never the table.</td>
-</tr>
-<tr>
 <td><code>csrc/cpu/topk_topp_sampler.cpp</code></td>
 <td>vLLM CPU top-k/top-p, AVX512 and AVX2 from vllm#43452, VSX and VXE from vllm#62440. Not a same-path file on current vLLM main.</td>
 <td>Tie-inclusive top-k; upstream keeps exactly k. Top-k plus top-p is an exact softmax cut on the survivors. Top-p alone, and a top-p-only row in a mixed batch, stays the approximate upstream kernel. Re-sync those two PRs, not only the files in the diff below.</td>
@@ -2516,44 +2511,14 @@ are missing.</p>
 <td>Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of <code>-march=native</code>, so wheels are portable.</td>
 </tr>
 <tr>
-<td><code>SpyreTopKTopPSampler.forward_native</code> (<code>spyre_inference/v1/sample/topk_topp_sampler.py</code>)</td>
-<td><code>TopKTopPSampler.forward_native</code> (<code>vllm/v1/sample/ops/topk_topp_sampler.py</code>)</td>
-<td>Reimplements the upstream tail (kernel top-k/top-p when the ops are in the loaded extension, otherwise sort-free top-k, plus the kernel draw); its comment names the vLLM version it mirrors.</td>
+<td><code>spyre_apply_top_k_top_p</code> (<code>spyre_inference/v1/worker/spyre/kernels.py</code>)</td>
+<td><code>apply_top_k_top_p</code> (<code>vllm/v1/sample/ops/topk_topp_sampler.py</code>), as MRV2's sampler and sampling states call it (<code>vllm/v1/worker/gpu/sample/</code>)</td>
+<td>Bound over both call sites by <code>kernels.bind()</code>. Runs the <code>csrc/cpu/topk_topp_sampler.cpp</code> filters when the loaded extension has them, otherwise the sort-free top-k/top-p. Logits are already on the host, so it never takes MRV2's full-vocab sort.</td>
 </tr>
 <tr>
 <td><code>spyre_inference/v1/spec_decode/xpress_head.py</code>, <code>SpyreQwen3XPressForCausalLM</code> (<code>spyre_inference/models/qwen3_dflash.py</code>)</td>
 <td><code>XPressRefinerHead</code> and <code>Qwen3XPressForCausalLM</code> (<code>vllm/model_executor/models/qwen3_xpress.py</code>)</td>
 <td>Construction, key mapping and mixer folding are upstream's; Spyre checks required head weights and the raw mixer shape. <code>_spyre_xpress_classes()</code> swaps the two module-level class names upstream builds by, so a rename upstream fails <code>test_upstream_xpress_construction_builds_the_spyre_classes</code>. The head subclass only no-ops <code>build_fused_buffers()</code> and swaps the Triton Jacobi kernels for compiled step helpers and Spyre weight layouts. <code>tests/spec_decode/xpress_reference.py</code> drives upstream's own <code>hidden_cache</code>/<code>refine_bias</code> as the oracle, so a change to upstream's math fails <code>test_xpress_upstream.py</code>.</td>
-</tr>
-<tr>
-<td><code>csrc/cpu/spec_decode_utils.cpp</code>, <code>spyre_inference/v1/spec_decode/rejection_sampler.py</code> and the platform kernel hook</td>
-<td>The four rejection kernels in <code>csrc/cpu/spec_decode_utils.cpp</code> and their adapters in <code>vllm/utils/cpu_triton_utils.py</code> (unchanged from v0.32.0 <code>5df63a7203</code> through v0.33.0)</td>
-<td>Native kernels in <code>_spyre_C</code>, with mixed int32/int64 inputs, floating-point parameter expansion, FP64 uniforms/noise, synthetic acceptance, placeholder and zero-probability rejection, and first-index/NaN argmax semantics. Recovery parallelizes token rows without vocabulary-sized score buffers. There is no Python rejection fallback; a missing or stale extension requires rebuilding. Re-sync alongside the other vendored CPU kernels. Upstream's opt-in FLy acceptance (<code>rejection_sample_method="fly"</code>, v0.33.0) is Triton-only and not ported.</td>
-</tr>
-<tr>
-<td><code>TorchSpyreModelRunner._sample</code> / <code>_bookkeeping_sync</code> (<code>spyre_inference/v1/worker/spyre_model_runner.py</code>)</td>
-<td>The same methods in <code>vllm/v1/worker/gpu_model_runner.py</code>, as patched by vllm#62688 (unmerged)</td>
-<td>Temporary port for #1420: restores the full state of CPU generators around sampling and hides them from upstream's <code>set_offset</code> rewind, which CPU generators lack. Delete both overrides once the pin includes vllm#62688; <code>tests/runtime/test_sampling_fallback.py::test_upstream_rewind_still_needs_the_cpu_generator_port</code> fails once upstream restores CPU generators itself. V1 only: MRV2 samples from <code>(seed, position)</code> and keeps no generator state.</td>
-</tr>
-<tr>
-<td>The sampler patch in <code>TorchSpyreModelRunner.__init__</code></td>
-<td><code>Sampler</code> (<code>vllm/v1/sample/sampler.py</code>), its construction and <code>RejectionSampler(self.sampler)</code> (<code>vllm/v1/worker/gpu_model_runner.py</code>)</td>
-<td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>
-</tr>
-<tr>
-<td><code>allow_xpress_on_v1()</code> (<code>spyre_inference/v1/spec_decode/config.py</code>)</td>
-<td><code>VllmConfig._get_v1_model_runner_unsupported_features</code> (<code>vllm/config/vllm.py</code>)</td>
-<td>Drops "xpress speculative decoding" and "mixed sliding/full dflash drafts": Spyre drives both through its V1 DFlash proposer. This is the config-level half of the decoder-layer workaround below. Retain while V1 is supported; delete when speculative decoding moves to V2 (#1575) and V1 is removed (#1245, part of #906).</td>
-</tr>
-<tr>
-<td><code>SpyreDFlashQwen3DecoderLayer.__init__</code> (<code>spyre_inference/models/qwen3_dflash.py</code>)</td>
-<td><code>_resolve_layer_attention</code>'s V2 check (<code>vllm/model_executor/models/qwen3_dflash.py</code>)</td>
-<td>Stubs the module's <code>get_current_vllm_config</code> to report <code>use_v2_model_runner=True</code> during layer construction, allowing mixed sliding/full drafts on V1. Spyre gives these layers a shared full-allocation KV group (<code>SpyreGemma4ForCausalLM.get_kv_cache_groups</code>) and splits attention metadata by window. Other current-config reads in the layer's construction see the stub too (currently only <code>DFlashQwen3Attention</code>'s ROCm branch); audit them on each vLLM upgrade. Delete once these drafts use V2 (#1575) and V1 is removed (#1245, part of #906).</td>
-</tr>
-<tr>
-<td><code>use_spyre_dflash_proposer()</code> (<code>spyre_inference/v1/spec_decode/dflash.py</code>)</td>
-<td>The <code>DFlashProposer</code> import, construction and <code>isinstance</code> checks in <code>vllm/v1/worker/gpu_model_runner.py</code></td>
-<td>Temporarily replaces the module's constructor during runner initialization. The replacement remains an upstream <code>DFlashProposer</code> subclass so later checks in <code>_prepare_inputs</code> and <code>sample_tokens</code> still pass after restoration.</td>
 </tr>
 <tr>
 <td><code>csrc/cpu/mrv2_kernels.cpp</code>, <code>csrc/cpu/mrv2_spec_decode_kernels.cpp</code>, <code>HOST_KERNELS</code> / <code>UNSUPPORTED_KERNELS</code> (<code>spyre_inference/v1/worker/spyre/kernels.py</code>)</td>
@@ -2566,33 +2531,25 @@ are missing.</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>&lt;vllm<span class="w"> </span>checkout&gt;<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>fetch<span class="w"> </span>--tags
 </span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>git<span class="w"> </span>diff<span class="w"> </span>v&lt;current&gt;<span class="w"> </span>v<span class="o">{</span>VERSION<span class="o">}</span><span class="w"> </span>--stat<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>csrc/cpu/cpu_types.hpp<span class="w"> </span>csrc/cpu/cpu_types_x86.hpp<span class="w"> </span>csrc/cpu/cpu_types_vsx.hpp<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>csrc/cpu/cpu_types_vxe.hpp<span class="w"> </span>csrc/cpu/sampling_kernels.cpp<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>csrc/cpu/spec_decode_utils.cpp<span class="w"> </span>csrc/cpu/torch_bindings.cpp<span class="w"> </span>csrc/core/registration.h<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>cmake/cpu_extension.cmake<span class="w"> </span>cmake/utils.cmake<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">  </span>vllm/v1/sample/ops/topk_topp_sampler.py<span class="w"> </span>vllm/v1/sample/sampler.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">  </span>vllm/v1/sample/rejection_sampler.py<span class="w"> </span>vllm/utils/cpu_triton_utils.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">  </span>vllm/v1/worker/gpu_model_runner.py
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>csrc/cpu/cpu_types_vxe.hpp<span class="w"> </span>csrc/cpu/torch_bindings.cpp<span class="w"> </span>csrc/core/registration.h<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>cmake/cpu_extension.cmake<span class="w"> </span>cmake/utils.cmake<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>vllm/v1/sample/ops/topk_topp_sampler.py<span class="w"> </span>vllm/v1/worker/gpu/sample/
 </span></code></pre></div>
-<p>For each changed file, port what applies and update the version in the <code>forward_native</code>
-comment. If the new vLLM pins a different torch, move every torch pin in <code>pyproject.toml</code>
+<p>For each changed file, port what applies. If the new vLLM pins a different torch, move every torch pin in <code>pyproject.toml</code>
 together: the extension links libtorch, so a mismatch fails at import. The list (six
 places, including the ppc64le source build) is in §3b of the <code>upgrade-torch-spyre</code> skill,
 and torch-spyre must support the new torch as well.
 <code>uv sync</code> rebuilds the extension because <code>csrc/</code> and <code>pyproject.toml</code> are in its cache keys.</p>
-<p>Then check the kernels and ordinary-sampling PyTorch fallback (CPU only, no card needed).
-The rejection sampler requires the built extension:</p>
+<p>Then check the filters and their PyTorch fallback (CPU only, no card needed):</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/runtime/test_sampling_kernels.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>tests/runtime/test_sampling_fallback.py<span class="w"> </span>tests/runtime/test_spyre_topk_sampler.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>tests/spec_decode/test_rejection_sampler.py<span class="w"> </span>--no-header
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>tests/runtime/test_top_k_top_p_sort_free.py<span class="w"> </span>tests/runtime/test_sampling_extension.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>tests/mrv2/test_kernels.py<span class="w"> </span>--no-header
 </span></code></pre></div>
 <ul>
-<li><code>test_sampling_kernels.py</code> checks the kernels against PyTorch baselines token for token:
-  <code>torch.argmax</code> for greedy, and a PyTorch implementation of the same hashed Gumbel draw.</li>
-<li><code>test_sampling_fallback.py</code> forces the fallback and checks it picks the same tokens as
-  upstream's stock <code>Sampler</code>, which catches upstream sampler changes we haven't mirrored.</li>
-<li><code>test_spyre_topk_sampler.py</code> checks the sort-free top-k/top-p against upstream's sort.</li>
-<li><code>test_rejection_sampler.py</code> exercises the native kernels through vLLM's dispatchers,
-  including mixed dtypes, FP64 noise, synthetic acceptance and target-distribution checks.</li>
+<li><code>test_sampling_kernels.py</code> checks the csrc/ filters against upstream's PyTorch filter.</li>
+<li><code>test_top_k_top_p_sort_free.py</code> checks the sort-free fallback against upstream's sort.</li>
+<li><code>test_sampling_extension.py</code> checks which extension build a host loads.</li>
+<li><code>tests/mrv2/test_kernels.py</code> checks <code>spyre_apply_top_k_top_p</code> on both paths.</li>
 </ul>
 <h2 id="step-3-triage-in-this-order">Step 3: Triage in This Order<a class="headerlink" href="#step-3-triage-in-this-order" title="Permanent link">&para;</a></h2>
 <p>Don't run the full <code>pytest</code> first — vLLM startup is ~30s per test file, and the failures cluster by category. Run the cheapest categories first so you can fix-and-rerun quickly.</p>
@@ -2615,7 +2572,7 @@ The rejection sampler requires the built extension:</p>
 <h3 id="3c-end-to-end-vllm-single-process">3c. End-to-End vLLM (Single-Process)<a class="headerlink" href="#3c-end-to-end-vllm-single-process" title="Permanent link">&para;</a></h3>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/e2e/test_vllm_spyre_next.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
 </span></code></pre></div>
-<p>This is the most common place to hit OOT platform traps (see above). Fix those with surgical <code>TorchSpyreWorker</code> overrides as described.</p>
+<p>This is the most common place to hit OOT platform traps (see above). Fix those with surgical <code>SpyreWorkerV2</code> overrides as described.</p>
 <p>Not all failures here are OOT traps — also watch for constructor or method signature changes on classes we instantiate or inherit from, new abstract methods on base classes, and import path moves (symbol relocated to a different vLLM module).</p>
 <h3 id="3d-distributed">3d. Distributed<a class="headerlink" href="#3d-distributed" title="Permanent link">&para;</a></h3>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"distributed"</span><span class="w"> </span>--no-header
@@ -2646,7 +2603,7 @@ The rejection sampler requires the built extension:</p>
 <li><code>pyproject.toml</code> — two things: the <code>rev</code> in the <code>[tool.uv.sources]</code> vllm entry, and the <code>vllm&gt;=X.Y.Z,&lt;X.(Y+1)</code> constraint in <code>[project] dependencies</code>.</li>
 <li><code>uv.lock</code> — auto-regenerated by <code>uv sync</code>. Don't hand-edit.</li>
 <li><code>tests/plugin/pyproject.toml</code> — auto-regenerated by <code>sync-upstream-test-deps</code> from the allow-list. Review the diff but don't hand-edit; to add or drop a dep, edit <code>ALLOW_LIST</code>/<code>EXCLUDED</code> in <code>sync_upstream_test_deps.py</code> and re-run. The allow-list edit itself is the fourth file that may change on a bump.</li>
-<li><code>spyre_inference/v1/worker/spyre_worker.py</code> (sometimes) or <code>spyre_inference/platform.py</code> — surgical overrides for new upstream wrappers.</li>
+<li><code>spyre_inference/v1/worker/spyre/worker.py</code> (sometimes) or <code>spyre_inference/platform.py</code> — surgical overrides for new upstream wrappers.</li>
 <li><code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> (sometimes) — fixture updates for upstream test-infra churn.</li>
 <li><code>csrc/cpu/</code>, <code>cmake/</code> and <code>spyre_inference/v1/sample/</code> (when upstream changed them) — the Step 2b re-sync of the vendored sampling code.</li>
 </ol>

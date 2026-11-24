@@ -2852,19 +2852,18 @@ different KV scales therefore compiles the transformer block and each recorded a
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.</p>
 <h2 id="model-runner">Model runner<a class="headerlink" href="#model-runner" title="Permanent link">&para;</a></h2>
-<p>The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
-host kernels built into the plugin (<code>SPYRE_MRV2_KERNELS=host</code>), so no Triton install is
-needed on any architecture.</p>
-<p>Set <code>SPYRE_MODEL_RUNNER=v1</code> to fall back to the V1 model runner. The fallback is
-best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
-the V1 runner (#1245). The plugin sets <code>VLLM_USE_V2_MODEL_RUNNER</code> from
-<code>SPYRE_MODEL_RUNNER</code>, so don't set it yourself.</p>
-<p>Differences on V2:</p>
+<p>The plugin runs vLLM's Model Runner V2 (MRV2), its only model runner: the V1 runner was
+removed (#1245), and <code>SPYRE_MODEL_RUNNER=v1</code> is refused at startup. MRV2's Triton
+kernels are replaced by host kernels built into the plugin (<code>SPYRE_MRV2_KERNELS=host</code>), so
+no Triton install is needed on any architecture. The plugin pins
+<code>VLLM_USE_V2_MODEL_RUNNER=1</code>, so don't set it yourself.</p>
+<p>Differences from the removed V1 runner:</p>
 <ul>
 <li>Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.</li>
 <li>These are refused at startup: speculative decoding other than DFlash/XPress,
-  batch-sharded sampling, <code>cudagraph_mm_encoder</code>, and prefill context parallelism.</li>
+  batch-sharded sampling, <code>cudagraph_mm_encoder</code>, prefill context parallelism, and,
+  untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).</li>
 </ul>
 <h2 id="offline-engine-in-the-calling-process">Offline engine in the calling process<a class="headerlink" href="#offline-engine-in-the-calling-process" title="Permanent link">&para;</a></h2>
 <p>At <code>tensor_parallel_size=1</code>, set <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> to run the offline

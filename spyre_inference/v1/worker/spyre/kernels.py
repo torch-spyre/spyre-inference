@@ -24,7 +24,11 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_only, apply_top_k_top_p_pytorch
 
-from spyre_inference.v1.sample.topk_topp_sampler import apply_top_k_top_p_sort_free
+from spyre_inference.v1.sample.sampling_kernels import has_topk_topp_kernels
+from spyre_inference.v1.sample.topk_topp_sampler import (
+    apply_top_k_top_p_kernels,
+    apply_top_k_top_p_sort_free,
+)
 
 logger = init_logger(__name__)
 
@@ -203,7 +207,10 @@ def spyre_apply_top_k_top_p(
     p: torch.Tensor | None,
     has_topp_only_rows: bool = True,
 ) -> torch.Tensor:
-    """apply_top_k_top_p without the full-vocab sort whenever top-k bounds it."""
+    """apply_top_k_top_p on V1's csrc/ filter kernels, which do not sort the vocab;
+    without them, a sort-free path whenever top-k bounds it."""
+    if has_topk_topp_kernels():
+        return apply_top_k_top_p_kernels(logits, k, p)
     if k is None:
         return logits if p is None else apply_top_k_top_p_pytorch(logits, k, p)
     if p is None:

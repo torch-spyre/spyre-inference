@@ -38,6 +38,7 @@ _SPEC_DECODE_BOUND = tuple(
         "rejection_sampler_utils",
         "acceptance_estimator",
         "dflash.speculator",
+        "dflash2.speculator",
         "xpress.kernels",
     )
 )

@@ -41,6 +41,7 @@ _ADAPTED_MODULES = ("bert", "roberta")
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
     "DFlashDraftModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
+    "LiLiCorrDraftModel": "spyre_inference.models.lilicorr:SpyreLiLiCorrForCausalLM",
     "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
     "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",

@@ -25,16 +25,46 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
-from vllm.model_executor.models.bert import BertModel, BertSelfAttention
+from vllm.model_executor.models.bert import BertAttention, BertModel, BertSelfAttention
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from spyre_inference.models import _ADAPTED_MODULES, spyre_models
-from spyre_inference.models.bert import SpyreSplitQKVMixin, split_bert_qkv
+from spyre_inference.models import _ADAPTED_MODULES, bert, spyre_models
+from spyre_inference.models.bert import SpyreSplitQKVMixin, grouped_rectangles, split_bert_qkv
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    _encoder_rect_kernel,
+    encoder_grid,
+    encoder_key_pad_mask,
+)
+
+WIDTH, EXTENT, HIDDEN, HEADS = 2, 64, 128, 4
 
 
 class _Capture(nn.Module):
     def forward(self, q, k, v):
         return q, k, v
+
+
+class _RectAttention(nn.Module):
+    def __init__(self, heads, head_dim):
+        super().__init__()
+        self.heads, self.head_dim = heads, head_dim
+        self.impl = type("Impl", (), {"scale": head_dim**-0.5})()
+
+    def forward(self, q, k, v):
+        h, d = self.heads, self.head_dim
+        a = _encoder_rect_kernel(
+            q.view(-1, h, d),
+            k.view(-1, h, d),
+            v.view(-1, h, d),
+            encoder_grid().mask,
+            d**-0.5,
+            WIDTH,
+            EXTENT,
+            h,
+            h,
+            d,
+        )
+        return a.reshape(-1, h * d)
 
 
 def _self_attention(hidden_size, num_heads, bias):
@@ -166,3 +196,117 @@ def test_checkpoint_reload_updates_split_weights_and_bias_in_place(
 def test_every_bert_family_model_splits_qkv(target):
     module, _, name = target.partition(":")
     assert issubclass(getattr(importlib.import_module(module), name), SpyreSplitQKVMixin)
+
+
+def _attention(prefix, rects):
+    attn = BertAttention(
+        hidden_size=HIDDEN, num_attention_heads=HEADS, layer_norm_eps=1e-5, prefix=prefix
+    )
+    g = torch.Generator().manual_seed(0)
+    for proj in (attn.self.qkv_proj, attn.output.dense):
+        proj.weight.data.copy_(torch.randn(proj.weight.shape, generator=g) * 0.1)
+        proj.bias.data.copy_(torch.randn(proj.bias.shape, generator=g) * 0.1)
+        proj.quant_method.process_weights_after_loading(proj)
+    attn.self.attn = _RectAttention(HEADS, HIDDEN // HEADS)
+    attn.spyre_group_rects = rects
+    split_bert_qkv(nn.Sequential(attn))
+    return attn
+
+
+@pytest.mark.parametrize("inline", [False, True], ids=["fallback", "rectangle"])
+def test_head_groups_match_one_group(default_vllm_config, tp_group, monkeypatch, inline):
+    x = torch.randn(WIDTH * EXTENT, HIDDEN, generator=torch.Generator().manual_seed(1))
+    mask = encoder_key_pad_mask(EXTENT, [EXTENT, EXTENT // 2], torch.float32, False)
+    encoder_grid().publish(mask if inline else None)
+    monkeypatch.setattr(bert, "encoder_inline_active", lambda: inline)
+    try:
+        one = _attention("one", frozenset())
+        two = _attention("two", frozenset({(WIDTH, EXTENT)}))
+
+        assert hasattr(two.self.qkv_proj, "q_weight_t_1")
+        assert not hasattr(one.self.qkv_proj, "q_weight_t_1")
+        torch.testing.assert_close(two(x), one(x), rtol=1e-5, atol=1e-5)
+    finally:
+        encoder_grid().publish(None)
+
+
+class _BertAttentionCheckpointModel(nn.Module):
+    hf_to_vllm_mapper = BertModel.hf_to_vllm_mapper
+    load_weights = BertModel.load_weights
+
+    def __init__(self, *, vllm_config, prefix=""):
+        super().__init__()
+        self.attention = BertAttention(
+            hidden_size=HIDDEN,
+            num_attention_heads=HEADS,
+            layer_norm_eps=1e-5,
+            prefix=f"{prefix}.attention",
+        )
+
+
+class _GroupedBert(SpyreSplitQKVMixin, _BertAttentionCheckpointModel):
+    pass
+
+
+@torch.no_grad()
+def test_checkpoint_reload_updates_head_groups_in_place(default_vllm_config, tp_group, caplog):
+    config = get_current_vllm_config()
+    g = torch.Generator().manual_seed(3)
+    names = [f"attention.self.{n}" for n in ("query", "key", "value")] + ["attention.output.dense"]
+    original = {
+        f"{name}.{suffix}": torch.randn(shape, generator=g, dtype=torch.float16)
+        for name in names
+        for suffix, shape in (("weight", (HIDDEN, HIDDEN)), ("bias", (HIDDEN,)))
+    }
+    original |= {
+        f"attention.output.LayerNorm.{n}": torch.randn(HIDDEN, generator=g, dtype=torch.float16)
+        for n in ("weight", "bias")
+    }
+    changed = {name: -value + 0.125 for name, value in original.items()}
+
+    with set_default_torch_dtype(torch.float16):
+        model = initialize_model(config, model_class=_GroupedBert)
+    model.attention.spyre_group_rects = frozenset({(WIDTH, EXTENT)})
+    model.load_weights((name, value.clone()) for name, value in original.items())
+    process_weights_after_loading(model, config.model_config, torch.device("cpu"))
+    proj, dense = model.attention.self.qkv_proj, model.attention.output.dense
+    grouped = {
+        name: param
+        for layer in (proj, dense)
+        for name, param in layer.named_parameters(recurse=False)
+        if name[-2:] in ("_0", "_1")
+    }
+    assert len(grouped) == 3 * 2 * 2 + 2
+    pointers = {name: param.data_ptr() for name, param in grouped.items()}
+
+    reload_weights(
+        config,
+        model,
+        weights_iterator=((name, value.clone()) for name, value in changed.items()),
+        weights_path=None,
+        is_checkpoint_format=True,
+    )
+    half = HIDDEN // 2
+    for part, name in zip(("q", "k", "v"), ("query", "key", "value")):
+        weight_t = changed[f"attention.self.{name}.weight"].t()
+        bias = changed[f"attention.self.{name}.bias"]
+        for gi in range(2):
+            cols = slice(gi * half, (gi + 1) * half)
+            torch.testing.assert_close(getattr(proj, f"{part}_weight_t_{gi}"), weight_t[:, cols])
+            torch.testing.assert_close(getattr(proj, f"{part}_bias_{gi}"), bias[cols])
+    wo_t = changed["attention.output.dense.weight"].t()
+    for gi in range(2):
+        torch.testing.assert_close(
+            getattr(dense, f"weight_t_{gi}"), wo_t[gi * half : (gi + 1) * half]
+        )
+    for name, param in grouped.items():
+        layer = proj if hasattr(proj, name) else dense
+        assert getattr(layer, name) is param and param.data_ptr() == pointers[name]
+    assert "Following weights were not loaded from checkpoint" not in caplog.text
+
+
+def test_planner_groups_only_kv_tiled_rectangles():
+    rects = [(64, 32), (128, 16), (256, 8), (512, 4)]
+    assert grouped_rectangles(rects, 16, 16, 64) == {(4, 512)}  # e5-large, bge-reranker-large
+    assert grouped_rectangles(rects, 12, 12, 64) == set()  # granite-embedding
+    assert grouped_rectangles([(64, 8), (128, 4)], 16, 16, 64) == set()  # all-roberta, L 128

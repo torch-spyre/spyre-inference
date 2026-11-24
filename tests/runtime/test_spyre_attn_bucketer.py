@@ -15,7 +15,6 @@
 """Unit tests for SpyreAttnBucketer. No hardware required."""
 
 from dataclasses import FrozenInstanceError
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -478,94 +477,6 @@ class TestEnvOverride:
     def test_parse_buckets_empty_is_none(self):
         assert _parse_buckets("") is None
         assert _parse_buckets(None) is None
-
-
-class TestRecorderBuilders:
-    """The recorder records through the builder each layer dispatches against."""
-
-    @staticmethod
-    def _builder():
-        """A stand-in that still satisfies the runner's isinstance check."""
-        from spyre_inference.v1.attention.backends.spyre_attn import (
-            SpyreAttentionMetadataBuilder,
-        )
-
-        return MagicMock(spec=SpyreAttentionMetadataBuilder)
-
-    @staticmethod
-    def _runner(*groups):
-        """A bare runner with one ``(layer_names, builders)`` argument per attention
-        group; ``builders`` is that group's per-ubatch list."""
-        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-        runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-        runner.attn_groups = [
-            [
-                SimpleNamespace(layer_names=list(layer_names), metadata_builders=list(builders))
-                for layer_names, builders in groups
-            ]
-        ]
-        return runner
-
-    def test_every_layer_maps_to_its_own_groups_builder(self):
-        builder = self._builder()
-        runner = self._runner((["layers.0.self_attn", "layers.1.self_attn"], [builder]))
-        assert runner._attn_metadata_builders() == {
-            "layers.0.self_attn": builder,
-            "layers.1.self_attn": builder,
-        }
-
-    def test_groups_keep_their_own_builders(self):
-        """Groups exist because their KV specs differ (block size, sliding window),
-        so one group's builder must not stand in for another's layers."""
-        first, second = self._builder(), self._builder()
-        runner = self._runner((["layers.0.self_attn"], [first]), (["layers.1.self_attn"], [second]))
-        builders = runner._attn_metadata_builders()
-        assert builders["layers.0.self_attn"] is first
-        assert builders["layers.1.self_attn"] is second
-
-    def test_first_ubatch_builder_stands_for_the_group(self):
-        """Ubatch builders share a spec, so either records the same variants."""
-        first, second = self._builder(), self._builder()
-        runner = self._runner((["layers.0.self_attn"], [first, second]))
-        assert runner._attn_metadata_builders() == {"layers.0.self_attn": first}
-
-    def test_skips_groups_without_a_spyre_builder(self):
-        """A foreign or empty group's layers are left out, so the recorder logs them
-        rather than recording against a builder that cannot enumerate variants."""
-        builder = self._builder()
-        runner = self._runner(
-            (["encoder.0.attn"], [MagicMock()]),
-            (["layers.0.self_attn"], [builder]),
-            (["layers.1.self_attn"], []),
-        )
-        assert runner._attn_metadata_builders() == {"layers.0.self_attn": builder}
-
-    def test_batched_decode_dispatches_onto_a_recorded_block_count(
-        self, monkeypatch, default_vllm_config
-    ):
-        """The regression this guards: ``build()`` and warmup must agree."""
-        from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
-
-        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-        envs.clear_env_cache()
-
-        from vllm.config import get_current_vllm_config
-
-        # block_size pinned to match what _padded_mask_metadata builds with, so
-        # the override resolves onto the same block counts build() produces.
-        vllm_config = get_current_vllm_config()
-        vllm_config.cache_config.block_size = BLOCK_SIZE
-        bucketer = SpyreAttnBucketer(vllm_config)
-
-        # 4 blocks of real KV.
-        metadata = _padded_mask_metadata(
-            [(1, 4 * BLOCK_SIZE)] * 4, max_num_blocks=bucketer.num_blocks_buckets[-1]
-        )
-
-        assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets
-        assert metadata.padded_num_seqs in bucketer.num_seqs_buckets
 
 
 class TestBatchedDecodeVariants:

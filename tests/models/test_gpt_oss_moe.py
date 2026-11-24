@@ -108,6 +108,7 @@ def _gpt_oss_layer(**moe_overrides):
         "has_bias": True,
         "swiglu_limit": None,
         "swiglu_alpha": None,
+        "in_dtype": torch.float16,
     } | moe_overrides
     return SimpleNamespace(
         moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(enable_eplb=False), **moe),
@@ -128,7 +129,10 @@ def test_configure_accepts_a_biased_swigluoai_layer():
 
     layer = _gpt_oss_layer()
     configure_spyre_moe_layer(layer, GPT_OSS_MOE_RECIPE)
+    # 16 experts divides a group of 4, so this layer keeps the recipe rather than dropping to 1.
     assert layer.spyre_moe_recipe is GPT_OSS_MOE_RECIPE
+    assert layer.spyre_moe_recipe.expert_group == 4
+    assert layer.spyre_moe_recipe.expert_group_tokens == (128, 512)
 
 
 @pytest.mark.parametrize(

@@ -486,15 +486,13 @@ def test_each_path_compiles_and_replays_from_its_own_staging():
     torch.testing.assert_close(out, torch.full_like(out, 1.0 + 101.0))
 
 
-def test_runner_warmup_builds_the_manager_and_serves_through_it():
+def test_runner_warmup_builds_the_manager_and_serves_through_it(monkeypatch):
     """The runner path: _record_vision_graphs compiles the model, builds the Spyre manager
     from the processor's largest item, captures every budget and warms the merge."""
     from vllm.config import CompilationMode
 
-    from spyre_inference.v1.worker.spyre_model_runner import (
-        TorchSpyreModelRunner,
-        _SpyreModelWrapper,
-    )
+    from spyre_inference.v1.worker.spyre import warmup
+    from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
     model = _FakeVisionModel()
     compiled = []
@@ -504,31 +502,38 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     vllm_config.compilation_config.inductor_compile_config = {}
     vllm_config.model_config.enforce_eager = False
     vllm_config.model_config.dtype = torch.float16
+    monkeypatch.setattr(
+        warmup,
+        "MultiModalBudget",
+        lambda *args, **kwargs: SimpleNamespace(mm_max_toks_per_item={"image": 300}),
+    )
 
-    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner.vllm_config = vllm_config
-    runner.compilation_config = vllm_config.compilation_config
-    runner.model_config = vllm_config.model_config
-    runner.supports_mm_inputs = True
-    runner.model = _SpyreModelWrapper(
+    wrapper = _SpyreModelWrapper(
         model,
         torch.device("cpu"),
         model_dtype=torch.float16,
         inputs_embeds_buffer=torch.zeros(16, 8, dtype=torch.float16),
     )
-    runner.spyre_shape_bucketer = SimpleNamespace(bucket_sizes=[1, 4, 16])
+    encoder_runner = SimpleNamespace(cudagraph_manager=None)
+    runner = SimpleNamespace(
+        vllm_config=vllm_config,
+        model_config=vllm_config.model_config,
+        supports_mm_inputs=True,
+        mm_registry=None,
+        model=wrapper,
+        get_model=lambda: model,
+        model_state=SimpleNamespace(encoder_runner=encoder_runner),
+        spyre_device=torch.device("cpu"),
+    )
     merged = []
     merge = model.vision_merge
     model.vision_merge = lambda text, image, mask: merged.append(text.shape[0]) or merge(
         text, image, mask
     )
-    runner.mm_budget = SimpleNamespace(mm_max_toks_per_item={"image": 300})
-    runner._spyre_device = torch.device("cpu")
-    runner.encoder_cudagraph_manager = None
 
-    runner._record_vision_graphs()
+    warmup._record_vision_graphs(runner, [1, 4, 16])
 
-    manager = runner.encoder_cudagraph_manager
+    manager = encoder_runner.cudagraph_manager
     assert compiled == [True]
     assert isinstance(manager, SpyreEncoderGraphManager)
     assert model.max_tokens_per_item == 300
@@ -665,7 +670,7 @@ def test_upstream_returns_text_alone_when_handed_no_image_tokens():
 def test_wrapper_stages_an_image_step_at_two_rows_and_keeps_the_mask_on_the_host():
     """A one-token image step (a chunk ending on a placeholder) stages two rows, so neither the
     staging copy nor upstream's copy is a single row (torch-spyre#4883)."""
-    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+    from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
     model = _FakeVisionModel()
     seen = []
@@ -698,7 +703,7 @@ def test_compiled_merge_through_the_wrapper_on_spyre(monkeypatch, num_tokens):
         pytest.skip("Spyre device not available")
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+    from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
     hidden = 128
     torch.manual_seed(0)

@@ -15,7 +15,7 @@
 """MRV2: attention-group construction (vllm/v1/worker/gpu/attn_utils.py:init_attn_backend).
 
 Upstream's init_attn_backend on a config whose per-layer specs cover the KV-sharing
-layers, then the sliding-window split; both are shared with V1.
+layers, then the sliding-window split (kv_cache_setup.py).
 """
 
 from collections.abc import Callable

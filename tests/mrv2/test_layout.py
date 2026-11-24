@@ -26,7 +26,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PACKAGE_ROOT = _REPO_ROOT / "spyre_inference" / "v1" / "worker" / "spyre"
 _SPYRE_INFERENCE_ROOT = _REPO_ROOT / "spyre_inference"
 
-# register() applies the Triton gate for both runners; platform.py checks its state.
+# register() applies the Triton gate; platform.py checks its state.
 _ALLOWED_IMPORTERS = {_SPYRE_INFERENCE_ROOT / "__init__.py", _SPYRE_INFERENCE_ROOT / "platform.py"}
 
 _PACKAGE_MODULE = "spyre_inference.v1.worker.spyre"
@@ -136,7 +136,7 @@ def test_nothing_outside_the_package_imports_it(path: pathlib.Path) -> None:
     if _imports_spyre_package(tree, _containing_package(path)):
         assert path in _ALLOWED_IMPORTERS, (
             f"{path.relative_to(_REPO_ROOT)} imports spyre_inference.v1.worker.spyre, "
-            "but nothing outside the package may import it until V1 is removed (#1245)."
+            "but nothing outside the package may import it."
         )
 
 

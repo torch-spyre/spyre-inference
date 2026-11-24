@@ -19,6 +19,8 @@ import os
 import signal
 import threading
 
+import torch
+
 __version__ = importlib.metadata.version("spyre_inference")
 
 
@@ -48,6 +50,11 @@ def register():
     if os.environ.get("FLEX_DEVICE") == "PF":
         for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
             os.environ.setdefault(name, "1")
+    # A process's first multi-threaded MKL vector-math call (cos, exp, sqrt, tanh, ...)
+    # computes some threads' chunks on a less accurate path, differently per process.
+    # A one-element call runs on one thread and sets MKL up first; fp32/cpu so an fp16
+    # or meta default can't skip MKL.
+    torch.zeros(1, dtype=torch.float32, device="cpu").cos()
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 

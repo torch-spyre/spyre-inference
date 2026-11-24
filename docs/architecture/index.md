@@ -218,7 +218,11 @@ with stand-in graphs that return zeros of the right shape so a bucket's forward 
 then resets Dynamo and runs the normal warm-up as a second pass of cache hits. The buckets whose
 token count is off the stick run their experts behind the opaque MoE op, whose compiled regions a
 stand-in block never reaches, so the first pass ends by running those experts itself
-(`moe.warm_opaque_regions`). A restart with warm caches skips it.
+(`moe.warm_opaque_regions`). A restart with warm caches skips it. At tensor parallel size above
+1 it sets `ENABLE_LX_CONTEXT_SWITCHING=0` unless that is set already: with LX context switching
+on, a worker can cache a graph that calls an all-reduce on a buffer it never allocated
+(torch-spyre/torch-spyre#6563). The warm-up logs a warning when a worker's LX planning stops at
+its time limit, since that plan is kept in the cache.
 
 The relayout and copy of one layer's stacks are independent of every other layer's, so loading
 prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this

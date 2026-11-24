@@ -17,13 +17,16 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import types
 
+import pytest
 import torch
 from vllm.config import CompilationMode
 
 from spyre_inference import envs
+from spyre_inference.v1.worker import parallel_precompile
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 BUCKETS = [1, 4, 16, 512]
@@ -42,10 +45,10 @@ class _Pool:
     """What fork_inner_compiles yields: counts one submitted compile per cold dummy run."""
 
     def __init__(self):
-        self.submitted = self.ok = self.failed = 0
+        self.submitted = self.ok = self.failed = self.time_limited = 0
 
 
-def _runner(monkeypatch, *, cold, workers="3", helper=True):
+def _runner(monkeypatch, *, cold, workers="3", helper=True, time_limited=0):
     monkeypatch.setenv("SPYRE_PARALLEL_WARMUP_PRECOMPILE", workers)
     envs.clear_env_cache()
     pools, checks, resets, in_pool = [], [], [], []
@@ -62,6 +65,7 @@ def _runner(monkeypatch, *, cold, workers="3", helper=True):
         finally:
             in_pool.pop()
         pool.ok = pool.submitted
+        pool.time_limited = time_limited
 
     def second_pass_check(expected):
         check = types.SimpleNamespace(expected=expected, finished=False)
@@ -181,3 +185,34 @@ def test_caching_precompile_keeps_the_workers_off(monkeypatch, caplog):
     assert pools == [] and resets == []
     assert [s for _, s in runs] == [512, 16, 4, 1, "rows=16", "rows=4", "rows=1"]
     assert any("TORCH_CACHING_PRECOMPILE" in r.message for r in caplog.records)
+
+
+def test_solves_that_stop_at_the_time_limit_are_reported(monkeypatch, caplog):
+    runner, _, _, _, _ = _runner(monkeypatch, cold=True, time_limited=2)
+    with caplog.at_level("WARNING"):
+        runner.warming_up_model()
+
+    assert any("2 of 4 graphs stopped LX planning" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("workers", "tp", "preset", "expected"),
+    [
+        ("3", 2, None, "0"),  # the workers at TP > 1: context switching off
+        ("3", 1, None, None),  # one rank: unchanged
+        ("0", 4, None, None),  # workers off: unchanged
+        ("3", 4, "1", "1"),  # an explicit value wins
+    ],
+)
+def test_lx_context_switching_is_off_only_for_the_workers_at_tp(
+    monkeypatch, workers, tp, preset, expected
+):
+    monkeypatch.setenv("SPYRE_PARALLEL_WARMUP_PRECOMPILE", workers)
+    if preset is None:
+        monkeypatch.delenv("ENABLE_LX_CONTEXT_SWITCHING", raising=False)
+    else:
+        monkeypatch.setenv("ENABLE_LX_CONTEXT_SWITCHING", preset)
+    envs.clear_env_cache()
+    parallel_precompile.keep_collectives_out_of_lx(tp)
+
+    assert os.environ.get("ENABLE_LX_CONTEXT_SWITCHING") == expected

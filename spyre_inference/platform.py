@@ -986,6 +986,11 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
 
+        # Before the workers start, so each of them reads it.
+        from spyre_inference.v1.worker.parallel_precompile import keep_collectives_out_of_lx
+
+        keep_collectives_out_of_lx(parallel_config.tensor_parallel_size)
+
         # YOCO fast prefill swaps in its own attention backend and metadata, which the
         # Spyre backend does not provide.
         if vllm_config.cache_config.kv_sharing_fast_prefill:

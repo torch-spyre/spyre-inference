@@ -25,7 +25,7 @@ import torch
 from vllm.config.profiler import ProfilerConfig
 from vllm.profiler import wrapper
 
-from spyre_inference.v1.worker import spyre_worker
+from spyre_inference.v1.worker.spyre import worker as spyre_worker
 
 
 @pytest.fixture

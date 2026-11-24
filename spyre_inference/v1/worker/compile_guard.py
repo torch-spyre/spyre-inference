@@ -17,7 +17,7 @@
 ``watch`` registers a callable whose compiles are all expected to have happened by
 the time ``arm`` is called; from then on a compile of one is reported, because it
 costs a full Inductor compile wherever it lands. Callers decide when that is --
-``TorchSpyreWorker`` arms once warmup returns.
+``SpyreWorkerV2`` arms once warmup returns.
 
 ``on_compile_start`` gives a ``compile_id`` whose last component is the frame's
 compile count, so a first compile and a guard-triggered recompile are

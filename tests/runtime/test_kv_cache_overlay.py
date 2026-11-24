@@ -140,6 +140,17 @@ def test_without_the_hybrid_manager_every_layer_gets_its_own_pages(recorded):
     assert by_head[256].num_kv_heads == 8 and by_head[512].num_kv_heads == 2
 
 
+def test_two_layers_of_one_group_at_one_offset_are_rejected(recorded):
+    """Only layers of different groups may share bytes; two of one group would overwrite
+    each other's KV."""
+    config = _kv_cache_config(_config(hybrid=False), _gemma4_26b(), num_blocks=50)
+    first, second = config.kv_cache_tensors
+    second.offset = first.offset
+
+    with pytest.raises(RuntimeError, match="KV cache group 0 already holds"):
+        kv_cache_setup.allocate_spyre_kv_caches(config, {}, {}, torch.device("cpu"))
+
+
 def test_sizing_counts_one_k_v_pair_per_slot():
     """Upstream's bytes per block: five 1 MiB pages, as five K and five V tensors."""
     layout = _kv_block_layout(_config(), _gemma4_26b())

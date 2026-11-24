@@ -115,6 +115,7 @@ def allocate_spyre_kv_caches(
     }
     num_blocks = kv_cache_config.num_blocks
     pages_by_offset: dict[int, SpyrePagedKVCache] = {}
+    claimed: set[tuple[int, int]] = set()
     kv_caches: dict[str, SpyrePagedKVCache] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         for index, layer_name in enumerate(kv_cache_tensor.layers):
@@ -132,6 +133,12 @@ def allocate_spyre_kv_caches(
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
             offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
+            if (offset, group_id) in claimed:
+                raise RuntimeError(
+                    f"{layer_name}: another layer of KV cache group {group_id} already "
+                    f"holds the pages at byte offset {offset}."
+                )
+            claimed.add((offset, group_id))
             num_pages = num_blocks * pages_per_block
             # The first layer at an offset allocates its pages; layers of other groups at the
             # same offset view them in their own page shape.

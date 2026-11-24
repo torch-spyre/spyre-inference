@@ -15,6 +15,8 @@
 """Unit tests for platform.py configuration logic."""
 
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -1206,3 +1208,32 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
     with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets") as err:
         TorchSpyrePlatform.validate_request(_image_input(256, 281, modality=modality), None)
     assert (err.value.parameter, err.value.value) == ("mm_processor_kwargs", 281)
+
+
+# Only a process's first multi-threaded MKL call is affected, so each check needs a fresh
+# interpreter. One process misses a missing warm-up now and then; two in parallel rarely do.
+# The fp16 and meta defaults make a warm-up that relies on the defaults fail too.
+_HOST_COS_SCRIPT = """
+import numpy as np
+import torch
+from spyre_inference import register
+
+torch.set_default_dtype(torch.float16)
+torch.set_default_device("meta")
+register()
+x = torch.linspace(0, 4096, 1 << 22, dtype=torch.float32, device="cpu")
+ref = np.cos(x.numpy().astype(np.float64))
+print(np.abs(x.cos().numpy() - ref).max())
+"""
+
+
+def test_register_initializes_host_vector_math():
+    env = {**os.environ, "OMP_NUM_THREADS": "32"}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _HOST_COS_SCRIPT], env=env, stdout=subprocess.PIPE, text=True
+        )
+        for _ in range(2)
+    ]
+    errors = [float(p.communicate(timeout=300)[0].split()[-1]) for p in procs]
+    assert max(errors) < 1e-6, f"first host cos max error {errors}, expected ~4e-8"

@@ -83,13 +83,39 @@ def _convert_op_func(
     if tensor.device.type == "spyre" and tensor.dtype != target_dtype:
         tensor = tensor.to(device="cpu")
 
-    if tensor.dtype != target_dtype:
+    owned = tensor.dtype != target_dtype
+    if owned:
         tensor = tensor.to(dtype=target_dtype)
 
     if tensor.device.type != target_device.type:
-        tensor = tensor.to(device=target_device)
+        if tensor.device.type == "cpu":
+            tensor = _async_source(tensor, owned).to(device=target_device, non_blocking=True)
+        else:
+            tensor = tensor.to(device=target_device)
 
     return tensor
+
+
+# torch-spyre stages converting uploads (int64 narrowing, the fp16 format change) before a
+# non-blocking copy returns; any other dtype is read by the DMA later, so it gets a private copy.
+_STAGED_UPLOAD_DTYPES = (torch.int64, torch.float16)
+
+
+def _async_source(tensor: torch.Tensor, owned: bool) -> torch.Tensor:
+    if owned or tensor.dtype in _STAGED_UPLOAD_DTYPES:
+        return tensor
+    return tensor.clone()
+
+
+def _to_layout_async(tensor: torch.Tensor, device, device_layout) -> torch.Tensor:
+    # torch-spyre's layout-aware `Tensor.to` always uploads blocking.
+    from torch_spyre._C import copy_tensor, spyre_empty_with_layout
+
+    dst = spyre_empty_with_layout(
+        tensor.size(), tensor.stride(), tensor.dtype, device_layout, device=device
+    )
+    copy_tensor(_async_source(tensor, owned=False), dst, non_blocking=True)
+    return dst
 
 
 def _convert_op_fake(
@@ -130,6 +156,16 @@ def convert(tensor, device=None, dtype=None, device_layout=None):
         # both a host->device placement and a same-device relayout (copy_from_d2d),
         # so a layout-aware conversion must not insist on a device transfer: a
         # cache already moved to Spyre still needs its rows placed outermost.
+        # Only a dense same-dtype upload is async: `Tensor.to` converts dtype on the device
+        # and honours the source strides, which the async copy does not.
+        if (
+            tensor.device.type == "cpu"
+            and device is not None
+            and device.type == "spyre"
+            and dtype in (None, tensor.dtype)
+            and tensor.is_contiguous()
+        ):
+            return _to_layout_async(tensor, device, device_layout)
         return tensor.to(
             tensor.device if device is None else device,
             dtype=tensor.dtype if dtype is None else dtype,

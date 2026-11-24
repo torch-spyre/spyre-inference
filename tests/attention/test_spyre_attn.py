@@ -560,14 +560,16 @@ def test_spyre_attn_bfloat16(
     )
 
 
-def test_kernel_blocks_are_cache_block_size():
+def test_kernel_blocks_are_cache_block_size(monkeypatch):
     """The kernels run at cache_config.block_size only: upstream keeps a block of that size
     whole and splits a block the hybrid manager grew (gemma-4's 256-token global group)
     into it, without padding either one's page."""
     from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backend import MultipleOf
     from vllm.v1.kv_cache_interface import FullAttentionSpec
     from vllm.v1.worker.utils import customize_attention_spec, select_common_block_size
 
+    from spyre_inference.v1.attention.backends import spyre_attn
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
 
     backend = SpyreAttentionBackend
@@ -583,6 +585,9 @@ def test_kernel_blocks_are_cache_block_size():
             )
             assert select_common_block_size(block_size, [backend], [spec]) == 128
             assert spec.page_size_bytes % spec.get_block_stride_alignment() == 0
+    # Without a config only the stick constrains the block size.
+    monkeypatch.setattr(spyre_attn, "get_current_vllm_config_or_none", lambda: None)
+    assert backend.get_supported_kernel_block_sizes() == [MultipleOf(64)]
 
 
 def test_block_size_validation():

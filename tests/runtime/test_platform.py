@@ -1218,17 +1218,10 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    ("architectures", "rows", "want_len", "want_seqs"),
-    [
-        (["XLMRobertaModel"], 258, 256, 8),
-        (["BertModel"], 258, 258, 4),
-        (["XLMRobertaModel"], 514, 512, 4),
-        (["BertModel"], 8192, 8192, 4),
-    ],
+    ("max_model_len", "want"),
+    [(128, 16), (256, 8), (512, 4), (514, 4), (2048, 4), (8192, 4)],
 )
-def test_pooling_default_max_num_seqs_is_capped_and_floored_at_4(
-    monkeypatch, architectures, rows, want_len, want_seqs
-):
+def test_pooling_default_max_num_seqs_widens_short_models_only(monkeypatch, max_model_len, want):
     from vllm.engine.arg_utils import EngineArgs
 
     from spyre_inference.platform import TorchSpyrePlatform
@@ -1242,14 +1235,7 @@ def test_pooling_default_max_num_seqs_is_capped_and_floored_at_4(
     monkeypatch.setattr(EngineArgs, "create_model_config", EngineArgs.create_model_config)
     TorchSpyrePlatform.pre_register_and_update()
 
-    hf_config = SimpleNamespace(
-        architectures=architectures,
-        max_position_embeddings=rows,
-        pad_token_id=1,
-        position_embedding_type="absolute",
-    )
-    model_config = SimpleNamespace(runner_type="pooling", hf_config=hf_config, max_model_len=rows)
+    model_config = SimpleNamespace(runner_type="pooling", max_model_len=max_model_len)
     args = SimpleNamespace(max_num_seqs=None, max_num_batched_tokens=None)
     EngineArgs._set_default_max_num_seqs_and_batched_tokens_args(args, None, model_config, None)
-    assert model_config.max_model_len == want_len
-    assert args.max_num_seqs == want_seqs
+    assert args.max_num_seqs == want

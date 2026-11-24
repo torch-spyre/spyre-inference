@@ -15,8 +15,9 @@
 """Spyre RMSNorm and GemmaRMSNorm: OOT dispatch, and on-device agreement with the fp32 reference.
 
 Both compile upstream ``forward_native`` where no block graph encloses them. GemmaRMSNorm
-compiles even under enforce_eager: its trailing fp32 multiply against a STANDARD
-``[hidden]`` weight is a mixed-EA form the backend can neither broadcast nor de-stagger.
+lowered eagerly in fp32 only until torch-spyre learned to broadcast a STANDARD
+``[hidden]`` weight against a staggered-EA activation (torch-spyre#2971); both dtypes
+now have a working eager form, so the layer compiles only in compiled mode.
 
 Since the op forwards to vLLM's ``forward_native``, the oracle is the fp32-accumulating
 upstream definition itself, so the tolerance is the device's own error rather than the
@@ -27,7 +28,6 @@ import sys
 
 import pytest
 import torch
-from torch._inductor.exc import InductorError
 
 # vLLM's own float16 bound for these ops (ir/ops/layernorm.py `override_tolerance`).
 _ATOL, _RTOL = 1e-2, 2e-3
@@ -151,31 +151,12 @@ def test_spyre_gemma_rmsnorm_accumulates_the_variance_in_fp32(default_vllm_confi
 
 @pytest.mark.rmsnorm
 @pytest.mark.parametrize("use_residual", [False, True])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(
-            torch.float16,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=InductorError,
-                reason=(
-                    "fp16 activations reach the trailing weight multiply as a staggered-EA "
-                    "fp32 convert (torch-spyre#2971) that the STANDARD [hidden] weight cannot "
-                    "broadcast against, so eager lowering raises 'Multi-arg pointwise with "
-                    "mixed EA'. This is what force=True exists for; when it XPASS-es, "
-                    "drop force from SpyreGemmaRMSNorm."
-                ),
-            ),
-        ),
-        torch.float32,
-    ],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_gemma_rmsnorm_eager_support_is_fp32_only(default_vllm_config, dtype, use_residual):
-    """Eager (uncompiled) ``forward_native`` lowers in fp32 but not in fp16.
+    """Eager (uncompiled) ``forward_native`` lowers in both dtypes.
 
     Calls the undecorated upstream method so ``maybe_compile`` cannot compile it,
-    which is the one path ``force=True`` denies the layer.
+    which is the one path ``force=True`` denied the layer.
     """
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 

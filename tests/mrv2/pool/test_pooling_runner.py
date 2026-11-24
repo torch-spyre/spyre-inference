@@ -28,9 +28,9 @@ from vllm.v1.pool.metadata import PoolingStates
 
 from spyre_inference.v1.pool import warmup
 from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 from spyre_inference.v1.worker.spyre.pool import pooling_runner
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
-from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 
 _HIDDEN = 4
 

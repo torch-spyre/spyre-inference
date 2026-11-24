@@ -212,13 +212,17 @@ host and copied into its slice of the device tensor. The copy is host-bound (the
 conversion), so the chunking costs no time, and a chunk's transpose stays in cache where a
 whole stack's does not.
 
-On a first start, with either model runner, `SPYRE_PARALLEL_WARMUP_PRECOMPILE=N` traces the warm-up
+On a first start, `SPYRE_PARALLEL_WARMUP_PRECOMPILE=N` traces the warm-up
 buckets once with each graph's Spyre inner compile in one of `N` forked processes (torch-spyre's `fork_inner_compiles`,
 with stand-in graphs that return zeros of the right shape so a bucket's forward runs to its end),
 then resets Dynamo and runs the normal warm-up as a second pass of cache hits. The buckets whose
 token count is off the stick run their experts behind the opaque MoE op, whose compiled regions a
 stand-in block never reaches, so the first pass ends by running those experts itself
-(`moe.warm_opaque_regions`). A restart with warm caches skips it.
+(`moe.warm_opaque_regions`). A restart with warm caches skips it. At tensor parallel size above
+1 it sets `ENABLE_LX_CONTEXT_SWITCHING=0` unless that is set already: with LX context switching
+on, a worker can cache a graph that calls an all-reduce on a buffer it never allocated
+(torch-spyre/torch-spyre#6563). The warm-up logs a warning when a worker's LX planning stops at
+its time limit, since that plan is kept in the cache.
 
 The relayout and copy of one layer's stacks are independent of every other layer's, so loading
 prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
@@ -451,7 +455,7 @@ disagree.
 A layer with a `kv_sharing_target_layer_name` (gemma-4 E2B / E4B) allocates no cache: the
 runner aliases its target's pages in `initialize_kv_cache_tensors`. vLLM adds such a layer to
 its target's KV cache group but not to that group's `UniformTypeKVCacheSpecs`, so the
-per-layer spec lookup in `initialize_attn_backend` would `KeyError`; both runners hand the
+per-layer spec lookup in `initialize_attn_backend` would `KeyError`; the runner hands the
 attention backend a copy (`with_kv_sharing_layer_specs`) that maps it to the target's spec,
 leaving the retained config's specs, and so its `page_size_bytes`, physical. YOCO fast prefill
 (`kv_sharing_fast_prefill`) swaps in an attention backend Spyre does not provide and is rejected.
@@ -667,25 +671,20 @@ attention kernels.
 
 ## Device Placement Strategy
 
-`TorchSpyreModelRunner` inherits from vLLM's `GPUModelRunner` and treats Spyre as the
-"GPU" in the `CpuGpuBuffer` pattern. Buffers are created via a `SpyreCpuGpuBuffer`
-override:
-
-- **Float dtypes**: `.cpu` on CPU (numpy staging for the scheduler), `.gpu` on Spyre as
-  `float16`
-- **Int / bool dtypes**: `.gpu` aliased to `.cpu` (Spyre doesn't natively support these)
-
-`self.device` stays `cpu` so that scatter, indexing, and block-table ops run on CPU, but
-float compute tensors land on Spyre via `self._spyre_device`. Because there is no
-`vllm._C` under `VLLM_TARGET_DEVICE=empty`, the runner also swaps in a pure-PyTorch
-`_compute_slot_mapping_impl` for the paged-cache slot-mapping kernel.
+`SpyreModelRunnerV2` (`v1/worker/spyre/model_runner.py`) subclasses Model Runner V2's
+`GPUModelRunner` (`vllm/v1/worker/gpu/model_runner.py`) on `device=cpu`: every MRV2 buffer,
+the input batch, block tables and sampling state live on the host, and the runner keeps
+the real device as `spyre_device`. MRV2's `torch.cuda` streams and events are replaced by
+host placeholders (`device_shims.py`), and every `@triton.jit` kernel MRV2 launches
+(batch prep, slot mapping, sampling, rejection) is bound to a csrc/ host op in its place
+(`kernels.py`, `csrc/cpu/mrv2_kernels.cpp`), so no Triton and no `vllm._C` is needed.
 
 At load time, `load_model` moves every module except `Attention` scale buffers onto Spyre.
 The weight transposes happen before that, in each layer's
 `process_weights_after_loading`, while the weights are still on CPU.
 
-`_SpyreModelWrapper` sits between the model runner and the model and converts at the
-call boundary:
+`_SpyreModelWrapper` (`v1/worker/spyre/model_wrapper.py`) sits between the model runner and
+the model and converts at the call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
 - **Output**: a generative model's hidden states stay on Spyre. Upstream's
@@ -723,49 +722,27 @@ rotation-cache gather and the embedding gather also run on-device.
 ## Host-side sampling
 
 `SpyreLogitsProcessor` hands the sampler CPU logits, so every sampling step runs on the
-host, serially between device forwards. vLLM picks its sampler path by platform:
-`TorchSpyrePlatform` is `PlatformEnum.OOT`, so `is_cpu()` is `False`, and
-`TopKTopPSampler` falls through to `forward_native` — eager PyTorch, with none of the
-fused kernels upstream reserves for `forward_cpu`. Left as is, that path sorts the full
-`[batch, vocab]` logits for top-k/top-p and generates a fresh `[batch, vocab]` noise tensor
-for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
-large share of each decode step.
+host, serially between device forwards, through MRV2's own sampler. Its Triton kernels
+(temperature, min-p, penalties, logit bias, the Gumbel draw, logprobs, rejection) run as
+the csrc/ host ops `kernels.bind()` installs; they match triton-cpu bit for bit
+(`tests/mrv2/kernels/`), so a seeded request draws the same tokens either way.
 
-`SpyreModelRunner` patches upstream's `Sampler` in place after construction, pointing its
-greedy draw at `greedy_sample` (`v1/sample/sampler.py`) and its random draw at
-`SpyreTopKTopPSampler`, so every holder of it, the rejection sampler included, samples the
-same way. That brings back the CPU kernels and drops the full-vocabulary sort:
+Top-k / top-p is the one sampling step `kernels.bind()` replaces with something other than
+a port: MRV2's `apply_top_k_top_p` sorts the full `[batch, vocab]` logits, which at a 262k
+vocabulary is a large share of each decode step. `spyre_apply_top_k_top_p` takes its place
+at both call sites. With the filter ops loaded, `apply_top_k_top_p_kernels` masks in place.
+Top-k keeps every tie with the k-th value and does not sort. Top-k together with top-p
+sorts those survivors and cuts top-p exactly on them, so a k near the vocabulary size is
+close to a full sort. Top-p alone, including a row whose k is disabled in a mixed batch,
+uses vLLM's approximate CPU kernel: the kept set can differ from a full sort by a few
+boundary tokens, and it does not drop below the requested probability mass. Without those
+ops, top-k uses `topk`, top-k with top-p uses `apply_top_k_top_p_sort_free`, and top-p
+alone sorts.
 
-- **Random draw** — `SpyreTopKTopPSampler.forward_native` calls
-  `torch.ops._spyre_C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
-  Gumbel noise `g` hashed per element from a per-row seed (splitmix64 of `(seed, i)`), so
-  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
-  running best (including every `-inf` left by top-k/top-p) are skipped exactly, and most
-  others are rejected with one `exp` before the two `log`s of the Gumbel transform. A
-  seeded request draws its row seed from its own `torch.Generator`, so it stays
-  reproducible. `use_fp64_gumbel` keeps fresh fp64 noise, drawn in log space
-  (`argmax(x - log q)`, `q ~ Exp(1)`). vLLM's kernel reads its noise from a fixed 2^20-entry
-  table instead, which limits each row to 2^20 noise windows and leaves much of a large
-  vocabulary unreachable.
-- **Greedy** — `greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
-  vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
-  single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
-  scan.
-- **Top-k / top-p** — with the filter ops loaded, `apply_top_k_top_p_kernels` masks in
-  place. Top-k keeps every tie with the k-th value and does not sort. Top-k together
-  with top-p sorts those survivors and cuts top-p exactly on them, so a k near the
-  vocabulary size is close to a full sort. Top-p alone, including a row whose k is disabled in a
-  mixed batch, uses vLLM's approximate CPU kernel: the kept set can differ from a full
-  sort by a few boundary tokens, and it does not drop below the requested probability
-  mass. Without those ops, top-k uses `topk`, top-k with top-p uses
-  `apply_top_k_top_p_sort_free`, and top-p alone sorts. Speculative decoding's
-  `apply_sampling_constraints` is separate from that sampler: it still calls vLLM's
-  `apply_top_k_top_p` and sorts. The shared `Sampler` only covers the token draw.
-
-The kernels live in `csrc/cpu/sampling_kernels.cpp` and `csrc/cpu/topk_topp_sampler.cpp`,
-with the vector exp in `csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from
-`setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
-so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
+The filters live in `csrc/cpu/topk_topp_sampler.cpp`, with the vector exp in
+`csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from `setup.py`, together with the
+MRV2 host ops, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from
+vLLM, so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
 AVX2 fallback (`_C_AVX2`). `v1/sample/sampling_kernels.py` loads `_C` when
 `torch.cpu.get_capabilities()` reports `avx512_f`, `avx512_vl`, `avx512_bw` and
 `avx512_dq`, and `_C_AVX2` when it reports `avx2` and `fma3` but not that set.
@@ -773,12 +750,9 @@ AVX512F alone is not enough: the build also uses VL, BW and DQ. The check ignore
 `ATEN_CPU_CAPABILITY`, so pinning ATen's dispatch level keeps the extension.
 The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
-cannot collide with a vLLM `_C` in the same environment. If the extension
-is missing or fails to import (a failed build, or a dev checkout that never built it), the
-import logs a warning and the samplers fall back to `torch.argmax` and a fresh-noise
-log-space draw. Because the sampler reimplements
-the tail of upstream `TopKTopPSampler.forward_native`, it has to be re-synced on a vLLM
-bump.
+cannot collide with a vLLM `_C` in the same environment. If the extension is missing or
+fails to import, the import logs a warning and the worker refuses to start: the MRV2 host
+ops have no Python fallback.
 
 ## Transformers backend
 
@@ -832,7 +806,7 @@ backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't 
 `tests/probes/test_spyre_comms_native_probes.py` xfail-strict suite is the canonical
 signal: when a probe flips green, delete the corresponding override or workaround.
 
-The worker (`TorchSpyreWorker`) inherits directly from vLLM's `Worker` (gpu_worker), not
+The worker (`SpyreWorkerV2`) inherits directly from vLLM's `Worker` (gpu_worker), not
 `CPUWorker` — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
 profiling). Data and pipeline parallelism (`data_parallel_size > 1` or
 `pipeline_parallel_size > 1`) are rejected in `check_and_update_config`.

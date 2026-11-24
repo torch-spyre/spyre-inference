@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The warm-up's first pass in forked compile workers, shared by the V1 and V2 runners.
+"""The warm-up's first pass in forked compile workers.
 
 ``SPYRE_PARALLEL_WARMUP_PRECOMPILE=N`` traces the warm-up once with every graph's Spyre
 inner compile forked into one of ``N`` processes (torch-spyre's ``fork_inner_compiles``
 with stand-in graphs), then forgets the stand-ins so the runner's normal warm-up pass
-retraces the same graphs into cache hits. Each runner supplies its own trace of the
-buckets; this module owns the pool, its guards and the accounting.
+retraces the same graphs into cache hits. The runner supplies its trace of the
+buckets, and this module owns the pool, its guards and the accounting.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -34,6 +35,30 @@ from vllm.logger import init_logger
 from spyre_inference import envs
 
 logger = init_logger(__name__)
+
+# torch-spyre reads it when its Inductor config loads, in each worker.
+LX_CONTEXT_SWITCHING_ENV = "ENABLE_LX_CONTEXT_SWITCHING"
+
+
+def keep_collectives_out_of_lx(tensor_parallel_size: int) -> None:
+    """At TP > 1 with the workers on, turn torch-spyre's LX context switching off.
+
+    With it on, the LX planner may keep an all-reduce input in LX, and the wrapper a
+    forked worker caches then calls the collective on a buffer it never allocated
+    (torch-spyre/torch-spyre#6563). Called before the workers start, so each of them
+    reads the value. An explicit value still wins.
+    """
+    if envs.SPYRE_PARALLEL_WARMUP_PRECOMPILE <= 0 or tensor_parallel_size <= 1:
+        return
+    if LX_CONTEXT_SWITCHING_ENV in os.environ:
+        return
+    os.environ[LX_CONTEXT_SWITCHING_ENV] = "0"
+    logger.info(
+        "SPYRE_PARALLEL_WARMUP_PRECOMPILE at tensor parallel size %d: setting %s=0 "
+        "(torch-spyre/torch-spyre#6563).",
+        tensor_parallel_size,
+        LX_CONTEXT_SWITCHING_ENV,
+    )
 
 
 def precompile_in_workers(
@@ -96,6 +121,17 @@ def precompile_in_workers(
         else f"{pool.submitted} graphs compiled in {workers} workers ({pool.failed} failed)",
         time.time() - t0,
     )
+    # A solve that stops at its time limit keeps the best plan found so far, and the FX
+    # graph cache keeps that plan (a torch-spyre before #6533 does not count them).
+    time_limited = getattr(pool, "time_limited", 0)
+    if not warm and time_limited:
+        logger.warning(
+            "Parallel warm-up precompile: %d of %d graphs stopped LX planning at its time "
+            "limit, so their kernels may be slower. Fewer workers or a larger "
+            "CPSAT_TIME_LIMIT_SECONDS give each solve more time.",
+            time_limited,
+            pool.submitted,
+        )
     if warm or not pool.submitted:
         return None
     return SecondPassCheck(expected=pool.ok)

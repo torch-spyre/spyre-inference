@@ -32,7 +32,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
-    # Not imported at runtime: the V1 runner imports spyre_encoder_attn lazily.
+    # Not imported at runtime: spyre_encoder_attn is imported lazily.
     from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
         EncoderGroupPlan,
         EncoderRectPlan,

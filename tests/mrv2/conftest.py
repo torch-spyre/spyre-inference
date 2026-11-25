@@ -14,7 +14,7 @@
 
 """Guards for tests/mrv2: an autouse fixture makes vllm.LLM.__init__() raise,
 and a time budget (1s/test summed across setup+call+teardown, ~20s/directory,
-exempting tests marked ``triton_cpu``, ``subprocess_isolated``,
+exempting tests marked ``triton_cpu``, ``subprocess_isolated`` or
 ``spyre_device`` or ``ast_walk``) fails the run if exceeded. The budget alone
 catches an accidental real torch.compile() too (its fixed tracing/codegen
 overhead alone exceeds the per-test budget), without a dedicated

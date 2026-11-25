@@ -93,9 +93,8 @@ def _state(causal: bool = False, **config_kwargs) -> SpyreEncoderOnlyModelState:
     return state
 
 
-def _step(state, batch):
-    """One MRV2 step's model-state calls, in execute_model's order."""
-    attn_metadata = state.prepare_attn(
+def _plan(state, batch):
+    return state.prepare_attn(
         batch,
         CUDAGraphMode.NONE,
         block_tables=(),
@@ -103,6 +102,11 @@ def _step(state, batch):
         attn_groups=[],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
     )
+
+
+def _step(state, batch):
+    """One MRV2 step's model-state calls, in execute_model's order."""
+    attn_metadata = _plan(state, batch)
     return attn_metadata, state.prepare_inputs(batch, req_states=None)
 
 
@@ -209,8 +213,11 @@ def _mm_state(monkeypatch, embeds: torch.Tensor) -> SpyreEncoderOnlyModelState:
 
 
 def _mm_step(state, batch):
-    _step(state, batch)
-    return state.prepare_inputs_embeds({}, batch, req_states=None)  # ty: ignore[invalid-argument-type]
+    """execute_model's order: prepare_attn, prepare_inputs_embeds, then prepare_inputs."""
+    _plan(state, batch)
+    embeds = state.prepare_inputs_embeds({}, batch, req_states=None)  # ty: ignore[invalid-argument-type]
+    state.prepare_inputs(batch, req_states=None)
+    return embeds
 
 
 def test_multimodal_plans_a_fitting_batch_rectangular(monkeypatch):

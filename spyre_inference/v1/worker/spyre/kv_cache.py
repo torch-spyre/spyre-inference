@@ -18,8 +18,9 @@
 Upstream's initialize_kv_cache runs as-is, so every attribute it sets stays
 upstream's. Its two module-level calls have no override hook, so they're swapped
 for the call: init_attn_backend gains the window split (attn_groups.py), and
-init_kv_cache allocates per-layer SpyrePagedKVCache pages on Spyre, draft layers
-included. The draft's own groups get the split in SpyreDFlashSpeculator.set_attn.
+init_kv_cache allocates SpyrePagedKVCache pages on Spyre at upstream's KVCacheTensor
+placement, draft layers included. The draft's own groups get the split in
+SpyreDFlashSpeculator.set_attn.
 
 The pages go on runner.spyre_kv_caches; upstream gets an empty dict back, since it
 filters by ``cache.device``, which the page tuple lacks. Only the KV connector and
@@ -68,6 +69,7 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
                 forward_context,
                 get_shared_kv_cache_layers(vllm_config),
                 runner.spyre_device,
+                kernel_block_sizes,
             )
         bindable = {name: c for name, c in kv_caches.items() if name in forward_context}
         bind_kv_cache_to_layers(bindable, forward_context)  # ty: ignore[invalid-argument-type]

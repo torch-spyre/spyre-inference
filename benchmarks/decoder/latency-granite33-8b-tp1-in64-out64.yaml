@@ -14,8 +14,7 @@ spec:
     load: {executor: iterations, iterations: 10, warmup_iterations: 2}
   run:
     cache: warm
-    repeats: 1
-    command: [make, bench-case, "CASE={case}", "BENCH_TYPES=latency", "RESULTS_DIR={raw_dir}"]
+    command: [make, bench-case, "CASE={case}", "BENCH_TYPES=latency", "RESULTS_DIR={raw_repeat_dir}"]
   identity:
     mode: ingest
     profile: vllm

@@ -16,8 +16,7 @@ spec:
     load: {executor: batch, requests: 16}
   run:
     cache: warm
-    repeats: 1
-    command: [make, bench-case, "CASE={case}", "BENCH_TYPES=throughput", "RESULTS_DIR={raw_dir}"]
+    command: [make, bench-case, "CASE={case}", "BENCH_TYPES=throughput", "RESULTS_DIR={raw_repeat_dir}"]
   identity:
     mode: ingest
     profile: vllm

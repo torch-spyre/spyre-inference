@@ -126,15 +126,17 @@ bench-run: ## Plan (unless BENCH_PLAN=plan.json), fetch the traces, then run on 
 		$(BENCH_PREFIX) $(BENCH) run --catalog '$(BENCH_DIR)' $(_bench_central) \
 			--plan '$(or $(BENCH_PLAN),$(BENCH_PLAN_FILE))' --out '$(BENCH_RESULTS_DIR)')
 
-# The ingest keys a stored benchmark by its file's basename, and each case's command already wrote
-# `<test_name>.json`, so a flat copy is all that is needed. Names cannot collide: a test name is
-# unique across the configs, which bench-check-ids enforces.
-bench-collect: ## Flatten the run's per-case result files into BENCH_NATIVE_DIR for the ClickHouse ingest.
+# The repeat-NNN level is kept: a repeated benchmark writes one `<test_name>.json` per repeat, and
+# the ingest reads the repeat from that directory name.
+bench-collect: ## Gather the run's per-case result files into BENCH_NATIVE_DIR for the ClickHouse ingest.
 	@mkdir -p '$(BENCH_NATIVE_DIR)'
 	@found=0; \
-	for f in $(BENCH_RESULTS_DIR)/cases/*/raw/*.json; do \
+	for f in $(BENCH_RESULTS_DIR)/cases/*/raw/*.json $(BENCH_RESULTS_DIR)/cases/*/raw/repeat-*/*.json; do \
 		[ -e "$$f" ] || continue; \
-		cp "$$f" '$(BENCH_NATIVE_DIR)/'; \
+		rep=$$(basename "$$(dirname "$$f")"); \
+		case "$$rep" in repeat-*) dest='$(BENCH_NATIVE_DIR)'/"$$rep";; *) dest='$(BENCH_NATIVE_DIR)';; esac; \
+		mkdir -p "$$dest"; \
+		cp "$$f" "$$dest/"; \
 		found=$$((found+1)); \
 	done; \
 	echo "bench-collect: $$found result file(s) in $(BENCH_NATIVE_DIR)"; \

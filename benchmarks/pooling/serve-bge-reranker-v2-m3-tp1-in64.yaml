@@ -17,8 +17,7 @@ spec:
     sampling: {ignore_eos: true}
   run:
     cache: warm
-    repeats: 1
-    command: [make, bench-case, "CASE={case}", "BENCH_TYPES=serve", "RESULTS_DIR={raw_dir}"]
+    command: [make, bench-case, "CASE={case}", "BENCH_TYPES=serve", "RESULTS_DIR={raw_repeat_dir}"]
   identity:
     mode: ingest
     profile: vllm

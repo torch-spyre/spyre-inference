@@ -304,11 +304,12 @@ def benchmark_file(config: dict, kind: str, system: str, dataset: str | None, in
         *workload_block(config, kind, dataset),
         "  run:",
         "    cache: warm",
-        "    repeats: 1",
-        # Through the Makefile, so the runner's location is written down once rather than in every
-        # generated file.
+        # No `repeats`: the planner then takes max(min_repeats) of the metrics this case reports,
+        # so the serve cases get the llm-serving pack's 3 and the offline ones stay at 1.
+        # Per-repeat dir because the runner's output filenames are fixed: one flat dir would
+        # leave only the last repeat's results behind.
         f'    command: [make, bench-case, "CASE={{case}}", "BENCH_TYPES={bench_type}",'
-        ' "RESULTS_DIR={raw_dir}"]',
+        ' "RESULTS_DIR={raw_repeat_dir}"]',
         *identity_block(config["test_name"], ingest),
         "  variants:",
         f"    - name: {name}",

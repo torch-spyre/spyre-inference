@@ -49,9 +49,11 @@ import platform
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from types import FunctionType
 from typing import Any
 
 import torch
+import torch._functorch.config
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -158,12 +160,12 @@ def _compile_mode() -> Iterator[None]:
 class AotKernel:
     """A ``torch.compile``'d kernel whose compiled code is kept on disk per input key."""
 
-    def __init__(self, fn: Callable[..., Any], compiled: Callable[..., Any]) -> None:
+    def __init__(self, fn: FunctionType, compiled: Callable[..., Any]) -> None:
         self._fn = fn
         self._compiled = compiled
         # A second compile object for aot_compile only, which keeps just the shape
         # guards. The plain object keeps all its guards for the fallback.
-        self._aot = torch.compile(
+        self._aot: Any = torch.compile(
             fn,
             dynamic=False,
             fullgraph=True,

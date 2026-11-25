@@ -97,6 +97,9 @@ def _run(disable_hybrid_kv_cache_manager: bool) -> tuple[int, Trace]:
     return num_groups, trace
 
 
+# Two compiled engine inits (warmup + attention recording, ~860s each on x86_64 CI pods in
+# run 45572834994) exceed the 1800s default on their own before generate runs at all.
+@pytest.mark.timeout(3600)
 def test_hybrid_kv_cache_manager_matches_it_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Covers the pages each group views, the kernel block split and the sliding groups'
     block freeing and reuse, which a vLLM bump changing placement or kernel block selection

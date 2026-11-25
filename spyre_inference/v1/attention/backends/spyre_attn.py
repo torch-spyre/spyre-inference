@@ -2294,6 +2294,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 v_pages,
                 attn_metadata.chunk_page_ids_dev,
                 attn_metadata.mask_by_chunk_dev,
+                attn_metadata.chunk_range,
                 b_seqs,
                 blocks_per_chunk,
                 block_size,

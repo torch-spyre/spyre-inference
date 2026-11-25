@@ -978,29 +978,44 @@ class TestRecordBatchedVerify:
         assert compiles() == snapshot
 
     def test_real_verify_batch_lands_on_a_recorded_key(self, spec_builder):
-        from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
+        """Built by the builder whose bucketer is enumerated, as warmup records it."""
+        from vllm.v1.attention.backend import CommonAttentionMetadata
 
+        verify_len = self.K + 1
         keys = {
-            (v.num_seqs, v.blocks_per_chunk, v.num_chunks, v.verify_len)
+            (v.num_seqs, v.blocks_per_chunk, None if v.dynamic_chunks else v.num_chunks)
             for v in spec_builder._attn_bucketer.batched_decode_variants()
         }
         for num_seqs in (1, 3):
             for kv_len in (65, 200):
-                metadata = _padded_mask_metadata(
-                    [(self.K + 1, kv_len)] * num_seqs,
-                    block_size=BLOCK_SIZE,
-                    num_query_heads=NUM_HEADS,
-                    num_kv_heads=NUM_KV_HEADS,
-                    head_size=HEAD_SIZE,
-                    max_num_blocks=NUM_PAGES,
+                query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32) * verify_len
+                seq_lens = torch.full((num_seqs,), kv_len, dtype=torch.int32)
+                metadata = spec_builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=CommonAttentionMetadata(
+                        query_start_loc=query_start_loc,
+                        query_start_loc_cpu=query_start_loc,
+                        seq_lens=seq_lens,
+                        num_reqs=num_seqs,
+                        num_actual_tokens=num_seqs * verify_len,
+                        max_query_len=verify_len,
+                        max_seq_len=kv_len,
+                        block_table_tensor=torch.arange(
+                            num_seqs * NUM_PAGES, dtype=torch.int32
+                        ).reshape(num_seqs, NUM_PAGES),
+                        slot_mapping=torch.zeros(num_seqs * verify_len, dtype=torch.int64),
+                        causal=True,
+                        is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+                    ),
                 )
                 assert metadata.padded_num_seqs is not None, "builder declined the batched path"
                 assert metadata.chunk_page_ids_cpu is not None
+                assert metadata.decode_query_len == verify_len
+                num_chunks = metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk
                 key = (
                     metadata.padded_num_seqs,
                     metadata.blocks_per_chunk,
-                    metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
-                    metadata.decode_query_len,
+                    None if metadata.chunk_range is not None else num_chunks,
                 )
                 assert key in keys, f"{key} was never recorded"
 

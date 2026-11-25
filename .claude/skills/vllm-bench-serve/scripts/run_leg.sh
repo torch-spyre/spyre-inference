@@ -4,15 +4,18 @@
 # `make perf-tests`, check the leg with collect.py validate, and restore the install. A
 # committed ref runs from a throwaway worktree; the working copy is never touched.
 #
-# Usage: run_leg.sh --bench DIR --leg NAME --ref REF [--label TEXT] [--role ROLE] [--env K=V]...
+# Usage: run_leg.sh --bench DIR --leg NAME --ref REF [--label TEXT] [--role ROLE] [--startup]
+#                   [--env K=V]...
 #   --bench DIR   bench directory holding serve-tests.yaml; the leg writes to DIR/NAME/
 #   --leg NAME    leg directory name, e.g. pr1043 or main
 #   --ref REF     git ref or sha; "." for the working copy, uncommitted changes included
 #   --label TEXT  leg name in the report (default: NAME)
 #   --role ROLE   target (default) or baseline
-#   --env K=V     env var for this leg, repeatable; SPYRE_KERNEL_CACHE=1 unless given. With
-#                 SPYRE_KERNEL_CACHE=0, TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 and
-#                 VLLM_DISABLE_COMPILE_CACHE=1 are also set unless given, so nothing is cached
+#   --startup     cold then warm start per config on a fresh private compile cache
+#                 (BENCH_SERVE_COMPILE_CACHE=cold-warm); default: one start on the default
+#                 cache path, its cache state reported
+#   --env K=V     env var for this leg, repeatable; SPYRE_KERNEL_CACHE=1 unless given. An
+#                 env var that disables a compile cache is rejected
 # Writes DIR/NAME/{leg.json,env.txt,sync.log,run.log,results/}.
 # Exit: 0 valid leg; 1 the run or the validity check failed; 2 bad usage or setup failure.
 # The harness .venv is restored from the harness checkout's lock, so a package installed by
@@ -21,7 +24,7 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
-BENCH="" LEG="" REF="" LABEL="" ROLE=target
+BENCH="" LEG="" REF="" LABEL="" ROLE=target COMPILE_CACHE=default
 ENVS=()
 die() { echo "run_leg.sh: $1" >&2; exit "${2:-2}"; }
 while [ $# -gt 0 ]; do
@@ -31,14 +34,24 @@ while [ $# -gt 0 ]; do
     --ref) REF=$2; shift 2 ;;
     --label) LABEL=$2; shift 2 ;;
     --role) ROLE=$2; shift 2 ;;
+    --startup) COMPILE_CACHE=cold-warm; shift ;;
     --env) [[ $2 == *=* ]] || die "--env needs KEY=VALUE, got $2"
            ENVS+=("$2"); shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) die "unknown option $1" ;;
   esac
 done
 [ -n "$BENCH" ] && [ -n "$LEG" ] && [ -n "$REF" ] || die "--bench, --leg and --ref are required"
 [[ $ROLE == target || $ROLE == baseline ]] || die "--role must be target or baseline"
+# Startup is measured cold and warm, never with a cache off: no deployment runs that way.
+for kv in "${ENVS[@]}"; do
+  case "$kv" in
+    SPYRE_KERNEL_CACHE=1|TORCHINDUCTOR_FORCE_DISABLE_CACHES=0|VLLM_DISABLE_COMPILE_CACHE=0) ;;
+    SPYRE_KERNEL_CACHE=*|TORCHINDUCTOR_FORCE_DISABLE_CACHES=*|VLLM_DISABLE_COMPILE_CACHE=*)
+      die "--env $kv disables a compile cache; use --startup for cold startup times" ;;
+    BENCH_SERVE_COMPILE_CACHE=*) die "use --startup instead of --env $kv" ;;
+  esac
+done
 BENCH=$(realpath "$BENCH")
 [ -f "$BENCH/serve-tests.yaml" ] || die "no $BENCH/serve-tests.yaml"
 OUT=$BENCH/$LEG
@@ -105,14 +118,14 @@ json.dump({
     "torch_spyre_pinned": e.get("TS_PIN", ""), "torch_spyre": e.get("TS_REV", ""),
     "torch": e.get("LEG_TORCH", ""), "vllm": e.get("LEG_VLLM", ""),
     "rpms_source": e.get("RPMS_SOURCE", ""), "rpms": json.loads(e.get("RPMS", "{}") or "{}"),
-    "env": dict(kv.split("=", 1) for kv in envs),
+    "env": dict(kv.split("=", 1) for kv in envs), "compile_cache": e["BENCH_SERVE_COMPILE_CACHE"],
     "host": platform.node(), "date": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
     "error": e.get("ERROR", ""),
 }, open(path, "w"), indent=2)
 EOF
 }
 fail() { export ERROR=$1; write_meta "${ENVS[@]}"; die "$1"; }
-export LEG LABEL=${LABEL:-$LEG} ROLE REF SHA DIRTY SRC
+export LEG LABEL=${LABEL:-$LEG} ROLE REF SHA DIRTY SRC BENCH_SERVE_COMPILE_CACHE=$COMPILE_CACHE
 
 echo "run_leg.sh: $LEG = $SHA from $SRC"
 UV_PROJECT_ENVIRONMENT="$REPO/.venv" uv sync --frozen --project "$SRC" >"$OUT/sync.log" 2>&1 \
@@ -158,15 +171,11 @@ default_env() {
   ENVS+=("$1")
 }
 default_env SPYRE_KERNEL_CACHE=1
-if printf '%s\n' "${ENVS[@]}" | grep -qx 'SPYRE_KERNEL_CACHE=0'; then
-  default_env TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
-  default_env VLLM_DISABLE_COMPILE_CACHE=1
-fi
 for kv in "${ENVS[@]}"; do export "${kv?}"; done
 env | grep -E '^(SPYRE|VLLM|TORCH|TORCHINDUCTOR|AIU|FLEX|DT|COLL|SENTIENT|OMP)_' | sort >"$OUT/env.txt"
 write_meta "${ENVS[@]}"
 
-echo "run_leg.sh: running $(grep -c 'test_name:' "$BENCH/serve-tests.yaml") configs, log in $OUT/run.log"
+echo "run_leg.sh: running $(grep -c 'test_name:' "$BENCH/serve-tests.yaml") configs ($COMPILE_CACHE), log in $OUT/run.log"
 setsid make perf-tests BENCH_TYPES=serve BENCH_CONFIGS_DIR="$BENCH" RESULTS_DIR="$OUT/results" \
   >"$OUT/run.log" 2>&1 &
 MAKE_PID=$!

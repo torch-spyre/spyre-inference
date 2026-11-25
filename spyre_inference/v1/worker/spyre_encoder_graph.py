@@ -204,9 +204,11 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         return bool(self._staging)
 
     def clear(self) -> None:
-        # The compiled graphs live on the model; only the staging buffers are dropped.
+        # The compiled graphs live on the model; only the staging buffers and any
+        # unfinished passes' activations are dropped.
         super().clear()
         self._staging.clear()
+        self._slice_passes.clear()
 
     def start_item(self, mm_kwargs: dict[str, Any]) -> VisionEncodeState:
         """Run ``vision_embed`` for one item at its smallest budget, for ``finish_item`` later.

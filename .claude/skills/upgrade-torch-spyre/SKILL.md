@@ -7,6 +7,72 @@ description: Bump the pinned `torch-spyre` git rev in `pyproject.toml`, refresh 
 
 `spyre-inference` pins `torch-spyre` to a specific commit SHA in `[tool.uv.sources]` of `pyproject.toml`. Bumping that pin is **not** mechanical: `torch-spyre` makes regular breaking changes that need matching updates in the host's `ibm-deeptools` / `ibm-flex` / `ibm-senlib` RPMs. If you naively bump to the tip of `main`, the C++ extension build will fail against whatever older RPMs are installed on this host. The job of this skill is to find the **latest commit that actually compiles here** — which is usually *not* the tip of `main`.
 
+## 🔥🔥🔥 TEMPORARY: PROD RPM BUNDLES ARE DOWN, READ THIS FIRST 🔥🔥🔥
+
+Since 2026-11-11 every prod snap job (`spyre-snap-all-archs`) fails, because its Jenkins can't reach github.ibm.com. No `main_snap_*` newer than `main_snap_2026_11_11_09` exists. `spyre-rpms.lock` is **hand-written** from one dev nightly of the `next/` tree (its header names it), and `[tool.spyre-rpms] bundle` is a fake `next_nightly_<date>_orch<N>` name. Until this section is deleted, these rules beat everything below, unattended mode included:
+
+- **Never put the lock back on a prod bundle.** Don't run `scripts/lock_spyre_rpms.py`: it only reads prod bundles, so it fails or regenerates the dead `main_snap_2026_11_11_09`.
+- **Step 4 calls this a "downgrade". It isn't.** Dev versions (`2.0.0_rc.*`, `master.503`) count lower than prod (`2.1.0`, `+3090`), but they're newer code. Order nightlies by orchestrator number, never by version or commit count. Never "fix" a downgrade warning by going back to prod.
+- **`Check spyre-rpms.lock` is red on purpose.** It's `--verify` against prod bundles. Don't fix it, and don't call it a failure of your change.
+- **Never take individual newer builds from `next/x86_64`.** `-devel` packages land a build away from their base, PR builds share the tree, and backfills upload old commits last. Move the lock only to a **whole** nightly.
+- **Torch-spyre-only bumps are fine.** Keep the lock as it is, and run §3–§6 against it. Install it with `bash scripts/install-pinned-rpms.sh --prefix ~/spyre-libs-next --rebuild`, then `source ~/spyre-libs-next/env.sh`: the host's `/opt/ibm/spyre` holds prod RPMs, not the lock's.
+
+**Moving the RPMs to a newer nightly** replaces §7 steps 1–2. Each 05:30 UTC dev nightly writes `next/_nodes/orchestrator-<N>/commit-manifest.json` (every component's main head) and `plan-amd64.json` (each package's build identity, plus the identity of every dependency it was built against) to the generic repo. This prints the newest nightly whose 11 packages are all in `next/x86_64` and were built against each other:
+
+```bash
+python3 - <<'PY'
+import json, os, re, sys, tomllib, urllib.request
+base = os.environ["ARTIFACTORY_URL"].rstrip("/") + "/artifactory"
+assert base.startswith("https:"), "ARTIFACTORY_URL must use https"
+GEN, RPM = os.environ["ARTIFACTORY_BUNDLE_PATH"].split("/")[0], os.environ["ARTIFACTORY_RPM_REPO"]
+
+def call(path, aql=None):
+    req = urllib.request.Request(f"{base}/{path}", data=aql and aql.encode(), method="POST" if aql else "GET",
+                                 headers={"Authorization": f"Bearer {os.environ['ARTIFACTORY_TOKEN']}", "Content-Type": "text/plain"})
+    return json.load(urllib.request.urlopen(req, timeout=120))
+
+def find(repo, path, name):
+    q = 'items.find({"repo":"%s","path":{"$match":"%s"},"name":{"$match":"%s"}}).include("repo","path","name","created")'
+    return call("api/search/aql", q % (repo, path, name))["results"]
+
+want = list(tomllib.load(open("spyre-rpms.lock", "rb"))["packages"])
+nightlies = sorted(find(GEN, "next/_nodes/orchestrator-*", "commit-manifest.json"), key=lambda r: r["created"], reverse=True)
+for r in nightlies[:7]:
+    orch = r["path"].rsplit("-", 1)[1]
+    plan = call(f"{GEN}/{r['path']}/plan-amd64.json")
+    ids = {a["name"]: a["id12"] for n in [*plan["nodes"].values(), *plan["dropped_nodes"].values()] for a in n.get("artifacts", [])}
+    pins = {}
+    for name in want:
+        hit = name in ids and find(RPM, "next/x86_64", f"{name}-2*.{ids[name]}.*.x86_64.rpm")
+        if hit:
+            pins[name] = re.fullmatch(rf"{name}-(.+)\.el10\.x86_64\.rpm", hit[0]["name"]).group(1)
+    built = {re.match(r"(ibm-[a-z0-9-]+?)-\*\.([0-9a-f]{12})\.", p["nevra"]).groups()
+             for n in plan["nodes"].values() for p in n.get("install_pkgs", []) if p["nevra"].startswith("ibm-")}
+    bad = [f"{k} built against {v}" for k, v in built if k in ids and ids[k] != v]
+    print(f"orchestrator-{orch} {r['created'][:16]}: {len(pins)}/{len(want)} in next/x86_64, {len(bad)} dep mismatches")
+    if len(pins) == len(want) and not bad:
+        print(json.dumps({"orchestrator": orch, "date": r["created"][:10], "packages": pins}, indent=1))
+        break
+else:
+    sys.exit("no complete nightly in the last 7: keep the current lock")
+PY
+```
+
+Then edit by hand:
+
+- Replace **every** `[packages]` version with the printed ones, from that one nightly. Never mix two nightlies.
+- Leave `[overrides.ppc64le]` / `[overrides.s390x]` alone: they stay on the last prod bundle (`tree = ""`).
+- Update the orchestrator number and date in the lock header.
+- Set `[bundle] id`, `[tool.spyre-rpms] bundle` and `SPYRE_RPM_BUNDLE` to the same `next_nightly_<YYYY_MM_DD>_orch<N>`. The stamp change alone makes uv rebuild torch-spyre.
+
+§7 steps 3 and 5 still apply unchanged (`resolve_rpms.py validate` must print `OK` 11 times). If torch-spyre won't build against the newest complete nightly, bisect over nightlies, never over packages.
+
+**The outage is over** when a `main_snap_*` newer than `main_snap_2026_11_11_09` appears under `<ARTIFACTORY_BUNDLE_PATH>/x86_64/prod/`. At that point, go back to the normal §7 flow with that bundle: `lock_spyre_rpms.py` rewrites the whole lock, header and `tree = ""` included. In the same PR:
+
+- delete this section;
+- delete the 🔥 comment above `[tool.spyre-rpms]` in `pyproject.toml`;
+- say in the PR body that the dev-lock period is over.
+
 ## When to use
 
 Trigger phrases:
@@ -290,6 +356,8 @@ If it fails, triage:
 - Numerical mismatches, fallback-warning storms, compile errors on `spyre` → real regressions introduced by the bump. Hand to [[debug-spyre]].
 
 ### 7. Update `spyre-rpms.lock`
+
+> 🔥 While the outage section at the top of this skill exists, its rules replace steps 1, 2 and 4 below.
 
 The torch-spyre bump typically coincides with newer `ibm-*` RPMs. Those are pinned by **bundle**: a published set of RPMs built against each other, at `<ARTIFACTORY_BUNDLE_PATH>/<arch>/prod/<bundle>/`, one build of each package. `[tool.spyre-rpms]` in `pyproject.toml` names the bundle and the packages; `spyre-rpms.lock` is generated from it — never hand-edit the lock. CI still downloads from `ARTIFACTORY_RPM_PATH`'s prod tree (`<repo>/<arch>/`, `[defaults].tree = ""`), and `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
 

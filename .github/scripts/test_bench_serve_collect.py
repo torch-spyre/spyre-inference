@@ -74,7 +74,6 @@ def _write_config(tmp_path: pathlib.Path, result: dict) -> pathlib.Path:
     return tmp_path
 
 
-CACHE_OFF = {"TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1", "VLLM_DISABLE_COMPILE_CACHE": "1"}
 RESULT = {
     "num_prompts": 6,
     "completed": 6,
@@ -88,21 +87,20 @@ RESULT = {
 def test_check_config_valid(mod, tmp_path):
     leg = _write_config(tmp_path, RESULT)
     cfg = {"test_name": "cfg", "environment_variables": {"SPYRE_DEVICES": 0}}
-    rec = mod.check_config(leg, cfg, {"SPYRE_DEVICES": "0,1", **CACHE_OFF})
+    rec = mod.check_config(leg, cfg, {"SPYRE_DEVICES": "0,1"})
     assert rec["valid"] and rec["errors"] == []
     assert rec["startup_s"] == 333.3  # from the result JSON, not the log
     assert rec["env"]["SPYRE_DEVICES"] == "0"  # config env overrides env.txt
-    assert rec["compile_cache"] is False
+    assert rec["default_state"] == "unknown"  # no startup record
     assert rec["compile_leak"] is False
 
 
 def test_check_config_invalid(mod, tmp_path):
     result = {**RESULT, "completed": 5, "failed": 1, "mean_itl_ms": 60.0}
     leg = _write_config(tmp_path, result)
-    rec = mod.check_config(leg, {"test_name": "cfg"}, {"SPYRE_KERNEL_CACHE": "1", **CACHE_OFF})
+    rec = mod.check_config(leg, {"test_name": "cfg"}, {"SPYRE_KERNEL_CACHE": "1"})
     assert not rec["valid"]
     assert rec["errors"][:2] == ["completed 5 of 6 prompts", "1 requests failed"]
-    assert rec["compile_cache"] is True
     assert rec["compile_leak"] is True
 
 
@@ -113,3 +111,72 @@ def test_delta_classes(mod):
     assert mod.delta(100, 120, "lower")[1] == "d-bad"
     assert mod.delta(100, 80, "higher")[1] == "d-bad"
     assert mod.delta(4, 4, "count") == ("", "", None)
+
+
+def _start(state: str, hits: int, misses: int, **extra) -> dict:
+    return {
+        "seconds": 100.0,
+        "state": state,
+        "fxgraph_hits": hits,
+        "fxgraph_misses": misses,
+        "aotautograd_hits": 0,
+        "aotautograd_misses": 0,
+        "spyre_kernel_hits": 0,
+        "spyre_kernel_misses": 0,
+        **extra,
+    }
+
+
+def _write_cold_warm(leg: pathlib.Path, warm: dict) -> None:
+    results = leg / "results"
+    (results / "cfg_cold_server.log").write_text(SERVER_LOG)
+    startup = {"mode": "cold-warm", "starts": {"cold": _start("cold", 0, 9), "warm": warm}}
+    (results / "cfg_startup.json").write_text(json.dumps(startup))
+
+
+def test_cold_warm_splits_the_startup_rows(mod, tmp_path):
+    leg = _write_config(tmp_path, RESULT)
+    _write_cold_warm(leg, _start("warm", 9, 0, fxgraph_new_files=0))
+    rec = mod.check_config(leg, {"test_name": "cfg"}, {})
+    assert rec["compile_cache_mode"] == "cold-warm"
+    assert (rec["cold_startup_s"], rec["warm_startup_s"]) == (100.0, 100.0)
+    assert rec["cold_compilation_s"] == 240.0
+    assert rec["warm_state_label"] == "warm (9 hit, 0 miss)"
+    assert rec["warnings"] == []
+    legs = [{"configs": {"cfg": rec}}]
+    keys = [r[0] for r in mod.all_rows(legs, ["cfg"]) if not isinstance(r, str)]
+    assert keys[:2] == ["cold_startup_s", "warm_startup_s"]
+    assert "warm_fxgraph_misses" in keys and "startup_s" not in keys
+
+
+def test_cold_warm_warm_start_that_misses_is_a_warning(mod, tmp_path):
+    leg = _write_config(tmp_path, RESULT)
+    _write_cold_warm(leg, _start("partial", 8, 1, spyre_kernel_new_files=2))
+    rec = mod.check_config(leg, {"test_name": "cfg"}, {})
+    assert rec["valid"]
+    assert rec["warnings"] == [
+        {"state": "partial", "misses": {"fxgraph": 1}, "new_files": {"spyre_kernel": 2}}
+    ]
+    assert "fxgraph 1 miss, spyre_kernel 2 new files" in mod.warning_text(rec["warnings"][0])
+
+
+def test_default_partial_start_is_only_a_label(mod, tmp_path):
+    leg = _write_config(tmp_path, RESULT)
+    startup = {"mode": "default", "starts": {"default": _start("partial", 5, 1)}}
+    (leg / "results" / "cfg_startup.json").write_text(json.dumps(startup))
+    rec = mod.check_config(leg, {"test_name": "cfg"}, {})
+    assert rec["default_state_label"] == "partial (5 hit, 1 miss)"
+    assert rec["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    ("base", "target", "flagged"),
+    [("warm", "warm", False), ("cold", "cold", False), ("warm", "cold", True)]
+    + [("partial", "partial", True), ("warm", "unknown", True)],
+)
+def test_startup_delta_is_unreliable_only_across_cache_states(mod, base, target, flagged):
+    def leg(state):
+        return {"configs": {"cfg": {"default_state": state}}}
+
+    assert mod.unreliable(leg(base), leg(target), "cfg", "default") is flagged
+    assert mod.unreliable(leg(base), leg(target), "cfg", None) is False

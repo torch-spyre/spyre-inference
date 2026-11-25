@@ -20,8 +20,9 @@ validate BENCH LEG
     Exit 0 = valid, 1 = invalid.
 
 summarize BENCH --legs TARGET[,TARGET...],BASELINE
-    Writes BENCH/summary.json (every metric, server startup, init and compile times,
-    validity, the server env and deltas per leg and config) and two HTML fragments in the classes of
+    Writes BENCH/summary.json (every metric, server startup, init and compile times, the
+    compile cache state and counts of every start, validity, warnings, the server env and
+    deltas per leg and config) and two HTML fragments in the classes of
     report-example.html: BENCH/results-table.html and BENCH/leg-validity.html. The last
     leg is the baseline. A leg without BENCH/<leg>/leg.json is reported as not run.
 """
@@ -38,11 +39,10 @@ REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO / ".github" / "scripts"))
 from run_vllm_benchmarks import _load_configs  # noqa: E402
 
-# (key, label, kind, timing). kind: lower / higher is better, count (Δ only when the
-# values differ, never coloured) or text. timing rows are unreliable while any compile cache is on.
-STARTUP_ROWS = [
-    ("startup_s", "Server startup (s)", "lower", True),
-    None,
+# (key, label, kind, start). kind: lower / higher is better, count (Δ only when the values
+# differ, never coloured) or text. start: the server start whose cache state a timing row
+# depends on (default, cold or warm), None for a row that does not depend on it.
+LOG_ROWS = [
     ("init_engine_s", "Init engine (s)", "lower", True),
     ("compilation_s", "Total compilation (s)", "lower", True),
     ("model_warmup_s", "Model graph warmup (s)", "lower", True),
@@ -51,18 +51,25 @@ STARTUP_ROWS = [
     ("attn_graphs", "Attention graphs", "count", False),
     ("attn_split", "Per layer: per-seq + batched-decode", "text", False),
 ]
+CACHE_LAYERS = [
+    ("fxgraph", "FX graph"),
+    ("aotautograd", "AOTAutograd"),
+    ("spyre_kernel", "Spyre kernel"),
+    ("output_code", "Output code"),
+    ("vllm", "vLLM"),
+]
 SUMMARY_ROWS = [
-    ("completed", "Successful requests", "count", False),
-    ("failed", "Failed requests", "count", False),
-    ("max_concurrency", "Max request concurrency", "count", False),
-    ("duration", "Benchmark duration (s)", "lower", False),
-    ("total_input_tokens", "Total input tokens", "count", False),
-    ("total_output_tokens", "Total generated tokens", "count", False),
-    ("request_throughput", "Request throughput (req/s)", "higher", False),
-    ("output_throughput", "Output token throughput (tok/s)", "higher", False),
-    ("max_output_tokens_per_s", "Peak output token throughput (tok/s)", "higher", False),
-    ("max_concurrent_requests", "Peak concurrent requests", "count", False),
-    ("total_token_throughput", "Total token throughput (tok/s)", "higher", False),
+    ("completed", "Successful requests", "count", None),
+    ("failed", "Failed requests", "count", None),
+    ("max_concurrency", "Max request concurrency", "count", None),
+    ("duration", "Benchmark duration (s)", "lower", None),
+    ("total_input_tokens", "Total input tokens", "count", None),
+    ("total_output_tokens", "Total generated tokens", "count", None),
+    ("request_throughput", "Request throughput (req/s)", "higher", None),
+    ("output_throughput", "Output token throughput (tok/s)", "higher", None),
+    ("max_output_tokens_per_s", "Peak output token throughput (tok/s)", "higher", None),
+    ("max_concurrent_requests", "Peak concurrent requests", "count", None),
+    ("total_token_throughput", "Total token throughput (tok/s)", "higher", None),
 ]
 LATENCY_BANDS = [
     ("ttft", "Time to first token", "TTFT"),
@@ -71,7 +78,6 @@ LATENCY_BANDS = [
     ("e2el", "End-to-end latency", "E2EL"),
 ]
 SECONDS = {"startup_s", "init_engine_s", "compilation_s", "model_warmup_s", "attn_record_s"}
-CACHE_CAVEAT = '<span class="caveat">unreliable: compile cache on</span>'
 ITL_LEAK_RATIO = 1.1
 
 TS = re.compile(r"\b(\d\d-\d\d \d\d:\d\d:\d\d)\b")
@@ -116,8 +122,8 @@ def read_env(path: Path) -> dict[str, str]:
 def startup_s(log: str) -> float | None:
     """First timestamp of the server log to the last one before startup completes.
 
-    Misses the imports before vLLM logs its first line; the result JSON's
-    server_startup_sec is preferred when present.
+    Misses the imports before vLLM logs its first line; the harness's own timing (the
+    startup record, or the result JSON's server_startup_sec) is preferred when present.
     """
     ts = first = None
     for line in log.splitlines():
@@ -155,6 +161,59 @@ def parse_server_log(log: str) -> dict:
     }
 
 
+def cache_label(start: dict) -> str:
+    """`warm (1558 hit, 0 miss)`: the state of one start with its total hits and misses."""
+    if start.get("state", "unknown") == "unknown":
+        return "unknown (no cache line)"
+    hits = sum(v for k, v in start.items() if k.endswith("_hits"))
+    misses = sum(v for k, v in start.items() if k.endswith("_misses"))
+    return f"{start['state']} ({hits} hit, {misses} miss)"
+
+
+def warm_start_warning(warm: dict) -> dict | None:
+    """The misses and new files of a cold-warm warm start, or None for a full hit.
+
+    The warm start reads the cache its own cold start just filled, so any miss or new
+    file means a cache key that is not stable across restarts.
+    """
+    misses = {k[: -len("_misses")]: v for k, v in warm.items() if k.endswith("_misses") and v}
+    new = {k[: -len("_new_files")]: v for k, v in warm.items() if k.endswith("_new_files") and v}
+    if not (misses or new or warm.get("state") == "unknown"):
+        return None
+    return {"state": warm.get("state"), "misses": misses, "new_files": new}
+
+
+def add_starts(rec: dict, results: Path, name: str, server_log: str) -> None:
+    """Every start of <name>_startup.json in rec, as `{start}_{field}`.
+
+    The default mode's one start keeps the unprefixed timing keys of today's table. In
+    cold-warm, the serving start's log gives the warm_ timing keys and
+    <name>_cold_server.log the cold_ ones.
+    """
+    path = results / f"{name}_startup.json"
+    startup = json.loads(path.read_text()) if path.exists() else {}
+    mode = startup.get("mode", "default")
+    starts = startup.get("starts", {})
+    rec["compile_cache_mode"] = mode
+    if mode == "cold-warm":
+        cold_path = results / f"{name}_cold_server.log"
+        cold_log = cold_path.read_text(errors="replace") if cold_path.exists() else ""
+        for prefix, log in (("cold_", cold_log), ("warm_", server_log)):
+            for key, v in parse_server_log(log).items():
+                rec[prefix + key] = v
+    for start, srec in starts.items():
+        for key, v in srec.items():
+            rec[f"{start}_{'startup_s' if key == 'seconds' else key}"] = v
+        rec[f"{start}_state_label"] = cache_label(srec)
+    if "default" not in starts and mode == "default":
+        rec["default_state"] = "unknown"
+        rec["default_state_label"] = "unknown (no startup record)"
+    if mode == "cold-warm" and "warm" in starts:
+        warning = warm_start_warning(starts["warm"])
+        if warning:
+            rec["warnings"].append(warning)
+
+
 def first_errors(*logs: str, limit: int = 5) -> list[str]:
     lines = [ln.strip() for log in logs for ln in log.splitlines() if ERROR_LINE.search(ln)]
     return lines[:limit]
@@ -167,19 +226,13 @@ def check_config(leg_dir: Path, cfg: dict, leg_env: dict) -> dict:
     bench_log_path = results / f"{name}_bench.log"
     server_log = server_log_path.read_text(errors="replace") if server_log_path.exists() else ""
     bench_log = bench_log_path.read_text(errors="replace") if bench_log_path.exists() else ""
-    rec = {"test_name": name, "errors": [], **parse_server_log(server_log)}
+    rec = {"test_name": name, "errors": [], "warnings": [], **parse_server_log(server_log)}
 
     # The server env: the config's environment_variables (SPYRE_DEVICES and AIU_WORLD_SIZE
     # included) override the leg's env.txt.
     env = {**leg_env, **{k: str(v) for k, v in cfg.get("environment_variables", {}).items()}}
     rec["env"] = env
-    # Compile times are comparable only when no compile cache can hit: the Spyre kernel
-    # cache, the inductor caches, and the vLLM compile cache.
-    rec["compile_cache"] = not (
-        env.get("SPYRE_KERNEL_CACHE", "0") != "1"
-        and env.get("TORCHINDUCTOR_FORCE_DISABLE_CACHES") == "1"
-        and env.get("VLLM_DISABLE_COMPILE_CACHE") == "1"
-    )
+    add_starts(rec, results, name, server_log)
 
     result_path = results / f"{name}.json"
     result = json.loads(result_path.read_text()) if result_path.exists() else None
@@ -224,6 +277,14 @@ def check_leg(bench: Path, leg: str) -> dict:
     return {**meta, "run": True, "valid": valid, "configs": recs}
 
 
+def warning_text(warning: dict) -> str:
+    parts = [f"{layer} {n} miss" for layer, n in warning["misses"].items()]
+    parts += [f"{layer} {n} new files" for layer, n in warning["new_files"].items()]
+    return f"warm start not a full cache hit ({warning['state']}): " + (
+        ", ".join(parts) or "no cache line"
+    )
+
+
 def validate(args) -> int:
     leg = check_leg(args.bench, args.leg)
     if not leg["run"]:
@@ -238,6 +299,8 @@ def validate(args) -> int:
         print(f"{args.leg} {name}: {status}{extra}")
         for err in rec["errors"]:
             print(f"    {err}")
+        for warning in rec["warnings"]:
+            print(f"    WARNING: {warning_text(warning)}")
     return 0 if leg["valid"] else 1
 
 
@@ -248,6 +311,15 @@ def value(leg: dict, cfg: str, key: str):
     if key in rec:
         return rec[key]
     return (rec.get("result") or {}).get(key)
+
+
+def unreliable(base: dict, target: dict, cfg: str, start: str | None) -> bool:
+    """A startup Δ compares like with like only when both starts had the same cache state
+    and neither was partial (or unknown)."""
+    if start is None:
+        return False
+    states = {value(leg, cfg, f"{start}_state") or "unknown" for leg in (base, target)}
+    return len(states) > 1 or bool(states & {"partial", "unknown"})
 
 
 def delta(base, target, kind: str) -> tuple[str, str, float | None]:
@@ -281,7 +353,7 @@ def fmt(v, key: str) -> str:
         return "—"
     if isinstance(v, str):
         return html.escape(v)
-    if key in SECONDS:
+    if re.sub(r"^(cold|warm)_", "", key) in SECONDS:
         return f"{v:.1f}"
     return f"{v:.2f}" if isinstance(v, float) else str(v)
 
@@ -297,15 +369,59 @@ def latency_rows(legs: list[dict], cfg_names: list[str]) -> list:
     rows = []
     for metric, band, short in LATENCY_BANDS:
         rows.append(band)
-        rows.append((f"mean_{metric}_ms", f"Mean {short} (ms)", "lower", False))
-        rows.append((f"median_{metric}_ms", f"Median {short} (ms)", "lower", False))
+        rows.append((f"mean_{metric}_ms", f"Mean {short} (ms)", "lower", None))
+        rows.append((f"median_{metric}_ms", f"Median {short} (ms)", "lower", None))
         for p in sorted(pcts, key=float):
-            rows.append((f"p{p}_{metric}_ms", f"P{p} {short} (ms)", "lower", False))
+            rows.append((f"p{p}_{metric}_ms", f"P{p} {short} (ms)", "lower", None))
+    return rows
+
+
+def cold_warm(legs: list[dict], cfg_names: list[str]) -> bool:
+    return any(
+        (leg["configs"].get(n) or {}).get("compile_cache_mode") == "cold-warm"
+        for leg in legs
+        for n in cfg_names
+    )
+
+
+def startup_rows(legs: list[dict], cfg_names: list[str]) -> list:
+    """The startup rows: one start in the default mode, cold and warm side by side in
+    cold-warm."""
+    if not cold_warm(legs, cfg_names):
+        rows = [
+            ("startup_s", "Server startup (s)", "lower", "default"),
+            "Startup and compilation",
+            ("default_state_label", "Compile cache state", "text", None),
+            *[(k, label, kind, "default" if t else None) for k, label, kind, t in LOG_ROWS],
+        ]
+        starts = [("default", "")]
+    else:
+        rows = [
+            ("cold_startup_s", "Server startup, cold (s)", "lower", "cold"),
+            ("warm_startup_s", "Server startup, warm (s)", "lower", "warm"),
+            "Startup and compilation",
+            ("cold_state_label", "Compile cache state, cold", "text", None),
+            ("warm_state_label", "Compile cache state, warm", "text", None),
+        ]
+        for key, label, kind, timing in LOG_ROWS:
+            if timing:
+                stem = label.removesuffix(" (s)")
+                rows.append((f"cold_{key}", f"{stem}, cold (s)", kind, "cold"))
+                rows.append((f"warm_{key}", f"{stem}, warm (s)", kind, "warm"))
+            else:
+                rows.append((f"warm_{key}", label, kind, None))
+        starts = [("cold", ", cold"), ("warm", ", warm")]
+    rows.append("Compile cache")
+    for start, suffix in starts:
+        for layer, name in CACHE_LAYERS:
+            rows.append((f"{start}_{layer}_hits", f"{name} hits{suffix}", "count", None))
+            rows.append((f"{start}_{layer}_misses", f"{name} misses{suffix}", "count", None))
+            rows.append((f"{start}_{layer}_new_files", f"{name} new files{suffix}", "count", None))
     return rows
 
 
 def all_rows(legs, cfg_names) -> list:
-    rows = [STARTUP_ROWS[0], "Startup and compilation", *STARTUP_ROWS[2:]]
+    rows = startup_rows(legs, cfg_names)
     rows += ["Request summary", *SUMMARY_ROWS]
     return rows + latency_rows(legs, cfg_names)
 
@@ -328,12 +444,9 @@ def render_table(legs, base, cfgs) -> str:
         if isinstance(row, str):
             body.append(f'<tr class="band"><td colspan="{ncols}">{html.escape(row)}</td></tr>')
             continue
-        key, label, kind, timing = row
+        key, label, kind, start = row
         if all(value(leg, n, key) is None for leg in legs for n in names):
             continue
-        cache_on = timing and any(
-            (leg["configs"].get(n) or {}).get("compile_cache") for leg in legs for n in names
-        )
         cells = []
         for n in names:
             b = value(base, n, key)
@@ -342,10 +455,14 @@ def render_table(legs, base, cfgs) -> str:
                 v = value(t, n, key)
                 text, cls, _ = delta(b, v, kind)
                 cells.append(f"<td>{fmt(v, key)}</td>")
-                cells.append(f'<td class="{cls}">{text}</td>' if cls else f"<td>{text}</td>")
-        tr = '<tr class="unreliable">' if cache_on else "<tr>"
-        caveat = CACHE_CAVEAT if cache_on else ""
-        body.append(f'{tr}<td class="k">{html.escape(label)}{caveat}</td>{"".join(cells)}</tr>')
+                if text and unreliable(base, t, n, start):
+                    cells.append(
+                        f'<td class="unreliable">{text}'
+                        '<span class="caveat">unreliable: cache states differ</span></td>'
+                    )
+                else:
+                    cells.append(f'<td class="{cls}">{text}</td>' if cls else f"<td>{text}</td>")
+        body.append(f'<tr><td class="k">{html.escape(label)}</td>{"".join(cells)}</tr>')
 
     return "\n".join(
         [
@@ -393,9 +510,13 @@ def render_validity(legs, cfgs) -> str:
                     '<span class="st no">invalid</span>',
                 )
             )
+            warn = "".join(
+                f'<span class="det caveat">{html.escape(warning_text(w))}</span>'
+                for w in rec.get("warnings", [])
+            )
             cards.append(
                 f'<div class="leg{cls}"><span class="who">{who}</span>{st}'
-                f'<span class="det">{" &middot; ".join(det)}</span></div>'
+                f'<span class="det">{" &middot; ".join(det)}</span>{warn}</div>'
             )
             if not ok:
                 errs = ([leg["error"]] if leg.get("error") else []) + rec["errors"]
@@ -421,27 +542,40 @@ def summarize(args) -> int:
             for row in all_rows(legs, [n]):
                 if isinstance(row, str):
                     continue
-                key, _, kind, _ = row
+                key, _, kind, start = row
                 text, cls, d = delta(value(base, n, key), value(t, n, key), kind)
                 if text:
                     deltas.setdefault(t["name"], {}).setdefault(n, {})[key] = {
                         "delta": d,
                         "text": text,
                         "class": cls,
+                        "unreliable": unreliable(base, t, n, start),
                     }
 
+    warnings = [
+        {"leg": leg["name"], "config": n, **w}
+        for leg in legs
+        for n, rec in leg["configs"].items()
+        for w in rec.get("warnings", [])
+    ]
     (args.bench / "results-table.html").write_text(render_table(legs, base, cfgs) + "\n")
     (args.bench / "leg-validity.html").write_text(render_validity(legs, cfgs) + "\n")
     summary = {
         "legs": legs,
         "baseline": base["name"],
+        "compile_cache": sorted(
+            {leg.get("compile_cache", "default") for leg in legs if leg["run"]}
+        ),
         "configs": {c["test_name"]: config_label(c) for c in cfgs},
         "deltas": deltas,
+        "warnings": warnings,
     }
     (args.bench / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     for leg in legs:
         state = "valid" if leg["valid"] else ("not run" if not leg["run"] else "INVALID")
         print(f"{leg['name']}: {state}")
+    for w in warnings:
+        print(f"WARNING: {w['leg']} {w['config']}: {warning_text(w)}")
     print(f"wrote {args.bench}/summary.json, results-table.html, leg-validity.html")
     return 0
 

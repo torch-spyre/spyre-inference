@@ -191,7 +191,7 @@ class SpyreWorkerV2(Worker):
         # Pin this worker to its assigned card before the spyreccl
         # backend is constructed in `init_process_group`.
         torch.spyre.set_device(self.local_rank)
-        logger.info(
+        logger.debug(
             "Spyre worker device selection: "
             "local_rank=%d requested SPYRE_DEVICES=%r pcie_address=%s",
             self.local_rank,

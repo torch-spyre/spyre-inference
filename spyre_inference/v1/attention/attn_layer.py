@@ -178,7 +178,7 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
         )
 
     if split:
-        logger.info(
+        logger.debug(
             "Scattering the KV cache inside the outer graph for %d attention layers.",
             len(split),
         )

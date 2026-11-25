@@ -982,6 +982,15 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
         configure_threading(worker_count=1)
 
 
+def test_banner_prints_once_per_process(monkeypatch, capsys):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_banner_printed", False)
+    VllmConfig()
+    VllmConfig()
+    assert capsys.readouterr().out.count("    version ") == 1
+
+
 # ---------------------------------------------------------------------------
 # Registry check — end-to-end through check_and_update_config + platform boot
 # ---------------------------------------------------------------------------
@@ -1005,6 +1014,7 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
     import logging
 
     from vllm.config import ParallelConfig
+    from vllm.logger import _print_warning_once
 
     from spyre_inference.platform import TorchSpyrePlatform
 
@@ -1021,6 +1031,8 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
         parallel_config=ParallelConfig(tensor_parallel_size=tp_size),
     )
 
+    # The VllmConfig above already logged it once, and the warning is a warning_once.
+    _print_warning_once.cache_clear()
     with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
         caplog.clear()
         TorchSpyrePlatform.check_and_update_config(vllm_config)

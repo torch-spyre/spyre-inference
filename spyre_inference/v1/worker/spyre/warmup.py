@@ -210,7 +210,9 @@ def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> Non
     encoder_runner.cudagraph_manager = SpyreEncoderGraphManager(
         runner.vllm_config, runner.spyre_device, dtype, model
     )
+    t0 = time.time()
     encoder_runner.cudagraph_manager.capture(graph_pool=None)
+    logger.info("Vision encoder budgets compiled in %.1fs.", time.time() - t0)
     wrapper = cast(_SpyreModelWrapper, runner.model)
     image_rows = [torch.zeros(1, model.out_hidden_size, dtype=dtype)]
     # An image step stages at least two rows (see _SpyreModelWrapper.embed_input_ids).
@@ -280,7 +282,7 @@ def run(runner: "SpyreModelRunnerV2") -> None:
     """Execute plan(runner), then record attention and the sampler dummy."""
     allocate_staging_buffers(runner.compilation_config.static_forward_context, runner.spyre_device)
     calls = plan(runner)
-    logger.info("MRV2 warmup: %d dummy runs %s", len(calls), [c.num_tokens for c in calls])
+    logger.debug("MRV2 warmup: %d dummy runs %s", len(calls), [c.num_tokens for c in calls])
     t0 = time.time()
     # Under inference_mode like MRV2's execute_model: grad mode is a guard on every
     # compiled graph, so warming outside it misses each one at serving time.

@@ -160,7 +160,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         t0 = time.time()
         with torch.inference_mode():
             self.model.encoder_cudagraph_forward(self._upload(values), path=path)
-        logger.info("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
+        logger.debug("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
         self._staging.setdefault(path, {})[token_budget] = values
 
     def _run_budget_graph(

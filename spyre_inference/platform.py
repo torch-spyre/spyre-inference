@@ -34,7 +34,7 @@ if sys.platform.startswith("darwin"):
 
 from vllm.logger import init_logger
 from vllm.platforms import PlatformEnum
-from vllm.platforms.cpu import CpuPlatform
+from vllm.platforms.cpu import CpuPlatform, _cpu_mamba_backend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 from spyre_inference import envs
@@ -138,7 +138,7 @@ def _maybe_uniproc(parallel_config, requested_backend) -> None:
         return
     if parallel_config.distributed_executor_backend != "mp":
         return
-    logger.info(
+    logger.info_once(
         "Using the uni executor at world_size 1; pass --distributed-executor-backend mp "
         "to run the worker in its own process."
     )
@@ -366,11 +366,15 @@ class TorchSpyrePlatform(CpuPlatform):
         except AttributeError:
             return int(os.environ.get("AIU_WORLD_SIZE", "0"))
 
+    _banner_printed = False
+
     @classmethod
     def log_server_boot(cls, vllm_config: VllmConfig) -> None:
-        # Only log in main process (not in TP workers)
-        if multiprocessing.current_process().name != "MainProcess":
+        # Once per process, and only in the main one (not in the EngineCore or TP workers):
+        # this hook runs for every VllmConfig built.
+        if cls._banner_printed or multiprocessing.current_process().name != "MainProcess":
             return
+        cls._banner_printed = True
 
         # yapf: disable
         logo_template = Template(
@@ -486,11 +490,21 @@ class TorchSpyrePlatform(CpuPlatform):
             if compile_sizes:
                 max_capture_size = max(int(s) for s in compile_sizes)
                 # Scheduler must not send more tokens than the largest body bucket.
-                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
-                logger.warning(
-                    "Capping max_num_batched_tokens to %d ",
-                    max_capture_size,
-                )
+                scheduler_config = vllm_config.scheduler_config
+                user_budget = cls._user_max_num_batched_tokens
+                if (
+                    user_budget is not None
+                    and scheduler_config.max_num_batched_tokens == user_budget
+                    and user_budget != max_capture_size
+                ):
+                    logger.warning(
+                        "Capping max_num_batched_tokens from %d to %d, the largest body bucket.",
+                        user_budget,
+                        max_capture_size,
+                    )
+                else:
+                    logger.info_once("Capping max_num_batched_tokens to %d", max_capture_size)
+                scheduler_config.max_num_batched_tokens = max_capture_size
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
         # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
@@ -573,16 +587,17 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.compilation_config.compile_sizes is None:
             vllm_config.compilation_config.compile_sizes = list(tables.budgets)
 
-        logger.info(
+        logger.info_once(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
             "max_num_batched_tokens=%d: bodies %s; rectangles (L, B) %s; "
             "ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
             tables.budget,
-            list(tables.budgets),
-            encoder_rectangles(vllm_config),
-            encoder_group_shapes(vllm_config) or "none reachable",
+            # str(): info_once dedupes on hashable args.
+            str(list(tables.budgets)),
+            str(encoder_rectangles(vllm_config)),
+            str(encoder_group_shapes(vllm_config) or "none reachable"),
         )
 
     @classmethod
@@ -765,7 +780,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
         if not cache_config.user_specified_block_size:
             if cache_config.block_size != cls._DEFAULT_BLOCK_SIZE:
-                logger.info(
+                logger.debug(
                     "Setting kv cache block size to %d for the Spyre paged attention backend.",
                     cls._DEFAULT_BLOCK_SIZE,
                 )
@@ -835,7 +850,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
         cfg = lookup_config(model_id, tp_size=tp_size, max_model_len=max_model_len, machine=machine)
         if cfg is None:
-            logger.warning(
+            logger.warning_once(
                 "Model %r with tp_size=%d max_model_len=%d platform=%s is not in the "
                 "Spyre model registry. The run may still succeed, but this "
                 "configuration has not been validated.",
@@ -1071,14 +1086,14 @@ class TorchSpyrePlatform(CpuPlatform):
 
         worker_class = "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
         if parallel_config.worker_cls == "auto":
-            logger.info("Loading worker from: %s", worker_class)
+            logger.debug("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
 
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config
         # Caps how many sequences prefill in one batch (SPYRE_MAX_NUM_PARTIAL_PREFILLS).
         scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
-        logger.info("Loading scheduler from: %s", scheduler_class)
+        logger.debug("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
         # The hybrid KV cache manager is off unless asked for (None is vLLM's unset
@@ -1100,6 +1115,15 @@ class TorchSpyrePlatform(CpuPlatform):
                 "Ignoring VLLM_CPU_KVCACHE_SPACE: Spyre sizes the KV cache from free "
                 "device memory. Pass --kv-cache-memory-bytes for a fixed budget."
             )
+
+        # CpuPlatform resets an unset SSM cache dtype to float32 with a warning even when the
+        # model has no SSM state; setting it first skips that branch.
+        if (
+            vllm_config.model_config is not None
+            and vllm_config.cache_config.mamba_ssm_cache_dtype == "auto"
+            and _cpu_mamba_backend(vllm_config) == "none"
+        ):
+            vllm_config.cache_config.mamba_ssm_cache_dtype = "float32"
 
         # CpuPlatform turns "uni" into "mp"; remember what was asked for (see _maybe_uniproc).
         requested_backend = parallel_config.distributed_executor_backend

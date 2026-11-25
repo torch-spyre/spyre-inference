@@ -43,7 +43,7 @@ logger = init_logger(__name__)
 
 @lru_cache(maxsize=1)
 def register_all():
-    logger.info("Registering custom ops for spyre_inference")
+    logger.debug("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
     register_spyre_fp8_config()
     utils.register()

@@ -252,4 +252,4 @@ def register_spyre_fp8_linear_kernel() -> None:
         return
     register_linear_kernel(SpyreFp8LinearKernel, PlatformEnum.OOT, kernel_type="fp8")
     _REGISTERED = True
-    logger.info("Registered SpyreFp8LinearKernel for PlatformEnum.OOT (spyre.scaled_mm)")
+    logger.debug("Registered SpyreFp8LinearKernel for PlatformEnum.OOT (spyre.scaled_mm)")

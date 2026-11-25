@@ -496,7 +496,7 @@ class SpyreAttnBucketer:
                     for kv in dense
                 }
             )
-            logger.info(
+            logger.info_once(
                 "SpyreAttnBucketer: batched decode at >= %d seqs uses %d num_blocks buckets "
                 "(%s) instead of %d.",
                 self._large_batch_min_seqs,
@@ -505,7 +505,7 @@ class SpyreAttnBucketer:
                 len(self._num_blocks_buckets),
             )
 
-        logger.info(
+        logger.info_once(
             "SpyreAttnBucketer: %d kv buckets [%d..%d], %d query buckets [%d..%d], "
             "max num_blocks=%d",
             len(self._kv_buckets),

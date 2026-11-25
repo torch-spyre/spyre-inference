@@ -30,8 +30,10 @@ def register():
     # imported, which is the last point the Triton gate can act.
     from vllm.logger import init_logger
 
-    from spyre_inference import envs
+    from spyre_inference import envs, log_filters
     from spyre_inference.v1.worker.spyre import triton_gate
+
+    log_filters.install()
 
     # vLLM's plugin probe swallows exceptions here and falls back to another platform,
     # so errors are only logged; check_and_update_config rejects the resulting state.

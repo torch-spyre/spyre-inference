@@ -91,7 +91,7 @@ def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
                 return method(self, *args, **kwargs)
             kernel = self.spyre_compiled_kernels.get(method)
             if kernel is None:
-                logger.info_once(
+                logger.debug_once(
                     "Compiling %s.%s as its own graph: %s.",
                     type(self).__name__,
                     method.__name__,

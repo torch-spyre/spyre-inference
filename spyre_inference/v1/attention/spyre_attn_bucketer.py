@@ -244,29 +244,11 @@ def validate_kv_ladder_env() -> None:
         kv_ladder(large, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH")
 
 
-def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
-    """The smallest KV head count any layer carries, after the TP split.
-
-    ``get_num_kv_heads`` reports one model-wide number that a heterogeneous config can
-    hide a smaller layer behind: gemma-4 reports 4 at TP2, its full-attention layers 1.
-    """
-    model_config = vllm_config.model_config
-    parallel_config = vllm_config.parallel_config
-    arch = model_config.model_arch_config
-    model_wide = model_config.get_num_kv_heads(parallel_config)
-    overrides = arch.per_layer_overrides or ()
-    return min(
-        (model_config.get_num_kv_heads(parallel_config, arch[i]) for i in range(len(overrides))),
-        default=model_wide,
-    )
-
-
-def _declared_page_range(max_pages: int, min_pages: int) -> DynamicRange | None:
+def _declared_page_range(max_pages: int) -> DynamicRange | None:
     """Return the range of page counts one per-sequence kernel is compiled for.
 
-    ``min_pages`` is the fewest pages a kernel can run. Returns None, and logs why, when
-    ``max_pages`` does not fit torch-spyre's limits; the kernels then use the KV buckets
-    instead.
+    Returns None, and logs why, when ``max_pages`` does not fit torch-spyre's limits; the
+    kernels then use the KV buckets instead.
     """
     from torch_spyre._inductor import config as ts_config
     from torch_spyre._inductor import pass_utils
@@ -283,7 +265,7 @@ def _declared_page_range(max_pages: int, min_pages: int) -> DynamicRange | None:
         ts_config.min_reserved_dim_size = 1
     if "MAX_BUCKETS" not in os.environ:
         ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
-    min_pages = max(min_pages, ts_config.min_reserved_dim_size)
+    min_pages = ts_config.min_reserved_dim_size
     # With min == max the size is a constant, which fails to trace.
     if not min_pages < max_pages <= ts_config.max_buckets:
         logger.warning_once(
@@ -451,18 +433,12 @@ class SpyreAttnBucketer:
             {(kv + block_size - 1) // block_size for kv in self._kv_buckets}
         )
 
-        # One KV head on one page leaves torch-spyre's codegen no spare dim for the stick
-        # dim, so the decode kernel will not compile there. A second, fully masked page
-        # does, and it lifts the SWA bound _max_active_blocks derives from it.
-        min_pages = 2 if _min_num_kv_heads(vllm_config) == 1 else 1
-        self._num_blocks_buckets = sorted({max(min_pages, n) for n in self._num_blocks_buckets})
-
         # With a page range, the per-sequence kernels take the page count at run time, so
         # they compile once per query bucket rather than once per (query, KV) bucket pair.
         self._page_range: DynamicRange | None = None
         self._prefill_page_range: DynamicRange | None = None
         if declare_pages:
-            self._page_range = _declared_page_range(self._num_blocks_buckets[-1], min_pages)
+            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
         if self._page_range is not None:
             self._prefill_page_range = _prefill_page_range(self._page_range)
 

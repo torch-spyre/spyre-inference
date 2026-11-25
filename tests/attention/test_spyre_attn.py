@@ -2335,6 +2335,7 @@ def test_spyre_attn_dispatches_by_query_width(
     [(1, "page_attn_decode", {16, 1, 3, 8}), (64, "page_attn_prefill", {16, 8})],
     ids=["decode", "prefill"],
 )
+@pytest.mark.parametrize("num_kv_heads", [2, 1], ids=["2kv", "1kv"])
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2349,11 +2350,13 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
     query_len,
     kernel_name,
     page_counts,
+    num_kv_heads,
     configure_compilation,
     configure_device,
 ):
     """One compiled per-sequence kernel per query width serves every page count up to
-    max_model_len, one page included, and matches the reference."""
+    max_model_len, one page included, and matches the reference. With one KV head too:
+    a lone KV head on a lone page compiles."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
 
@@ -2383,12 +2386,13 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
                 configure_device=configure_device,
                 # 8 x 128 query heads keep prefill page grouping eligible.
                 num_query_heads=8,
-                num_kv_heads=2,
+                num_kv_heads=num_kv_heads,
             )
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
     assert walked == page_counts
 
 
+@pytest.mark.parametrize("num_kv_heads", [2, 1], ids=["2kv", "1kv"])
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2401,6 +2405,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     default_vllm_config,
     monkeypatch,
     batched_decode_calls,
+    num_kv_heads,
     configure_compilation,
     configure_device,
 ):
@@ -2442,7 +2447,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
                 configure_compilation=configure_compilation,
                 configure_device=configure_device,
                 num_query_heads=8,
-                num_kv_heads=2,
+                num_kv_heads=num_kv_heads,
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"

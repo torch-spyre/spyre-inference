@@ -543,8 +543,7 @@ Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
   to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
-  selects a denser preset. A layer with one KV head floors the ladder at two blocks: one
-  KV head on one page leaves the decode kernel no spare dim for the stick
+  selects a denser preset.
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the

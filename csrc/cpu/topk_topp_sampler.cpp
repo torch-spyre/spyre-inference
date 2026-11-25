@@ -44,7 +44,7 @@
 
 namespace {
 constexpr float kPadSentinel = -1e30f;      // logits below this are PAD
-constexpr float kBoundaryTol = 1e-5f;       // tie tolerance for top-p cut
+constexpr float kBoundaryTol = 1e-5f;       // near-max tolerance for p <= 0
 constexpr int kMeanStdSampleN = 8192;       // mean/std sample cap
 constexpr int kBsearchMaxIters = 32;        // binary-search iteration cap
 constexpr int kTernarySearchMaxIters = 18;  // matches Triton
@@ -305,9 +305,10 @@ __attribute__((always_inline)) static inline int count_within_tol(
 // kInclusive keeps threshold itself. Top-k needs that: nextafter(kth, -inf) is
 // a denormal when kth is 0, and a DAZ compare then treats it as zero and drops
 // the tie. The other callers want a strict cut.
+// Writes fill to row[i] where key[i] is below threshold; key may be row.
 template <bool kInclusive = false>
 __attribute__((always_inline)) static inline void mask_write_below(
-    float* row, int V, float threshold, float fill) {
+    float* row, const float* key, int V, float threshold, float fill) {
   int i = 0;
 #if defined(__AVX512F__)
   constexpr int kCmp = kInclusive ? _CMP_GE_OQ : _CMP_GT_OQ;
@@ -315,7 +316,8 @@ __attribute__((always_inline)) static inline void mask_write_below(
   const vec_op::FP32Vec16 f16(fill);
   for (; i + 16 <= V; i += 16) {
     vec_op::FP32Vec16 v16(row + i);
-    __mmask16 keep = _mm512_cmp_ps_mask(v16.reg, cutoff16.reg, kCmp);
+    vec_op::FP32Vec16 k16(key + i);
+    __mmask16 keep = _mm512_cmp_ps_mask(k16.reg, cutoff16.reg, kCmp);
     vec_op::FP32Vec16(_mm512_mask_blend_ps(keep, f16.reg, v16.reg))
         .save(row + i);
   }
@@ -325,8 +327,9 @@ __attribute__((always_inline)) static inline void mask_write_below(
   const vec_op::FP32Vec16 f16(fill);
   for (; i + 16 <= V; i += 16) {
     vec_op::FP32Vec16 v16(row + i);
-    __m256 klo = _mm256_cmp_ps(v16.reg_low, cutoff16.reg_low, kCmp);
-    __m256 khi = _mm256_cmp_ps(v16.reg_high, cutoff16.reg_high, kCmp);
+    vec_op::FP32Vec16 k16(key + i);
+    __m256 klo = _mm256_cmp_ps(k16.reg_low, cutoff16.reg_low, kCmp);
+    __m256 khi = _mm256_cmp_ps(k16.reg_high, cutoff16.reg_high, kCmp);
     vec_op::FP32Vec16(_mm256_blendv_ps(f16.reg_low, v16.reg_low, klo),
                       _mm256_blendv_ps(f16.reg_high, v16.reg_high, khi))
         .save(row + i);
@@ -337,17 +340,24 @@ __attribute__((always_inline)) static inline void mask_write_below(
   for (; i + 16 <= V; i += 16) {
     for (int r = 0; r < 4; ++r) {
       const vf32 v = vec_xl(0, row + i + 4 * r);
+      const vf32 k = vec_xl(0, key + i + 4 * r);
       const auto keep =
-          kInclusive ? vec_cmpge(v, cutoff) : vec_cmpgt(v, cutoff);
+          kInclusive ? vec_cmpge(k, cutoff) : vec_cmpgt(k, cutoff);
       vec_xst(vec_sel(fv, v, keep), 0, row + i + 4 * r);
     }
   }
 #endif
   for (; i < V; ++i) {
     const bool drop =
-        kInclusive ? !(row[i] >= threshold) : !(row[i] > threshold);
+        kInclusive ? !(key[i] >= threshold) : !(key[i] > threshold);
     if (drop) row[i] = fill;
   }
+}
+
+template <bool kInclusive = false>
+__attribute__((always_inline)) static inline void mask_write_below(
+    float* row, int V, float threshold, float fill) {
+  mask_write_below<kInclusive>(row, row, V, threshold, fill);
 }
 
 // Vectorised max/min/finite-count over row[0..V). PAD lanes (<= pad_sentinel)
@@ -460,6 +470,28 @@ __attribute__((always_inline)) static inline bool any_above16(const float* buf,
 #endif
 }
 
+// Whether any of buf[0..16) equals value.
+__attribute__((always_inline)) static inline bool any_equal16(const float* buf,
+                                                              float value) {
+#if defined(__AVX512F__)
+  return _mm512_cmp_ps_mask(_mm512_loadu_ps(buf), _mm512_set1_ps(value),
+                            _CMP_EQ_OQ) != 0;
+#elif defined(__AVX2__)
+  const __m256 v = _mm256_set1_ps(value);
+  const __m256 lo = _mm256_cmp_ps(_mm256_loadu_ps(buf), v, _CMP_EQ_OQ);
+  const __m256 hi = _mm256_cmp_ps(_mm256_loadu_ps(buf + 8), v, _CMP_EQ_OQ);
+  return _mm256_movemask_ps(_mm256_or_ps(lo, hi)) != 0;
+#elif defined(__powerpc__) || defined(__s390x__)
+  const vf32 v = vec_splats(value);
+  return vec_any_eq(vec_xl(0, buf), v) || vec_any_eq(vec_xl(16, buf), v) ||
+         vec_any_eq(vec_xl(32, buf), v) || vec_any_eq(vec_xl(48, buf), v);
+#else
+  for (int r = 0; r < 16; ++r)
+    if (buf[r] == value) return true;
+  return false;
+#endif
+}
+
 // Calls f(i, buf[i]) for each buf[i] > threshold, in order. Spyre: skips
 // 16-wide chunks with none, since the callers keep a small fraction.
 template <bool kInclusive = false, typename F>
@@ -508,24 +540,34 @@ static inline void compute_mean_std(const float* row, int V, float* avg_out,
   *std_out = sqrtf(var > 0.f ? var : 0.f);
 }
 
-// Apply boundary-tie resolution in row order. Keeps all v > pivot, plus up to
-// n_keep_at_boundary values within tol of dup_value. Rare path: called only
-// when binary/ternary search lands exactly on a duplicate boundary value.
-static inline void apply_boundary_tie_loop(float* row, int V, float pivot,
-                                           float dup_value, float tol,
+// Use the same probabilities as the search: converting the boundary back to
+// a logit can round to either side of a tie and bypass its quota.
+// Only 16-wide chunks holding a tie while the quota lasts take the scalar loop.
+static inline void apply_boundary_tie_loop(float* row, const float* probs,
+                                           int V, float boundary_prob,
                                            int n_keep_at_boundary) {
   const float neg_inf = -std::numeric_limits<float>::infinity();
   int kept_boundary = 0;
-  for (int i = 0; i < V; ++i) {
-    float v = row[i];
-    bool keep = v > pivot;
-    if (!keep && fabsf(v - dup_value) < tol &&
-        kept_boundary < n_keep_at_boundary) {
-      keep = true;
-      ++kept_boundary;
+  auto scalar = [&](int lo, int hi) {
+    for (int i = lo; i < hi; ++i) {
+      float prob = probs[i];
+      bool keep = prob > boundary_prob;
+      if (prob == boundary_prob && kept_boundary < n_keep_at_boundary) {
+        keep = true;
+        ++kept_boundary;
+      }
+      if (!keep) row[i] = neg_inf;
     }
-    if (!keep) row[i] = neg_inf;
+  };
+  int j = 0;
+  for (; j + 16 <= V; j += 16) {
+    if (kept_boundary < n_keep_at_boundary &&
+        any_equal16(probs + j, boundary_prob))
+      scalar(j, j + 16);
+    else
+      mask_write_below(row + j, probs + j, 16, boundary_prob, neg_inf);
   }
+  scalar(j, V);
 }
 
 }  // namespace
@@ -610,8 +652,14 @@ static float binary_search_buffer(const float* buf, int n, float p_val,
       s_hi = s;
     }
   }
+  // At the iteration cap, hi can still lie between stored probabilities.
+  // The least value above lo keeps at least p mass, with a disjoint tie group.
+  float boundary = hi;
+  for_each_above(buf, n, lo,
+                 [&](int, float v) { boundary = std::min(boundary, v); });
+  if (boundary != hi) s_hi = sum_gt_to_double(buf, n, boundary);
   *sum_above_out = s_hi;
-  return hi;
+  return boundary;
 }
 
 static void scan_pivot_stats(const float* buf, int n, float pivot, float tol,
@@ -838,6 +886,20 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
   #endif
       acc.add(e16);
     }
+    // A padded step gives the tail the body's exp, so equal logits get equal
+    // probabilities on every V.
+    if (i < V) {
+      float tail[16];
+      std::fill(tail, tail + 16, kPadSentinel);
+      std::copy(row + i, row + V, tail);
+      vec_op::FP32Vec16 v16(tail);
+      vec_op::FP32Vec16 e16 = fast_exp(v16 - base16);
+  #if defined(__powerpc__)
+      e16 = zero_pad_lanes(v16, e16);
+  #endif
+      acc.add(e16);
+      i = V;
+    }
     sum_exp_d += acc.reduce();
 #endif
     for (; i < V; ++i) sum_exp_d += (double)expf(row[i] - st.max_l);
@@ -846,7 +908,6 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
 
   float outlier_prob = expf(outlier_logit - st.max_l) / sum_exp;
   float max_prob = 1.0f / sum_exp;
-  float min_prob = expf(st.min_l - st.max_l) / sum_exp;
 
   double sum_out_d = 0.0;
   {
@@ -862,6 +923,19 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
       p16 = zero_pad_lanes(v16, p16);
   #endif
       p16.save(scratch + i);
+    }
+    if (i < V) {
+      float tail[16];
+      std::fill(tail, tail + 16, kPadSentinel);
+      std::copy(row + i, row + V, tail);
+      vec_op::FP32Vec16 v16(tail);
+      vec_op::FP32Vec16 p16 = fast_exp(v16 - base16) * isum16;
+  #if defined(__powerpc__)
+      p16 = zero_pad_lanes(v16, p16);
+  #endif
+      p16.save(tail);
+      std::copy(tail, tail + (V - i), scratch + i);
+      i = V;
     }
 #endif
     for (; i < V; ++i) scratch[i] = expf(row[i] - st.max_l) * inv_sum;
@@ -881,40 +955,27 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
     sbuf = scratch;
     sn = V;
     buf_hi = max_prob;
-    buf_lo = min_prob;
+    // A near-one p may need the minimum group, so lo must be below it.
+    buf_lo = 0.0f;
   }
 
   double sum_above;
   float boundary_prob =
       binary_search_buffer(sbuf, sn, p_val, buf_lo, buf_hi, &sum_above);
 
-  float dup_logit = logf(boundary_prob * sum_exp) + st.max_l;
-
-  // NaN or overflow above max_l means binary search degenerated; skip masking.
-  if (!(dup_logit <= st.max_l)) {
+  // Degenerate softmax (e.g. an all-masked row): leave the logits untouched.
+  if (!(boundary_prob > 0.0f) || !std::isfinite(boundary_prob)) {
     return;
   }
 
-  int n_at_boundary = count_within_tol(row, V, dup_logit, kBoundaryTol);
-
   int n_keep_at_boundary = 0;
-  if (n_at_boundary > 0) {
-    double remaining = (double)p_val - sum_above;
-    if (remaining > 0.0 && (double)boundary_prob > 0.0) {
-      double needed_d = ceil(remaining / (double)boundary_prob);
-      if (needed_d >= (double)n_at_boundary)
-        n_keep_at_boundary = n_at_boundary;
-      else if (needed_d > 0.0)
-        n_keep_at_boundary = (int)needed_d;
-    }
+  double remaining = (double)p_val - sum_above;
+  if (remaining > 0.0) {
+    double needed_d = ceil(remaining / (double)boundary_prob);
+    n_keep_at_boundary = (int)std::min(needed_d, (double)V);
   }
 
-  if (n_keep_at_boundary == 0) {
-    mask_write_below(row, V, dup_logit, neg_inf);
-  } else {
-    apply_boundary_tie_loop(row, V, dup_logit, dup_logit, kBoundaryTol,
-                            n_keep_at_boundary);
-  }
+  apply_boundary_tie_loop(row, scratch, V, boundary_prob, n_keep_at_boundary);
 }
 
 static void top_k_row(float* __restrict__ row, int V, int k_val,

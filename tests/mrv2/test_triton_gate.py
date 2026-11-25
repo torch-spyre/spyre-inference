@@ -97,27 +97,16 @@ _WITH_TRITON_CPU = pytest.mark.parametrize(
 @_WITH_TRITON_CPU
 @pytest.mark.parametrize("cuda_visible_devices", [None, ""])
 @pytest.mark.parametrize("first", _FIRST_IMPORTS)
-def test_v1_stays_triton_free(first: str, cuda_visible_devices: str | None, _env: str) -> None:
-    """An empty CUDA_VISIBLE_DEVICES is where vLLM's own check keeps Triton on."""
-    env = {"SPYRE_MODEL_RUNNER": "v1"}
-    if cuda_visible_devices is not None:
-        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+def test_v2_on_host_kernels_stays_triton_free(
+    first: str, cuda_visible_devices: str | None, _env: str
+) -> None:
+    """The default: kernels.bind() replaces every kernel, so vLLM never sees Triton. An
+    empty CUDA_VISIBLE_DEVICES is where vLLM's own check keeps Triton on."""
+    env = {} if cuda_visible_devices is None else {"CUDA_VISIBLE_DEVICES": cuda_visible_devices}
     assert _probe(_FIRST_IMPORTS[first], **env) == ["False", "TritonPlaceholder", "function"]
 
 
-@pytest.mark.subprocess_isolated
-@_WITH_TRITON_CPU
-@pytest.mark.parametrize("first", _FIRST_IMPORTS)
-def test_v2_on_host_kernels_stays_triton_free(first: str, _env: str) -> None:
-    """The default: kernels.bind() replaces every kernel, so vLLM never sees Triton."""
-    assert _probe(_FIRST_IMPORTS[first], SPYRE_MODEL_RUNNER="v2") == [
-        "False",
-        "TritonPlaceholder",
-        "function",
-    ]
-
-
-_V2_ON_TRITON = {"SPYRE_MODEL_RUNNER": "v2", "SPYRE_MRV2_KERNELS": "triton"}
+_V2_ON_TRITON = {"SPYRE_MRV2_KERNELS": "triton"}
 
 
 @pytest.mark.triton_cpu
@@ -162,7 +151,7 @@ _V2_WORKER = ["True", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"]
 @pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("machine", ["ppc64le", "s390x", "x86_64"])
 def test_v2_on_host_kernels_builds_without_triton(machine: str) -> None:
-    out = _run(_V2_CONFIG_WITHOUT_TRITON.format(machine=machine), SPYRE_MODEL_RUNNER="v2")
+    out = _run(_V2_CONFIG_WITHOUT_TRITON.format(machine=machine))
     assert out[-2:] == _V2_WORKER
 
 
@@ -171,7 +160,6 @@ def test_v2_on_host_kernels_builds_without_triton(machine: str) -> None:
 def test_v2_on_triton_refuses_without_triton_cpu(machine: str) -> None:
     out = _run(
         _V2_CONFIG_WITHOUT_TRITON.format(machine=machine),
-        SPYRE_MODEL_RUNNER="v2",
         SPYRE_MRV2_KERNELS="triton",
     )
     assert out[-2:] == ["refused", "True"]
@@ -278,7 +266,7 @@ def test_check_restores_the_patched_lookups(monkeypatch: pytest.MonkeyPatch) -> 
     assert half.find_spec is not find_spec
     assert half.vllm_version_matches_substr is not matches
 
-    triton_gate.check("v1", "host")
+    triton_gate.check("host")
 
     assert importlib.util.find_spec is half.find_spec is find_spec
     assert vllm.platforms.vllm_version_matches_substr is half.vllm_version_matches_substr is matches

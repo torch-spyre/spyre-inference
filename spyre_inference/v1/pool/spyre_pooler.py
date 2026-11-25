@@ -102,20 +102,41 @@ def _pooler_output_on_cpu(raw_pooler_output: PoolerOutput) -> PoolerOutput:
 def copy_pooler_output_to_cpu(
     raw_pooler_output: PoolerOutput, finished_mask: list[bool]
 ) -> list[torch.Tensor | None]:
-    """vLLM ``_copy_pooler_output_to_cpu`` after Spyre→CPU via ``convert``.
+    """The finished requests' pooled outputs on CPU, None for the others.
 
-    Upstream uses ``.to("cpu", non_blocking=True)``, which is not a valid Spyre
-    D2H path. Convert first so the shared finished-mask / partial-batch logic
-    stays in vLLM.
+    vLLM 0.33's ``_copy_pooler_output_to_cpu`` (gpu_model_runner.py), after a Spyre→CPU
+    ``convert``: upstream's ``.to("cpu", non_blocking=True)`` is not a valid Spyre D2H.
     """
-    from vllm.v1.worker.gpu_model_runner import (
-        _copy_pooler_output_to_cpu as _vllm_copy_pooler_output_to_cpu,
-    )
-
-    return _vllm_copy_pooler_output_to_cpu(
-        _pooler_output_on_cpu(raw_pooler_output),
-        finished_mask,
-    )
+    raw_pooler_output = _pooler_output_on_cpu(raw_pooler_output)
+    num_reqs = len(finished_mask)
+    if isinstance(raw_pooler_output, torch.Tensor):
+        if raw_pooler_output.shape[0] != num_reqs:
+            raise ValueError(
+                "Pooler output batch size does not match finished mask size: "
+                f"{raw_pooler_output.shape[0]} != {num_reqs}."
+            )
+        num_finished = sum(finished_mask)
+        if num_finished == 0:
+            return [None] * num_reqs
+        if num_finished == num_reqs:
+            return list(raw_pooler_output)
+        finished_indices = [i for i, include in enumerate(finished_mask) if include]
+        finished_outputs = raw_pooler_output.index_select(
+            0, torch.tensor(finished_indices, dtype=torch.long)
+        )
+        partial: list[torch.Tensor | None] = [None] * num_reqs
+        for i, out in zip(finished_indices, finished_outputs):
+            partial[i] = out
+        return partial
+    if len(raw_pooler_output) != num_reqs:
+        raise ValueError(
+            "Pooler output batch size does not match finished mask size: "
+            f"{len(raw_pooler_output)} != {num_reqs}."
+        )
+    return [
+        out if include else None
+        for out, include in zip(raw_pooler_output, finished_mask, strict=True)
+    ]
 
 
 def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
@@ -330,7 +351,7 @@ class SpyreDispatchPooler(DispatchPooler):
     length, so ``torch.compile(dynamic=False)`` adds a specialization per distinct
     length and Dynamo rescans a growing guard chain on every later call —
     throughput decays as more distinct lengths are seen, which is why
-    ``TorchSpyreModelRunner._pool`` deliberately hands this a padded tensor in the
+    ``SpyrePoolingRunner.pool`` deliberately hands this a padded tensor in the
     first place. Undoing the slice here is what makes that intent hold.
 
     Safe because CLS and LAST address valid rows through cursor indices (CLS uses

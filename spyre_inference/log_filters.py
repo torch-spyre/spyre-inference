@@ -12,12 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vLLM log records that are noise on Spyre, dropped at the logger that emits them.
-
-Each entry matches one exact message template. Every entry has a row in the vLLM
-upgrade procedure (Step 2b), and ``tests/runtime/test_log_filters.py`` fails when a
-vLLM bump rewords a template, so a filter cannot silently stop matching.
-"""
+"""vLLM log records that are noise on Spyre. Each entry has a row in the vLLM upgrade
+procedure (Step 2b), and test_log_filters.py fails when vLLM rewords its template."""
 
 import logging
 from collections.abc import Callable
@@ -35,7 +31,6 @@ class LogFilter:
 
 
 def _platform_cast(record: logging.LogRecord) -> bool:
-    """The fp16 cast the platform forces, already reported once at config time."""
     args = record.args
     return (
         isinstance(args, tuple)

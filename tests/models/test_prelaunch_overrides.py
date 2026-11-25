@@ -24,14 +24,14 @@ from spyre_inference.models import _prelaunch, apply_prelaunch_overrides
 
 @pytest.mark.parametrize("model_type", ["gemma4", "mistral3", "llama"])
 def test_the_processor_normalizes_images_for_every_spyre_tower(
-    monkeypatch: pytest.MonkeyPatch, model_type: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path, model_type: str
 ) -> None:
     """vLLM 0.34 defaults to raw pixels for towers that normalize on the device, which
     the Spyre towers' own patch embedding does not do."""
     monkeypatch.setattr(
         _prelaunch, "load_hf_config", lambda args: SimpleNamespace(model_type=model_type)
     )
-    engine_args = EngineArgs(model="unused")
+    engine_args = EngineArgs(model=str(tmp_path))  # a local path: no hub lookup
     assert engine_args.mm_device_do_normalize
     apply_prelaunch_overrides(engine_args)
     assert engine_args.mm_device_do_normalize is False

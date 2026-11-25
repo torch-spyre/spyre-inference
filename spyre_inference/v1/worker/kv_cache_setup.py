@@ -121,13 +121,15 @@ def allocate_spyre_kv_caches(
     device: torch.device,
     kernel_block_sizes: list[int] | None = None,
 ) -> dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]]:
-    """SpyrePagedKVCache pages per attention layer, at upstream's KVCacheTensor placement,
-    and a tuple of state tensors per Mamba layer.
+    """SpyrePagedKVCache pages per attention layer and a tuple of state tensors per Mamba
+    layer, at upstream's KVCacheTensor placement.
 
-    Attention layers placed on the same bytes (layer ``l`` of every cache group) share one
-    K/V pair, each viewing it in its own page shape. A Spyre tensor never spans the
-    allocator's regions, so each byte range is its own allocation rather than one backing
-    buffer.
+    Layers placed on the same bytes (layer ``l`` of every cache group) share one allocation
+    per kind: attention layers one K/V pair, each viewing it in its own page shape, and
+    Mamba layers one state tuple. Upstream also lays the Mamba states over the attention
+    pages, which Spyre's separate K and V tensors cannot hold. A Spyre tensor never spans
+    the allocator's regions, so each byte range is its own allocation rather than one
+    backing buffer.
     """
     group_by_layer = {
         layer_name: (group_id, group.kv_cache_spec)
@@ -136,6 +138,7 @@ def allocate_spyre_kv_caches(
     }
     num_blocks = kv_cache_config.num_blocks
     pages_by_offset: dict[int, SpyrePagedKVCache] = {}
+    states_by_offset: dict[int, tuple[MambaSpec, tuple[torch.Tensor, ...]]] = {}
     claimed: set[tuple[int, int]] = set()
     kv_caches: dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -143,9 +146,25 @@ def allocate_spyre_kv_caches(
             group_id, spec = group_by_layer[layer_name]
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[layer_name]
-            # Upstream lays a Mamba page over attention bytes; Spyre keeps them apart.
+            offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
+            if (offset, group_id) in claimed:
+                raise RuntimeError(
+                    f"{layer_name}: another layer of KV cache group {group_id} already "
+                    f"holds the pages at byte offset {offset}."
+                )
+            claimed.add((offset, group_id))
             if isinstance(spec, MambaSpec):
-                kv_caches[layer_name] = _allocate_mamba_states(num_blocks, spec, device)
+                # Block IDs are unique across groups, so the groups' slots never collide.
+                if offset not in states_by_offset:
+                    states = _allocate_mamba_states(num_blocks, spec, device)
+                    states_by_offset[offset] = (spec, states)
+                first_spec, states = states_by_offset[offset]
+                if (spec.shapes, spec.dtypes) != (first_spec.shapes, first_spec.dtypes):
+                    raise NotImplementedError(
+                        f"{layer_name}: its Mamba states {spec.shapes} {spec.dtypes} differ "
+                        f"from those already at byte offset {offset}."
+                    )
+                kv_caches[layer_name] = states
                 continue
             # The group's kernel block size from upstream, which can split a manager block
             # into several kernel blocks. Without an entry the kernels read whole manager blocks.
@@ -157,13 +176,6 @@ def allocate_spyre_kv_caches(
             # A layer without an impl (fixture stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
-            if (offset, group_id) in claimed:
-                raise RuntimeError(
-                    f"{layer_name}: another layer of KV cache group {group_id} already "
-                    f"holds the pages at byte offset {offset}."
-                )
-            claimed.add((offset, group_id))
             num_pages = num_blocks * pages_per_block
             # The first layer at an offset allocates its pages; layers of other groups at the
             # same offset view them in their own page shape.

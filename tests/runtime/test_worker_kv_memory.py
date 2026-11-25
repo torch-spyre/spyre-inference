@@ -172,22 +172,27 @@ def _mamba_hybrid(num_mamba: int = 6) -> dict:
     return {**{f"layers.{i}.mixer": mamba for i in range(num_mamba)}, "layers.99.attn": _full()}
 
 
-def test_a_mamba_hybrid_is_sized_by_its_per_layer_device_cost(monkeypatch):
-    """vLLM's pool needs one shared page per block for all groups, but Spyre gives every
-    layer its own page: the budget converts the measured device bytes into blocks at
-    Spyre's cost, so they fit on the card."""
+def test_a_mamba_hybrid_is_sized_by_its_per_kind_device_cost(monkeypatch):
+    """vLLM's pool lays the Mamba states over the attention page of one block, but Spyre
+    allocates them apart: the six one-layer Mamba groups share one state tuple next to the
+    attention page. The budget converts into blocks at Spyre's cost, so they fit on the
+    card. (An explicit budget skips the region cap, which a model this shallow hits.)"""
     specs = _mamba_hybrid()
+    budget = 8 * GiB
     worker = _worker(
-        monkeypatch, free_after_load=20 * GiB, kv_cache_spec=specs, hybrid_kv_cache_manager=True
+        monkeypatch,
+        free_after_load=20 * GiB,
+        kv_cache_memory_bytes=budget,
+        kv_cache_spec=specs,
+        hybrid_kv_cache_manager=True,
     )
     mamba_bytes = specs["layers.0.mixer"].real_page_size_bytes
-    spyre_bytes_per_block = 6 * mamba_bytes + BLOCK_BYTES
+    spyre_bytes_per_block = mamba_bytes + BLOCK_BYTES
 
     blocks = worker.determine_available_memory() // BLOCK_BYTES
 
-    measured = worker.requested_memory - (TOTAL - 20 * GiB)
-    assert blocks == measured // spyre_bytes_per_block
-    assert blocks * spyre_bytes_per_block <= measured
+    assert blocks == budget // spyre_bytes_per_block
+    assert blocks * spyre_bytes_per_block <= budget
 
 
 def test_a_hybrid_model_is_sized_at_upstreams_bytes_per_block(monkeypatch):

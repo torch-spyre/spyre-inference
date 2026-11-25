@@ -41,7 +41,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from resource_sampler import ContainerSampler, write_resource_metrics
+
+# The sibling scripts are not a package, and PYTHONSAFEPATH=1 (set by vllm-bench-serve's
+# run_leg.sh) keeps this script's directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from resource_sampler import ContainerSampler, write_resource_metrics  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)

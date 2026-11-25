@@ -1,0 +1,38 @@
+direction: right
+classes: {
+  plugin: {style: {fill: "#2e7d32"; stroke: "#1b5e20"; font-color: "#ffffff"}}
+  device: {style: {fill: "#1565c0"; stroke: "#0d47a1"; font-color: "#ffffff"}}
+  gap: {style: {fill: "#ef6c00"; stroke: "#e65100"; font-color: "#ffffff"}}
+  container: {style: {fill: "#e0e0e0"; stroke: "#9e9e9e"; font-color: "#212121"}}
+}
+
+x: "x [T, H] fp16\nrouter logits" {class: plugin}
+quant: "Per-token quant, once per layer\nquantscalepertokenfp8 + qfp8ch → x8, s_x" {class: device}
+route: "Recipe routing on device\nsoftmax, top-k, renormalize" {class: plugin}
+
+gathered: "Gathered form (decode)" {
+  class: container
+  g1: "scaled_bmm(x8, gate/up[idx])\nT2: K-split chunk view" {class: gap}
+  g2: "× s_x · s_w13[e]; gelu_tanh(gate) · up\nper-token quant → a8, s_a" {class: device}
+  g3: "scaled_bmm(a8, down[idx])\n× s_a · s_w2[e]; weighted top-k sum" {class: device}
+  g1 -> g2 -> g3
+}
+
+persistent: "Persistent form (prefill): for_each_tile over E" {
+  class: container
+  p1: "scaled_mm(x8, gate_e / up_e)\nT3: tile of stored QFP8WT pool" {class: gap}
+  p2: "× s_x · s_w13[e]; gelu_tanh(gate) · up\nper-token quant in body → a8" {class: device}
+  p3: "scaled_mm(a8, down_e) × s_a · s_w2[e]\nacc += route_e · out" {class: device}
+  p1 -> p2 -> p3
+}
+
+y: "y [T, H] fp16" {class: plugin}
+
+x -> quant
+x -> route
+quant -> gathered.g1: "T not a stick multiple"
+quant -> persistent.p1: "T a stick multiple"
+route -> gathered.g1: "expert index"
+route -> persistent.p3: "route column"
+gathered.g3 -> y
+persistent.p3 -> y

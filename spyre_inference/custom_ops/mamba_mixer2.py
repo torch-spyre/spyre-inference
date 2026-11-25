@@ -329,7 +329,7 @@ class SpyreMambaMixer2(MambaMixer2):
         heads = (self.intermediate_size, self.tp_size)
         groups = (n_groups * self.ssm_state_size, n_groups)
         conv_loader = group_replicated_loader([heads, groups, groups], self.tp_size, tp_rank)
-        _set_weight_loader(self.conv1d.weight, conv_loader)
+        _set_weight_loader(cast(torch.Tensor, self.conv1d.weight), conv_loader)
         if self.conv1d.bias is not None:
             _set_weight_loader(self.conv1d.bias, conv_loader)
         proj_loader = group_replicated_loader(

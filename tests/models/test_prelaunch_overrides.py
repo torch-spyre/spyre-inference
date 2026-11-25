@@ -28,7 +28,9 @@ def test_the_processor_normalizes_images_for_every_spyre_tower(
 ) -> None:
     """vLLM 0.34 defaults to raw pixels for towers that normalize on the device, which
     the Spyre towers' own patch embedding does not do."""
-    monkeypatch.setattr(_prelaunch, "load_hf_config", lambda args: SimpleNamespace(model_type=model_type))
+    monkeypatch.setattr(
+        _prelaunch, "load_hf_config", lambda args: SimpleNamespace(model_type=model_type)
+    )
     engine_args = EngineArgs(model="unused")
     assert engine_args.mm_device_do_normalize
     apply_prelaunch_overrides(engine_args)

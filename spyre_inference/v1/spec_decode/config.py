@@ -12,9 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import torch
 
 MAX_DFLASH_BATCH_SIZE = 4
+# What VllmConfig._get_v2_model_runner_unsupported_features reports for suffix decoding.
+_SUFFIX_ON_V2 = "speculative method 'suffix'"
+
+
+def allow_suffix_on_v2() -> None:
+    """Let suffix decoding past upstream's V2 refusal: Spyre's runner builds its own
+    suffix speculator (``spyre/suffix_decode.py``). Idempotent."""
+    from vllm.config.vllm import VllmConfig
+
+    original = VllmConfig._get_v2_model_runner_unsupported_features
+    if getattr(original, "_spyre_patched", False):
+        return
+
+    @functools.wraps(original)
+    def without_suffix(self) -> list[str]:
+        return [f for f in original(self) if f != _SUFFIX_ON_V2]
+
+    without_suffix._spyre_patched = True
+    VllmConfig._get_v2_model_runner_unsupported_features = without_suffix  # ty: ignore[invalid-assignment]
 
 
 def normalize_speculative_config(engine_args) -> None:

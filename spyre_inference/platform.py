@@ -1062,6 +1062,10 @@ class TorchSpyrePlatform(CpuPlatform):
         triton_gate.check(mrv2_kernels)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner()
+        # Every process, ahead of the V2 validation that follows this hook in __post_init__.
+        from spyre_inference.v1.spec_decode.config import allow_suffix_on_v2
+
+        allow_suffix_on_v2()
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.rejection_sample_method == "fly":

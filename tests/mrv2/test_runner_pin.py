@@ -189,6 +189,39 @@ def test_suffix_decoding_passes_the_v2_feature_check(
     TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
 
 
+def test_upstreams_v2_refusal_of_suffix_is_lifted_and_its_others_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.vllm import VllmConfig
+
+    from spyre_inference.v1.spec_decode.config import allow_suffix_on_v2
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "_get_v2_model_runner_unsupported_features",
+        lambda self: ["speculative method 'suffix'", "heterogeneous-vocabulary draft models"],
+    )
+    allow_suffix_on_v2()
+    allow_suffix_on_v2()
+    assert VllmConfig._get_v2_model_runner_unsupported_features(None) == [  # ty: ignore[invalid-argument-type]
+        "heterogeneous-vocabulary draft models"
+    ]
+
+
+def test_upstream_still_names_suffix_as_it_refuses_it() -> None:
+    """allow_suffix_on_v2 matches upstream's wording; a rewording fails here."""
+    import inspect
+
+    from vllm.config.vllm import VllmConfig
+
+    from spyre_inference.v1.spec_decode import config
+
+    source = inspect.getsource(VllmConfig._get_v2_model_runner_unsupported_features)
+    assert 'in ("suffix", "custom_class")' in source
+    assert "f\"speculative method '{speculative_config.method}'\"" in source
+    assert config._SUFFIX_ON_V2 == "speculative method 'suffix'"
+
+
 def test_v2_check_and_update_config_runs_the_feature_check(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:

@@ -373,7 +373,8 @@ void mrv2_compute_local_logits_stats(
                                    &t_max[i * target_local_max_stride + blk],
                                    &t_sum[i * target_local_sumexp_stride + blk]);
         if (HAS_DRAFT_LOGITS) {
-          const int64_t drow = req * draft_logits_stride_0 + local_pos[i] * draft_logits_stride_1;
+          const int64_t drow = draft_row(draft_logits_row_mapping_ptr, req) * draft_logits_stride_0 +
+                               local_pos[i] * draft_logits_stride_1;
           mrv2_vx::max_sumexp<true>(d32 + drow, begin, end, temp,
                                     &d_max[i * draft_local_max_stride + blk],
                                     &d_sum[i * draft_local_sumexp_stride + blk]);
@@ -565,7 +566,7 @@ void mrv2_resample(
     // The draft-ratio residual of fp32 rows, 4 tokens a step.
     if (!bonus && rejected_token >= 0 && HAS_DRAFT_LOGITS && target.f32() && draft->f32()) {
       const float* t = target.f32() + token_idx * target_logits_stride;
-      const float* d = draft->f32() + req * draft_logits_stride_0 + step * draft_logits_stride_1;
+      const float* d = draft->f32() + drow * draft_logits_stride_0 + step * draft_logits_stride_1;
       const vf32 vt = vec_splats(temp), vtl = vec_splats(t_lse[r]), vdl = vec_splats(d_lse[r]);
       const vf32 one = vec_splats(1.0f), ninf = vec_splats(kNegInf);
       for (; v0 + 4 <= vocab_size; v0 += 4) {

@@ -271,6 +271,39 @@ records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+#### One per-sequence kernel for every page count
+
+The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
+use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.
+
+Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
+prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
+their own page count.
+
+The page tables and mask stacks are copied to the device with torch-spyre's
+`tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+`--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
+below that rounded value, prefill reads one page per loop step instead.
+
+The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
+bucket pair, when any of these holds:
+
+- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
+  `MAX_BUCKETS`; startup logs a warning;
+- the layer uses sliding-window attention.
+
+The batched decode kernel takes its chunk count at run time in the same way, and under the
+same conditions. The kernel reads the KV cache one *chunk* per loop step: the next
+`32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
+cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
+and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
+masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
+chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
+num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
+
 ## KV cache size
 
 The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
@@ -279,13 +312,19 @@ left of `--gpu-memory-utilization` (default 0.92) × total. The cache keeps ever
 that memory pays for, usually far more than `--max-num-seqs` requests at `--max-model-len`
 need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.
 
-Each Spyre layer allocates its own page per block, so the budget is converted into blocks
-at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
-groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
-one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
-regions, so a model with few layers gets fewer blocks than its budget: they must still pack
-into the regions. When memory runs out before a full batch fits, a warning names the knobs,
-and requests wait for pages instead of all running at full length.
+Spyre turns vLLM's hybrid KV cache manager off by default, so every layer allocates its own
+page per block and the budget is converted into blocks at the device cost of all layers' pages.
+`--no-disable-hybrid-kv-cache-manager` turns it on: a model that mixes
+sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets one KV cache group per
+kind, sliding-window groups return blocks that fall out of the window, and the groups overlay
+one another as upstream lays them out, each layer reading the shared pages in its own shape, so
+a block costs what vLLM's pool counts. Either way the pages are
+laid out layer-outer, so `VLLM_KV_CACHE_LAYOUT` accepts only `LBNHC` (the default) or `LBHNC`,
+and a block-outer value fails at startup. Every K and V page allocation is one tensor, and the
+Spyre allocator never splits a tensor across its 16 GiB memory regions, so a model with few
+layers gets fewer blocks than its budget: they must still pack into the regions. When memory
+runs out before a full batch fits, a warning names the knobs, and requests wait for pages
+instead of all running at full length.
 
 The profile run is skipped, as the first forward on Spyre would trace the model before
 the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`
@@ -316,6 +355,22 @@ The scales are compiled into the graphs as constants. A checkpoint whose layers 
 different KV scales therefore compiles the transformer block and each recorded attention
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.
+
+## Model runner
+
+The plugin runs vLLM's Model Runner V2 (MRV2), its only model runner: the V1 runner was
+removed (#1245), and `SPYRE_MODEL_RUNNER=v1` is refused at startup. MRV2's Triton
+kernels are replaced by host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so
+no Triton install is needed on any architecture. The plugin pins
+`VLLM_USE_V2_MODEL_RUNNER=1`, so don't set it yourself.
+
+Differences from the removed V1 runner:
+
+- Seeded sampling draws a different token sequence for the same seed, because MRV2
+  seeds each position rather than one generator per request. Greedy output is unchanged.
+- These are refused at startup: speculative decoding other than DFlash/XPress,
+  batch-sharded sampling, `cudagraph_mm_encoder`, prefill context parallelism, and,
+  untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).
 
 ## Offline engine in the calling process
 

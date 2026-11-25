@@ -144,6 +144,20 @@ Three adaptations worth knowing:
   all-expert form whatever its size, since each row's storage offset has to span whole sticks
   for the compiled loop to address it; a single token is handed to the gathered form whole, so
   it never needs that.
+  Traced into a compiled block, the all-expert form is one `for_each_tile` loop over the
+  experts, one expert per trip on all cores. A model's recipe can run G experts per trip
+  (`SpyreMoERecipe.expert_group`, default 1) for the stick-aligned batch sizes in
+  `expert_group_tokens`, both ends included: the cores form G groups, each core takes a block
+  of tokens through one whole expert, each group adds into its own accumulator, and one sum
+  over the G accumulators follows the loop. Only fp16 rounding changes. The range is the
+  recipe's because the batch sizes where grouping pays depend on the model's expert shapes.
+  G must divide the expert count and the core count, and the cores must divide a stick of
+  tokens; a recipe group that does not fit runs one expert per trip, with a warning. The
+  accumulators stay in LX only on a torch-spyre that gives the sum after the loop a relayout
+  copy of the loop's carry; without it the values are the same and the accumulators live in
+  HBM. Batches outside the range, batches that are not whole sticks of tokens (the usual decode
+  sizes) and the eager forms are unchanged. The gemma-4 recipe runs G = 4 for 128 to 512
+  tokens. Device tests cover a grouped loop at TP 1, and at TP 2 on the nano checkpoint.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` stacks those forms contract on (see
   [MoE expert weights](#moe-expert-weights)), freeing each source stack as it goes,
@@ -342,16 +356,16 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 
 | Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) |
 |---|---|---|---|---|
-| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, key-padding row, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
 | `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions | valid patches only, offset-major by position; segments; x and y |
-| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | one image's offset-major patches, a zero key-padding row, RoPE positions | valid patches only, offset-major by position; segments; x and y |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, `[1, 1, 1, P]` key-padding mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
 | `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses |
 | `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` |
 | `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default |
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
-| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 1 (so the mask only hides padding) | 63 (one-hot width) |
 | `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` |
 | `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
 | `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
@@ -381,9 +395,11 @@ Constraints the layout follows:
   its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
   and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
   reshape feeding a matmul cannot be laid out.
-- The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
-  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
-  cannot lay out.
+- Pixtral encodes one image per call, so its mask is a `[P]` key-padding row (0 for real
+  patches, `finfo.min / 2` for padding slots) broadcast over queries. Gemma 4 packs images,
+  and its image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the
+  last column reserved for padding slots), not a column-minus-row broadcast, which
+  torch-spyre cannot lay out.
 - RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
   `GatherTable` (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
   one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
@@ -410,7 +426,7 @@ materialized contiguously first.
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
+| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets (the per-sequence kernels usually keep each sequence's own block count instead, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
 | 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter, one per KV head, through a row view of the paged cache (fused into one kernel); only the row-index vectors are computed host-side and copied over |
 | 3. Page attention | Spyre | Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 4. Write-back | Spyre | Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy |
@@ -427,7 +443,7 @@ disagree.
 A layer with a `kv_sharing_target_layer_name` (gemma-4 E2B / E4B) allocates no cache: the
 runner aliases its target's pages in `initialize_kv_cache_tensors`. vLLM adds such a layer to
 its target's KV cache group but not to that group's `UniformTypeKVCacheSpecs`, so the
-per-layer spec lookup in `initialize_attn_backend` would `KeyError`; both runners hand the
+per-layer spec lookup in `initialize_attn_backend` would `KeyError`; the runner hands the
 attention backend a copy (`with_kv_sharing_layer_specs`) that maps it to the target's spec,
 leaving the retained config's specs, and so its `page_size_bytes`, physical. YOCO fast prefill
 (`kv_sharing_fast_prefill`) swaps in an attention backend Spyre does not provide and is rejected.
@@ -436,24 +452,27 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
 per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
 block counts that fit its smallest real query length; variants exceeding the allocated
-page count are skipped. Failed recordings are logged and compile on first use instead.
+page count are skipped. When the per-sequence page count is dynamic (copied to the device
+with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
+bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
+it. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
+traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
+compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
-declined at dispatch. A single step can carry a mix of prefill and decode sequences; each
-sequence is padded to its own query bucket (decodes use the length-1 bucket) before
-dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
+just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
+recorded at the chunk count of `max_model_len`, that runs every longer batch. A single step can carry a mix of prefill
+and decode sequences; each sequence is padded to its own query bucket (decodes use the
+length-1 bucket) before dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
-with KV length. `SPYRE_ATTN_FOR_EACH_TILE=1` walks that axis with torch-spyre's
-`for_each_tile` instead, leaving one body plus a tile spec, and the same applies to the
-batched-decode kernel's walk over block chunks. The kernels carry the online softmax as
-a `(tile_max, tile_sum, tile_output)` triple either way. `walk_tiles` selects the walk;
-the same flag also controls `fullgraph` and the batched-decode page-index upload.
-`SPYRE_ATTN_FOR_EACH_TILE=1` is the default; setting it to `0` uses Python loops as a
-rollback path. The flag is read once at import, so set it before importing
-`spyre_inference`.
+with KV length. The kernels therefore walk that axis with torch-spyre's `for_each_tile`,
+leaving one body plus a tile spec, and the same applies to the batched-decode kernel's
+walk over block chunks. The kernels carry the online softmax as a
+`(tile_max, tile_sum, tile_output)` triple.
 
 ### LX-resident pages
 
@@ -476,8 +495,7 @@ Two things follow from those choices. The gather is a 2-D subscript, which lower
 `aten.index` and fails eager on Spyre by upcasting its int32 index (torch-spyre#4334,
 tracked by `test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is
 always compiled on Spyre, even under `--enforce-eager` — attention compiles in its own
-domain, so the rest of the model still runs eager. Off Spyre an eager run calls the same
-kernels uncompiled, which is how the CPU-reference tests exercise them. Because the bmm's
+domain, so the rest of the model still runs eager. Because the bmm's
 output axes (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling
 them would mean K-splitting a reduction a gather cannot mirror, the attention compile alone
 is capped at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's
@@ -638,25 +656,20 @@ attention kernels.
 
 ## Device Placement Strategy
 
-`TorchSpyreModelRunner` inherits from vLLM's `GPUModelRunner` and treats Spyre as the
-"GPU" in the `CpuGpuBuffer` pattern. Buffers are created via a `SpyreCpuGpuBuffer`
-override:
-
-- **Float dtypes**: `.cpu` on CPU (numpy staging for the scheduler), `.gpu` on Spyre as
-  `float16`
-- **Int / bool dtypes**: `.gpu` aliased to `.cpu` (Spyre doesn't natively support these)
-
-`self.device` stays `cpu` so that scatter, indexing, and block-table ops run on CPU, but
-float compute tensors land on Spyre via `self._spyre_device`. Because there is no
-`vllm._C` under `VLLM_TARGET_DEVICE=empty`, the runner also swaps in a pure-PyTorch
-`_compute_slot_mapping_impl` for the paged-cache slot-mapping kernel.
+`SpyreModelRunnerV2` (`v1/worker/spyre/model_runner.py`) subclasses Model Runner V2's
+`GPUModelRunner` (`vllm/v1/worker/gpu/model_runner.py`) on `device=cpu`: every MRV2 buffer,
+the input batch, block tables and sampling state live on the host, and the runner keeps
+the real device as `spyre_device`. MRV2's `torch.cuda` streams and events are replaced by
+host placeholders (`device_shims.py`), and every `@triton.jit` kernel MRV2 launches
+(batch prep, slot mapping, sampling, rejection) is bound to a csrc/ host op in its place
+(`kernels.py`, `csrc/cpu/mrv2_kernels.cpp`), so no Triton and no `vllm._C` is needed.
 
 At load time, `load_model` moves every module except `Attention` scale buffers onto Spyre.
 The weight transposes happen before that, in each layer's
 `process_weights_after_loading`, while the weights are still on CPU.
 
-`_SpyreModelWrapper` sits between the model runner and the model and converts at the
-call boundary:
+`_SpyreModelWrapper` (`v1/worker/spyre/model_wrapper.py`) sits between the model runner and
+the model and converts at the call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
 - **Output**: a generative model's hidden states stay on Spyre. Upstream's
@@ -694,51 +707,37 @@ rotation-cache gather and the embedding gather also run on-device.
 ## Host-side sampling
 
 `SpyreLogitsProcessor` hands the sampler CPU logits, so every sampling step runs on the
-host, serially between device forwards. vLLM picks its sampler path by platform:
-`TorchSpyrePlatform` is `PlatformEnum.OOT`, so `is_cpu()` is `False`, and
-`TopKTopPSampler` falls through to `forward_native` — eager PyTorch, with none of the
-fused kernels upstream reserves for `forward_cpu`. Left as is, that path sorts the full
-`[batch, vocab]` logits for top-k/top-p and generates a fresh `[batch, vocab]` noise tensor
-for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
-large share of each decode step.
+host, serially between device forwards, through MRV2's own sampler. Its Triton kernels
+(temperature, min-p, penalties, logit bias, the Gumbel draw, logprobs, rejection) run as
+the csrc/ host ops `kernels.bind()` installs; they match triton-cpu bit for bit
+(`tests/mrv2/kernels/`), so a seeded request draws the same tokens either way.
 
-`SpyreModelRunner` patches upstream's `Sampler` in place after construction, pointing its
-greedy draw at `greedy_sample` (`v1/sample/sampler.py`) and its random draw at
-`SpyreTopKTopPSampler`, so every holder of it, the rejection sampler included, samples the
-same way. That brings back the CPU kernels and drops the full-vocabulary sort:
+Top-k / top-p is the one sampling step `kernels.bind()` replaces with something other than
+a port: MRV2's `apply_top_k_top_p` sorts the full `[batch, vocab]` logits, which at a 262k
+vocabulary is a large share of each decode step. `spyre_apply_top_k_top_p` takes its place
+at both call sites. With the filter ops loaded, `apply_top_k_top_p_kernels` masks in place.
+Top-k keeps every tie with the k-th value and does not sort. Top-k together with top-p
+sorts those survivors and cuts top-p exactly on them, so a k near the vocabulary size is
+close to a full sort. Top-p alone, including a row whose k is disabled in a mixed batch,
+uses vLLM's approximate CPU kernel: the kept set can differ from a full sort by a few
+boundary tokens, and it does not drop below the requested probability mass. Without those
+ops, top-k uses `topk`, top-k with top-p uses `apply_top_k_top_p_sort_free`, and top-p
+alone sorts.
 
-- **Random draw** — `SpyreTopKTopPSampler.forward_native` calls
-  `torch.ops._spyre_C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
-  Gumbel noise `g` hashed per element from a per-row seed (splitmix64 of `(seed, i)`), so
-  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
-  running best (including every `-inf` left by top-k/top-p) are skipped exactly, and most
-  others are rejected with one `exp` before the two `log`s of the Gumbel transform. A
-  seeded request draws its row seed from its own `torch.Generator`, so it stays
-  reproducible. `use_fp64_gumbel` keeps fresh fp64 noise, drawn in log space
-  (`argmax(x - log q)`, `q ~ Exp(1)`). vLLM's kernel reads its noise from a fixed 2^20-entry
-  table instead, which limits each row to 2^20 noise windows and leaves much of a large
-  vocabulary unreachable.
-- **Greedy** — `greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
-  vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
-  single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
-  scan.
-- **Top-k + top-p** — `apply_top_k_top_p_sort_free` takes a `topk` window of `2 × max_k`
-  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
-  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
-  exact tie count when ties run past it. Top-p without top-k still sorts.
-
-The kernels live in `csrc/cpu/sampling_kernels.cpp` and are built with CMake from
-`setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
-so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
-AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
-supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
+The filters live in `csrc/cpu/topk_topp_sampler.cpp`, with the vector exp in
+`csrc/cpu/cpu_fast_exp.hpp`. They are built with CMake from `setup.py`, together with the
+MRV2 host ops, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from
+vLLM, so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
+AVX2 fallback (`_C_AVX2`). `v1/sample/sampling_kernels.py` loads `_C` when
+`torch.cpu.get_capabilities()` reports `avx512_f`, `avx512_vl`, `avx512_bw` and
+`avx512_dq`, and `_C_AVX2` when it reports `avx2` and `fma3` but not that set.
+AVX512F alone is not enough: the build also uses VL, BW and DQ. The check ignores
+`ATEN_CPU_CAPABILITY`, so pinning ATen's dispatch level keeps the extension.
+The ops register under the fixed `_spyre_C`
 namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
-cannot collide with a vLLM `_C` in the same environment. If the extension
-is missing or fails to import (a failed build, or a dev checkout that never built it), the
-import logs a warning and the samplers fall back to `torch.argmax` and a fresh-noise
-log-space draw. Because the sampler reimplements
-the tail of upstream `TopKTopPSampler.forward_native`, it has to be re-synced on a vLLM
-bump.
+cannot collide with a vLLM `_C` in the same environment. If the extension is missing or
+fails to import, the import logs a warning and the worker refuses to start: the MRV2 host
+ops have no Python fallback.
 
 ## Transformers backend
 
@@ -792,7 +791,7 @@ backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't 
 `tests/probes/test_spyre_comms_native_probes.py` xfail-strict suite is the canonical
 signal: when a probe flips green, delete the corresponding override or workaround.
 
-The worker (`TorchSpyreWorker`) inherits directly from vLLM's `Worker` (gpu_worker), not
+The worker (`SpyreWorkerV2`) inherits directly from vLLM's `Worker` (gpu_worker), not
 `CPUWorker` — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
 profiling). Data and pipeline parallelism (`data_parallel_size > 1` or
 `pipeline_parallel_size > 1`) are rejected in `check_and_update_config`.

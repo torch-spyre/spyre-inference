@@ -14,7 +14,6 @@ defaults:
   server_parameters:
     load-format: auto
     compilation-config.mode: STOCK_TORCH_COMPILE
-    trust-remote-code: true
     allowed-local-media-path: ${SPYRE_VISION_IMAGES_DATASET}
   parameters:
     dataset-name: custom_image
@@ -38,6 +37,7 @@ tests:
   - test_name: serve_granite-vision41-4b_tp1_vision
     server_parameters:
       model: ibm-granite/granite-vision-4.1-4b
+      trust-remote-code: true
       tensor-parallel-size: 1
       max-model-len: 8192
       max-num-seqs: 16
@@ -45,6 +45,7 @@ tests:
   - test_name: serve_granite-vision41-4b_tp2_vision
     server_parameters:
       model: ibm-granite/granite-vision-4.1-4b
+      trust-remote-code: true
       tensor-parallel-size: 2
       max-model-len: 16384
       max-num-seqs: 16

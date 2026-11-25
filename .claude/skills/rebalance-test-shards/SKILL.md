@@ -71,8 +71,8 @@ distributed / probes / quality):
   (e.g. `Spyre attention tests (shard 3/9)`). The label is cosmetic; the `test_target` id
   is what runs.
 
-Do **not** touch the `test_retry` job — its matrix is built dynamically from
-`collect_failed_suites`, so it inherits the new shards automatically.
+Do **not** touch `_test_leg.yaml` — every leg carries its own pod-level retry, so new
+shards get one automatically.
 
 The e2e-smoke suites are sized by the `e2e_smoke` admission budget
 (`docs/contributing/integration-tier.md`), not just the per-shard ceiling: if their total

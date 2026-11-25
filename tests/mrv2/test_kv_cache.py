@@ -28,7 +28,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 
-from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl, SpyrePagedKVCache
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionBackend,
+    SpyreAttentionImpl,
+    SpyrePagedKVCache,
+)
 from spyre_inference.v1.worker.spyre import attn_groups, kv_cache, triton_gate
 
 from .fakes import make_fake_kv_cache_config
@@ -238,7 +242,7 @@ def test_initialize_kv_cache_sets_every_upstream_attribute() -> None:
             [sys.executable, "-c", script.replace("{store}", os.path.join(tmp, "store"))],
             capture_output=True,
             text=True,
-            env={**os.environ, "SPYRE_MODEL_RUNNER": "v2"},
+            env=os.environ,
             timeout=300,
         )
     assert result.returncode == 0, result.stderr[-3000:]
@@ -254,7 +258,14 @@ def test_pages_allocate_on_spyre(monkeypatch) -> None:
     _, forward_context = _run_init_kv_cache(monkeypatch, runner, [SpyreAttentionImpl] * 2, "cpu")
 
     want = (_NUM_BLOCKS, 1, _BLOCK, _HEAD)
+    assert SpyreAttentionBackend.get_kv_cache_shape(_NUM_BLOCKS, _BLOCK, 1, _HEAD) == want
     for name, pages in runner.spyre_kv_caches.items():
         assert pages.k_pages.device.type == "spyre"
         assert tuple(pages.k_pages.shape) == tuple(pages.v_pages.shape) == want
         assert forward_context[name].kv_cache is pages
+        # The kernel gathers a (page, kv_head) row, which has to stay whole at device
+        # position 0 (torch-spyre#3705) or the gather costs the whole cache, not one page.
+        for page in (pages.k_pages, pages.v_pages):
+            device_size = page.device_tensor_layout().device_size
+            assert device_size[0] == _NUM_BLOCKS * 1
+            assert device_size[1] == _BLOCK

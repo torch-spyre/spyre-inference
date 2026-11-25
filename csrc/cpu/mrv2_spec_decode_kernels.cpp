@@ -27,6 +27,10 @@
 
 #include <torch/all.h>
 
+#if defined(__s390x__)
+  #include "mrv2_s390x.hpp"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -40,6 +44,10 @@ namespace {
 
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr float kTlRandMin = 4.6566127342e-10f;
+
+#if defined(__s390x__)
+using namespace mrv2_vx;  // NOLINT: z15 helpers, mrv2_s390x.hpp
+#endif
 
 template <typename T>
 T* ptr(const torch::Tensor& t) {
@@ -87,6 +95,10 @@ class Floats {
       case at::kBFloat16: return static_cast<float>(static_cast<const at::BFloat16*>(data_)[i]);
       default: TORCH_CHECK(false, "unsupported logits dtype ", type_);
     }
+  }
+  // The fp32 storage, or nullptr for any other dtype.
+  const float* f32() const {
+    return type_ == at::kFloat ? static_cast<const float*>(data_) : nullptr;
   }
 
  private:
@@ -200,7 +212,31 @@ std::pair<int64_t, acc_t> gumbel_block(const std::vector<float>& row, int64_t be
   acc_t best = -std::numeric_limits<acc_t>::infinity();
   int64_t best_idx = 0;
   bool nan_seen = false;
-  for (int64_t v = begin; v < end; ++v) {
+  int64_t v = begin;
+#if defined(__s390x__)
+  if constexpr (!fp64) {
+    if (!noisy) {
+      const int64_t i = first_nan_or_max(row.data(), begin, end);
+      return {i - begin, row[i]};
+    }
+    // 16 tokens of noise a step, then the scalar loop's own update over them.
+    alignas(16) float noised[16];
+    for (; v + 16 <= end && !nan_seen; v += 16) {
+      for (int i = 0; i < 4; ++i)
+        vec_xst(vec_xl(0, row.data() + v + 4 * i) + gumbel_noise4(lo_prefix, v + 4 * i), 0,
+                noised + 4 * i);
+      for (int i = 0; i < 16 && !nan_seen; ++i) {
+        const float value = noised[i];
+        if (std::isnan(value) || v + i == begin || value > best) {
+          nan_seen = std::isnan(value);
+          best = value;
+          best_idx = v + i - begin;
+        }
+      }
+    }
+  }
+#endif
+  for (; v < end; ++v) {
     acc_t value = static_cast<acc_t>(row[v]);
     if (noisy) {
       if constexpr (fp64) {
@@ -314,6 +350,29 @@ void mrv2_compute_local_logits_stats(
       const float temp = temps[req];
       const int64_t begin = blk * BLOCK_SIZE, end = std::min(begin + BLOCK_SIZE, vocab_size);
       const int64_t row = i * target_logits_stride;
+#if defined(__s390x__)
+      // fp32 rows on z15; any other dtype takes the scalar loops below.
+      const float* t32 = target.f32();
+      const float* d32 = HAS_DRAFT_LOGITS ? draft->f32() : nullptr;
+      if (t32 && temp == 0.0f) {
+        const int64_t v = first_nan_or_max(t32 + row, begin, end);
+        t_argmax.set(i * target_local_argmax_stride + blk, v);
+        t_max[i * target_local_max_stride + blk] = t32[row + v];
+        continue;
+      }
+      if (t32 && (!HAS_DRAFT_LOGITS || d32)) {
+        mrv2_vx::max_sumexp<false>(t32 + row, begin, end, 1.0f,
+                                   &t_max[i * target_local_max_stride + blk],
+                                   &t_sum[i * target_local_sumexp_stride + blk]);
+        if (HAS_DRAFT_LOGITS) {
+          const int64_t drow = req * draft_logits_stride_0 + local_pos[i] * draft_logits_stride_1;
+          mrv2_vx::max_sumexp<true>(d32 + drow, begin, end, temp,
+                                    &d_max[i * draft_local_max_stride + blk],
+                                    &d_sum[i * draft_local_sumexp_stride + blk]);
+        }
+        continue;
+      }
+#endif
       if (temp == 0.0f) {
         float best = kNegInf;
         int64_t best_idx = 0;
@@ -488,7 +547,22 @@ void mrv2_resample(
     if (temp == 0.0f && !bonus) continue;
     const int64_t rejected_token = bonus ? 0 : draft_sampled[token_idx + 1];
     std::vector<float> residual(vocab_size);
-    for (int64_t v = 0; v < vocab_size; ++v) {
+    int64_t v0 = 0;
+#if defined(__s390x__)
+    // The draft-ratio residual of fp32 rows, 4 tokens a step.
+    if (!bonus && rejected_token >= 0 && HAS_DRAFT_LOGITS && target.f32() && draft->f32()) {
+      const float* t = target.f32() + token_idx * target_logits_stride;
+      const float* d = draft->f32() + req * draft_logits_stride_0 + step * draft_logits_stride_1;
+      const vf32 vt = vec_splats(temp), vtl = vec_splats(t_lse[r]), vdl = vec_splats(d_lse[r]);
+      const vf32 one = vec_splats(1.0f), ninf = vec_splats(kNegInf);
+      for (; v0 + 4 <= vocab_size; v0 += 4) {
+        const vf32 tl = vec_xl(0, t + v0) - vtl;
+        const vf32 ratio = exp4((vec_xl(0, d + v0) / vt - vdl) - tl);
+        vec_xst(vec_sel(ninf, tl + log1p4(-ratio), vec_cmplt(ratio, one)), 0, residual.data() + v0);
+      }
+    }
+#endif
+    for (int64_t v = v0; v < vocab_size; ++v) {
       const float t = target[token_idx * target_logits_stride + v];
       if (bonus || rejected_token < 0) {
         residual[v] = t;

@@ -17,9 +17,7 @@ for output and buffer for buffer. One subprocess per pytest process runs the cas
 selected: the gate has to open real Triton before vLLM imports, which this process
 did with it closed."""
 
-import importlib.util
 import os
-import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -28,10 +26,7 @@ import pytest
 
 from . import parity_cases, spec_decode_cases  # noqa: F401  (registers cases)
 
-pytestmark = pytest.mark.skipif(
-    platform.machine() != "x86_64" or importlib.util.find_spec("triton") is None,
-    reason="the parity reference is triton-cpu, which is x86-only and not installed",
-)
+pytestmark = pytest.mark.triton_cpu
 
 
 @pytest.fixture(scope="module")
@@ -50,7 +45,6 @@ def parity_report(request: pytest.FixtureRequest) -> dict[str, list[str]]:
         text=True,
         env={
             **os.environ,
-            "SPYRE_MODEL_RUNNER": "v2",
             "SPYRE_MRV2_KERNELS": "triton",
             # Not via `tests`: a PEP 420 namespace that upstream vLLM's tests package shadows.
             "PYTHONPATH": os.pathsep.join(
@@ -71,7 +65,6 @@ def parity_report(request: pytest.FixtureRequest) -> dict[str, list[str]]:
     return report
 
 
-@pytest.mark.triton_cpu
 @pytest.mark.parametrize("name", sorted(parity_cases.CASES))
 def test_host_kernel_matches_triton(parity_report: dict[str, list[str]], name: str) -> None:
     assert name in parity_report, f"{name} did not run"

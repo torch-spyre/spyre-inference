@@ -120,10 +120,10 @@ class TestLevelParsing:
         """
         import inspect
 
-        from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
+        from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
 
-        init_source = inspect.getsource(TorchSpyreWorker.init_device)
-        warmup_source = inspect.getsource(TorchSpyreWorker.compile_or_warm_up_model)
+        init_source = inspect.getsource(SpyreWorkerV2.init_device)
+        warmup_source = inspect.getsource(SpyreWorkerV2.compile_or_warm_up_model)
 
         assert "parse_level" in init_source, "init_device no longer validates the level"
         assert "parse_level" not in warmup_source, (

@@ -23,7 +23,6 @@ every query row, so this kernel spends it instead: batched GQA over
 import torch
 
 from spyre_inference.v1.attention.ops.sinks import normalize
-from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
 def page_attn_prefill_kernel(
@@ -48,8 +47,7 @@ def page_attn_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    The page walk goes through `walk_tiles`. Shapes are
-    ``page_attn_decode``'s, except:
+    The page walk is a `for_each_tile`. Shapes are ``page_attn_decode``'s, except:
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor, row i
             holding the i-th active block's page index at column 0, indexing
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
@@ -59,6 +57,8 @@ def page_attn_prefill_kernel(
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
         page_group: pages per online-softmax update; must divide num_blocks.
     """
+    from torch_spyre._inductor.wsr import for_each_tile
+
     if page_group < 1 or num_blocks % page_group:
         raise ValueError(
             f"page_group={page_group} must be a positive divisor of num_blocks={num_blocks}"
@@ -79,7 +79,7 @@ def page_attn_prefill_kernel(
     if grouped:
         q = q.unsqueeze(0)
 
-    # Both walks tile tensor axes, so what an unrolled walk read per block arrives
+    # `for_each_tile` tiles tensor axes, so what an unrolled walk read per block arrives
     # stacked on dim 0.
     operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q)
     dims: tuple[int | None, ...] = (0, None, None, 0, None)
@@ -117,15 +117,6 @@ def page_attn_prefill_kernel(
         scores = scores + mask
         scores_max = fold_group(torch.amax(scores, dim=-1, keepdim=True), torch.amax)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
-        if carry is None:
-            tile_probs = torch.exp(scores - scores_max)
-            return (
-                scores_max,
-                fold_group(tile_probs.sum(dim=-1, keepdim=True), torch.sum),
-                fold_group(torch.matmul(tile_probs, v_page), torch.sum),
-            ), None
-
         tile_max, tile_sum, tile_output = carry
         # Read tile_max before the maximum that supersedes it, or the tiled lowering
         # copies the whole carry every trip. Identical to exp(tile_max - new_max).
@@ -139,7 +130,7 @@ def page_attn_prefill_kernel(
     group_axis = (1,) if grouped else ()
     state_shape = (*group_axis, num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (tile_max, tile_sum, tile_output), _ = walk_tiles(
+    (tile_max, tile_sum, tile_output), _ = for_each_tile(
         block_body,
         operands,
         dims=dims,

@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import sys
 import types
 
 import pytest
@@ -32,6 +33,7 @@ import pytest
 _SCRIPT = pathlib.Path(__file__).resolve().parent / "ingest_vllm_benchmarks.py"
 # The shaping lives in the ingest library, shared with offline results bundles.
 vllm = pytest.importorskip("spyre_clickhouse_ingest.vllm")
+_DbError = pytest.importorskip("clickhouse_connect.driver.exceptions").DatabaseError
 _RUN = "dab2a67f-14bf-53be-b6e4-fc9642086e47"
 
 
@@ -494,3 +496,74 @@ def test_only_a_failed_keyed_leg_supersedes_the_verdict(
     _artifact_write(mod, [_flat()], monkeypatch, state=state, leg_key=leg_key)
 
     assert seen["supersede"] is supersede
+
+
+# --- what a denied write costs the leg -----------------------------------------------------
+#
+# oss_ci_benchmark_metadata_mv reads oss_ci_benchmark_v3 back, so a login inserting
+# benchmark_runs needs SELECT there too, and only an admin can add that grant.
+
+_DENIED = (
+    "Received ClickHouse exception, code: 497, server response: Code: 497. DB::Exception: "
+    "***: Not enough privileges. To execute this query, it's necessary to have the grant "
+    "SELECT(repo, benchmark, model, runners, metric, head_branch, head_sha, workflow_id, "
+    "timestamp) ON spyre_v2.oss_ci_benchmark_v3: while pushing to view "
+    "spyre_v2.oss_ci_benchmark_metadata_mv: while pushing to view "
+    "spyre_v2.oss_ci_benchmark_v3_mv: While executing WaitForAsyncInsert. (ACCESS_DENIED)"
+)
+
+
+class _Coded(Exception):
+    """show_clickhouse_errors=False: the code survives only as the attribute."""
+
+    def __init__(self, code):
+        super().__init__("Unrecognized ClickHouse error")
+        self.code = code
+
+
+def _main(mod, monkeypatch, boom=None):
+    argv = ["ingest", "--results-dir", "d", "--branch", "main", "--sha", "abc", "--gha-run-id", "7"]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(mod, "extract_rows", lambda **_k: [_flat()])
+
+    def insert(*_a, **_k):
+        if boom is not None:
+            raise boom
+
+    monkeypatch.setattr(mod, "insert_to_clickhouse", insert)
+    mod.main()
+
+
+def test_a_denied_write_annotates_instead_of_failing_the_leg(mod, monkeypatch, capsys):
+    _main(mod, monkeypatch, boom=_DbError(_DENIED))
+    out = capsys.readouterr().out
+    assert out.startswith("::error title=ClickHouse ingest denied::")
+    # GitHub reads a workflow command to the end of the line, so a wrapped message loses its tail.
+    assert len(out.splitlines()) == 1
+    assert "CLICKHOUSE_V2_USER" in out
+    assert "SELECT(repo" in out and "spyre_v2.oss_ci_benchmark_v3" in out
+
+
+def test_any_other_write_failure_still_fails_the_leg(mod, monkeypatch):
+    with pytest.raises(_DbError):
+        _main(mod, monkeypatch, boom=_DbError("Code: 241. DB::Exception: Memory limit exceeded"))
+
+
+def test_denied_is_read_from_the_code_when_the_detail_is_suppressed(mod):
+    assert mod.denied_grant(_Coded(497))
+    assert not mod.denied_grant(_Coded(241))
+
+
+def test_denied_is_seen_through_a_wrapped_error(mod):
+    try:
+        try:
+            raise _DbError(_DENIED)
+        except _DbError as exc:
+            raise RuntimeError("v2 perf write failed") from exc
+    except RuntimeError as exc:
+        assert mod.denied_grant(exc)
+
+
+def test_a_bare_code_in_a_message_is_not_a_grant_gap(mod):
+    # Benchmark text can carry anything; only the server's own `Code: N. DB::Exception:` counts.
+    assert not mod.denied_grant(_DbError("benchmark name: Code: 497 ON a bench"))

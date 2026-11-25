@@ -55,6 +55,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.granite4_vision:SpyreGranite4VisionForConditionalGeneration"
     ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
+    "MuseGlimmerForConditionalGeneration": (
+        "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM"
+    ),
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (

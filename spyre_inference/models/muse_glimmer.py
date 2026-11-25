@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Muse Glimmer (text backbone) on Spyre: upstream's model runs as written.
+"""Muse Glimmer (text backbone) on Spyre: upstream's model, its final norm in the model
+dtype (upstream builds it with an fp32 weight, which the logits-row gather after it
+cannot lower on Spyre).
 
 The vision tower is not adapted, so a checkpoint carrying one serves text only; see
 ``disable_vision``.
@@ -23,12 +25,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models import muse_glimmer as mg
 
 from spyre_inference.models._prelaunch import disable_modalities
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
+    from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
@@ -52,3 +56,10 @@ def disable_vision(engine_args: EngineArgs, hf_config: PretrainedConfig | None) 
     disable_modalities(engine_args, ("image", "video"), "Muse Glimmer")
     engine_args.language_model_only = True
     logger.info("Muse Glimmer: serving text only (language_model_only=True).")
+
+
+class SpyreMuseGlimmerForCausalLM(mg.MuseGlimmerForCausalLM):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        norm = self.model.norm
+        self.model.norm = RMSNorm(norm.hidden_size, eps=norm.variance_epsilon)

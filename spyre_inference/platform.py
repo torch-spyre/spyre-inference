@@ -1052,6 +1052,10 @@ class TorchSpyrePlatform(CpuPlatform):
         if mrv2_kernels not in ("host", "triton"):
             raise ValueError(f"SPYRE_MRV2_KERNELS={mrv2_kernels!r} is not host or triton.")
         triton_gate.check(mrv2_kernels)
+        if mrv2_kernels == "host":
+            from spyre_inference.v1.worker.spyre import kernels
+
+            kernels.check_launch_sites()
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.rejection_sample_method == "fly":

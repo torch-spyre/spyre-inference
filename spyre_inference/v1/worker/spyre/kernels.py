@@ -16,6 +16,7 @@
 ``@triton.jit`` kernel MRV2 launches, so V2 needs no Triton on any architecture."""
 
 import ast
+import functools
 import importlib
 import importlib.util
 import inspect
@@ -358,7 +359,8 @@ def _is_jit(decorator: ast.expr) -> bool:
     return isinstance(target, ast.Attribute) and target.attr == "jit"
 
 
-def launch_sites() -> set[str]:
+@functools.cache
+def launch_sites() -> frozenset[str]:
     """Every ``<module>.<kernel>`` launched with ``kernel[grid]`` under vllm/v1/worker."""
     root = Path(importlib.util.find_spec(_WORKER).origin).parent  # ty: ignore
     sources = {
@@ -377,16 +379,18 @@ def launch_sites() -> set[str]:
     }
     # Kernels can be launched from a module that imports them by name.
     launch = re.compile(rf"\b(?:{'|'.join(map(re.escape, jitted))})\[")
-    return {
-        f"{module}.{node.func.value.id}"
-        for module, tree in trees.items()
-        if launch.search(sources[module])
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Subscript)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in jitted
-    }
+    return frozenset(
+        {
+            f"{module}.{node.func.value.id}"
+            for module, tree in trees.items()
+            if launch.search(sources[module])
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Subscript)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in jitted
+        }
+    )
 
 
 # name -> (the module holding it, the upstream kernel, the stand-in registered over it).
@@ -473,19 +477,23 @@ def unbind() -> None:
         del triton.next_power_of_2
 
 
+def check_launch_sites() -> None:
+    """Raise if vLLM launches a kernel under vllm/v1/worker that is listed nowhere here.
+    Once per engine (it parses vLLM's sources), from the platform's config hook."""
+    unlisted = launch_sites() - set(HOST_KERNELS) - set(UNSUPPORTED_KERNELS)
+    if unlisted:
+        raise RuntimeError(
+            f"MRV2 launches {sorted(unlisted)}, which kernels.py neither binds to a "
+            "host op nor lists as unsupported."
+        )
+
+
 def bind_or_raise() -> None:
-    """Raise at startup if bind() left a kernel unbound, not at its first launch: one
-    listed here but gone upstream, or a launch site under vllm/v1/worker listed nowhere."""
+    """Raise at startup if bind() left a kernel listed here unbound (gone upstream), not
+    at its first launch."""
     expected = {f"{site}.apply_top_k_top_p" for site in _TOP_K_TOP_P_SITES}
     if not use_triton():
-        listed = set(HOST_KERNELS) | set(UNSUPPORTED_KERNELS)
-        unlisted = launch_sites() - listed
-        if unlisted:
-            raise RuntimeError(
-                f"MRV2 launches {sorted(unlisted)}, which kernels.py neither binds to a "
-                "host op nor lists as unsupported."
-            )
-        expected |= listed
+        expected |= set(HOST_KERNELS) | set(UNSUPPORTED_KERNELS)
     bound = bind()
     missing = expected - bound
     if missing:

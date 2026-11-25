@@ -55,11 +55,10 @@ def test_host_kernel_refuses_unknown_launch_arguments() -> None:
         kernel[(1,)](1, 2)
 
 
-def test_bind_or_raise_names_an_unlisted_launch_site(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kernels, "use_triton", lambda: False)
+def test_an_unlisted_launch_site_is_named(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delitem(kernels.HOST_KERNELS, "gpu.sample.gumbel._gumbel_combine_kernel")
     with pytest.raises(RuntimeError, match="gumbel_combine_kernel.*neither binds"):
-        kernels.bind_or_raise()
+        kernels.check_launch_sites()
 
 
 def test_unsupported_kernel_names_the_feature() -> None:

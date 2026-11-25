@@ -257,3 +257,45 @@ def test_register_logs_a_gate_error_and_keeps_the_platform(
 
     assert spyre_inference.register() == "spyre_inference.platform.TorchSpyrePlatform"
     assert logged == ["Spyre Triton gate could not be applied"]
+
+
+def test_the_config_hook_sweeps_the_launch_sites(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    """Once per engine here, rather than parsing vLLM's sources in every worker."""
+    from spyre_inference.v1.worker.spyre import kernels
+
+    _set_runner(monkeypatch, "v2")
+
+    def swept() -> None:
+        raise RuntimeError("swept")
+
+    monkeypatch.setattr(kernels, "check_launch_sites", swept)
+    with pytest.raises(RuntimeError, match="swept"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_every_speculator_the_kernel_sweep_skips_is_refused(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    """The sweep leaves out the kernels of the speculators the platform refuses; one it
+    started accepting would launch kernels nothing binds."""
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+    from vllm.v1.worker.gpu.spec_decode import speculator_config
+
+    from spyre_inference.v1.worker.spyre import kernels
+
+    _set_runner(monkeypatch, "v2")
+    skipped = []
+    for method, qualname in speculator_config._CONFIG_BY_METHOD.items():
+        target = resolve_obj_by_qualname(qualname).speculator_class
+        module = (target or "").rpartition(".")[0].removeprefix("vllm.v1.worker.")
+        if not kernels._REFUSED_SPECULATORS.match(module):
+            continue
+        skipped.append(method)
+        vllm_config.speculative_config = SimpleNamespace(  # ty: ignore[invalid-assignment]
+            method=method, use_dflash=lambda method=method: method == "dflash"
+        )
+        with pytest.raises(ValueError, match="speculative decoding other than DFlash"):
+            TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+    assert skipped and "dflash" not in skipped

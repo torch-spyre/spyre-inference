@@ -336,14 +336,19 @@ setting it to a size next to `--kv-cache-memory-bytes` is an error.
 
 ## FP8 KV cache
 
-Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
-each cached token takes:
+An FP8 model (FP8 linear weights: the `fp8` method, or a compressed-tensors checkpoint
+with 8-bit float weights) stores its KV cache in float8 (e4m3) by default, halving the
+bytes each cached token takes. Any other model opts in with `--kv-cache-dtype fp8`. An FP8
+model opts out with its checkpoint's 16-bit dtype, `float16` or `bfloat16`; either gives a
+float16 cache, the only 16-bit cache Spyre has:
 
 ```bash
-vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+vllm serve ibm-granite/granite-4.1-8b-fp8                             # FP8 KV cache
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype bfloat16   # float16 cache
 ```
 
-It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+It needs a head size that is a multiple of 128; with a smaller one an FP8 model keeps a
+model-dtype cache, and an explicit `--kv-cache-dtype fp8` is rejected. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
 ...) are rejected at startup. Since the KV cache is sized from free device memory (see
 [KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
 Attention still computes in the model dtype: pages are dequantized on read with the

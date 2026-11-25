@@ -518,7 +518,14 @@ per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding a
 ### FP8 KV cache
 
 `--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the pages as `float8_e4m3fn`, halving KV
-memory and the bytes each page read moves.
+memory and the bytes each page read moves. An FP8 model gets it by default:
+`TorchSpyrePlatform._resolve_kv_cache_dtype` turns `auto` into `fp8` when the checkpoint's
+linears are FP8 (`_has_fp8_weights`) and the head size fills a float8 stick (128). An
+explicit `float16` is kept, and `bfloat16` becomes `float16`: upstream accepts the
+checkpoint's own 16-bit dtype before the platform forces float16, and the impl only takes
+the model dtype. vLLM runs `check_and_update_config` again after the EngineCore handshake,
+so each result is a fixed point; rewriting `float16` to `auto` would turn into `fp8` on
+that second pass.
 Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
 The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`

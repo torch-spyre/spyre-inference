@@ -926,3 +926,141 @@ def test_remote_code_models_are_pinned():
         "trust-remote-code on a model with no pinned revision in "
         ".github/cache_config/hf_models_and_datasets.yaml:\n" + "\n".join(offenders)
     )
+
+
+# ── compile cache modes ──
+
+# A stand-in for `python -m vllm.entrypoints.cli.main`: `serve` compiles into an empty
+# private cache (all misses) and hits on a filled one, then answers /health; `bench serve`
+# writes a result JSON.
+FAKE_VLLM = r"""
+import http.server, json, os, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:2] == ["bench", "serve"]:
+    out = Path(args[args.index("--result-dir") + 1]) / args[args.index("--result-filename") + 1]
+    out.write_text(json.dumps({"completed": 2, "num_prompts": 2, "failed": 0}))
+    sys.exit(0)
+
+cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+kernels = Path(cache, "inductor-spyre-cache") if cache else None
+if kernels is not None and kernels.is_dir():
+    line = "fxgraph 2 hit 0 miss, aotautograd 2 hit 0 miss, spyre kernel 3 hit 0 miss"
+else:
+    line = "fxgraph 0 hit 2 miss, aotautograd 0 hit 2 miss, spyre kernel 0 hit 3 miss"
+    if cache:
+        for sub, n in [("inductor-spyre-cache", 3), ("fxgraph", 2), ("aotautograd", 2), ("ab", 1)]:
+            Path(cache, sub).mkdir(parents=True, exist_ok=True)
+            for i in range(n):
+                Path(cache, sub, f"f{i}").write_text("")
+        Path(os.environ["VLLM_CACHE_ROOT"]).mkdir(parents=True, exist_ok=True)
+        Path(os.environ["VLLM_CACHE_ROOT"], "graph.py").write_text("")
+for tp in (0, 1):
+    print(f"(Worker_TP{tp}) INFO Compile cache: {line}", flush=True)
+
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+http.server.HTTPServer(("127.0.0.1", int(args[args.index("--port") + 1])), Health).serve_forever()
+"""
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _run_fake_serve(monkeypatch, tmp_path, mode: str) -> tuple[str | None, dict]:
+    fake = tmp_path / "fake_vllm.py"
+    fake.write_text(FAKE_VLLM)
+    monkeypatch.setattr(runner, "VLLM_CLI", [sys.executable, str(fake)])
+    results = tmp_path / "results"
+    results.mkdir()
+    error = runner.run_serve_benchmark(
+        test_name="t",
+        server_parameters={"model": "m", "port": _free_port()},
+        bench_parameters={},
+        env_config={},
+        results_dir=results,
+        spyre_devices="0",
+        aiu_world_size="1",
+        health_timeout=30,
+        compile_cache=mode,
+    )
+    return error, json.loads((results / "t_startup.json").read_text())
+
+
+def test_cold_warm_records_a_cold_then_a_warm_start(monkeypatch, tmp_path, caplog):
+    error, startup = _run_fake_serve(monkeypatch, tmp_path, "cold-warm")
+
+    assert error is None
+    assert startup["mode"] == "cold-warm"
+    cold, warm = startup["starts"]["cold"], startup["starts"]["warm"]
+    assert cold["state"] == "cold" and warm["state"] == "warm"
+    assert (cold["spyre_kernel_misses"], warm["spyre_kernel_hits"]) == (3, 3)
+    assert cold["spyre_kernel_new_files"] == 3
+    assert (cold["output_code_new_files"], cold["vllm_new_files"]) == (1, 1)
+    assert all(v == 0 for k, v in warm.items() if k.endswith("_new_files"))
+    assert (tmp_path / "results" / "t_cold_server.log").exists()
+    assert not (tmp_path / "results" / "t_compile_cache").exists()
+    assert "not a full cache hit" not in caplog.text
+
+
+def test_default_mode_records_one_start_on_the_environments_cache(monkeypatch, tmp_path):
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    error, startup = _run_fake_serve(monkeypatch, tmp_path, "default")
+
+    assert error is None
+    assert list(startup["starts"]) == ["default"]
+    start = startup["starts"]["default"]
+    assert start["state"] == "cold" and start["fxgraph_misses"] == 2
+    assert not any(k.endswith("_new_files") for k in start)
+    assert not (tmp_path / "results" / "t_cold_server.log").exists()
+
+
+def test_warm_start_that_misses_is_flagged(caplog):
+    warm = {"seconds": 1.0, "state": "partial", "fxgraph_hits": 2, "fxgraph_misses": 1}
+    runner._warn_unless_full_hit("t", warm)
+    assert "not a full cache hit (state partial): fxgraph_misses 1" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("line", "state"),
+    [
+        ("fxgraph 5 hit 0 miss, aotautograd 4 hit 0 miss, spyre kernel 3 hit 0 miss", "warm"),
+        ("fxgraph 0 hit 5 miss, aotautograd 0 hit 4 miss, spyre kernel 0 hit 3 miss", "cold"),
+        ("fxgraph 5 hit 0 miss, aotautograd 4 hit 0 miss, spyre kernel 2 hit 1 miss", "partial"),
+    ],
+)
+def test_cache_state_from_the_worker_line(line, state):
+    counts = runner.parse_cache_counts(f"(Worker_TP0) INFO Compile cache: {line}\n")
+    assert runner.cache_state(counts) == state
+
+
+def test_cache_counts_are_the_max_across_workers():
+    log_text = (
+        "Compile cache: fxgraph 5 hit 0 miss, aotautograd 4 hit 0 miss, spyre kernel 3 hit 0 miss\n"
+        "Compile cache: fxgraph 5 hit 1 miss, aotautograd 4 hit 0 miss, spyre kernel 2 hit 0 miss\n"
+    )
+    counts = runner.parse_cache_counts(log_text)
+    assert counts is not None
+    assert (counts["fxgraph_misses"], counts["spyre_kernel_hits"]) == (1, 3)
+    assert runner.cache_state(runner.parse_cache_counts("no line")) == "unknown"
+
+
+def test_unknown_compile_cache_mode_fails_the_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("BENCH_SERVE_COMPILE_CACHE", "off")
+    path = _write(tmp_path, [_serve_config("d")])
+    [result] = runner.run_benchmarks_from_file(path, "serve", tmp_path, "0", "1", set(), set())
+    assert "BENCH_SERVE_COMPILE_CACHE" in result.error

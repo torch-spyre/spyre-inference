@@ -1,58 +1,79 @@
-# Generated from the Spyre RPM bundle below by scripts/lock_spyre_rpms.py.
-# Change [tool.spyre-rpms] in pyproject.toml and re-run it instead of editing.
+# 🔥🔥🔥 HAND-WRITTEN. NOT GENERATED. scripts/lock_spyre_rpms.py CANNOT PRODUCE THIS FILE. 🔥🔥🔥
 #
-# x86_64 is pinned to the bundle's exact builds. Power (ppc64le) and Z (s390x)
-# pin the same commits with the build number wildcarded: builds differ across
-# platforms. A row marked `stale` is held at an older commit by
-# [tool.spyre-rpms.stale.<arch>] until that arch builds the bundled one.
+# The prod snap jobs (spyre-snap-all-archs) have failed every run since the 2026-11 network
+# partition: their Jenkins can't reach github.ibm.com, so no bundle after
+# main_snap_2026_11_11_09 exists. Until they recover, x86_64 runs on DEV builds from the
+# `next/` tree, which has no bundles, mixes PR builds into the main tree, and routinely
+# has -devel packages a build ahead of their base. "Take the newest of everything" there
+# gets you a franken-stack. Don't.
+#
+# This set is ONE dev nightly: orchestrator-10780, 2026-11-25 05:30 UTC, whose plan is
+# published at <generic repo>/next/_nodes/orchestrator-10780/plan-amd64.json and whose
+# commit-manifest.json lists every component's main head (git ls-remote). Every package
+# below is that plan's artifact, and every dependency it was built against is the
+# identity pinned here (the plan's install_pkgs): coherent by construction, not by guess.
+# The 12-hex field in each version is the build's `spyre.identity`.
+#
+# Expected red: `Check spyre-rpms.lock` (lock_spyre_rpms.py --verify) fails, because dev
+# versions have no `_<build>` suffix and this is not rendered from a bundle. It is not a
+# required check. Everything that DOWNLOADS (resolve_rpms.py, populate-rpm-cache,
+# install-pinned-rpms.sh) already honours `tree`, so no script changes.
+#
+# Power and Z stay on the last prod bundle (per-row `tree = ""`): no recent nightly is
+# complete there, and nothing tests P/Z in CI anyway.
+#
+# REVERT THIS ENTIRE FILE the day prod bundles come back: set [tool.spyre-rpms] bundle to
+# the new snapshot and re-run `python3 scripts/lock_spyre_rpms.py`. To move to a newer
+# nightly in the meantime, take ALL rows from that one orchestrator's plan, never mix runs.
 
 version = 2
 
 [defaults]
-# Artifactory subdir (<repo>/<tree>/<arch>/); "" is the prod/base tree.
-tree = ""
+# Artifactory subdir (<repo>/<tree>/<arch>/). "next" = the dev tree. "" would be prod.
+tree = "next"
 
 [bundle]
-id = "main_snap_2026_11_11_09"
+# Not a real bundle. Must equal [tool.spyre-rpms] bundle and SPYRE_RPM_BUNDLE in pyproject.toml.
+id = "next_nightly_2026_11_25_orch10780"
 
-# x86_64
+# x86_64: exact dev builds
 [packages]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+42.c95ca64_234" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+3090.29f77d0_578" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+3090.29f77d0_578" }
-ibm-flex              = { version = "2.1.0-0.main.1+796.25d457e_763" }
-ibm-flex-devel        = { version = "2.1.0-0.main.1+796.25d457e_763" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+365.1612905_558" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+365.1612905_558" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+365.1612905_558" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+261.4c13c05_414" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+261.4c13c05_414" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+56.0fcee39_159" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0_rc.5-0.main.10+10.1a165508.2fdf593dea75.1a16550" }
+ibm-deeptools         = { version = "2.0.0_rc.1-0.master.503+503.c4f8b2be.16698090ea9b.c4f8b2b" }
+ibm-deeptools-devel   = { version = "2.0.0_rc.1-0.master.503+503.c4f8b2be.16698090ea9b.c4f8b2b" }
+ibm-flex              = { version = "2.0.0_rc.1-0.main.228+228.a79ab4f8.e48a6177eaf0.a79ab4f" }
+ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.228+228.a79ab4f8.e48a6177eaf0.a79ab4f" }
+ibm-senlib-core       = { version = "2.0.0_rc.5-0.main.83+83.ca0ac972.fc11a11a10d9.ca0ac97" }
+ibm-senlib-dd2        = { version = "2.0.0_rc.5-0.main.83+83.ca0ac972.fc11a11a10d9.ca0ac97" }
+ibm-senlib-headers    = { version = "2.0.0_rc.5-0.main.83+83.ca0ac972.fc11a11a10d9.ca0ac97" }
+ibm-spyre-comms       = { version = "2.0.0_rc.1-0.main.93+93.fdca55bf.fb090ef5c322.fdca55b" }
+ibm-spyre-comms-devel = { version = "2.0.0_rc.1-0.main.93+93.fdca55bf.fb090ef5c322.fdca55b" }
+ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.24+24.674de929.92c8ff32c5b2.674de92" }
 
-# Power
+# Power: frozen on prod bundle main_snap_2026_11_11_09
 [overrides.ppc64le]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+42.c95ca64_*" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+3090.29f77d0_*" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+3090.29f77d0_*" }
-ibm-flex              = { version = "2.1.0-0.main.1+796.25d457e_*" }
-ibm-flex-devel        = { version = "2.1.0-0.main.1+796.25d457e_*" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+365.1612905_*" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+365.1612905_*" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+365.1612905_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+261.4c13c05_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+261.4c13c05_*" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+56.0fcee39_*" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+42.c95ca64_*", tree = "" }
+ibm-deeptools         = { version = "2.1.0-0.main.1+3090.29f77d0_*", tree = "" }
+ibm-deeptools-devel   = { version = "2.1.0-0.main.1+3090.29f77d0_*", tree = "" }
+ibm-flex              = { version = "2.1.0-0.main.1+796.25d457e_*", tree = "" }
+ibm-flex-devel        = { version = "2.1.0-0.main.1+796.25d457e_*", tree = "" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+365.1612905_*", tree = "" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+365.1612905_*", tree = "" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+365.1612905_*", tree = "" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+261.4c13c05_*", tree = "" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+261.4c13c05_*", tree = "" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+56.0fcee39_*", tree = "" }
 
-# Z
+# Z: frozen on prod bundle main_snap_2026_11_11_09
 [overrides.s390x]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+42.c95ca64_*" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+3090.29f77d0_*" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+3090.29f77d0_*" }
-ibm-flex              = { version = "2.1.0-0.main.1+796.25d457e_*" }
-ibm-flex-devel        = { version = "2.1.0-0.main.1+796.25d457e_*" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+365.1612905_*" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+365.1612905_*" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+365.1612905_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+261.4c13c05_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+261.4c13c05_*" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+56.0fcee39_*" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+42.c95ca64_*", tree = "" }
+ibm-deeptools         = { version = "2.1.0-0.main.1+3090.29f77d0_*", tree = "" }
+ibm-deeptools-devel   = { version = "2.1.0-0.main.1+3090.29f77d0_*", tree = "" }
+ibm-flex              = { version = "2.1.0-0.main.1+796.25d457e_*", tree = "" }
+ibm-flex-devel        = { version = "2.1.0-0.main.1+796.25d457e_*", tree = "" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+365.1612905_*", tree = "" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+365.1612905_*", tree = "" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+365.1612905_*", tree = "" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+261.4c13c05_*", tree = "" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+261.4c13c05_*", tree = "" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+56.0fcee39_*", tree = "" }

@@ -115,10 +115,19 @@ def test_placeholder_next_power_of_2() -> None:
     assert powers == [1, 1, 2, 4, 1024, 1024]
 
 
+@pytest.mark.parametrize("csrc_filters", [True, False], ids=["csrc", "sort_free"])
 @pytest.mark.parametrize("use_k", [True, False])
 @pytest.mark.parametrize("use_p", [True, False])
-def test_sort_free_top_k_top_p_keeps_the_same_tokens(use_k: bool, use_p: bool) -> None:
+def test_sort_free_top_k_top_p_keeps_the_same_tokens(
+    use_k: bool, use_p: bool, csrc_filters: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from spyre_inference.v1.sample import sampling_kernels
+
+    if csrc_filters and not sampling_kernels.has_topk_topp_kernels():
+        pytest.skip("the csrc/ top-k/top-p filters are not built")
+    monkeypatch.setattr(sampling_kernels, "has_topk_topp_kernels", lambda: csrc_filters)
 
     # Not torch.manual_seed: seeding every device's generator initializes Spyre.
     logits = torch.randn(4, 1000, generator=torch.Generator().manual_seed(0))
@@ -126,5 +135,14 @@ def test_sort_free_top_k_top_p_keeps_the_same_tokens(use_k: bool, use_p: bool) -
     p = torch.tensor([0.5, 0.9, 0.99, 1.0]) if use_p else None
     expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
     actual = kernels.spyre_apply_top_k_top_p(logits.clone(), k, p)
-    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
-    assert torch.equal(actual[torch.isfinite(actual)], expected[torch.isfinite(expected)])
+    kept = torch.isfinite(actual)
+    assert torch.equal(actual[kept], logits[kept])
+    if use_k or not use_p:
+        assert torch.equal(kept, torch.isfinite(expected))
+    else:
+        # Top-p alone is vLLM's binary-search kernel: its cut may differ from the full
+        # sort by a few boundary tokens, never keeping less than p of the mass.
+        diff = (kept.sum(-1) - torch.isfinite(expected).sum(-1)).abs()
+        assert int(diff.max()) <= 3
+        mass = torch.where(kept, logits.softmax(-1).double(), 0.0).sum(-1)
+        assert (mass >= p.double() - 1e-6).all()

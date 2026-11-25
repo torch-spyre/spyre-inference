@@ -17,7 +17,7 @@ EncoderOnlyModelState).
 
 Dispatches through an EncoderPlan (rectangular grid vs. ragged rows)
 instead of upstream's non-causal metadata path directly. Plan selection and
-grid expansion are V1's own functions, shared rather than copied.
+grid expansion are shared functions (spyre_encoder_attn.py, encoder_grid.py).
 
 MRV2 calls prepare_attn before prepare_inputs, so the plan is built first.
 """
@@ -200,7 +200,7 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
 
         grid = self.encoder_plan.grid if self.encoder_plan is not None else None
         # A model that masks multimodal rows after embedding (CLIP, models/clip.py)
-        # needs its mask in the same row layout as the embeddings, as in V1.
+        # needs its mask in the same row layout as the embeddings.
         align_token_mask = getattr(self.model, "spyre_align_token_mask", None)
         if align_token_mask is not None:
             align_token_mask(input_batch.num_tokens if grid is None else sum(grid[2]), grid)

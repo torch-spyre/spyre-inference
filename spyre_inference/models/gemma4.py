@@ -149,9 +149,11 @@ def force_text_backbone(engine_args: EngineArgs, hf_config: PretrainedConfig | N
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
-def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Fold Gemma's output scale into the source down-projection stack."""
-    return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
+def _fold_gemma4_expert_scale(
+    down_weight: torch.Tensor, experts: slice, scale: torch.Tensor
+) -> torch.Tensor:
+    """Fold Gemma's output scale into a chunk ``experts`` of the source down stack."""
+    return down_weight * scale[experts].detach().to(down_weight.dtype).view(-1, 1, 1)
 
 
 def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
@@ -171,6 +173,9 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
                     _fold_gemma4_expert_scale,
                     scale=cast(Gemma4Router, decoder.router).per_expert_scale,
                 ),
+                # At 1,024 tokens four experts per trip are slower than one (TP 4 shapes).
+                expert_group=4,
+                expert_group_tokens=(128, 512),
             ),
         )
         configured += 1

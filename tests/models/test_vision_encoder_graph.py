@@ -95,7 +95,7 @@ class _FakeVisionModel(SpyreVisionEncoderMixin, _Upstream):
         return x.reshape(self.patches_per_token, -1, x.shape[-1]).mean(dim=0)
 
 
-def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
+def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0, max_model_len=4096):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
@@ -103,10 +103,11 @@ def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         model_config=SimpleNamespace(
+            max_model_len=max_model_len,
             multimodal_config=SimpleNamespace(
                 get_limit_per_prompt=lambda modality: videos if modality == "video" else 4,
                 mm_encoder_tp_mode=tp_mode,
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=2),
     )
@@ -122,6 +123,13 @@ def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     manager = _manager(_FakeVisionModel(max_tokens=300))
     assert manager.token_budgets == [16, 32, 64, 128, 256, 304]
     assert all(b * MERGE_PATCHES % 64 == 0 for b in manager.token_budgets)
+
+
+def test_largest_budget_is_capped_at_max_model_len():
+    """An item longer than the context is rejected before the encoder, so no budget holds it."""
+    manager = _manager(_FakeVisionModel(max_tokens=300), max_model_len=128)
+    assert manager.token_budgets == [16, 32, 64, 128]
+    _manager(_FakeVisionModel(max_tokens=300), max_model_len=128, budgets=[64, 128])
 
 
 def test_user_budgets_below_the_largest_item_fail_at_startup():
@@ -478,15 +486,13 @@ def test_each_path_compiles_and_replays_from_its_own_staging():
     torch.testing.assert_close(out, torch.full_like(out, 1.0 + 101.0))
 
 
-def test_runner_warmup_builds_the_manager_and_serves_through_it():
+def test_runner_warmup_builds_the_manager_and_serves_through_it(monkeypatch):
     """The runner path: _record_vision_graphs compiles the model, builds the Spyre manager
     from the processor's largest item, captures every budget and warms the merge."""
     from vllm.config import CompilationMode
 
-    from spyre_inference.v1.worker.spyre_model_runner import (
-        TorchSpyreModelRunner,
-        _SpyreModelWrapper,
-    )
+    from spyre_inference.v1.worker.spyre import warmup
+    from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
     model = _FakeVisionModel()
     compiled = []
@@ -496,31 +502,38 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     vllm_config.compilation_config.inductor_compile_config = {}
     vllm_config.model_config.enforce_eager = False
     vllm_config.model_config.dtype = torch.float16
+    monkeypatch.setattr(
+        warmup,
+        "MultiModalBudget",
+        lambda *args, **kwargs: SimpleNamespace(mm_max_toks_per_item={"image": 300}),
+    )
 
-    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner.vllm_config = vllm_config
-    runner.compilation_config = vllm_config.compilation_config
-    runner.model_config = vllm_config.model_config
-    runner.supports_mm_inputs = True
-    runner.model = _SpyreModelWrapper(
+    wrapper = _SpyreModelWrapper(
         model,
         torch.device("cpu"),
         model_dtype=torch.float16,
         inputs_embeds_buffer=torch.zeros(16, 8, dtype=torch.float16),
     )
-    runner.spyre_shape_bucketer = SimpleNamespace(bucket_sizes=[1, 4, 16])
+    encoder_runner = SimpleNamespace(cudagraph_manager=None)
+    runner = SimpleNamespace(
+        vllm_config=vllm_config,
+        model_config=vllm_config.model_config,
+        supports_mm_inputs=True,
+        mm_registry=None,
+        model=wrapper,
+        get_model=lambda: model,
+        model_state=SimpleNamespace(encoder_runner=encoder_runner),
+        spyre_device=torch.device("cpu"),
+    )
     merged = []
     merge = model.vision_merge
     model.vision_merge = lambda text, image, mask: merged.append(text.shape[0]) or merge(
         text, image, mask
     )
-    runner.mm_budget = SimpleNamespace(mm_max_toks_per_item={"image": 300})
-    runner._spyre_device = torch.device("cpu")
-    runner.encoder_cudagraph_manager = None
 
-    runner._record_vision_graphs()
+    warmup._record_vision_graphs(runner, [1, 4, 16])
 
-    manager = runner.encoder_cudagraph_manager
+    manager = encoder_runner.cudagraph_manager
     assert compiled == [True]
     assert isinstance(manager, SpyreEncoderGraphManager)
     assert model.max_tokens_per_item == 300
@@ -531,6 +544,35 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it():
     assert manager.graph_hits == 2 and manager.graph_misses == 0
     # Every bucket an image step can reach; the one-token bucket is never one.
     assert merged == [4, 16]
+
+
+def test_mrv2_encoder_runner_serves_through_the_captured_budgets(monkeypatch):
+    import vllm.v1.worker.gpu.mm.encoder_runner as encoder_runner_module
+    from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
+
+    model = _FakeVisionModel(max_tokens=300)
+    model.embed_multimodal = lambda **kwargs: pytest.fail("fell back to embed_multimodal")
+    manager = _manager(model)
+    assert not manager.is_captured()
+    manager.capture(graph_pool=None)
+    assert manager.is_captured()
+
+    monkeypatch.setattr(
+        encoder_runner_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **kwargs: [("image", len(items), {"tokens": [10, 30]})],
+    )
+    runner: Any = EncoderRunner.__new__(EncoderRunner)
+    runner.model = model
+    runner.device = torch.device("cpu")
+    runner.cudagraph_manager = manager
+
+    outputs = runner.execute_mm_encoder([("image", None), ("image", None)])
+
+    assert [o.shape[0] for o in outputs] == [10, 30]
+    assert (manager.graph_hits, manager.graph_misses) == (2, 0)
+    manager.clear()
+    assert not manager.is_captured()
 
 
 def _prompt(mask_rows: list[int], num_tokens: int = 12):
@@ -628,7 +670,7 @@ def test_upstream_returns_text_alone_when_handed_no_image_tokens():
 def test_wrapper_stages_an_image_step_at_two_rows_and_keeps_the_mask_on_the_host():
     """A one-token image step (a chunk ending on a placeholder) stages two rows, so neither the
     staging copy nor upstream's copy is a single row (torch-spyre#4883)."""
-    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+    from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
     model = _FakeVisionModel()
     seen = []
@@ -661,7 +703,7 @@ def test_compiled_merge_through_the_wrapper_on_spyre(monkeypatch, num_tokens):
         pytest.skip("Spyre device not available")
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+    from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
     hidden = 128
     torch.manual_seed(0)

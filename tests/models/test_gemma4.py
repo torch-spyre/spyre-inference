@@ -242,8 +242,14 @@ def test_moe_recipe_reads_the_decoder_experts_and_router_scale(monkeypatch):
     assert configure_gemma4_moe_layers([moe, SimpleNamespace(experts=None)]) == 1
     ((routed, recipe),) = calls
     assert routed == "routed"
-    folded = recipe.prepare_down_weight(torch.ones(2, 1, 1))
+    folded = recipe.prepare_down_weight(torch.ones(2, 1, 1), slice(0, 2))
     torch.testing.assert_close(folded.flatten(), scale)
+    # Per chunk: a slice of the stack sees the scale of its own experts.
+    torch.testing.assert_close(
+        recipe.prepare_down_weight(torch.ones(1, 1, 1), slice(1, 2)).flatten(), scale[1:]
+    )
+    assert recipe.expert_group == 4
+    assert recipe.expert_group_tokens == (128, 512)
 
 
 @pytest.mark.parametrize(

@@ -1,7 +1,7 @@
 name: push-hw-diagnostics-to-clickhouse
 
 # Parses hardware/RAS failure signatures out of the raw job logs of a completed
-# test run and ingests them into ClickHouse (spyre.hw_failure_diagnostics), which
+# test run and ingests them into ClickHouse (spyre_v2.hw_failure_diagnostics), which
 # backs the "Spyre Hardware Health" Grafana dashboard. Without this, a card-level
 # fault (e.g. RAS::CBRB::ResponseTimeout) surfaces only as a pytest failure and
 # never reaches the hardware-health view.
@@ -67,13 +67,28 @@ jobs:
       # workflow follows only runs on the x86 Spyre pool today. arch is a run_id hash
       # input, so a wrong value here derives a run_id that joins nothing, silently.
       LEG_ARCH: x86_64
-      # Dual-write during the migration window; empty CLICKHOUSE_DB_V2 makes v2 a no-op.
-      INGEST_SCHEMA: both
+      # v2 only: the writer login has no DDL, and v1 would self-migrate its table.
+      INGEST_SCHEMA: v2
+      # CLICKHOUSE_V2_USER / _PASSWORD are the writer login; _HOST / _PORT are optional and fall
+      # back to CLICKHOUSE_HOST / _PORT, the port following whichever host is used.
+      CH_HOST: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+      CH_PORT: ${{ secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT || !secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT || '' }}
+      CH_DB_V2: spyre_v2
+      CH_USER: ${{ secrets.CLICKHOUSE_V2_USER }}
+      CH_PASS: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
 
     steps:
+      # A host without the v2 login must fail loudly (fork PRs have no host and skip).
+      - name: Require the v2 login
+        run: |
+          if [ -n "${CH_HOST}" ] && { [ -z "${CH_USER}" ] || [ -z "${CH_PASS}" ]; }; then
+            echo "::error::ClickHouse host is set but CLICKHOUSE_V2_USER/CLICKHOUSE_V2_PASSWORD is empty; results would be lost."
+            exit 1
+          fi
+
       # Nested local `uses: ./...` actions inside ingest-hw-diagnostics-to-clickhouse resolve against this checkout, not torch-spyre's own repo.
       - name: Checkout torch-spyre composite actions
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: torch-spyre/torch-spyre
           sparse-checkout: |
@@ -111,7 +126,7 @@ jobs:
 
       - name: Ingest hardware-failure diagnostics into ClickHouse
         id: ingest
-        uses: torch-spyre/torch-spyre/.github/actions/ingest-hw-diagnostics-to-clickhouse@main
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-hw-diagnostics-to-clickhouse@e4ff7fe8e86232291d5d57e3099f5dc4b49c0726 # main pinned 2026-11-22
         with:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
@@ -121,13 +136,15 @@ jobs:
           component: ${{ env.INGEST_COMPONENT }}
           arch: ${{ env.LEG_ARCH }}
           gh-token: ${{ secrets.GITHUB_TOKEN }}
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-host: ${{ env.CH_HOST }}
+          clickhouse-port: ${{ env.CH_PORT }}
+          clickhouse-user: ${{ env.CH_USER }}
+          clickhouse-pass: ${{ env.CH_PASS }}
+          clickhouse-db: ${{ env.CH_DB_V2 }}
+          clickhouse-db-v2: ${{ env.CH_DB_V2 }}
           schema: ${{ env.INGEST_SCHEMA }}
+          # Needs torch-spyre's `strict` input; an unknown input is only a warning until it lands.
+          strict: 'true'
 
       - name: Upload JSON artifact
         if: always() && steps.ingest.outputs.json-file != ''

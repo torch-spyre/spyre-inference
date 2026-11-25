@@ -99,7 +99,7 @@ kinds of case:
 
 ```bash
 make test-quality              # the whole gate, one card
-make test-quality-shard-0      # one CI shard (QUALITY_SHARDS=8)
+make test-quality-shard-0      # one CI shard (QUALITY_SHARDS=5)
 ```
 
 CI runs the gate as `QUALITY_SHARDS` parallel 1-card jobs, weighted by recorded runtime like

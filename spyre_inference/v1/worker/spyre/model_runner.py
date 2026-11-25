@@ -37,10 +37,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.spec_decode.config import validate_dflash_config
 from spyre_inference.v1.worker.model_load import rewarm_after_reload
 from spyre_inference.v1.worker.spyre import bucketing, kv_cache, load, warmup
+from spyre_inference.v1.worker.spyre.model_wrapper import unwrap_model
 from spyre_inference.v1.worker.spyre.pool import output as pool_output
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
-from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
 
 
 class SpyreModelRunnerV2(GPUModelRunner):
@@ -52,8 +52,9 @@ class SpyreModelRunnerV2(GPUModelRunner):
         self.spyre_device = device
         if self.speculator is not None:
             self.speculator = SpyreDFlashSpeculator(vllm_config, self.device, device)
-        # Filled by initialize_kv_cache; warmup records the attention kernels against them.
-        self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+        # Filled by initialize_kv_cache: attention pages, or a Mamba layer's state tensors.
+        # Warmup records the attention kernels and warms the Mamba ones against them.
+        self.spyre_kv_caches: dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]] = {}
         # Set by load_model.
         self.pooling_on_spyre = False
         self.compiled_tower_blocks = 0
@@ -109,5 +110,6 @@ class SpyreModelRunnerV2(GPUModelRunner):
         warmup.run(self)
 
     def profile_run(self, randomize_inputs: bool = False) -> None:
-        # No forward, only the staging buffers, as TorchSpyreModelRunner.profile_run.
+        # No forward: the first forward is the trace, and without KV pages it traces no KV
+        # write. Allocated here, the staging buffers count towards the measured memory.
         allocate_staging_buffers(self.compilation_config.static_forward_context, self.spyre_device)

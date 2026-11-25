@@ -96,7 +96,6 @@ def _run(
         "TORCHINDUCTOR_AUTOGRAD_CACHE",
         "VLLM_DISABLE_COMPILE_CACHE",
         "TORCH_SPYRE_CACHE_SCAN",
-        "SPYRE_ATTN_FOR_EACH_TILE",
     ):
         env.pop(var, None)
     env.update(

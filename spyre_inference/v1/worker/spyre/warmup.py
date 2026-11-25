@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MRV2: V2 warmup driver (vllm/v1/worker/gpu_worker.py:Worker.compile_or_warm_up_model,
-TorchSpyreModelRunner.warming_up_model).
+"""MRV2: V2 warmup driver (vllm/v1/worker/gpu_worker.py:Worker.compile_or_warm_up_model).
 
 Decoder dummies skip attention and publish null KV slots; pooling dummies keep
 attention on; a separate pass then records attention over attn_groups and runs the
@@ -26,35 +25,37 @@ already-bucketed token counts itself.
 """
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
-from vllm.config import CompilationMode
+from vllm.config import CompilationMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
 from spyre_inference import envs
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.mamba_mixer2 import SpyreMambaMixer2
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
+    SpyrePagedKVCache,
     allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inline_active
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
-from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
-from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
-from spyre_inference.v1.worker.spyre_model_runner import (  # shared with V1; moves at the flip
-    _set_spyre_compilation_settings,
+from spyre_inference.v1.worker.compile_granularity import compile_granularity
+from spyre_inference.v1.worker.spyre.model_wrapper import (
     _SpyreModelWrapper,
     warm_sample_row_gathers,
 )
+from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator
+from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_shape_tables,
@@ -90,18 +91,31 @@ def plan(runner: "SpyreModelRunnerV2") -> list[DummyCall]:
 
 
 def _dummy_run(runner: "SpyreModelRunnerV2", num_tokens: int, skip_attn: bool):
-    """MRV2's _dummy_run, with a pooling model's hidden states D2H'd for upstream's host
-    logits_indices gather and handed back on Spyre, where the pooler reads them."""
+    """MRV2's _dummy_run, D2H'ing for upstream's host gather but returning a pooling
+    model's raw device output: a CPU round trip changes the Spyre layout."""
     if skip_attn:
         # MRV2 builds no slot mappings with skip_attn, but the block graph's KV write
         # needs a target, or warmup traces a graph serving never runs.
         attn_layer.publish_null_slots(num_tokens)
-    with cast(_SpyreModelWrapper, runner.model).outputs_on_host() as keep:
-        hidden_states, sample_hidden_states = runner._dummy_run(
-            num_tokens, skip_attn=skip_attn, is_profile=True
-        )
-    if keep and hidden_states is not None and hidden_states.numel() > 0:
-        hidden_states = convert(hidden_states, runner.spyre_device)
+    wrapper = cast(_SpyreModelWrapper, runner.model)
+    model = wrapper._model
+    outputs = []
+
+    def capture(*args, **kwargs):
+        outputs.append(model(*args, **kwargs))
+        return outputs[-1]
+
+    if wrapper._keep_outputs_on_device:
+        object.__setattr__(wrapper, "_model", capture)
+    try:
+        with wrapper.outputs_on_host():
+            hidden_states, sample_hidden_states = runner._dummy_run(
+                num_tokens, skip_attn=skip_attn, is_profile=True
+            )
+    finally:
+        object.__setattr__(wrapper, "_model", model)
+    if outputs and hidden_states is not None and hidden_states.numel() > 0:
+        hidden_states = outputs[0]
     return hidden_states, sample_hidden_states
 
 
@@ -111,15 +125,18 @@ def _warm_pooling(runner: "SpyreModelRunnerV2", hidden_states: torch.Tensor) -> 
     if not runner.pooling_on_spyre:
         return
     rectangles = list(encoder_shape_tables(runner.vllm_config).rectangles)
+    pooler = cast(VllmModelForPooling, runner.get_model()).pooler
     warm_pooler_row_widths(
-        cast(VllmModelForPooling, runner.get_model()).pooler,
+        pooler,
         hidden_states,
         rectangles,
         runner.max_num_reqs,
     )
     if rectangles:
         # pool_rows_for's re-compaction gather keeps the buffer's row count.
-        select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+        packed = select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+        # LAST and token poolers read the re-compacted output, whose layout can differ.
+        warm_pooler_row_widths(pooler, packed, rectangles, runner.max_num_reqs)
 
 
 def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -> None:
@@ -145,8 +162,7 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
-    """The input embedding at every body size, and the encoder at every batch width
-    (V1's _warmup_input_embedding / _warmup_multimodal_encoder).
+    """The input embedding at every body size, and the encoder at every batch width.
 
     A dummy run hands the model the staging buffer instead of producing it through
     embed_input_ids, and no dummy run reaches the encoder. A generative model's tower is
@@ -179,7 +195,7 @@ def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
 
 def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
     """A SpyreVisionEncoderMixin tower compiles per token budget, then serves through the
-    encoder runner's graph manager (V1's _record_vision_graphs / _warmup_vision_merge).
+    encoder runner's graph manager.
 
     Not keyed on cudagraph_mm_encoder, which also gates GPU-only memory profiling.
     """
@@ -231,12 +247,66 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
         causal_by_layer.update(
             zip(draft.get_draft_kv_cache_layer_names(), draft.get_draft_attn_causal(), strict=True)
         )
+    # Mamba layers hold a tuple of state tensors; only paged attention records graphs.
+    pages = {
+        name: cache
+        for name, cache in runner.spyre_kv_caches.items()
+        if isinstance(cache, SpyrePagedKVCache)
+    }
     record_attention_graphs(
         runner.compilation_config.static_forward_context,
-        runner.spyre_kv_caches,
+        pages,
         builders,
         causal_by_layer=causal_by_layer,
     )
+
+
+def _warm_mamba(runner: "SpyreModelRunnerV2", body_buckets: list[int]) -> None:
+    """Compile every Mamba layer's decode and prefill kernels on the null state slot.
+
+    MRV2's dummy runs carry no Mamba metadata, so the mixer body never runs there.
+    """
+    if runner.compilation_config.mode is CompilationMode.NONE:
+        return
+    static_ctx = runner.compilation_config.static_forward_context
+    mixers = [layer for layer in static_ctx.values() if isinstance(layer, SpyreMambaMixer2)]
+    if not mixers:
+        return
+    t0 = time.time()
+    for mixer in mixers:
+        mixer.warm_kernels(body_buckets)
+    logger.info(
+        "Mamba kernels warmed for %d layers (body buckets %s, decode buckets %s, "
+        "prefill chunk %d) in %.3fs.",
+        len(mixers),
+        body_buckets,
+        mixers[0].decode_buckets,
+        mixers[0].chunk_size,
+        time.time() - t0,
+    )
+
+
+@contextmanager
+def _set_spyre_compilation_settings(config: VllmConfig):
+    """Spyre's Inductor settings for the duration of warmup."""
+    import torch._inductor.config as torch_inductor_config
+
+    inductor_config = config.compilation_config.inductor_compile_config
+    freezing_value = torch_inductor_config.freezing
+    try:
+        if inductor_config.get("max_autotune", False):
+            # Freezing folds per-block weights into each block's graph, defeating
+            # artifact sharing. Warn rather than override an explicit max_autotune.
+            if compile_granularity() == "block" and not config.model_config.enforce_eager:
+                logger.warning(
+                    "max_autotune enables Inductor freezing, which folds per-block "
+                    "weights into each block's graph and defeats per-block artifact "
+                    "sharing. Compile time will grow with layer count."
+                )
+            torch_inductor_config.freezing = True
+        yield
+    finally:
+        torch_inductor_config.freezing = freezing_value
 
 
 def run(runner: "SpyreModelRunnerV2") -> None:
@@ -249,7 +319,11 @@ def run(runner: "SpyreModelRunnerV2") -> None:
     # compiled graph, so warming outside it misses each one at serving time.
     bucketer = SpyreShapeBucketer.for_config(runner.vllm_config)
     row_widths = (
-        [] if bucketer is None else logits_row_buckets(bucketer.bucket_sizes, runner.max_num_reqs)
+        []
+        if bucketer is None
+        else logits_row_buckets(
+            bucketer.bucket_sizes, runner.max_num_reqs, runner.num_speculative_steps
+        )
     )
     with _set_spyre_compilation_settings(runner.vllm_config), torch.inference_mode():
         widest = None
@@ -282,7 +356,10 @@ def run(runner: "SpyreModelRunnerV2") -> None:
                     # Wider than any sampled batch: the prompt-logprobs chunk, which
                     # only goes through compute_logits, never the sampler.
                     wrapper.compute_logits(widest.new_zeros(rows, widest.shape[1]))
+        # The bench tooling (vllm-bench-serve's collect.py) parses this line.
+        logger.info("Warmup complete in %.3fs for %d buckets.", time.time() - t0, len(calls))
         if runner.spyre_kv_caches:
+            _warm_mamba(runner, [] if bucketer is None else bucketer.bucket_sizes)
             _record_attention(runner)
         if not runner.model_config.enforce_eager:
             _record_vision_graphs(runner, [c.num_tokens for c in calls])

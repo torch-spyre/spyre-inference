@@ -146,6 +146,101 @@ def _maybe_uniproc(parallel_config, requested_backend) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
+# Hosts where `--load-format spyre` is the default. Everywhere else it is opt-in.
+_SPYRE_LOADER_DEFAULT_MACHINES = frozenset({"ppc64le", "ppc64"})
+
+
+def _host_machine() -> str:
+    """CPU architecture of the host (``uname -m``). A function so tests can patch it.
+
+    os.uname() rather than the ``platform`` module: this file is itself named platform.py."""
+    return os.uname().machine
+
+
+# Expert-count attributes used across HF model families (Mixtral, Qwen MoE, Gemma 4,
+# DeepSeek, etc.).
+_MOE_EXPERT_ATTRS = ("num_experts", "num_local_experts", "n_routed_experts")
+
+
+def _hf_config_has_moe(text_config) -> bool:
+    """Return True when the HF text config describes a MoE model.
+
+    A missing attribute or a value of 0 / 1 is treated as a dense model.
+    """
+    if text_config is None:
+        return False
+    for attr in _MOE_EXPERT_ATTRS:
+        val = getattr(text_config, attr, None)
+        if val is not None and int(val) > 1:
+            return True
+    return False
+
+
+def _padding_active(vllm_config) -> bool:
+    """True when head_dim / intermediate_size padding was applied to the text config.
+
+    Padded models stay on the stock loader: the pad passes wrap
+    ``get_all_weights`` and need full, unsharded, host-resident tensors,
+    which the direct-to-device path does not provide:
+      - TP=1: it yields Spyre-resident tensors, so the pad runs as eager Spyre copies
+        that the backend cannot lower ("no offset-free alternative stick dim for
+        mutation target").
+      - TP>1: shard-on-read slices the tensor before the pad wrapper sees it, so the
+        wrapper's width checks no longer match and the TP narrowing then fails.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    text_cfg = getattr(model_config, "hf_text_config", None)
+    return (
+        getattr(text_cfg, "_spyre_orig_head_dim", None) is not None
+        or getattr(text_cfg, "_spyre_orig_intermediate_size", None) is not None
+    )
+
+
+def _spyre_loader_supported(vllm_config) -> bool:
+    """Return True when SpyreModelLoader is safe to use for this config.
+
+    Allow-list: only runner_type="generate", unquantized, dense, non-MoE,
+    non-transformers-backend models are supported. Any config outside that set
+    stays on the stock loader until explicitly validated.
+    Excluded:
+      - runner_type != "generate": pooling and any future runner types are
+        excluded; their host-residency needs are not yet covered (torch-spyre#2971).
+      - quantized: FP8 and other quant schemes have their own weight layout logic.
+      - transformers backend: uses a different model class hierarchy.
+      - padded head_dim / intermediate_size: the pad passes need the
+        full tensor on the host, but the direct path yields Spyre-resident (TP1)
+        or pre-sharded (TP>1) tensors. Those configs stay on the stock loader.
+      - MoE: dma_moe_expert_weight_to_spyre requires a CPU source tensor.
+      - speculative decoding: the draft model is loaded with the target's load_config,
+        and drafters such as XPress run host-side ops in load_weights that expect
+        host tensors.
+
+    Supported, and worth knowing about when touching the loader:
+      - TP > 1: linear weights are sharded on read (see
+        ``model_loader._iter_tp_sharded_weights``).
+      - multimodal: the language backbone streams direct-to-device; vision-tower and
+        projector parameters stay host-loaded (see ``_get_host_loaded_param_names``).
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return False
+    if getattr(model_config, "quantization", None) is not None:
+        return False
+    if getattr(model_config, "runner_type", None) != "generate":
+        return False
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        return False
+    if (
+        hasattr(model_config, "using_transformers_backend")
+        and model_config.using_transformers_backend()
+    ):
+        return False
+    return not (
+        _hf_config_has_moe(getattr(model_config, "hf_text_config", None))
+        or _padding_active(vllm_config)
+    )
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -214,7 +309,15 @@ class TorchSpyrePlatform(CpuPlatform):
             cls._user_max_num_batched_tokens = self.max_num_batched_tokens
             original(self, usage_context, model_config, parallel_config)
             if not user_supplied and self.max_num_seqs is not None:
-                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+                default = cls._DEFAULT_MAX_NUM_SEQS
+                if getattr(model_config, "runner_type", None) == "pooling":
+                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                        pooling_default_max_num_seqs,
+                    )
+
+                    # Only widen: a long model keeps batching short documents.
+                    default = max(default, pooling_default_max_num_seqs(model_config.max_model_len))
+                self.max_num_seqs = min(self.max_num_seqs, default)
 
         _spyre_patched._spyre_patched = True
         EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
@@ -242,25 +345,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def register_triton_kernel_overrides(cls) -> None:
-        from vllm.triton_utils.dispatcher import register_kernels
-
-        from spyre_inference.v1.spec_decode import rejection_sampler
-
-        # Use our vendored C++ kernels; CpuPlatform's wrappers require the absent vllm._C.
-        register_kernels(
-            {
-                "vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel": (
-                    rejection_sampler.greedy_sample
-                ),
-                "vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel": (
-                    rejection_sampler.random_sample
-                ),
-                "vllm.v1.sample.rejection_sampler.expand_kernel": rejection_sampler.expand,
-                "vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel": (
-                    rejection_sampler.recover
-                ),
-            }
-        )
+        # CpuPlatform's overrides target V1 modules and call the absent vllm._C; MRV2's
+        # kernels are bound to host ops by kernels.bind() in the worker.
+        pass
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -410,6 +497,25 @@ class TorchSpyrePlatform(CpuPlatform):
         # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
+
+        # On POWER hosts the direct-to-device loader is the default; elsewhere a user opts in
+        # with --load-format spyre.
+        load_config = getattr(vllm_config, "load_config", None)
+        if (
+            load_config is not None
+            and load_config.load_format == "auto"
+            and _host_machine() in _SPYRE_LOADER_DEFAULT_MACHINES
+        ):
+            # Padding is normally applied in check_and_update_config, after this hook, so the
+            # gate would not see it. The passes are idempotent: run them first so padded
+            # models stay on the stock loader.
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            repair_head_dim_access(vllm_config.model_config.hf_config)
+            cls._maybe_pad_head_dim(vllm_config)
+            cls._maybe_pad_intermediate_size(vllm_config)
+            if _spyre_loader_supported(vllm_config):
+                load_config.load_format = "spyre"
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
@@ -634,8 +740,7 @@ class TorchSpyrePlatform(CpuPlatform):
             return
         if not supports_intermediate_padding(text_config):
             return
-        moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
-        is_moe = any(getattr(text_config, a, None) for a in moe_attrs)
+        is_moe = any(getattr(text_config, a, None) for a in _MOE_EXPERT_ATTRS)
         expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
             text_config, "expert_intermediate_size", None
         )
@@ -704,6 +809,12 @@ class TorchSpyrePlatform(CpuPlatform):
             # A CUDA-graph encoder manager; Spyre compiles towers per budget at warmup.
             "cudagraph_mm_encoder": vllm_config.compilation_config.cudagraph_mm_encoder,
             "prefill context parallelism": parallel_config.prefill_context_parallel_size > 1,
+            # Accepted upstream but never tested on Spyre.
+            "HiSparse": getattr(vllm_config.attention_config, "hisparse_config", None) is not None,
+            "watermarking": getattr(vllm_config, "watermark_config", None) is not None,
+            "AuxOutput (e.g. returning routed experts)": bool(
+                getattr(getattr(vllm_config, "aux_output_config", None), "enabled", False)
+            ),
         }
         for feature, requested in unsupported.items():
             if requested:
@@ -856,7 +967,7 @@ class TorchSpyrePlatform(CpuPlatform):
         parallel_config = vllm_config.parallel_config
 
         # Spyre does not currently support data parallelism. The worker's
-        # WORLD_SIZE / RANK derivation in spyre_worker.init_device assumes a
+        # WORLD_SIZE / RANK derivation in SpyreWorkerV2.init_device assumes a
         # single DP replica, and the spyre-comms global rank space has not
         # been validated for DP×TP configurations.
         if parallel_config.data_parallel_size > 1:
@@ -878,6 +989,23 @@ class TorchSpyrePlatform(CpuPlatform):
         # Spyre backend does not provide.
         if vllm_config.cache_config.kv_sharing_fast_prefill:
             raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
+
+        # Reject --load-format spyre (explicit, or the POWER default) for configs the loader
+        # doesn't support, instead of failing later inside the loader. The head_dim /
+        # intermediate_size padding above has already run, so it is visible here.
+        load_config = getattr(vllm_config, "load_config", None)
+        if (
+            load_config is not None
+            and load_config.load_format == "spyre"
+            and not _spyre_loader_supported(vllm_config)
+        ):
+            raise ValueError(
+                "--load-format spyre is not supported for this configuration. "
+                "Supported: unquantized, dense, non-MoE, generate-only, "
+                "non-transformers-backend models without head_dim / "
+                "intermediate_size padding or speculative decoding. "
+                "Use --load-format auto or --load-format safetensors instead."
+            )
 
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
@@ -909,48 +1037,19 @@ class TorchSpyrePlatform(CpuPlatform):
         from spyre_inference import pin_model_runner
         from spyre_inference.v1.worker.spyre import triton_gate
 
-        # Read fresh, not from the cache register() filled, so a value changed after
-        # `import vllm` is caught by the gate check below.
-        runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
-        if runner not in ("v1", "v2"):
-            raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        # Every process, ahead of the V1 validation that follows this hook in __post_init__.
-        from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
-
-        allow_xpress_on_v1()
+        # Read fresh, not from envs' cache, so a value set after `import vllm` is caught.
+        runner = os.environ.get("SPYRE_MODEL_RUNNER", "")
+        if runner not in ("", "v2"):
+            raise ValueError(
+                f"SPYRE_MODEL_RUNNER={runner!r}: the V1 model runner was removed (#1245) and "
+                "Model Runner V2 is the only one; unset SPYRE_MODEL_RUNNER."
+            )
         mrv2_kernels = envs.environment_variables["SPYRE_MRV2_KERNELS"]()
         if mrv2_kernels not in ("host", "triton"):
             raise ValueError(f"SPYRE_MRV2_KERNELS={mrv2_kernels!r} is not host or triton.")
-        triton_gate.check(runner, mrv2_kernels)
+        triton_gate.check(mrv2_kernels)
         # Again, for a value set after `import vllm` that child processes would inherit.
-        pin_model_runner(runner)
-
-        if runner == "v1":
-            # Two features outrank the env var inside use_v2_model_runner, so rejecting
-            # them here is what actually keeps the pin true. Left alone, hisparse raises
-            # "HiSparse requires Model Runner V2; remove VLLM_USE_V2_MODEL_RUNNER=0" --
-            # blaming an env var the user never set, since we set it -- and watermarking
-            # silently returns V2 anyway, landing on the missing Triton much later.
-            if getattr(vllm_config.attention_config, "hisparse_config", None) is not None:
-                raise ValueError(
-                    "Spyre does not support HiSparse: it requires the V2 model runner, and "
-                    "TorchSpyreWorker only builds the V1 runner."
-                )
-            if getattr(vllm_config, "watermark_config", None) is not None:
-                raise ValueError(
-                    "Spyre does not support watermarking: it requires the V2 model runner, "
-                    "and TorchSpyreWorker only builds the V1 runner."
-                )
-            # 0.31 leaves AuxOutput validation to out-of-tree platforms; in-tree it is
-            # only wired to the V2 runner, so on ours it would be accepted and never
-            # produced.
-            aux_output_config = getattr(vllm_config, "aux_output_config", None)
-            if aux_output_config is not None and aux_output_config.enabled:
-                raise ValueError(
-                    "Spyre does not support AuxOutput (e.g. returning routed experts): it "
-                    "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
-                    "runner."
-                )
+        pin_model_runner()
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.rejection_sample_method == "fly":
@@ -959,22 +1058,19 @@ class TorchSpyrePlatform(CpuPlatform):
                 "Spyre does not support rejection_sample_method='fly': its acceptance "
                 "kernels are Triton-only and have no host implementation."
             )
-        if runner == "v2":
-            cls._reject_unsupported_v2_features(vllm_config)
+        cls._reject_unsupported_v2_features(vllm_config)
 
         # The pin holds only if the resolved property agrees; anything new that outranks
         # the env var must fail here rather than at the first runner-specific code path.
         # A raise, not an assert: -O would strip the tripwire.
-        if vllm_config.use_v2_model_runner != (runner == "v2"):
+        if not vllm_config.use_v2_model_runner:
             raise RuntimeError(
-                f"SPYRE_MODEL_RUNNER={runner} did not take effect: use_v2_model_runner is "
-                f"{vllm_config.use_v2_model_runner}. A config field now forces the other "
-                "model runner; reject it in TorchSpyrePlatform.check_and_update_config."
+                "use_v2_model_runner is False although VLLM_USE_V2_MODEL_RUNNER=1 is pinned: "
+                "a config field now forces the V1 model runner, which Spyre no longer has. "
+                "Reject it in TorchSpyrePlatform.check_and_update_config."
             )
 
-        worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
-        if runner == "v2":
-            worker_class = "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
+        worker_class = "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
         if parallel_config.worker_cls == "auto":
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
@@ -986,16 +1082,21 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
-        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
-        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
-        # KV-cache manager gives every layer its own buffer; SWA is still computed, per
-        # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
-        # Mamba hybrids keep it: their state specs cannot be unified with attention,
-        # and kv_cache_setup gives every layer its own buffer anyway.
+        # The hybrid KV cache manager is off unless asked for (None is vLLM's unset
+        # default, resolved after this hook). Mamba hybrids need it: without it,
+        # upstream's KV grouping cannot unify their state specs with attention.
         is_mamba_hybrid = (
             vllm_config.model_config is not None and vllm_config.model_config.is_hybrid
         )
-        scheduler_config.disable_hybrid_kv_cache_manager = not is_mamba_hybrid
+        if is_mamba_hybrid:
+            if scheduler_config.disable_hybrid_kv_cache_manager:
+                raise ValueError(
+                    "Mamba hybrid models need the hybrid KV cache manager on Spyre; "
+                    "remove --disable-hybrid-kv-cache-manager."
+                )
+            scheduler_config.disable_hybrid_kv_cache_manager = False
+        elif scheduler_config.disable_hybrid_kv_cache_manager is None:
+            scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,
         # overriding the flag; a size would also skip the measurement and hand out a

@@ -503,15 +503,6 @@ def test_dense_kernel_matches_dense_sdpa_reference(
     ],
 )
 @pytest.mark.parametrize(
-    "block_size",
-    [
-        # Valid block_size values: must be multiples of 64 for Spyre stick alignment.
-        pytest.param(64, id="block_size(64)"),
-        pytest.param(128, id="block_size(128)"),
-        pytest.param(256, id="block_size(256)"),
-    ],
-)
-@pytest.mark.parametrize(
     "dtype",
     [
         pytest.param(torch.float16, id="dtype(fp16)"),
@@ -521,7 +512,6 @@ def test_dense_kernel_matches_dense_sdpa_reference(
 def test_spyre_encoder_attn(
     default_vllm_config,
     dtype: torch.dtype,
-    block_size: int,
     head_size: int,
     num_heads: tuple[int, int],
     seq_lens: list[tuple[int, int]],
@@ -530,6 +520,8 @@ def test_spyre_encoder_attn(
 ) -> None:
     """Validate SpyreEncoderAttentionImpl against a bidirectional reference."""
     num_query_heads, num_kv_heads = num_heads
+    # The encoder keeps no KV cache, so the block size reaches nothing it computes.
+    block_size = 64
     # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")
     set_random_seed(0)

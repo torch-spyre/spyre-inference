@@ -159,12 +159,11 @@ def test_single_image_prompt_produces_output(monkeypatch):
 @pytest.mark.uses_subprocess
 @pytest.mark.e2e_smoke
 def test_two_image_prompt_produces_output():
-    """Two images make the vision mask non-trivial: the `cu_seqlens`-derived
-    block-diagonal mask must actually block cross-image attention, not collapse to a
-    single full-range block.
+    """Two images per prompt: the encoder runs once per image, and both images' tokens
+    reach the decoder.
 
-    Eager only: the mask is built on CPU either way, so a compiled twin would cost a
-    graph build for no new coverage.
+    Eager only: the compiled one-call-per-image path is covered on the card by
+    `test_compiled_manager_runs_one_call_per_image_on_spyre`.
     """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")
@@ -222,8 +221,15 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
     monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "2")
     from vllm import SamplingParams
 
+    def encoder_graph_manager(worker):
+        runner = worker.model_runner
+        if hasattr(runner, "encoder_cudagraph_manager"):
+            return runner.encoder_cudagraph_manager
+        # The V2 runner keeps it on the model state's encoder runner.
+        return runner.model_state.encoder_runner.cudagraph_manager
+
     def record_encoder_calls(worker):
-        manager = worker.model_runner.encoder_cudagraph_manager
+        manager = encoder_graph_manager(worker)
         manager.calls = []
         execute = manager._execute_local
 
@@ -235,7 +241,7 @@ def test_gemma4_request_max_soft_tokens_replays_warmed_budgets(monkeypatch):
         return manager.graph_hits, manager.graph_misses
 
     def encoder_calls(worker):
-        manager = worker.model_runner.encoder_cudagraph_manager
+        manager = encoder_graph_manager(worker)
         return manager.calls, manager._pack_tokens, manager.graph_hits, manager.graph_misses
 
     llm = _llm(

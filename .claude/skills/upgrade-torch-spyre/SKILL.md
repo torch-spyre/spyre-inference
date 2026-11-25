@@ -38,12 +38,30 @@ Validate before starting (note: strip trailing slash from `ARTIFACTORY_URL` to a
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
-curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+# Token via curl stdin config (-K -), never argv: argv is world-readable through
+# /proc/<pid>/cmdline and lands in shell history. --proto/--proto-redir keep the
+# request and every redirect hop on https so the header never travels in the clear.
+case "$ARTIFACTORY_URL" in https:*) ;; *) echo "ARTIFACTORY_URL must use https" >&2; exit 1;; esac
+curl -sf --proto '=https' --proto-redir '=https' -K - \
   "$ARTIFACTORY_URL/artifactory/api/repositories/$ARTIFACTORY_RPM_REPO" \
-  | jq .key
+  <<CURL_CONFIG | jq .key
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 ```
 
 If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §7. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
+
+## Unattended mode (hive `deps` agent)
+
+The hive `deps` agent (`.hive/agents/deps.md`) runs this skill in a sandbox with nobody to ask and no GitHub credentials. Where the steps below differ, these rules win:
+
+- **No user to talk to.** Anything the steps say to tell the user, or to state in chat, goes into the PR body (§9) instead.
+- **Ceiling.** When the prompt names a ceiling commit, list the §1 range only up to the commit before it (`<current-sha>..<ceiling>^`), so neither the tip attempt nor the bisect reaches it.
+- **Downgrades (§7 step 4).** Do not ship one. Keep `[tool.spyre-rpms]` on its current bundle, do a torch-spyre-only bump if it builds against that bundle, and note the downgrade in the PR body.
+- **Artifactory unavailable.** The run fails. Every later run would hit the same wall, so an operator has to fix the credentials. Do not fall back to a torch-spyre-only bump: a build against the image's RPMs with an unvalidated lock can pass here and fail to link in CI.
+- **First failing commit.** When the bisect stops short of the tip, keep the first failing commit (`commits[high]`) and the first `error:` line of its `/tmp/spyre-bisect/<sha>.log`. The prompt explains how to report it.
+- **PR text.** Write the §9 description to `.hive/pr-body.md`, and the title to `.hive/pr-title.txt` as `chore(deps): bump torch-spyre to <new-sha, 8 chars>`.
+- **§10 does not apply.** Commit the changed lock/pin files with `git commit -s`. Never push; hive does that.
 
 ## Workflow
 
@@ -53,15 +71,15 @@ If any vars are missing or the request returns a 401 (revoked/expired token), **
 grep -n "torch-spyre = " pyproject.toml
 # → torch-spyre = { git = "...", rev = "<current-sha>" }
 
-gh api repos/torch-spyre/torch-spyre/commits/main \
-  --jq '{sha: .sha, message: .commit.message, date: .commit.author.date}'
+git clone -q --filter=blob:none https://github.com/torch-spyre/torch-spyre /tmp/torch-spyre 2>/dev/null \
+  || git -C /tmp/torch-spyre fetch -q origin main
+git -C /tmp/torch-spyre log -1 --format='%H %cs %s' origin/main
 ```
 
-If `current-sha == main`, there's nothing to do. Otherwise compare the range:
+If `current-sha == main`, there's nothing to do. Otherwise list the range (anonymous `git` works for this public repo, so this needs no `gh` login):
 
 ```bash
-gh api 'repos/torch-spyre/torch-spyre/compare/<current-sha>...<main-sha>' \
-  --jq '.commits | to_entries | .[] | "\(.key) \(.value.sha) \(.value.commit.message | split("\n")[0])"'
+git -C /tmp/torch-spyre log --first-parent --reverse --format='%H %s' <current-sha>..origin/main | nl -v0
 ```
 
 That gives you a numbered list (oldest → newest) of every candidate commit. Save the count — call it `N`. The bisect runs over indices `[-1, N-1]`, where `-1` is the known-good current pin and `N-1` is the candidate tip.
@@ -84,7 +102,7 @@ Use the helper below. Even if you think the tip won't build, try it first — sa
 
 #### Bisect helper (`/tmp/spyre-bisect/try.sh`)
 
-Write this once at the start of the session:
+Write this once at the start of the session, and run it from the repo root:
 
 ```bash
 mkdir -p /tmp/spyre-bisect
@@ -96,7 +114,7 @@ cat > /tmp/spyre-bisect/try.sh <<'BASH'
 set -u
 sha="${1:?need sha}"
 log="/tmp/spyre-bisect/${sha:0:7}.log"
-cd /home/senuser/spyre-inference
+cd "$(git rev-parse --show-toplevel)"
 
 python3 - "$sha" <<'PY'
 import re, sys, pathlib
@@ -158,8 +176,7 @@ libtorch, so torch is pinned exactly in several places that must move together. 
 target commit's requirement:
 
 ```bash
-gh api "repos/torch-spyre/torch-spyre/contents/pyproject.toml?ref=<target-sha>" \
-  --jq .content | base64 -d | grep -n "torch"
+git -C /tmp/torch-spyre show <target-sha>:pyproject.toml | grep -n "torch"
 ```
 
 If the current pin still satisfies it, nothing to do. A bisect step that exits 2 (lock
@@ -197,7 +214,7 @@ PyTorch baselines:
 
 ```bash
 uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
-  tests/runtime/test_sampling_fallback.py --no-header
+  tests/runtime/test_top_k_top_p_sort_free.py --no-header
 ```
 
 `test_sampling_kernels.py` skips when the extension didn't load, so check it ran rather
@@ -294,9 +311,12 @@ List the dated snaps (`main_snap_YYYY_MM_DD_HH`; `main_nightly_*` before 2026-10
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
-curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+case "$ARTIFACTORY_URL" in https:*) ;; *) echo "ARTIFACTORY_URL must use https" >&2; exit 1;; esac
+curl -sf --proto '=https' --proto-redir '=https' -K - \
   "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_BUNDLE_PATH/x86_64/prod" \
-  | jq -r '.children[].uri' | grep -E 'main_snap_|main_nightly_' | sort | tail -5
+  <<CURL_CONFIG | jq -r '.children[].uri' | grep -E 'main_snap_|main_nightly_' | sort | tail -5
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 ```
 
 If torch-spyre fails to build against the newest bundle, bisect over bundles, not over individual packages.
@@ -374,10 +394,13 @@ ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
 cat /tmp/relpaths.txt   # one repo-relative <tree>/<arch>/<file> per package
 
 BASE="${ARTIFACTORY_URL}/artifactory/${ARTIFACTORY_RPM_REPO}"
+case "$BASE" in https:*) ;; *) echo "ARTIFACTORY_URL must use https" >&2; exit 1;; esac
 mkdir -p /tmp/rpm-dl-check
 while read -r rel; do
-  curl -fSL -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
-    -o "/tmp/rpm-dl-check/$(basename "$rel")" "${BASE}/${rel}"
+  curl -fSL --proto '=https' --proto-redir '=https' \
+    -o "/tmp/rpm-dl-check/$(basename "$rel")" -K - "${BASE}/${rel}" <<CURL_CONFIG
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 done < /tmp/relpaths.txt
 ```
 
@@ -488,7 +511,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 
 ### 10. Stop — do not commit or push
 
-The skill's job ends here. Present the user with a summary of what changed and the draft PR description. The user will:
+Interactive runs only; an unattended run commits instead (see [Unattended mode](#unattended-mode-hive-deps-agent)). The skill's job ends here. Present the user with a summary of what changed and the draft PR description. The user will:
 
 1. Review the changes (`pyproject.toml`, `uv.lock`, `spyre-rpms.lock`)
 2. Commit on their chosen branch

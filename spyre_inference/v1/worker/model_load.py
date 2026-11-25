@@ -69,12 +69,19 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
     fix_padded_qk_norm_eps(model, text_config, model_config)
 
 
+def keep_attention_buffers_on_host() -> None:
+    """Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
+
+    Note: This _apply cannot reside in SpyreAttentionImpl, as it is not an nn.Module,
+    but just the attention implementation. It patches the class for good, so every
+    path that loads or moves a model calls it.
+    """
+    Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+
+
 def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     """Move the layer weights to Spyre."""
-    # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-    # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
-    # an nn.Module, but just the attention implementation.
-    Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+    keep_attention_buffers_on_host()
     model.to(device=device)
 
 
@@ -132,7 +139,7 @@ def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) 
 
 
 def rewarm_after_reload(runner: Any) -> None:
-    """After upstream's reload_weights, shared by the V1 and V2 runners.
+    """After upstream's reload_weights.
 
     The reload reprocesses the weights, which rewrites the layers' KV scales. The
     graphs that read them guard on their values, so only those retrace; warming here

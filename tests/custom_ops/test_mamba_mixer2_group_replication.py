@@ -162,3 +162,30 @@ def test_norm_keeps_upstream_path_when_tp_divides_the_groups(monkeypatch):
     torch.nn.Module.__init__(norm)
     m.SpyreMixer2RMSNormGated.__init__(norm, INNER, G, True, eps=1e-5)
     assert norm._group_column is None
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_grouped_norm_equals_upstreams(monkeypatch, tp):
+    """The grouped norm applies the weight per group, a regrouping of upstream's product."""
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import Mixer2RMSNormGated
+
+    from spyre_inference.custom_ops import mamba_mixer2 as m
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_world_size",
+        lambda: tp,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_rank", lambda: 0
+    )
+    norm = object.__new__(m.SpyreMixer2RMSNormGated)
+    torch.nn.Module.__init__(norm)
+    m.SpyreMixer2RMSNormGated.__init__(norm, INNER, G, True, eps=1e-5)
+    gen = torch.Generator().manual_seed(2)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(norm.weight.shape, generator=gen))
+    x, gate = (torch.randn(3, INNER // tp, generator=gen) for _ in range(2))
+
+    got = norm.forward_native(x, gate)
+
+    torch.testing.assert_close(got, Mixer2RMSNormGated.forward_native(norm, x, gate))

@@ -276,6 +276,8 @@ class SpyreMixer2RMSNormGated(Mixer2RMSNormGated):
 
     def forward_native(self, x: torch.Tensor, gate: torch.Tensor):
         if self._group_column is None:
+            if self.use_rms_norm and self.n_groups > 1 and self.n_groups % self.tp_size == 0:
+                return self._grouped_norm(x, gate)
             return super().forward_native(x.to(torch.float32), gate.clone()).to(x.dtype)
         y = x.to(torch.float32) * F.silu(gate.clone().to(torch.float32))
         partial = y.pow(2).sum(-1, keepdim=True) * self._group_column
@@ -283,6 +285,22 @@ class SpyreMixer2RMSNormGated(Mixer2RMSNormGated):
         variance = (sums * self._group_column).sum(-1, keepdim=True) / self.group_size
         y = y * torch.rsqrt(variance + self.variance_epsilon)
         return (self.weight * y).to(x.dtype)
+
+    def _grouped_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Upstream's per-group norm, with the weight applied in the grouped shape.
+
+        Applied after the view back to ``[T, I]``, as upstream does, a one-row block graph
+        that also holds ``in_proj`` lowers to wrong values: every bs=1 decode step on
+        Nemotron-H-4B came out as garbage.
+        """
+        y = x.to(torch.float32) * F.silu(gate.clone().to(torch.float32))
+        *rows, width = y.shape
+        grouped = y.view(*rows, width // self.group_size, self.group_size)
+        grouped = grouped * torch.rsqrt(
+            grouped.pow(2).mean(-1, keepdim=True) + self.variance_epsilon
+        )
+        grouped = grouped * self.weight.view(-1, self.group_size)
+        return grouped.view(*rows, width).to(x.dtype)
 
 
 @MambaMixer2.register_oot(name="MambaMixer2")

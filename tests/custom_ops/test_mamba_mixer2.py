@@ -215,3 +215,42 @@ def test_prefill_chunks_match_the_recurrence(params, tokens, has_initial_state):
     assert _rel(out.cpu()[start : start + tokens], y_ref) < _RTOL
     assert _rel(mixer.kv_cache[0].cpu()[slot], conv_ref) < _RTOL
     assert _rel(mixer.kv_cache[1].cpu()[slot], ssm_ref) < _RTOL
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_gated_norm_after_in_proj_matches_fp32(monkeypatch, rows):
+    """Nemotron-H-4B's in_proj and gated norm in one graph, as a block compiles them.
+
+    With the weight applied after the grouped view, as upstream does, one row (every bs=1
+    decode step) lowered to wrong values.
+    """
+    from spyre_inference.custom_ops import mamba_mixer2 as m
+    from spyre_inference.custom_ops.linear import spyre_linear_t
+
+    inner, groups, hidden, width = 7168, 8, 3072, 16496
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_rank", lambda: 0
+    )
+    norm = object.__new__(m.SpyreMixer2RMSNormGated)
+    torch.nn.Module.__init__(norm)
+    m.SpyreMixer2RMSNormGated.__init__(norm, inner, groups, True, eps=1e-5)
+    gen = torch.Generator().manual_seed(0)
+    w_in = (torch.randn(hidden, width, generator=gen) * 0.02).half()
+    weight = (1 + 0.1 * torch.randn(inner, generator=gen)).half()
+    h = torch.randn(rows, hidden, generator=gen).half()
+    x = torch.randn(rows, inner, generator=gen).half()
+    with torch.no_grad():
+        norm.weight = torch.nn.Parameter(weight.float(), requires_grad=False)
+        gate = (h.float() @ w_in.float())[:, :inner]
+        expected = norm.forward_native(x.float(), gate)
+    norm.weight = torch.nn.Parameter(weight.to("spyre"), requires_grad=False)
+
+    def block(h, x, w):
+        return norm.forward_native(x, spyre_linear_t(h, w, None, pad_rows=True)[:, :inner])
+
+    got = torch.compile(block, dynamic=False)(h.to("spyre"), x.to("spyre"), w_in.to("spyre"))
+    assert _rel(got, expected) < _RTOL

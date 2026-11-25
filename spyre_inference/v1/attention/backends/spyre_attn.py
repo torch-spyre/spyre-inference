@@ -323,17 +323,16 @@ def _compile_with_dynamic_count(
     """``torch.compile`` ``fn``, whose trip count may vary over its ``range_arg`` range.
 
     Dynamo traces a size of 1 as a constant, so a graph traced at another size guards the
-    count at 2 or more and recompiles for one page or chunk. Where the range admits 1,
-    ``fn`` traces size-obliviously instead: the count starts at 0 and only the range's own
-    checks bound it. The count is the only size these kernels leave dynamic. The inductor
-    caches do not key on this setting, so an artifact traced without it keeps the floor.
+    count at 2 or more and recompiles for one page or chunk. With a range, ``fn`` therefore
+    traces size-obliviously: the count starts at 0 and only the range's own checks bound
+    it. The count is the only size these kernels leave dynamic. The inductor caches do not
+    key on this setting, so an artifact traced without it keeps the floor.
     """
     compiled = torch.compile(fn, dynamic=False, fullgraph=True)
 
     @functools.wraps(fn)
     def run(**kwargs: Any) -> torch.Tensor:
-        size_range = kwargs[range_arg]
-        if size_range is None or size_range["min"] > 1:
+        if kwargs[range_arg] is None:
             return compiled(**kwargs)
         prior = fx_config.backed_size_oblivious
         fx_config.backed_size_oblivious = True  # ty: ignore[invalid-assignment]

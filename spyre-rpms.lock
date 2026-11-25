@@ -1,30 +1,13 @@
-# 🔥🔥🔥 HAND-WRITTEN. NOT GENERATED. scripts/lock_spyre_rpms.py CANNOT PRODUCE THIS FILE. 🔥🔥🔥
+# 🔥 HAND-WRITTEN, NOT GENERATED: prod snaps have failed since 2026-11-11 (their Jenkins can't
+# reach github.ibm.com), so there is no bundle to lock from. lock_spyre_rpms.py can't produce
+# this file and `Check spyre-rpms.lock` is red on purpose. Don't "fix" it.
 #
-# The prod snap jobs (spyre-snap-all-archs) have failed every run since the 2026-11 network
-# partition: their Jenkins can't reach github.ibm.com, so no bundle after
-# main_snap_2026_11_11_09 exists. Until they recover, x86_64 runs on DEV builds from the
-# `next/` tree, which has no bundles, mixes PR builds into the main tree, and routinely
-# has -devel packages a build ahead of their base. "Take the newest of everything" there
-# gets you a franken-stack. Don't.
+# x86_64 is ONE dev nightly, all of it: next/_nodes/orchestrator-10780 (2026-11-25) in the
+# generic repo; its plan pins every dependency identity used here. Never mix in individual
+# newer next/ builds: -devel and base drift apart and PR builds land in the same tree.
+# Power/Z stay on main_snap_2026_11_11_09 (tree = ""): no complete nightly there.
 #
-# This set is ONE dev nightly: orchestrator-10780, 2026-11-25 05:30 UTC, whose plan is
-# published at <generic repo>/next/_nodes/orchestrator-10780/plan-amd64.json and whose
-# commit-manifest.json lists every component's main head (git ls-remote). Every package
-# below is that plan's artifact, and every dependency it was built against is the
-# identity pinned here (the plan's install_pkgs): coherent by construction, not by guess.
-# The 12-hex field in each version is the build's `spyre.identity`.
-#
-# Expected red: `Check spyre-rpms.lock` (lock_spyre_rpms.py --verify) fails, because dev
-# versions have no `_<build>` suffix and this is not rendered from a bundle. It is not a
-# required check. Everything that DOWNLOADS (resolve_rpms.py, populate-rpm-cache,
-# install-pinned-rpms.sh) already honours `tree`, so no script changes.
-#
-# Power and Z stay on the last prod bundle (per-row `tree = ""`): no recent nightly is
-# complete there, and nothing tests P/Z in CI anyway.
-#
-# REVERT THIS ENTIRE FILE the day prod bundles come back: set [tool.spyre-rpms] bundle to
-# the new snapshot and re-run `python3 scripts/lock_spyre_rpms.py`. To move to a newer
-# nightly in the meantime, take ALL rows from that one orchestrator's plan, never mix runs.
+# When prod snaps are back: revert this file, set [tool.spyre-rpms] bundle, re-run the tool.
 
 version = 2
 

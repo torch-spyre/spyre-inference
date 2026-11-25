@@ -17,10 +17,11 @@
 Upstream's ``init_speculator`` (vllm/v1/worker/gpu/spec_decode/__init__.py) raises for
 ``method="suffix"``. ``building_suffix_speculator`` swaps in one that builds
 ``SpyreSuffixSpeculator`` while ``GPUModelRunner.__init__`` runs, as load.py swaps the
-loader. The speculator follows V1's ``SuffixDecodingProposer``
-(vllm/v1/spec_decode/suffix_decoding.py) on arctic-inference's suffix cache. It reads each
-request's tokens from the runner's ``RequestState``, which the Spyre runner keeps on the
-host, and returns drafts in the shape upstream's ngram speculator does.
+loader. The speculator follows vLLM 0.33's ``SuffixDecodingProposer``
+(vllm/v1/spec_decode/suffix_decoding.py, gone in 0.34) on arctic-inference's suffix
+cache. It reads each request's tokens from the runner's ``RequestState``, which the
+Spyre runner keeps on the host, and returns drafts in the shape upstream's ngram
+speculator does.
 """
 
 import contextlib

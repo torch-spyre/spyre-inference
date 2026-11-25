@@ -16,14 +16,11 @@
 (vllm/v1/worker/gpu/cudagraph_utils.py).
 
 Spyre has no cudagraph capture, so dispatch() only picks the padded bucket
-size and always reports CUDAGraphMode.NONE. Replaces V1's
-_determine_batch_execution_and_padding / _spyre_bucket_batch_descriptor.
+size and always reports CUDAGraphMode.NONE.
 
 Warmup dummies never reach dispatch(): MRV2 runs them with is_profile=True,
 which skips it, so warmup.plan() picks bucket sizes itself through bucket().
-That is also why padding is not gated on the bucketer's is_warmed_up, as V1's
-warmed_bucket() is: the gate only kept V1's own warmup dummies unpadded, and here
-it would leave every step unpadded unless warmup remembered to mark it.
+Padding is therefore not gated on warmup having run.
 """
 
 from typing import TYPE_CHECKING

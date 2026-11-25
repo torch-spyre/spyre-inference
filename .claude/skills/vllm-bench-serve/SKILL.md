@@ -110,7 +110,7 @@ List the targets in run order and the baseline last. A leg that did not run is r
     - **server startup**: `server_startup_sec` of the result JSON, timed by the harness from the server spawn to the first healthy `/health`; from the `_server.log` timestamps only when the JSON has none;
     - **init and compile times** from `_server.log`, as the max across TP workers (each one logs its own, as vLLM does for `compilation`):
         - `init engine (...) took <s> s (compilation: <s> s)`, from vLLM `core.py`. Compilation is the wall time of the whole Spyre warmup (`SpyreWorker.compile_or_warm_up_model`), covering the two below;
-        - `Warmup complete in <s>s for <n> buckets.`, from `SpyreModelRunner.warming_up_model`;
+        - `Warmup complete in <s>s for <n> buckets.`, from `warmup.run` (`v1/worker/spyre/warmup.py`), logged before attention recording;
         - `Attention graph recording complete: <n> graphs in <s>s.`, from `attention.warmup.record_attention_graphs`, with the per-layer `<p> per-seq + <d> batched-decode` split;
     - whether any compile cache was on (`compile_cache`: false only with `SPYRE_KERNEL_CACHE=0`, `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` and `VLLM_DISABLE_COMPILE_CACHE=1`), the server env (`env`: `env.txt` overridden by the config's `environment_variables`), the validity errors, the ITL mean/median ratio (`compile_leak` when it is above 1.1, which points to compilation or a stall inside the measured window), and on failure the first `Error` / `Traceback` lines and the last 50 log lines;
     - the Δ of every row, target vs baseline, with its colour class.

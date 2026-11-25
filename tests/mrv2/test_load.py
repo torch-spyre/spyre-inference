@@ -33,8 +33,8 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import set_eagle3_aux_hid
 
 from spyre_inference.v1.worker.spyre import load
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper, unwrap_model
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
-from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper, unwrap_model
 
 from .fakes import FakeModel
 
@@ -423,7 +423,7 @@ def test_load_model_through_upstreams_body() -> None:
         from spyre_inference.v1.worker.spyre import device_shims
         from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
         from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
-        from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+        from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
         from spyre_inference.v1.worker.spyre import load
 
@@ -461,7 +461,7 @@ def test_load_model_through_upstreams_body() -> None:
             [sys.executable, "-c", script.replace("{store}", os.path.join(tmp, "store"))],
             capture_output=True,
             text=True,
-            env={**os.environ, "SPYRE_MODEL_RUNNER": "v2"},
+            env=os.environ,
             timeout=600,
         )
     assert result.returncode == 0, result.stderr[-4000:]

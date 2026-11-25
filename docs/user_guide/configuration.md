@@ -211,6 +211,9 @@ request runs a 4-wide attention kernel instead of a 512-wide one. Both follow
 `num_speculative_tokens` automatically; an explicit `compile_sizes` or
 `SPYRE_ATTN_QUERY_BUCKETS` still wins, and then needs to include the verification widths
 yourself. Each extra body bucket adds a warmup compile.
+Suffix decoding (`"method": "suffix"`) always verifies all `num_speculative_tokens`
+drafts, as upstream's ngram speculator does: when the suffix cache speculates fewer, the
+rest repeat the last sampled token, so every verification has the same width.
 
 **Attention (KV length × query length).** Set the buckets directly as comma-separated
 lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
@@ -324,13 +327,19 @@ left of `--gpu-memory-utilization` (default 0.92) × total. The cache keeps ever
 that memory pays for, usually far more than `--max-num-seqs` requests at `--max-model-len`
 need; with prefix caching on, the spare blocks keep earlier prompts' KV for reuse.
 
-Each Spyre layer allocates its own page per block, so the budget is converted into blocks
-at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
-groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
-one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
-regions, so a model with few layers gets fewer blocks than its budget: they must still pack
-into the regions. When memory runs out before a full batch fits, a warning names the knobs,
-and requests wait for pages instead of all running at full length.
+Spyre turns vLLM's hybrid KV cache manager off by default, so every layer allocates its own
+page per block and the budget is converted into blocks at the device cost of all layers' pages.
+`--no-disable-hybrid-kv-cache-manager` turns it on: a model that mixes
+sliding-window and full-attention layers (Gemma-3, Gemma-4) then gets one KV cache group per
+kind, sliding-window groups return blocks that fall out of the window, and the groups overlay
+one another as upstream lays them out, each layer reading the shared pages in its own shape, so
+a block costs what vLLM's pool counts. Either way the pages are
+laid out layer-outer, so `VLLM_KV_CACHE_LAYOUT` accepts only `LBNHC` (the default) or `LBHNC`,
+and a block-outer value fails at startup. Every K and V page allocation is one tensor, and the
+Spyre allocator never splits a tensor across its 16 GiB memory regions, so a model with few
+layers gets fewer blocks than its budget: they must still pack into the regions. When memory
+runs out before a full batch fits, a warning names the knobs, and requests wait for pages
+instead of all running at full length.
 
 The profile run is skipped, as the first forward on Spyre would trace the model before
 the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`
@@ -364,24 +373,19 @@ compiles them once, as an fp16 cache does.
 
 ## Model runner
 
-The plugin runs vLLM's Model Runner V2 by default. MRV2's Triton kernels are replaced by
-host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so no Triton install is
-needed on any architecture.
+The plugin runs vLLM's Model Runner V2 (MRV2), its only model runner: the V1 runner was
+removed (#1245), and `SPYRE_MODEL_RUNNER=v1` is refused at startup. MRV2's Triton
+kernels are replaced by host kernels built into the plugin (`SPYRE_MRV2_KERNELS=host`), so
+no Triton install is needed on any architecture. The plugin pins
+`VLLM_USE_V2_MODEL_RUNNER=1`, so don't set it yourself.
 
-Set `SPYRE_MODEL_RUNNER=v1` to fall back to the V1 model runner. The fallback is
-best-effort: CI covers it with a single smoke test, and it is removed before vLLM drops
-the V1 runner (#1245). The plugin sets `VLLM_USE_V2_MODEL_RUNNER` from
-`SPYRE_MODEL_RUNNER`, so don't set it yourself.
-
-Differences on V2:
+Differences from the removed V1 runner:
 
 - Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.
-- Suffix decoding verifies all `num_speculative_tokens` drafts every step, as upstream's
-  ngram speculator does: when the suffix cache speculates fewer, the rest repeat the
-  last sampled token. V1 verifies only the drafts the cache returns.
 - These are refused at startup: speculative decoding other than DFlash/XPress and suffix,
-  batch-sharded sampling, `cudagraph_mm_encoder`, and prefill context parallelism.
+  batch-sharded sampling, `cudagraph_mm_encoder`, prefill context parallelism, and,
+  untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).
 
 ## Offline engine in the calling process
 

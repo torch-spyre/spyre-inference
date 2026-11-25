@@ -38,9 +38,15 @@ Validate before starting (note: strip trailing slash from `ARTIFACTORY_URL` to a
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
-curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+# Token via curl stdin config (-K -), never argv: argv is world-readable through
+# /proc/<pid>/cmdline and lands in shell history. --proto/--proto-redir keep the
+# request and every redirect hop on https so the header never travels in the clear.
+case "$ARTIFACTORY_URL" in https:*) ;; *) echo "ARTIFACTORY_URL must use https" >&2; exit 1;; esac
+curl -sf --proto '=https' --proto-redir '=https' -K - \
   "$ARTIFACTORY_URL/artifactory/api/repositories/$ARTIFACTORY_RPM_REPO" \
-  | jq .key
+  <<CURL_CONFIG | jq .key
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 ```
 
 If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §7. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
@@ -208,7 +214,7 @@ PyTorch baselines:
 
 ```bash
 uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
-  tests/runtime/test_sampling_fallback.py --no-header
+  tests/runtime/test_top_k_top_p_sort_free.py --no-header
 ```
 
 `test_sampling_kernels.py` skips when the extension didn't load, so check it ran rather
@@ -305,9 +311,12 @@ List the dated snaps (`main_snap_YYYY_MM_DD_HH`; `main_nightly_*` before 2026-10
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
-curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+case "$ARTIFACTORY_URL" in https:*) ;; *) echo "ARTIFACTORY_URL must use https" >&2; exit 1;; esac
+curl -sf --proto '=https' --proto-redir '=https' -K - \
   "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_BUNDLE_PATH/x86_64/prod" \
-  | jq -r '.children[].uri' | grep -E 'main_snap_|main_nightly_' | sort | tail -5
+  <<CURL_CONFIG | jq -r '.children[].uri' | grep -E 'main_snap_|main_nightly_' | sort | tail -5
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 ```
 
 If torch-spyre fails to build against the newest bundle, bisect over bundles, not over individual packages.
@@ -385,10 +394,13 @@ ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
 cat /tmp/relpaths.txt   # one repo-relative <tree>/<arch>/<file> per package
 
 BASE="${ARTIFACTORY_URL}/artifactory/${ARTIFACTORY_RPM_REPO}"
+case "$BASE" in https:*) ;; *) echo "ARTIFACTORY_URL must use https" >&2; exit 1;; esac
 mkdir -p /tmp/rpm-dl-check
 while read -r rel; do
-  curl -fSL -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
-    -o "/tmp/rpm-dl-check/$(basename "$rel")" "${BASE}/${rel}"
+  curl -fSL --proto '=https' --proto-redir '=https' \
+    -o "/tmp/rpm-dl-check/$(basename "$rel")" -K - "${BASE}/${rel}" <<CURL_CONFIG
+header = "Authorization: Bearer ${ARTIFACTORY_TOKEN}"
+CURL_CONFIG
 done < /tmp/relpaths.txt
 ```
 

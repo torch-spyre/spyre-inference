@@ -135,17 +135,14 @@ def batched_decode_chunking(
 def batched_decode_query_len(vllm_config: VllmConfig) -> int:
     """Query width the batched decode kernel serves: 1, or 1 + k under spec decode.
 
-    1 + k only where every verification is that wide once the scheduler pads its
-    drafts, so not for a per-batch-size k, nor for V1 parallel drafting, whose decode
-    width is not 1 + k.
+    The runner verifies all k drafts of every request, so a verification is 1 + k wide,
+    except under a per-batch-size k, which has no single width.
     """
     spec = vllm_config.speculative_config
     if not envs.SPYRE_BATCHED_DECODE or spec is None or not spec.num_speculative_tokens:
         return 1
     width = 1 + spec.num_speculative_tokens
-    if spec.num_speculative_tokens_per_batch_size or max_decode_query_len(vllm_config) != width:
-        return 1
-    return width
+    return 1 if spec.num_speculative_tokens_per_batch_size else width
 
 
 @dataclass(frozen=True)
@@ -504,7 +501,7 @@ class SpyreAttnBucketer:
             lambda: kv_ladder(envs.SPYRE_ATTN_KV_LADDER)(max_model_len, block_size),
         )
 
-        # One width, not a ladder: the scheduler pads every draft list to k.
+        # One width, not a ladder: the runner verifies all k drafts of every request.
         self._batched_decode_query_len = batched_decode_query_len(vllm_config)
 
         # num_blocks is what the kernel specializes on. Derived from the kv

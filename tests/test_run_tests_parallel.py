@@ -37,11 +37,9 @@ rtp = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = rtp  # @dataclass looks its module up here
 _spec.loader.exec_module(rtp)
 
-# Under `make test-smoke-shard-N` (CI), MAKEFLAGS carries the outer command-line vars
-# (PYTEST_ARGS with the shard flags) into any nested make.
-_CLEAN_MAKE_ENV = {
-    k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")
-}
+# Under CI's `make test-smoke-shard-N`, make exports its command-line vars (PYTEST_ARGS with
+# the shard flags) to the environment, where a nested make's `?=` picks them up.
+_CLEAN_MAKE_ENV = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
 
 
 def _make_targets() -> list[str]:

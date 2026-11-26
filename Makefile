@@ -530,3 +530,18 @@ perf-legs: ## Print the CI perf legs (one per selected model and TP, with the ca
 		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)" \
 		--suite "$(BENCH_SUITE)"
+
+# TEMPORARY (PR validation only, dropped before merge): the same targets PARALLEL, then serial.
+AB_TARGETS = $(call _shards,test-attention-shard,$(ATTN_SHARDS)) test-probes-shard-0 test-distributed-tp4
+parallel-ab:
+	$(AIU_SETUP_CMD); \
+	echo "AB host: PCIDEVICE_IBM_COM_AIU_PF=$${PCIDEVICE_IBM_COM_AIU_PF:-} AIU_WORLD_SIZE=$${AIU_WORLD_SIZE:-} SPYRE_DEVICES=$${SPYRE_DEVICES:-}"; \
+	t0=$$(date +%s); \
+	prc=0; uv run --active --no-sync python scripts/run_tests_parallel.py --cards auto --results-dir ab/parallel $(AB_TARGETS) || prc=$$?; \
+	t1=$$(date +%s); \
+	for f in ab/parallel/parallel-logs/*.log; do echo "== tail $$f"; tail -5 "$$f"; done; \
+	rc=0; \
+	for t in $(AB_TARGETS); do mkdir -p "ab/serial/junit-$$t" && $(MAKE) $$t JUNIT_XML="$(CURDIR)/ab/serial/junit-$$t/junit-$$t.xml" || rc=1; done; \
+	t2=$$(date +%s); \
+	echo "AB exit codes: parallel=$$prc serial=$$rc"; \
+	uv run --active --no-sync python scripts/_parallel_ab_compare.py ab/serial ab/parallel $$((t2-t1)) $$((t1-t0)) $(AB_TARGETS)

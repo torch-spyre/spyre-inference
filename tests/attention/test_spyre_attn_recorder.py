@@ -50,7 +50,6 @@ from spyre_inference.v1.attention.ops.page_attn_prefill import (
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
-    batched_decode_chunking,
 )
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 
@@ -755,10 +754,10 @@ class TestRecompileLimit:
 class TestRecordBatchedDecode:
     """Recording the batched decode kernel's variants."""
 
-    # entries = num_seqs * blocks_per_chunk tops out at the core count, so a cache
-    # this wide clears the recorder's page-budget skip for every variant. The
+    # entries = num_seqs * blocks_per_chunk tops out at BATCHED_DECODE_MAX_ENTRIES (64), so a
+    # cache this wide clears the recorder's page-budget skip for every variant. The
     # per-seq recorder is still bounded by NUM_PAGES, hence the two page counts.
-    PAGES = 64
+    PAGES = 128
 
     @pytest.fixture(autouse=True)
     def _enabled(self, monkeypatch):
@@ -1056,6 +1055,6 @@ def test_large_batch_dispatch_lands_on_a_recorded_key(builder, monkeypatch, num_
         realized.add(key)
 
     base = {
-        (num_seqs, *batched_decode_chunking(num_seqs, nb)) for nb in bucketer.num_blocks_buckets
+        (num_seqs, *bucketer.decode_chunking(num_seqs, nb)) for nb in bucketer.num_blocks_buckets
     }
     assert realized - base, "dispatch never used a large-batch bucket"

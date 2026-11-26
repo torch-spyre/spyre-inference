@@ -407,6 +407,9 @@ def use_kv_buckets(monkeypatch) -> None:
     from spyre_inference.v1.attention.backends import spyre_attn
     from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
+    # Keeps the layer group's decode entries; drops only declare_pages.
     monkeypatch.setattr(
-        spyre_attn, "SpyreAttnBucketer", lambda vllm_config, **_: SpyreAttnBucketer(vllm_config)
+        spyre_attn,
+        "SpyreAttnBucketer",
+        lambda vllm_config, *args, **_: SpyreAttnBucketer(vllm_config, *args),
     )

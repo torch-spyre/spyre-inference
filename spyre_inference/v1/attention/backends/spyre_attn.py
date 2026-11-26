@@ -77,6 +77,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
+    batched_decode_entries,
 )
 from spyre_inference.v1.worker import compile_guard
 
@@ -616,6 +617,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # they keep the buckets.
         self._attn_bucketer = SpyreAttnBucketer(
             vllm_config,
+            batched_decode_entries(self.num_kv_heads, self.head_size),
             declare_pages=self.sliding_window is None and not self._encoder_only,
         )
 

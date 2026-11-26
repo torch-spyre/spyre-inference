@@ -275,23 +275,25 @@ extra lever there, and the same keep-it-short advice applies.
 
 The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
 use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
-sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
-sequence that fits in one page also gets a masked copy of it as a second page.
+sequence length up to `--max-model-len`.
 
-Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
-prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
-their own page count.
+Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
+per loop step at every sequence length. When `--max-model-len` is too short for that, prefill
+keeps its own page count, but covers at least two pages. Decode sequences keep their own page
+count. A model
+with a layer of one KV head (after the tensor-parallel split) runs at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
-export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 1, and `MAX_BUCKETS` to at least
 `--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
 below that rounded value, prefill reads one page per loop step instead.
 
 The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
 bucket pair, when any of these holds:
 
-- `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an exported
+- `--max-model-len / block_size` is not above the minimum page count, or is above an exported
   `MAX_BUCKETS`; startup logs a warning;
 - the layer uses sliding-window attention.
 
@@ -300,9 +302,9 @@ same conditions. The kernel reads the KV cache one *chunk* per loop step: the ne
 `32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
 cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
 and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
-masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
-chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
-num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
+masked past their own length. The same kernel runs a batch that fits in one chunk, so warmup
+compiles one batched kernel per num-sequences bucket. A num-sequences bucket whose
+`--max-model-len` fits in one chunk keeps its KV buckets.
 
 ## KV cache size
 

@@ -455,17 +455,18 @@ block counts that fit its smallest real query length; variants exceeding the all
 page count are skipped. When the per-sequence page count is dynamic (copied to the device
 with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
 bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
-it. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
-traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
-compile on first use instead.
+it. When prefill gets its own range of multiples of 8 pages, a prefill variant is traced
+at that page count rounded up to a multiple of 8. Failed recordings are logged and compile
+on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
 declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
-just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
-recorded at the chunk count of `max_model_len`, that runs every longer batch. A single step can carry a mix of prefill
-and decode sequences; each sequence is padded to its own query bucket (decodes use the
-length-1 bucket) before dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+one dynamic variant, at the chunk count of `max_model_len`, that runs every batch, a
+single chunk included. A single step can carry a mix of prefill and decode sequences;
+each sequence is padded to its own query bucket (decodes use the length-1 bucket) before
+dispatch.
+`SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows

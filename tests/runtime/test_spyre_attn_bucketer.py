@@ -662,22 +662,28 @@ class TestDeclaredPages:
         assert {v.num_blocks for v in variants} == {b.num_blocks_buckets[-1]}
         assert [v.padded_query_len for v in variants] == sorted(b.query_buckets, reverse=True)
 
-    def test_page_range_spans_two_pages_to_max_model_len(self):
+    def test_page_range_spans_one_page_to_max_model_len(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
-        assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
-        assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [2, 2, 7, 32]
+        assert b.page_range == {"min": 1, "max": 2048 // BLOCK_SIZE, "granularity": 1}
+        assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [1, 2, 7, 32]
 
-    def test_prefill_page_counts_are_multiples_of_eight_from_sixteen(self):
+    def test_one_kv_head_keeps_two_pages_at_minimum(self):
+        """The single-KV-head floor is a codegen limit of one page, not a compile limit."""
+        b = SpyreAttnBucketer(make_config(max_model_len=2048, num_kv_heads=1), declare_pages=True)
+        assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
+        assert b.find_declared_pages(1) == 2
+
+    def test_prefill_page_counts_are_multiples_of_eight(self):
         from torch_spyre._inductor import config as ts_config
 
         b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
         assert b.page_range is not None
         assert b.page_range["max"] == 31
-        assert b.prefill_page_range == {"min": 16, "max": 32, "granularity": 8}
+        assert b.prefill_page_range == {"min": 8, "max": 32, "granularity": 8}
         assert ts_config.max_buckets >= 32
-        assert [b.find_declared_pages(n, prefill=True) for n in (1, 8, 16, 17, 32)] == [
-            16,
-            16,
+        assert [b.find_declared_pages(n, prefill=True) for n in (1, 8, 9, 17, 32)] == [
+            8,
+            8,
             16,
             24,
             32,
@@ -691,6 +697,15 @@ class TestDeclaredPages:
         b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
         assert b.page_range is not None
         assert b.prefill_page_range == b.page_range
+
+    def test_a_prefill_on_the_per_sequence_range_covers_two_pages(self):
+        """Too short for multiples of eight, prefill takes the per-sequence range, but a
+        one-page prefill still runs over two: one page lets its unused slots through."""
+        b = SpyreAttnBucketer(make_config(max_model_len=2 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range == {"min": 1, "max": 2, "granularity": 1}
+        assert b.prefill_page_range == b.page_range
+        assert b.find_declared_pages(1, prefill=True) == 2
+        assert b.find_declared_pages(1) == 1
 
     def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
@@ -709,7 +724,7 @@ class TestDeclaredPages:
         from torch_spyre._inductor import config as ts_config
 
         b = SpyreAttnBucketer(make_config(max_model_len=32768), declare_pages=True)
-        assert b.page_range == {"min": 2, "max": 32768 // BLOCK_SIZE, "granularity": 1}
+        assert b.page_range == {"min": 1, "max": 32768 // BLOCK_SIZE, "granularity": 1}
         assert ts_config.max_buckets == 32768 // BLOCK_SIZE
 
     def test_a_context_above_the_exported_max_buckets_keeps_the_buckets(self, monkeypatch):
@@ -724,7 +739,7 @@ class TestDeclaredPages:
 
 
 class TestDynamicChunks:
-    """Batched decode takes a chunk range instead of the KV buckets past one chunk."""
+    """Batched decode takes a chunk range instead of the KV buckets, one chunk included."""
 
     @pytest.fixture(autouse=True)
     def _declarable(self):
@@ -735,44 +750,50 @@ class TestDynamicChunks:
         with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
             yield
 
-    def test_one_variant_past_one_chunk_covers_every_longer_context(self):
+    def test_one_variant_covers_every_context_a_single_chunk_included(self):
         b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
         max_pages = 8192 // BLOCK_SIZE
         for num_seqs in b.num_seqs_buckets:
             width = 32 // num_seqs
-            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
-            (dynamic,) = [v for v in variants if v.dynamic_chunks]
-            assert (dynamic.blocks_per_chunk, dynamic.num_chunks) == (width, max_pages // width)
-            assert all(v.num_blocks <= width for v in variants if not v.dynamic_chunks)
-            for nb in (width + 1, 3 * width - 1, max_pages):
+            (variant,) = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
+            assert variant.dynamic_chunks
+            assert (variant.blocks_per_chunk, variant.num_chunks) == (width, max_pages // width)
+            for nb in (1, width, width + 1, 3 * width - 1, max_pages):
                 plan = b.batched_decode_plan(num_seqs, nb)
                 assert plan is not None
-                assert plan.chunk_range == {"min": 2, "max": max_pages // width, "granularity": 1}
+                assert plan.chunk_range == {"min": 1, "max": max_pages // width, "granularity": 1}
                 assert plan.blocks_per_chunk == width
                 assert (plan.num_chunks - 1) * width < nb <= plan.num_chunks * width
-            plan = b.batched_decode_plan(num_seqs, width)
-            assert plan is not None
-            assert (plan.chunk_range, plan.num_chunks) == (None, 1)
 
-    def test_one_chunk_kernel_serves_every_call_within_one_chunk(self):
+    def test_one_kv_head_covers_two_blocks_at_minimum(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, num_kv_heads=1, max_num_seqs=32), declare_pages=True
+        )
+        # One block per chunk at 32 sequences, so two chunks; one chunk covers two elsewhere.
+        assert b._chunk_ranges[32]["min"] == 2
+        assert all(b._chunk_ranges[n]["min"] == 1 for n in b.num_seqs_buckets if n < 32)
+        plan = b.batched_decode_plan(32, 1)
+        assert plan is not None
+        assert (plan.blocks_per_chunk, plan.num_chunks) == (1, 2)
+
+    def test_an_exported_min_reserved_dim_size_raises_the_minimum_chunk_count(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "3")
+        ts_config.min_reserved_dim_size = 3
         b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
-        for num_seqs in b.num_seqs_buckets:
-            width = 32 // num_seqs
-            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
-            assert [
-                (v.blocks_per_chunk, v.num_chunks) for v in variants if not v.dynamic_chunks
-            ] == [(width, 1)]
-            for nb in range(1, width + 1):
-                assert b.batched_decode_plan(num_seqs, nb) == (width, width, 1, None)
+        assert all(r["min"] == 3 for r in b._chunk_ranges.values())
+        plan = b.batched_decode_plan(4, 1)
+        assert plan is not None
+        assert plan.num_chunks == 3
 
-    def test_a_batch_size_whose_context_fits_two_chunks_keeps_the_buckets(self):
-        # 32 pages: one chunk at one sequence, two at two sequences.
+    def test_a_batch_size_whose_context_fits_one_chunk_keeps_the_buckets(self):
+        # 32 pages: one full chunk at one sequence, two at two sequences.
         b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
-        for num_seqs in (1, 2):
-            variants = [v for v in b.batched_decode_variants() if v.num_seqs == num_seqs]
-            assert not any(v.dynamic_chunks for v in variants)
-            assert {v.num_blocks for v in variants} == set(b.num_blocks_buckets)
-        assert any(v.dynamic_chunks for v in b.batched_decode_variants() if v.num_seqs == 4)
+        variants = [v for v in b.batched_decode_variants() if v.num_seqs == 1]
+        assert not any(v.dynamic_chunks for v in variants)
+        assert {v.num_blocks for v in variants} == set(b.num_blocks_buckets)
+        assert any(v.dynamic_chunks for v in b.batched_decode_variants() if v.num_seqs == 2)
 
     def test_without_a_page_range_batched_decode_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=8192))

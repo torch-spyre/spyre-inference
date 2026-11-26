@@ -35,7 +35,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     reuse_metadata_across_groups,
 )
 from spyre_inference.v1.worker.spyre.model_states.default import SpyreDefaultModelState
-from tests.mrv2.model_states.state_fakes import make_config, make_input_batch
+
+from .state_fakes import make_config, make_input_batch
 
 BS = 128
 

@@ -82,6 +82,21 @@ pytest --upstream -m "attention"
 coverage into the `integration` tier. Adding a test to either is an admission decision; see
 [The Integration Tier](integration-tier.md).
 
+#### Running the Full Suite on a Multi-Card Host
+
+`make tests TEST_TYPE=regression` (or `trunk`) runs the CI shard jobs one after another. On a
+host with more than one card, `PARALLEL` runs them at once, each with the card count CI gives
+it:
+
+```bash
+make tests TEST_TYPE=trunk PARALLEL=auto   # every card on the host
+make tests TEST_TYPE=trunk PARALLEL=2      # the first 2 cards
+```
+
+It collects every shard first and stops if a shard is empty or a test is in no shard or in two.
+Each shard writes its log to `RESULTS_DIR/parallel-logs/` and its JUnit file to the same place
+as a serial run.
+
 #### Model Output Quality Gate
 
 The quality gate holds the product models to their output, and runs as one suite of two

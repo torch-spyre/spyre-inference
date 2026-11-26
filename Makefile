@@ -205,7 +205,7 @@ test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # The integration tier's unit-level jobs: the smoke expression without tests/e2e.
-SMOKE_UNIT_SHARDS ?= 3
+SMOKE_UNIT_SHARDS ?= 8
 SMOKE_UNIT_SHARD_ID ?= 0
 test-smoke-unit-shard: ## Run one unit-level smoke shard, tests/e2e excluded (SMOKE_UNIT_SHARDS=N SMOKE_UNIT_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' \
@@ -254,7 +254,7 @@ test-quality: ## Run the model-output quality gate (product-model output checks 
 # weighted partition (--quality-shards) balances by recorded runtime when a durations file
 # is present, else by the decoder/eval-vs-encoder path weight. No partition beats the slowest
 # single case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
-QUALITY_SHARDS ?= 8
+QUALITY_SHARDS ?= 5
 QUALITY_SHARD_ID ?= 0
 test-quality-shard: ## Run one quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i). Needs 1 card.
 	$(MAKE) run-one MARK_OVERRIDE='(model_quality and not (distributed or upstream)) or (gsm8k and upstream)' \
@@ -272,7 +272,7 @@ test-probes: ## Run the torch-spyre backend probes (excluded from integration), 
 # The 2-card probe suite is sharded across parallel 2-card CI jobs, like the
 # distributed suite; the weighted partition (--probe-shards) balances by recorded
 # runtime when a durations file is present, else evenly. PROBE_SHARDS is the count.
-PROBE_SHARDS ?= 2
+PROBE_SHARDS ?= 1
 PROBE_SHARD_ID ?= 0
 test-probes-shard: ## Run one probe shard (PROBE_SHARDS=N PROBE_SHARD_ID=i). Needs 2 cards.
 	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' \
@@ -353,7 +353,7 @@ test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (lo
 # job; the weighted partition (--upstream-shards) balances them automatically,
 # by recorded per-test runtime when a durations file is present else by models/
 # path weight. UPSTREAM_SHARDS is the single source of the count.
-UPSTREAM_SHARDS ?= 7
+UPSTREAM_SHARDS ?= 5
 UPSTREAM_SHARD_ID ?= 0
 test-upstream-shard: ## Run one non-distributed upstream shard (UPSTREAM_SHARDS=N UPSTREAM_SHARD_ID=i).
 	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not gsm8k' \

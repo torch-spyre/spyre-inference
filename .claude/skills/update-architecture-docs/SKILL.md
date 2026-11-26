@@ -41,8 +41,8 @@ base class names, inheritance relationships, and any new extension points:
 
 **Worker & model runner:**
 
-- `v1/worker/gpu_worker.py` — `Worker` base class (parent of `TorchSpyreWorker`)
-- `v1/worker/gpu_model_runner.py` — `GPUModelRunner` (pattern reference for model runners)
+- `v1/worker/gpu_worker.py` — `Worker` base class (parent of `SpyreWorkerV2`)
+- `v1/worker/gpu/model_runner.py` — MRV2 `GPUModelRunner` (parent of `SpyreModelRunnerV2`)
 
 **Engine & scheduling:**
 

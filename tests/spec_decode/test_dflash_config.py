@@ -22,27 +22,16 @@ from spyre_inference.v1.spec_decode.config import (
     normalize_speculative_config,
     validate_dflash_config,
 )
-from spyre_inference.v1.spec_decode.dflash import accepted_context_length
 
 
-@pytest.mark.parametrize(
-    "scheduled,drafts,sampled,expected",
-    [(64, 0, 0, 64), (5, 0, 1, 5), (16, 15, 1, 1), (16, 15, 4, 4), (16, 15, 16, 16)],
-)
-def test_context_excludes_rejected_rows_and_uncomputed_correction(
-    scheduled, drafts, sampled, expected
-):
-    assert accepted_context_length(scheduled, drafts, sampled) == expected
-
-
-def test_dflash_bridge_disables_padding_and_only_the_default_prefix_cache():
+def test_dflash_bridge_disables_only_the_default_prefix_cache():
     original = dict(method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128)
     args = NS(speculative_config=original, enable_prefix_caching=None)
     normalize_speculative_config(args)
     assert original == dict(
         method="dflash", model="checkpoint", num_speculative_tokens=15, xpress_topc=128
     )
-    assert args.speculative_config == original | {"disable_padded_drafter_batch": True}
+    assert args.speculative_config == original
     assert args.enable_prefix_caching is False
     args.speculative_config = original
     args.enable_prefix_caching = True
@@ -63,9 +52,7 @@ def test_inferred_dflash_normalizes_before_vllm_cache_defaults(method, prefix_ca
     original = dict(model="z-lab/Qwen3-8B-DFlash", **method)
     args = NS(speculative_config=original, enable_prefix_caching=prefix_cache)
     normalize_speculative_config(args)
-    assert args.speculative_config == dict(
-        model=original["model"], method="dflash", disable_padded_drafter_batch=True
-    )
+    assert args.speculative_config == dict(model=original["model"], method="dflash")
     assert args.enable_prefix_caching is (prefix_cache is True)
     assert original == dict(model="z-lab/Qwen3-8B-DFlash", **method)
 
@@ -137,7 +124,6 @@ def test_published_contract_is_accepted(config, batch):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = 128
     validate_dflash_config(config)
-    assert config.speculative_config.disable_padded_drafter_batch
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
 
@@ -264,12 +250,6 @@ def test_shifted_anchor_layout_is_rejected(config, nested):
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("runner", ["v1", "v2"])
-def test_both_runners_are_accepted(config, monkeypatch, runner):
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", runner)
-    validate_dflash_config(config)
-
-
 @pytest.mark.parametrize(
     "invalid",
     [
@@ -326,24 +306,3 @@ def test_token_budget_includes_the_vllm_drafting_reservation(config, batch, budg
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget
     validate_dflash_config(config)
-
-
-def test_v1_keeps_upstreams_other_refusals_but_allows_xpress(monkeypatch):
-    from vllm.config.vllm import VllmConfig
-
-    from spyre_inference.v1.spec_decode.config import allow_xpress_on_v1
-
-    monkeypatch.setattr(
-        VllmConfig,
-        "_get_v1_model_runner_unsupported_features",
-        lambda self: [
-            "prefill context parallel",
-            "xpress speculative decoding",
-            "mixed sliding/full dflash drafts",
-        ],
-    )
-    allow_xpress_on_v1()
-    allow_xpress_on_v1()
-    assert VllmConfig._get_v1_model_runner_unsupported_features(None) == [
-        "prefill context parallel"
-    ]

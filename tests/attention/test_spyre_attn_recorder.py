@@ -890,10 +890,12 @@ class TestRecordBatchedDecode:
             _dispatch_batched(impl, builder, wide_cache, bucket)
         assert compiles() == snapshot
 
-    def test_real_decode_batch_lands_on_a_recorded_key(self, builder):
+    def test_real_decode_batch_lands_on_a_recorded_key(self, builder, monkeypatch):
         """A batch the scheduler could hand over must realize a key warmup enumerated."""
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+        # _padded_mask_metadata builds with its own bucketer; keep it on the KV buckets too.
+        use_kv_buckets(monkeypatch)
         bucketer = builder._attn_bucketer = make_bucketer()
         keys = {
             (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
@@ -922,9 +924,9 @@ class TestRecordBatchedDecode:
 
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
 def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
-    """With a chunk range, every decode batch runs a kernel that warmup recorded: the
-    one-chunk kernel if it fits in one chunk, else the dynamic kernel at a chunk count in
-    its range."""
+    """Every decode batch runs a kernel that warmup recorded: the dynamic kernel at a chunk
+    count in its range, a single chunk included, or the KV bucket's kernel for a batch size
+    without a chunk range."""
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 

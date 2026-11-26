@@ -16,7 +16,7 @@
 
 RoBERTa reuses BERT's ``token_type_ids`` bit-pack transport, so these mirror
 ``spyre_inference.models.bert``. The position offset (``padding_idx + 1``) is
-applied on the host in ``TorchSpyreModelRunner._preprocess``, before the ids
+applied on the host in ``SpyreEncoderOnlyModelState.prepare_inputs``, before the ids
 are copied up. The embedding forward gathers those positions in one program.
 """
 

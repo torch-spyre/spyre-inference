@@ -15,6 +15,8 @@
 """Unit tests for platform.py configuration logic."""
 
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -600,53 +602,6 @@ def test_only_tensor_parallelism_is_accepted(field):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("requested", ["1", "true", "0", None])
-def test_v1_model_runner_is_pinned(monkeypatch, requested):
-    """With SPYRE_MODEL_RUNNER=v1, TorchSpyreWorker only builds the V1 runner, so the
-    resolved config must agree whatever the user asked for. An explicit
-    VLLM_USE_V2_MODEL_RUNNER=1 short-circuits upstream's HAS_TRITON fallback, so the
-    override is what prevents V2 here."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
-    # After construction: register() pins the env var before VllmConfig reads it.
-    vllm_config = _defaults_config(enforce_eager=True, mode=None)
-    if requested is None:
-        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", requested)
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
-    assert vllm_config.use_v2_model_runner is False
-
-
-@pytest.mark.parametrize("feature", ["hisparse", "watermark", "aux_output"])
-def test_v2_only_features_are_rejected(monkeypatch, feature):
-    """hisparse and watermarking outrank VLLM_USE_V2_MODEL_RUNNER inside
-    use_v2_model_runner: hisparse raises an error blaming the env var *we* set, and
-    watermarking silently returns V2. AuxOutput never flips the runner, so the tripwire
-    cannot catch it, and it would be accepted and never produced. Reject all three on
-    SPYRE_MODEL_RUNNER=v1."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    monkeypatch.setenv("SPYRE_MODEL_RUNNER", "v1")
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    vllm_config = _defaults_config(enforce_eager=True, mode=None)
-    if feature == "hisparse":
-        monkeypatch.setattr(
-            vllm_config.attention_config, "hisparse_config", object(), raising=False
-        )
-    elif feature == "watermark":
-        monkeypatch.setattr(vllm_config, "watermark_config", object(), raising=False)
-    else:
-        monkeypatch.setattr(vllm_config.aux_output_config, "enable_return_routed_experts", True)
-
-    with pytest.raises(ValueError, match="Spyre does not support"):
-        TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-
 def test_fly_rejection_sampling_is_rejected(monkeypatch):
     """FLy is Triton-only, and upstream's CPU guard misses the spyre runner device."""
     from types import SimpleNamespace
@@ -689,6 +644,72 @@ def test_quantization_is_rejected_with_bfloat16():
 
     with pytest.raises(ValueError, match="does not support quantization"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def _compressed_tensors_config(weight_bits: int, weight_type: str, targets: list[str]) -> dict:
+    """The part of a compressed-tensors ``quantization_config`` the FP8 check reads."""
+    return {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {
+                "targets": targets,
+                "weights": {"num_bits": weight_bits, "type": weight_type},
+            }
+        },
+    }
+
+
+_FP8_LINEARS = _compressed_tensors_config(8, "float", ["Linear"])
+
+
+@pytest.mark.parametrize(
+    ("quantization", "quant_cfg", "requested", "expected"),
+    [
+        ("fp8", None, "auto", "fp8"),
+        ("compressed-tensors", _FP8_LINEARS, "auto", "fp8"),
+        ("fp8", None, "fp8_e4m3", "fp8_e4m3"),
+        ("fp8", None, "float16", "float16"),
+        ("fp8", None, "bfloat16", "float16"),
+        ("compressed-tensors", _compressed_tensors_config(4, "int", ["Linear"]), "auto", "auto"),
+        ("compressed-tensors", _compressed_tensors_config(8, "float", ["lm_head"]), "auto", "auto"),
+        ("gptq", None, "auto", "auto"),
+        (None, None, "auto", "auto"),
+        (None, None, "fp8", "fp8"),
+    ],
+)
+def test_fp8_model_defaults_to_an_fp8_kv_cache(
+    monkeypatch, quantization, quant_cfg, requested, expected
+):
+    """``auto`` gives a model with FP8 linears an FP8 cache; an explicit dtype wins, and
+    either 16-bit one keeps a float16 cache. vLLM runs the hook again after the EngineCore
+    handshake, so a second pass must leave the result alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.quantization = quantization
+    monkeypatch.setattr(
+        vllm_config.model_config.hf_config, "quantization_config", quant_cfg, raising=False
+    )
+    vllm_config.cache_config.cache_dtype = requested
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert vllm_config.cache_config.cache_dtype == expected
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert vllm_config.cache_config.cache_dtype == expected
+
+
+def test_fp8_model_keeps_a_model_dtype_cache_below_a_float8_stick(monkeypatch):
+    """A head size that does not fill a float8 stick cannot hold an FP8 cache."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.quantization = "fp8"
+    monkeypatch.setattr(vllm_config.model_config, "get_head_size", lambda: 64)
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.cache_dtype == "auto"
 
 
 def test_alibi_model_is_rejected(monkeypatch):
@@ -769,16 +790,13 @@ def test_raise_dynamo_recompile_limits_survives_a_clobber():
         ) = saved
 
 
-@pytest.mark.parametrize("runner", ["v1", "v2"])
-def test_worker_reasserts_recompile_limits_after_autoload(runner):
+def test_worker_reasserts_recompile_limits_after_autoload():
     """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
     import inspect
 
     from spyre_inference.v1.worker.spyre.worker import SpyreWorkerV2
-    from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
 
-    worker = TorchSpyreWorker if runner == "v1" else SpyreWorkerV2
-    src = inspect.getsource(worker.init_device)
+    src = inspect.getsource(SpyreWorkerV2.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
 
 
@@ -1239,3 +1257,32 @@ def test_pooling_default_max_num_seqs_widens_short_models_only(monkeypatch, max_
     args = SimpleNamespace(max_num_seqs=None, max_num_batched_tokens=None)
     EngineArgs._set_default_max_num_seqs_and_batched_tokens_args(args, None, model_config, None)
     assert args.max_num_seqs == want
+
+
+# Only a process's first multi-threaded MKL call is affected, so each check needs a fresh
+# interpreter. One process misses a missing warm-up now and then; two in parallel rarely do.
+# The fp16 and meta defaults make a warm-up that relies on the defaults fail too.
+_HOST_COS_SCRIPT = """
+import numpy as np
+import torch
+from spyre_inference import register
+
+torch.set_default_dtype(torch.float16)
+torch.set_default_device("meta")
+register()
+x = torch.linspace(0, 4096, 1 << 22, dtype=torch.float32, device="cpu")
+ref = np.cos(x.numpy().astype(np.float64))
+print(np.abs(x.cos().numpy() - ref).max())
+"""
+
+
+def test_register_initializes_host_vector_math():
+    env = {**os.environ, "OMP_NUM_THREADS": "32"}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _HOST_COS_SCRIPT], env=env, stdout=subprocess.PIPE, text=True
+        )
+        for _ in range(2)
+    ]
+    errors = [float(p.communicate(timeout=300)[0].split()[-1]) for p in procs]
+    assert max(errors) < 1e-6, f"first host cos max error {errors}, expected ~4e-8"

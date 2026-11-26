@@ -35,8 +35,6 @@ from spyre_inference.multimodal.utils import (
     align_up,
     linear_weight,
     padded_sdpa,
-    rope_perm_matrix,
-    rope_rotate_matmul,
 )
 
 if TYPE_CHECKING:

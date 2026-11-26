@@ -214,8 +214,18 @@ class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
         # One graph: L eager clones would cost L host launches per step.
         return tuple(ple[:, i, :].clone() for i in range(self.config.num_hidden_layers))
 
+    @maybe_compile(force=True)
+    def _spyre_project_per_layer_inputs(
+        self, inputs_embeds: torch.Tensor, per_layer_inputs: torch.Tensor | None
+    ) -> torch.Tensor:
+        # Outside the block graphs this would run eagerly, and under TP the projection's
+        # gather_output then takes SpyreCommunicator's eager list-form all_gather, which
+        # costs more than the rest of a decode step. Compiled, it lowers to
+        # spyre::all_gather_async alongside the scale, norm and combine.
+        return cast(torch.Tensor, super().project_per_layer_inputs(inputs_embeds, per_layer_inputs))
+
     def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs):
-        ple = cast(torch.Tensor, super().project_per_layer_inputs(inputs_embeds, per_layer_inputs))
+        ple = self._spyre_project_per_layer_inputs(inputs_embeds, per_layer_inputs)
         rows = ple.as_subclass(_PerLayerRows)
         rows.spyre_rows = self.split_per_layer_inputs(ple)
         return rows

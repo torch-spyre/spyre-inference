@@ -167,6 +167,30 @@ def test_job_env_pins_cards_and_scopes_the_reaper():
     assert env["SPYRE_PARALLEL_WORKER"] == "1"
     assert env["SPYRE_TEST_CARD_SCOPE"].startswith("cards-2-3-")
     assert env["TORCHINDUCTOR_CACHE_DIR"].endswith("__card_2")
+    assert env["VLLM_CACHE_ROOT"].endswith("__card_2")
+
+
+def test_job_env_drops_the_jobserver_fds():
+    env = rtp.job_env({"MAKEFLAGS": " -j4 --jobserver-auth=3,4 -- TEST_TYPE=trunk"}, ["0"])
+    assert env["MAKEFLAGS"] == "-j4 -- TEST_TYPE=trunk"
+
+
+def test_seed_card_caches_adds_new_entries_and_keeps_the_cards_own(tmp_path):
+    base = tmp_path / "inductor"
+    (base / "sub").mkdir(parents=True)
+    (base / "sub" / "a").write_text("base-a")
+    env = {"TORCHINDUCTOR_CACHE_DIR": str(base), "VLLM_CACHE_ROOT": str(tmp_path / "none")}
+    rtp.seed_card_caches(env, ["0", "1"])
+    card0 = tmp_path / "inductor__card_0"
+    assert (card0 / "sub" / "a").read_text() == "base-a"
+    (card0 / "sub" / "a").unlink()
+    (card0 / "sub" / "a").write_text("card-a")  # the card compiled its own entry
+    (base / "sub" / "b").write_text("base-b")  # a later serial run added one
+    rtp.seed_card_caches(env, ["0", "1"])
+    assert (card0 / "sub" / "a").read_text() == "card-a"
+    assert (card0 / "sub" / "b").read_text() == "base-b"
+    assert (base / "sub" / "a").read_text() == "base-a"
+    assert not (tmp_path / "none__card_0").exists()
 
 
 def test_run_order_widest_first():
@@ -188,6 +212,9 @@ def test_parse_collected_skips_annotations_and_summary():
         tests/a.py::TestK::test_y
         ../../.cache/vllm-upstream-tests/worktree-abc/tests/v1/t.py::test_z
 
+        ===== warnings summary =====
+        tests/b.py::TestHasInit
+          PytestCollectionWarning: cannot collect test class 'TestHasInit'
         3 tests collected in 1.2s
         """
     )
@@ -196,6 +223,14 @@ def test_parse_collected_skips_annotations_and_summary():
         "tests/a.py::TestK::test_y",
         "../../.cache/vllm-upstream-tests/worktree-abc/tests/v1/t.py::test_z",
     ]
+
+
+def test_junit_key_matches_pytest_junitxml():
+    assert rtp.junit_key("tests/e2e/test_a.py::TestK::test_x[a::b/c.py]") == (
+        "tests.e2e.test_a.TestK",
+        "test_x[a::b/c.py]",
+    )
+    assert rtp.junit_key("tests/test_b.py::test_y") == ("tests.test_b", "test_y")
 
 
 def test_shard_family():
@@ -264,23 +299,30 @@ def test_check_collection_flags_a_test_in_two_shards():
     ]
 
 
-def _junit(path: Path, n: int) -> Path:
+def _junit(path: Path, keys: list[tuple[str, str]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cases = "".join(f'<testcase classname="c" name="t{i}"/>' for i in range(n))
+    cases = "".join(f'<testcase classname="{c}" name="{n}"/>' for c, n in keys)
     path.write_text(f'<testsuites><testsuite name="pytest">{cases}</testsuite></testsuites>')
     return path
 
 
 def test_check_results(tmp_path):
+    ids = ["tests/t.py::a", "tests/t.py::b"]
     paths = {
-        "a": _junit(tmp_path / "a.xml", 3),
-        "b": _junit(tmp_path / "b.xml", 2),
-        "c": tmp_path / "missing.xml",
+        # extra entries (module-level skip, teardown error) are fine
+        "ok": _junit(tmp_path / "ok.xml", [("tests.t", "a"), ("tests.t", "b"), ("tests.u", "u")]),
+        "short": _junit(tmp_path / "short.xml", [("tests.t", "a"), ("tests.t", "a")]),
+        "gone": tmp_path / "missing.xml",
     }
-    assert rtp.check_results({"a": 3, "b": 3, "c": 1}, paths) == [
-        "b: collected 3 test(s) but JUnit has 2",
-        f"c: no JUnit file at {tmp_path / 'missing.xml'}",
+    assert rtp.check_results({"ok": ids, "short": ids, "gone": ids}, paths) == [
+        "short: 1 of 2 collected test(s) not in JUnit, e.g. tests/t.py::b",
+        f"gone: no JUnit file at {tmp_path / 'missing.xml'}",
     ]
+
+
+def test_cross_target_overlap_is_reported():
+    collected = {"x": ["tests/t.py::a"], "y": ["tests/t.py::a", "tests/t.py::b"]}
+    assert rtp.cross_target_overlap(collected, ["x", "y"]) == ["tests/t.py::a: in both x and y"]
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +340,14 @@ _FAKE_MAKE = textwrap.dedent(
     ids = plan["run" if "JUNIT_XML" in kv and kv["JUNIT_XML"] else "collect"].get(
         target, plan["collect"][target])
     if "--collect-only" in kv.get("PYTEST_ARGS", ""):
-        print("\\n".join(ids))
-        sys.exit(0 if ids else 5)
+        print("\\n".join(ids) if ids else "no tests ran in 0.01s")
+        sys.exit(0 if ids else 2)  # make exits 2 when pytest exits 5
     with open(os.environ["FAKE_LOG"], "a") as f:
         f.write(json.dumps({"t": target, "cards": os.environ["SPYRE_DEVICES"],
                             "start": time.time()}) + "\\n")
     time.sleep(0.05)
-    cases = "".join(f'<testcase classname="c" name="{i}"/>' for i in ids)
+    keys = [(i.split("::")[0].replace("/", ".")[:-3], i.split("::")[1]) for i in ids]
+    cases = "".join(f'<testcase classname="{c}" name="{n}"/>' for c, n in keys)
     open(kv["JUNIT_XML"], "w").write(f"<testsuites><testsuite>{cases}</testsuite></testsuites>")
     with open(os.environ["FAKE_LOG"], "a") as f:
         f.write(json.dumps({"t": target, "end": time.time()}) + "\\n")
@@ -403,7 +446,7 @@ def test_end_to_end_subset_of_a_family_skips_the_family_check(tmp_path):
 def test_end_to_end_fails_when_a_shard_runs_fewer_tests(tmp_path):
     proc, _ = _fake_run(tmp_path, _COLLECT, run={"test-smoke-shard-0": _ids("s1")})
     assert proc.returncode == 1
-    assert "test-smoke-shard-0: collected 2 test(s) but JUnit has 1" in proc.stdout
+    assert "test-smoke-shard-0: 1 of 2 collected test(s) not in JUnit" in proc.stdout
 
 
 def test_end_to_end_refuses_more_cards_than_the_host_has(tmp_path):
@@ -432,3 +475,12 @@ def test_reaper_scope_matches_only_its_own_shard():
     finally:
         child.kill()
         child.wait()
+    # An orphan with no scope (from an earlier serial or crashed run) stays reapable.
+    env.pop(vfio_reaper.CARD_SCOPE_ENV)
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
+    try:
+        time.sleep(0.2)
+        assert vfio_reaper._in_card_scope(orphan.pid, "cards-1-42")
+    finally:
+        orphan.kill()
+        orphan.wait()

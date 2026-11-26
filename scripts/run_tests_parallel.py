@@ -157,28 +157,50 @@ def run_order(targets: list[str], needs: dict[str, int]) -> list[str]:
     return sorted(targets, key=lambda t: -needs[t])
 
 
-def inductor_cache_dir(base: dict[str, str]) -> str:
-    # torch's default when TORCHINDUCTOR_CACHE_DIR is unset.
-    return base.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(
-        tempfile.gettempdir(), f"torchinductor_{getpass.getuser()}"
-    )
+def cache_dirs(base: dict[str, str]) -> dict[str, str]:
+    """The compile caches a shard writes, at their defaults when unset. The Inductor dir
+    also holds the Spyre kernel cache (SPYRE_KERNEL_CACHE)."""
+    return {
+        "TORCHINDUCTOR_CACHE_DIR": base.get("TORCHINDUCTOR_CACHE_DIR")
+        or os.path.join(tempfile.gettempdir(), f"torchinductor_{getpass.getuser()}"),
+        "VLLM_CACHE_ROOT": base.get("VLLM_CACHE_ROOT")
+        or os.path.join(os.path.expanduser("~"), ".cache", "vllm"),
+    }
 
 
-def card_cache_dir(base: dict[str, str], card: str) -> str:
-    # Concurrent jobs sharing one Inductor cache reused mismatched graphs (CI fix, PR 591),
-    # so each job uses the cache of its first card, which no other running job holds.
-    return f"{inductor_cache_dir(base)}__card_{card}"
+def card_cache_dir(src: str, card: str) -> str:
+    # Concurrent jobs sharing one compile cache reused mismatched graphs (CI fix, PR 591),
+    # so each job uses the caches of its first card, which no other running job holds.
+    return f"{src}__card_{card}"
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    if os.path.lexists(dst):
+        return  # already seeded; the card's own entry wins
+    try:
+        os.link(src, dst)  # caches write through rename, so a shared inode is not modified
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def seed_card_caches(base: dict[str, str], devices: list[str]) -> None:
-    """Copy the existing Inductor cache to each card's cache once, so shards start warm."""
-    src = Path(inductor_cache_dir(base))
-    if not src.is_dir():
-        return
-    for card in devices:
-        dest = Path(card_cache_dir(base, card))
-        if not dest.exists():
-            shutil.copytree(src, dest, symlinks=True)
+    """Add the base caches' entries to each card's caches, so shards start warm."""
+    for src in cache_dirs(base).values():
+        if not os.path.isdir(src):
+            continue
+        for card in devices:
+            shutil.copytree(
+                src,
+                card_cache_dir(src, card),
+                symlinks=True,
+                copy_function=_link_or_copy,
+                dirs_exist_ok=True,
+            )
+
+
+def _drop_jobserver(makeflags: str) -> str:
+    # subprocess closes the jobserver fds, so the inner make would warn on every shard.
+    return " ".join(w for w in makeflags.split() if not w.startswith("--jobserver"))
 
 
 def job_env(base: dict[str, str], cards: list[str]) -> dict[str, str]:
@@ -187,7 +209,10 @@ def job_env(base: dict[str, str], cards: list[str]) -> dict[str, str]:
     env["AIU_WORLD_SIZE"] = str(len(cards))
     env[CARD_SCOPE_ENV] = f"cards-{'-'.join(cards)}-{os.getpid()}"
     env[WORKER_ENV] = "1"
-    env["TORCHINDUCTOR_CACHE_DIR"] = card_cache_dir(base, cards[0])
+    for var, src in cache_dirs(base).items():
+        env[var] = card_cache_dir(src, cards[0])
+    if "MAKEFLAGS" in env:
+        env["MAKEFLAGS"] = _drop_jobserver(env["MAKEFLAGS"])
     return env
 
 
@@ -197,8 +222,25 @@ def job_env(base: dict[str, str], cards: list[str]) -> dict[str, str]:
 
 
 def parse_collected(output: str) -> list[str]:
-    """Node ids from `pytest --collect-only -q` output."""
-    return [line.strip() for line in output.splitlines() if _NODE_ID_RE.match(line.strip())]
+    """Node ids from `pytest --collect-only -q` output, up to the first `===` section
+    (the warnings summary lists `path::Name` locations that are not tests)."""
+    ids = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("==="):
+            break
+        if _NODE_ID_RE.match(line):
+            ids.append(line)
+    return ids
+
+
+def junit_key(node_id: str) -> tuple[str, str]:
+    """(classname, name) that pytest's junitxml writes for a node id (mangle_test_address)."""
+    path, bracket, params = node_id.partition("[")
+    names = path.split("::")
+    names[0] = re.sub(r"\.py$", "", names[0].replace("/", "."))
+    names[-1] += bracket + params
+    return ".".join(names[:-1]), names[-1]
 
 
 def shard_family(target: str) -> str | None:
@@ -241,24 +283,43 @@ def check_collection(collected: dict[str, list[str]], families: dict[str, list[s
     return errors
 
 
-def junit_case_count(path: Path) -> int:
-    return sum(1 for _ in ET.parse(path).getroot().iter("testcase"))
+def cross_target_overlap(collected: dict[str, list[str]], targets: list[str]) -> list[str]:
+    """Tests that two targets both select. Not an error: the serial run and CI also run
+    them twice; in parallel the two runs are on different cards."""
+    owner: dict[str, str] = {}
+    notes = []
+    for t in targets:
+        for node in collected[t]:
+            if node in owner and owner[node] != t:
+                notes.append(f"{node}: in both {owner[node]} and {t}")
+            owner.setdefault(node, t)
+    return notes
 
 
-def check_results(expected: dict[str, int], junit_paths: dict[str, Path]) -> list[str]:
+def junit_keys(path: Path) -> set[tuple[str, str]]:
+    return {(c.get("classname", ""), c.get("name", "")) for c in ET.parse(path).iter("testcase")}
+
+
+def check_results(expected: dict[str, list[str]], junit_paths: dict[str, Path]) -> list[str]:
+    """Errors for a shard whose JUnit file lacks a test it collected. Extra entries (a
+    module-level skip, a teardown error after a failure) are not errors."""
     errors = []
-    for target, want in expected.items():
+    for target, ids in expected.items():
         path = junit_paths[target]
         if not path.is_file():
             errors.append(f"{target}: no JUnit file at {path}")
             continue
         try:
-            got = junit_case_count(path)
+            got = junit_keys(path)
         except ET.ParseError as e:
             errors.append(f"{target}: unreadable JUnit file {path}: {e}")
             continue
-        if got != want:
-            errors.append(f"{target}: collected {want} test(s) but JUnit has {got}")
+        missing = [i for i in ids if junit_key(i) not in got]
+        if missing:
+            errors.append(
+                f"{target}: {len(missing)} of {len(ids)} collected test(s) not in JUnit, "
+                f"e.g. {missing[0]}"
+            )
     return errors
 
 
@@ -279,8 +340,10 @@ def collect(make: list[str], target: str, env: dict[str, str]) -> list[str]:
     cmd = [*make, target, "PYTEST_ARGS=--collect-only -q -p no:cacheprovider", "JUNIT_XML="]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)  # noqa: S603
     ids = parse_collected(proc.stdout)
-    # pytest exits 5 when nothing is collected; check_collection reports that case.
-    if proc.returncode not in (0, 5):
+    # pytest exits 5 on an empty collection, which make turns into 2; check_collection
+    # reports that case as a parity error.
+    empty = not ids and re.search(r"no tests (ran|collected)|collected 0 items", proc.stdout)
+    if proc.returncode != 0 and not empty:
         tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-20:])
         raise RuntimeError(f"collecting {target} failed (rc={proc.returncode}):\n{tail}")
     return ids
@@ -323,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     to_collect.sort(key=lambda t: not t.startswith("test-upstream"))
     base_env = dict(os.environ)
     base_env[WORKER_ENV] = "1"
+    if "MAKEFLAGS" in base_env:
+        base_env["MAKEFLAGS"] = _drop_jobserver(base_env["MAKEFLAGS"])
     start = time.monotonic()
     collected: dict[str, list[str]] = {}
     try:
@@ -344,11 +409,14 @@ def main(argv: list[str] | None = None) -> int:
             log(f"ERROR: {e}")
         log("parity guard failed; not running the tests")
         return 3
+    overlap = cross_target_overlap(collected, args.targets)
+    if overlap:
+        log(f"note: {len(overlap)} test(s) run by two targets (as in CI), e.g. {overlap[0]}")
 
     # 2. Run, widest first, each on its own cards.
     t0 = time.monotonic()
     seed_card_caches(dict(os.environ), devices)
-    log(f"seeded per-card Inductor caches in {time.monotonic() - t0:.0f}s")
+    log(f"seeded per-card compile caches in {time.monotonic() - t0:.0f}s")
     logs_dir = args.results_dir / "parallel-logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     junit = {t: args.results_dir / f"junit-{t}" / f"junit-{t}.xml" for t in args.targets}
@@ -358,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.monotonic()
         try:
             junit[target].parent.mkdir(parents=True, exist_ok=True)
+            junit[target].unlink(missing_ok=True)  # a crashed shard must not pass on old results
             log(f"start {target} on card(s) {','.join(cards)}")
             with open(logs_dir / f"{target}.log", "w") as out:
                 rc = subprocess.call(  # noqa: S603
@@ -379,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     wall = time.monotonic() - start
 
     # 3. Every shard ran what it collected.
-    errors = check_results({t: len(collected[t]) for t in args.targets}, junit)
+    errors = check_results({t: collected[t] for t in args.targets}, junit)
     failed = [r for r in results if r.rc != 0]
     log(f"wall time {wall:.0f}s; sum of shard times {sum(r.seconds for r in results):.0f}s")
     for r in failed:

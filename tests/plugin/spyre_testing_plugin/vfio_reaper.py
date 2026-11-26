@@ -60,13 +60,18 @@ CARD_SCOPE_ENV = "SPYRE_TEST_CARD_SCOPE"
 
 
 def _in_card_scope(pid: int, scope: str | None) -> bool:
+    """False only for a holder that belongs to another shard. A holder with no scope
+    (an orphan of an earlier serial or crashed run) stays ours to wait for and reap."""
     if not scope:
         return True
     try:
         with open(f"/proc/{pid}/environ", "rb") as f:
-            return f"{CARD_SCOPE_ENV}={scope}".encode() in f.read().split(b"\0")
+            env = f.read().split(b"\0")
     except OSError:
         return False  # another user's process, or gone: not ours
+    prefix = f"{CARD_SCOPE_ENV}=".encode()
+    theirs = [e for e in env if e.startswith(prefix)]
+    return not theirs or theirs[0] == prefix + scope.encode()
 
 
 def _pids_holding_vfio(exclude_pids: set[int]) -> list[tuple[int, str, str]]:

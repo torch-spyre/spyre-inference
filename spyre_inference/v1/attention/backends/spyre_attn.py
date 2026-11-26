@@ -1458,8 +1458,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     @property
     def supports_update_block_table(self) -> bool:
         # vLLM reuses metadata across groups keyed on spec and builder type, which
-        # leaves out a draft's causal_override; encoder-only metadata has no pages.
-        return not self._encoder_only and self.causal_override is None
+        # leaves out a draft's causal_override.
+        return self.causal_override is None
 
     def update_block_table(
         self,
@@ -1467,9 +1467,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> SpyreAttentionMetadata:
-        """``metadata``, built for this batch by a builder of this one's spec, rebound to
-        another group's block table: the page IDs are rebuilt as build() builds them, the
-        masks and row tables are shared."""
+        """``metadata``, built for this batch by a builder of this one's spec and not yet
+        run, rebound to another group's block table: the page IDs are rebuilt as build()
+        builds them, the masks and row tables are shared."""
         assert metadata.attention_mask_stacks is not None
         assert metadata.num_kv_heads == self.num_kv_heads
         assert (metadata.active_block_indices is None) == (self.sliding_window is None)
@@ -1507,9 +1507,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     blk_table,
                     active,
                 )
-                decode_groups.append(
-                    replace(g, chunk_page_ids_cpu=chunk_ids, rows_dev=None, metadata=None)
-                )
+                decode_groups.append(replace(g, chunk_page_ids_cpu=chunk_ids))
         return replace(
             metadata,
             block_table=blk_table,
@@ -1521,13 +1519,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 real_num_blocks,
                 self._attn_bucketer.page_range is not None,
             ),
-            kernel_index_tables=None,
-            query_row_tables=None,
-            attention_mask_stacks_device=None,
-            rep_row_ids_dev=None,
             chunk_page_ids_cpu=chunk_page_ids_cpu,
-            chunk_page_ids_dev=None,
-            mask_by_chunk_dev=None,
             decode_groups=decode_groups,
         )
 

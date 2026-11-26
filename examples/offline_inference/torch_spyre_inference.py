@@ -14,7 +14,7 @@
 
 """
 This example shows how to run offline inference on Spyre using the torch-spyre
-plugin code with the TorchSpyreModelRunner.
+plugin code with the Spyre model runner.
 
 By default this runs with torch.compile (STOCK_TORCH_COMPILE).
 Use --enforce-eager to skip torch.compile and run in eager mode.

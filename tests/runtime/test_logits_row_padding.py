@@ -17,7 +17,7 @@
 import torch
 import torch.nn as nn
 
-from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 from spyre_inference.v1.worker.spyre_shape_bucketer import logits_row_buckets
 
 HIDDEN, VOCAB = 8, 5

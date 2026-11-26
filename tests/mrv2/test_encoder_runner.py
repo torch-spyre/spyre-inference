@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.model_states import interface as upstream_interface
 
 from spyre_inference.v1.worker.spyre.mm.encoder_runner import SpyreEncoderRunner
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
-from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
+from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper
 
 from .fakes import FakeModel
 

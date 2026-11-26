@@ -16,7 +16,7 @@
 through triton-cpu and once with kernels.bind()'s host op in its place, and
 compares every output and every buffer the kernel may write.
 
-Run as a script under SPYRE_MODEL_RUNNER=v2 SPYRE_MRV2_KERNELS=triton (the
+Run as a script under SPYRE_MRV2_KERNELS=triton (the
 gate must open real Triton before vLLM imports), so test_parity.py spawns it.
 """
 

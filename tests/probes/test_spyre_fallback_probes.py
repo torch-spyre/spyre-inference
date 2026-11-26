@@ -1305,16 +1305,12 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#2971: eager GemmaRMSNorm cannot multiply its staggered-EA "
-        "FP32 activation by a STANDARD [hidden] FP32 weight. When this XPASS-es, "
-        "remove force=True from SpyreGemmaRMSNorm."
-    ),
-)
 def test_spyre_eager_gemma_rms_norm(spyre_device):
-    """Upstream FP32 GemmaRMSNorm should run without a surrounding compiled graph."""
+    """Upstream FP32 GemmaRMSNorm should run without a surrounding compiled graph.
+
+    Was strict-xfail on torch-spyre#2971: the staggered-EA FP32 activation could not
+    multiply the STANDARD [hidden] FP32 weight.
+    """
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
     torch.manual_seed(0)

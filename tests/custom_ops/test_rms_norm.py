@@ -27,7 +27,6 @@ import sys
 
 import pytest
 import torch
-from torch._inductor.exc import InductorError
 
 # vLLM's own float16 bound for these ops (ir/ops/layernorm.py `override_tolerance`).
 _ATOL, _RTOL = 1e-2, 2e-3
@@ -153,23 +152,7 @@ def test_spyre_gemma_rmsnorm_accumulates_the_variance_in_fp32(default_vllm_confi
 @pytest.mark.parametrize("use_residual", [False, True])
 @pytest.mark.parametrize(
     "dtype",
-    [
-        pytest.param(
-            torch.float16,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=InductorError,
-                reason=(
-                    "fp16 activations reach the trailing weight multiply as a staggered-EA "
-                    "fp32 convert (torch-spyre#2971) that the STANDARD [hidden] weight cannot "
-                    "broadcast against, so eager lowering raises 'Multi-arg pointwise with "
-                    "mixed EA'. This is what force=True exists for; when it XPASS-es, "
-                    "drop force from SpyreGemmaRMSNorm."
-                ),
-            ),
-        ),
-        torch.float32,
-    ],
+    [torch.float16, torch.float32],
 )
 def test_gemma_rmsnorm_eager_support_is_fp32_only(default_vllm_config, dtype, use_residual):
     """Eager (uncompiled) ``forward_native`` lowers in fp32 but not in fp16.

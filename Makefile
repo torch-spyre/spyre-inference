@@ -128,7 +128,7 @@ RESULTS_DIR ?= .
         test-distributed test-distributed-shard test-distributed-tp4 \
         test-upstream test-upstream-shard \
         test-upstream-distributed \
-        tests-single-card tests-multi-card
+        tests-single-card tests-multi-card tests-parallel print-test-targets
 
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -136,6 +136,7 @@ help: ## Show this help message
 	@echo "Variables: TEST_TYPE=unit|integration|regression|trunk|perf (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
 	@echo "  RESULTS_DIR (aggregate JUnit output dir for TEST_TYPE=regression/trunk, default '$(RESULTS_DIR)'),"
+	@echo "  PARALLEL=auto|N (regression/trunk: run the CI shards at once, one card set each),"
 	@echo "  COVERAGE=1 (measure coverage during test runs), then \`make coverage\` to aggregate"
 	@echo "  (COVERAGE_DATA=dir of data files, COVERAGE_TOOL=coverage for a standalone runner)"
 
@@ -158,13 +159,17 @@ print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_
 # it, not the image's baked venv that ibm-aiu-setup.sh re-activates in-shell. Prebaked
 # images have no project .venv and fall through to $VIRTUAL_ENV.
 AIU_SETUP_STAMP := /tmp/.spyre-inference-aiu-setup-done
+# A PARALLEL=... shard (SPYRE_PARALLEL_WORKER set) skips the setup: it inherits the parent's
+# env, and a re-run would race on aiu_env.sh and reset AIU_WORLD_SIZE to every card.
 define AIU_SETUP_CMD
+if [ -z "$${SPYRE_PARALLEL_WORKER:-}" ]; then \
 if [ ! -f "$(AIU_SETUP_STAMP)" ]; then rm -f /tmp/etc/ibm/spyre/topo.json; touch "$(AIU_SETUP_STAMP)"; fi; \
 unset _IBM_AIU_SETUP; \
 set +e; \
 source "$$HOME/.bashrc"; \
 source /etc/profile.d/ibm-aiu-setup.sh; \
 set -e; \
+fi; \
 if [ -d "$(CURDIR)/.venv" ]; then export VIRTUAL_ENV="$(CURDIR)/.venv"; export PATH="$(CURDIR)/.venv/bin:$$PATH"; fi
 endef
 
@@ -371,23 +376,33 @@ test-upstream-distributed: ## Run the upstream+distributed marker combo.
 
 # Single-card / multi-card split, grouping the marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
+# The shard targets per card count, as GHA's _test_matrix.yaml runs them. The serial targets
+# and PARALLEL=... both walk these lists.
+_shards = $(foreach i,$(shell seq 0 $$(( $(2) - 1 ))),$(1)-$(i))
+SINGLE_CARD_TARGETS = $(call _shards,test-smoke-shard,$(SMOKE_SHARDS)) \
+  $(call _shards,test-quality-shard,$(QUALITY_SHARDS)) \
+  $(call _shards,test-attention-shard,$(ATTN_SHARDS)) \
+  test-encoder-attention \
+  $(call _shards,test-upstream-shard,$(UPSTREAM_SHARDS))
+MULTI_CARD_TARGETS = $(call _shards,test-distributed-shard,$(DIST_SHARDS)) \
+  test-upstream-distributed \
+  $(call _shards,test-probes-shard,$(PROBE_SHARDS)) \
+  test-distributed-tp4
+
+define RUN_TARGETS_SERIALLY
+mkdir -p "$(RESULTS_DIR)"; \
+rc=0; \
+for t in $(1); do \
+  mkdir -p "$(RESULTS_DIR)/junit-$$t" && $(MAKE) $$t JUNIT_XML="$(RESULTS_DIR)/junit-$$t/junit-$$t.xml" || rc=1; \
+done; \
+exit $$rc
+endef
+
+print-test-targets: ## Internal: print SINGLE_CARD_TARGETS then MULTI_CARD_TARGETS, one per line.
+	@printf '%s\n' $(SINGLE_CARD_TARGETS) $(MULTI_CARD_TARGETS)
+
 tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
-	mkdir -p "$(RESULTS_DIR)"; \
-	rc=0; \
-	for i in $$(seq 0 $$(( $(SMOKE_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-smoke-shard-$$i" && $(MAKE) test-smoke-shard SMOKE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-shard-$$i/junit-test-smoke-shard-$$i.xml" || rc=1; \
-	done; \
-	for i in $$(seq 0 $$(( $(QUALITY_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-quality-shard-$$i" && $(MAKE) test-quality-shard QUALITY_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-quality-shard-$$i/junit-test-quality-shard-$$i.xml" || rc=1; \
-	done; \
-	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
-	done; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-encoder-attention" && $(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-encoder-attention/junit-test-encoder-attention.xml" || rc=1; \
-	for i in $$(seq 0 $$(( $(UPSTREAM_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-upstream-shard-$$i" && $(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-shard-$$i/junit-test-upstream-shard-$$i.xml" || rc=1; \
-	done; \
-	exit $$rc
+	+$(call RUN_TARGETS_SERIALLY,$(SINGLE_CARD_TARGETS))
 
 tests-integration: ## Run the integration tier: unit-level smoke, e2e_smoke, attention_smoke, one JUnit file each under RESULTS_DIR. TP=2 e2e_smoke cases need 2 cards.
 	$(if $(JUNIT_XML),@echo "warning: JUNIT_XML is ignored here; JUnit goes to $(RESULTS_DIR)/junit-test-*/" >&2;) \
@@ -399,30 +414,33 @@ tests-integration: ## Run the integration tier: unit-level smoke, e2e_smoke, att
 	exit $$rc
 
 tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstream-distributed/probes/tp4). Needs 2 cards minimum; TP=4 tests skip gracefully on hosts with fewer than 4 cards.
-	mkdir -p "$(RESULTS_DIR)"; \
-	rc=0; \
-	for i in $$(seq 0 $$(( $(DIST_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-distributed-shard-$$i" && $(MAKE) test-distributed-shard DIST_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed-shard-$$i/junit-test-distributed-shard-$$i.xml" || rc=1; \
-	done; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-upstream-distributed" && $(MAKE) test-upstream-distributed JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-distributed/junit-test-upstream-distributed.xml" || rc=1; \
-	for i in $$(seq 0 $$(( $(PROBE_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-probes-shard-$$i" && $(MAKE) test-probes-shard PROBE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-probes-shard-$$i/junit-test-probes-shard-$$i.xml" || rc=1; \
-	done; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-distributed-tp4" && $(MAKE) test-distributed-tp4 JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed-tp4/junit-test-distributed-tp4.xml" || rc=1; \
-	exit $$rc
+	+$(call RUN_TARGETS_SERIALLY,$(MULTI_CARD_TARGETS))
+
+# PARALLEL=auto|N runs the same targets at once, each on its own cards, with the card count
+# CI gives it (scripts/run_tests_parallel.py). It checks collection parity first.
+PARALLEL ?=
+tests-parallel: ## Run SINGLE_CARD_TARGETS + MULTI_CARD_TARGETS at once across this host's cards (PARALLEL=auto|N).
+	$(AIU_SETUP_CMD); \
+	uv run --active --no-sync python scripts/run_tests_parallel.py \
+	  --cards "$(or $(PARALLEL),auto)" --results-dir "$(RESULTS_DIR)" \
+	  $(SINGLE_CARD_TARGETS) $(MULTI_CARD_TARGETS)
 
 # When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same
 # coverage), GHA's _test_matrix.yaml runs this as 6 separate marker-combo
 # jobs, not one unfiltered run -- mirror that here so
 # `make test TEST_TYPE=regression` is GHA-parity, one flat JUnit file per
 # combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
-tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default regression) or set MARK_OVERRIDE directly.
-	if [ "$(TEST_TYPE)" = "perf" ]; then \
+tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default regression) or set MARK_OVERRIDE directly. PARALLEL=auto|N spreads regression/trunk across cards.
+	if [ -n "$(PARALLEL)" ] && { [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "regression" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; }; then \
+	  echo "ERROR: PARALLEL needs TEST_TYPE=regression or trunk, and no MARK_OVERRIDE" >&2; exit 2; \
+	elif [ "$(TEST_TYPE)" = "perf" ]; then \
 	  $(MAKE) perf-tests RESULTS_DIR="$(RESULTS_DIR)"; \
 	elif [ -z "$(MARK_OVERRIDE)" ] && [ "$(TEST_TYPE)" = "integration" ]; then \
 	  $(MAKE) tests-integration RESULTS_DIR="$(RESULTS_DIR)"; \
 	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "regression" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
+	elif [ -n "$(PARALLEL)" ]; then \
+	  $(MAKE) tests-parallel RESULTS_DIR="$(RESULTS_DIR)"; \
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \
 	  rc=0; \

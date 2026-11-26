@@ -447,8 +447,8 @@ def _chunk_page_ids(
 
 
 # Until vLLM's V2 runner reuses metadata for every builder that sets
-# supports_update_block_table, not only for Mamba groups. Then delete this,
-# reuse_metadata_across_groups and SpyreDefaultModelState.prepare_attn.
+# supports_update_block_table, not only for Mamba groups (vllm-project/vllm#70132).
+# Then delete this, reuse_metadata_across_groups and SpyreDefaultModelState.prepare_attn.
 _reused_metadata: ContextVar[dict | None] = ContextVar("spyre_reused_metadata", default=None)
 
 

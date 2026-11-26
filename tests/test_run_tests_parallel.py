@@ -65,6 +65,7 @@ def test_targets_match_the_ci_matrix(tier):
         if tier in e["test_types"].split()
         and "x86_64" in e["runs_on"]
         and not e.get("extra_groups")
+        and e["test_target"] != "parallel-ab"  # TEMPORARY A/B leg
     }
     targets = _make_targets()
     assert len(targets) == len(set(targets))

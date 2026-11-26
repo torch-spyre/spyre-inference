@@ -3224,7 +3224,14 @@ per-sequence kernel's <code>(page, kv_head)</code> fold has nothing to buy there
 1.5–2x more kernel time across the decode batches and contexts tried.</p>
 <h3 id="fp8-kv-cache">FP8 KV cache<a class="headerlink" href="#fp8-kv-cache" title="Permanent link">&para;</a></h3>
 <p><code>--kv-cache-dtype fp8</code> (or <code>fp8_e4m3</code>) stores the pages as <code>float8_e4m3fn</code>, halving KV
-memory and the bytes each page read moves.
+memory and the bytes each page read moves. An FP8 model gets it by default:
+<code>TorchSpyrePlatform._resolve_kv_cache_dtype</code> turns <code>auto</code> into <code>fp8</code> when the checkpoint's
+linears are FP8 (<code>_has_fp8_weights</code>) and the head size fills a float8 stick (128). An
+explicit <code>float16</code> is kept, and <code>bfloat16</code> becomes <code>float16</code>: upstream accepts the
+checkpoint's own 16-bit dtype before the platform forces float16, and the impl only takes
+the model dtype. vLLM runs <code>check_and_update_config</code> again after the EngineCore handshake,
+so each result is a fixed point; rewriting <code>float16</code> to <code>auto</code> would turn into <code>fp8</code> on
+that second pass.
 Upstream sizes the cache as <code>uint8</code> bytes and <code>allocate_pages</code> maps that back to e4m3.
 The store writes <code>K / k_scale</code> and <code>V / v_scale</code>, clamped to e4m3's range first because
 the float8 cast maps an overflow to NaN, and converts with <code>spyre.qfp8ch</code>: a plain <code>.to</code>

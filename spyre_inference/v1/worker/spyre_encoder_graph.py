@@ -37,11 +37,13 @@ logger = init_logger(__name__)
 class SpyreEncoderGraphManager(EncoderCudaGraphManager):
     """Compiles the encoder at each token budget during warmup, then serves through it.
 
-    Inherited from upstream: budget selection and user overrides, packing items into budgets,
-    replay padding, and the per-item output split. Overridden: capture compiles the model's
-    graphs at that budget's static shape, replay copies the inputs into host staging
-    buffers, uploads them once and runs those graphs, and the manager counts as captured
-    while those buffers are staged.
+    Inherited from upstream: budget selection and user overrides, replay padding, and the
+    per-item output split. Overridden: capture compiles the model's graphs at that budget's
+    static shape, replay copies the inputs into host staging buffers, uploads them once and
+    runs those graphs, and the manager counts as captured while those buffers are staged.
+    Each budget is one tower compile at warmup and any other shape compiles mid-request, so
+    it keeps vLLM 0.33's power-of-two budget grid, and splits a batch that 0.34 would run
+    eagerly (too many items, or past the largest budget) into parts that fit.
     """
 
     def __init__(
@@ -119,11 +121,28 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                 )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
+    @staticmethod
+    def _generate_budgets(min_budget: int, max_budget: int, cap: int | None = None) -> list[int]:
+        """vLLM 0.33's power-of-two budgets from min_budget, plus max_budget. ``cap``
+        (encoder_cudagraph_max_token_budget) is ignored: past it a batch would compile."""
+        budgets: list[int] = []
+        b = min_budget
+        while b <= max_budget:
+            budgets.append(b)
+            b *= 2
+        if not budgets or budgets[-1] < max_budget:
+            budgets.append(max_budget)
+        return budgets
+
+    @classmethod
+    def _item_multiple_budgets(cls, item_tokens: int, max_budget: int) -> list[int]:
+        return cls._generate_budgets(item_tokens, max_budget)
+
     def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
-        """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
+        """Each item above ``vision_pack_tokens`` runs alone."""
         pack = self._pack_tokens
         if pack is None:
-            return super()._execute_local(mm_kwargs)
+            return self._execute_split(mm_kwargs)
         tokens = self._get_per_item_out_tokens(mm_kwargs)
         small = [i for i, t in enumerate(tokens) if t <= pack]
         budgets = self.path_token_budgets
@@ -133,17 +152,41 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             # capped budgets, and a lone large item every budget.
             self.path_token_budgets = self._pack_budgets
             if len(small) == len(tokens):
-                return super()._execute_local(mm_kwargs)
+                return self._execute_split(mm_kwargs)
             if small:
                 group = self._select_items(mm_kwargs, small)[0]
-                outputs.update(zip(small, super()._execute_local(group), strict=True))
+                outputs.update(zip(small, self._execute_split(group), strict=True))
             self.path_token_budgets = budgets
             for i, t in enumerate(tokens):
                 if t > pack:
-                    (outputs[i],) = super()._execute_local(self._select_items(mm_kwargs, [i])[0])
+                    (outputs[i],) = self._execute_split(self._select_items(mm_kwargs, [i])[0])
         finally:
             self.path_token_budgets = budgets
         return [outputs[i] for i in range(len(tokens))]
+
+    def _execute_split(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        """Upstream's ``_execute_local`` per part, the batch split where it would pass
+        ``max_batch_size`` or a path's largest budget: upstream runs that eagerly."""
+        specs = self._get_item_specs(mm_kwargs)
+        limits = {path: max(budgets) for path, budgets in self.path_token_budgets.items()}
+        parts: list[list[int]] = [[]]
+        used = dict.fromkeys(limits, 0)
+        for i, spec in enumerate(specs):
+            need = {path: spec.get_path_output_tokens(path) for path in limits}
+            full = len(parts[-1]) == self.max_batch_size
+            if parts[-1] and (full or any(used[p] + need[p] > limits[p] for p in limits)):
+                parts.append([])
+                used = dict.fromkeys(limits, 0)
+            parts[-1].append(i)
+            for path in limits:
+                used[path] += need[path]
+        if len(parts) == 1:
+            return super()._execute_local(mm_kwargs)
+        outputs: dict[int, torch.Tensor] = {}
+        for part in parts:
+            group = self._select_items(mm_kwargs, part)[0]
+            outputs.update(zip(part, super()._execute_local(group), strict=True))
+        return [outputs[i] for i in range(len(specs))]
 
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()

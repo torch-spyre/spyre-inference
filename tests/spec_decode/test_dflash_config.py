@@ -92,7 +92,8 @@ def config():
     return NS(
         speculative_config=NS(
             use_dflash=lambda: True,
-            draft_shares_target_positions=lambda: True,
+            # The draft's positions are the target's: it sets no length limit.
+            speculator_config=NS(max_model_len=None),
             max_model_len=None,
             draft_model_config=NS(
                 hf_config=draft,
@@ -152,8 +153,8 @@ def test_draft_context_limit_respects_target_positions(
     config.model_config.max_model_len = 8192
     spec = config.speculative_config
     spec.max_model_len = requested
-    spec.draft_shares_target_positions = lambda: shares_positions
     spec.draft_model_config.max_model_len = requested or 2048
+    spec.speculator_config.max_model_len = None if shares_positions else 2048
     validate_dflash_config(config)
     assert spec.draft_model_config.max_model_len == expected
 

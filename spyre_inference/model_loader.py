@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import copy
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING
 
 import torch
@@ -57,7 +57,7 @@ class SpyreModelLoader(BaseModelLoader):
 
     def get_all_weights(
         self, model_config: ModelConfig, model: nn.Module
-    ) -> Iterable[tuple[str, torch.Tensor]]:
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Yield (name, tensor) pairs from checkpoint shards using physical disk order.
 
         Tensors destined for Spyre are loaded via safe_open(device="spyre"),

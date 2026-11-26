@@ -302,7 +302,6 @@ def test_install_allows_dummy_load_format_with_padding():
 
     loader = DummyModelLoader(LoadConfig(load_format="dummy"))
     assert loader.load_config.load_format == "dummy"
-    assert not hasattr(loader, "get_all_weights")
     install_mlp_pad_weight_loader(loader, hf_config)
 
 

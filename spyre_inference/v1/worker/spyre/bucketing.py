@@ -53,7 +53,7 @@ class SpyreBucketManager(ModelCudaGraphManager):
             vllm_config,
             device,
             CUDAGraphMode.NONE,
-            decode_query_len,
+            vllm_config.get_decode_cudagraph_query_lens(decode_query_len),
             lora_capture_cases=lora_capture_cases,
         )
         self.shape_bucketer = SpyreShapeBucketer.for_config(vllm_config)

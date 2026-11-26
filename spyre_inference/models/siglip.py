@@ -49,8 +49,8 @@ def pad_siglip_heads(tower: nn.Module) -> None:
     before the slice-assignments (a strided slice-assign is silently wrong on Spyre) and moved
     back. A no-op for a head_dim that is already stick-aligned, and for a tower padded before.
     """
-    for layer in tower.encoder.layers:  # ty: ignore[not-iterable]
-        attn = layer.self_attn
+    for layer in tower.encoder.layers:  # ty: ignore[not-iterable, possibly-missing-attribute]
+        attn = layer.self_attn  # ty: ignore[possibly-missing-attribute]
         if getattr(attn, "_spyre_head_dim_padded", False):
             continue
         orig = attn.head_dim

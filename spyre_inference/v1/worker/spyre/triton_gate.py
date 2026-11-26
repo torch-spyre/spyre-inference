@@ -123,14 +123,26 @@ def check(mrv2_kernels: str) -> None:
 
 
 @contextlib.contextmanager
-def v2_worker_init() -> Iterator[None]:
+def _report_triton(module: Any) -> Iterator[None]:
+    saved = module.HAS_TRITON
+    module.HAS_TRITON = True
+    try:
+        yield
+    finally:
+        module.HAS_TRITON = saved
+
+
+def v2_worker_init() -> contextlib.AbstractContextManager[None]:
     """Pass upstream's "Model Runner V2 requires Triton" check in the worker's own
     process: kernels.bind() replaces every kernel MRV2 launches."""
     import vllm.v1.worker.gpu_worker as worker_module
 
-    saved = worker_module.HAS_TRITON
-    worker_module.HAS_TRITON = True
-    try:
-        yield
-    finally:
-        worker_module.HAS_TRITON = saved
+    return _report_triton(worker_module)
+
+
+def cpu_platform_check() -> contextlib.AbstractContextManager[None]:
+    """Pass CpuPlatform.check_and_update_config's "vLLM on x86 CPUs requires Triton"
+    check, for the same reason; it imports HAS_TRITON from vllm.triton_utils lazily."""
+    import vllm.triton_utils
+
+    return _report_triton(vllm.triton_utils)

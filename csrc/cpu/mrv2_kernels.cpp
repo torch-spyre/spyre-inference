@@ -725,44 +725,63 @@ void mrv2_gumbel_sample(
     const std::optional<torch::Tensor>& logits_cache_col_ptr,
     const std::optional<torch::Tensor>& logits_cache_source_ptr,
     int64_t logits_cache_source_stride,
+    const std::optional<torch::Tensor>& logits_cache_row_mapping_ptr,
     const torch::Tensor& logits_ptr, int64_t logits_stride,
+    const std::optional<torch::Tensor>& bias_ptr, int64_t bias_stride,
     const torch::Tensor& expanded_idx_mapping_ptr, const torch::Tensor& seeds_ptr,
     const torch::Tensor& pos_ptr, const torch::Tensor& temp_ptr,
     int64_t vocab_size, int64_t BLOCK_SIZE, bool IS_DRAFTING,
-    bool APPLY_TEMPERATURE, bool USE_FP64, bool PER_TOKEN_COL) {
+    bool APPLY_TEMPERATURE, bool USE_FP64, bool PER_TOKEN_COL, bool HAS_BIAS) {
   const Ints idx(expanded_idx_mapping_ptr), seeds(seeds_ptr), positions(pos_ptr);
-  // Draft logits cache (spec decode): the pre-temperature source row is stored at
-  // [req, col], and col is mixed into the seed's high word (spec_step_seed).
+  // The sampled rows: the logits, or with a bias, logits + bias rounded to the logits
+  // dtype, as the kernel computes them.
+  torch::Tensor sampled = logits_ptr;
+  int64_t sampled_stride = logits_stride;
+  if (HAS_BIAS) {
+    const auto rows = logits_ptr.as_strided({grid[0], vocab_size}, {logits_stride, 1});
+    const auto bias = bias_ptr->as_strided({grid[0], vocab_size}, {bias_stride, 1});
+    sampled = (rows.to(at::kFloat) + bias.to(at::kFloat)).to(logits_ptr.scalar_type());
+    sampled_stride = vocab_size;
+  }
+  // Draft logits cache (spec decode): the pre-temperature row is stored at [row, col],
+  // and col is mixed into the seed's high word (spec_step_seed). The row is the request's,
+  // or its row_mapping entry, -1 for a request another rank caches.
   const bool cached = logits_cache_ptr.has_value();
-  std::optional<Ints> cols;
+  std::optional<Ints> cols, row_mapping;
   if (cached) cols.emplace(*logits_cache_col_ptr);
+  if (logits_cache_row_mapping_ptr.has_value()) row_mapping.emplace(*logits_cache_row_mapping_ptr);
   auto col_of = [&](int64_t t) { return PER_TOKEN_COL ? (*cols)[t] : (*cols)[0]; };
   if (cached) {
     const at::ScalarType dtype = logits_cache_ptr->scalar_type();
-    TORCH_CHECK(logits_cache_source_ptr->scalar_type() == dtype,
+    const bool from_source = logits_cache_source_ptr.has_value();
+    const torch::Tensor& source_t = from_source ? *logits_cache_source_ptr : sampled;
+    const int64_t source_stride = from_source ? logits_cache_source_stride : sampled_stride;
+    TORCH_CHECK(source_t.scalar_type() == dtype,
                 "logits cache source and destination dtypes differ");
     const int64_t elem = logits_cache_ptr->element_size();
     char* cache = static_cast<char*>(ptr<void>(*logits_cache_ptr));
-    const char* source = static_cast<const char*>(ptr<void>(*logits_cache_source_ptr));
+    const char* source = static_cast<const char*>(ptr<void>(source_t));
     for (int64_t t = 0; t < grid[0]; ++t) {
       const int64_t req = idx[t];
       if (req < 0) continue;
+      const int64_t row = row_mapping ? (*row_mapping)[req] : req;
+      if (row < 0) continue;
       std::memcpy(
-          cache + (req * logits_cache_stride_0 + col_of(t) * logits_cache_stride_1) * elem,
-          source + t * logits_cache_source_stride * elem, vocab_size * elem);
+          cache + (row * logits_cache_stride_0 + col_of(t) * logits_cache_stride_1) * elem,
+          source + t * source_stride * elem, vocab_size * elem);
     }
   }
   const float* temps = ptr<float>(temp_ptr);
   int64_t* local_argmax = ptr<int64_t>(local_argmax_ptr);
   const int64_t num_blocks = grid[1];
-  dispatch_logits(logits_ptr, [&](auto tag) {
+  dispatch_logits(sampled, [&](auto tag) {
     using scalar_t = decltype(tag);
-    const scalar_t* logits = ptr<scalar_t>(logits_ptr);
+    const scalar_t* logits = ptr<scalar_t>(sampled);
     auto run = [&](auto* local_max) {
       using acc_t = std::remove_pointer_t<decltype(local_max)>;
       // One task per (row, block), as Triton's grid: a batch of a few rows over a
       // 262k vocab would otherwise leave most cores idle. Each block keeps its own
-      // first-max, and the wrapper's argmax over blocks keeps the first block's.
+      // first-max, and mrv2_gumbel_combine keeps the first block's.
 #pragma omp parallel for collapse(2) schedule(dynamic, 4) if (grid[0] * num_blocks > 1)
       for (int64_t t = 0; t < grid[0]; ++t) {
         for (int64_t blk = 0; blk < num_blocks; ++blk) {
@@ -773,7 +792,7 @@ void mrv2_gumbel_sample(
           const int64_t pos = positions[t] + (IS_DRAFTING ? kDraftNoiseSalt : 0);
           const int64_t begin = blk * BLOCK_SIZE;
           const auto [token, value] = gumbel_row<scalar_t, acc_t>(
-              logits + t * logits_stride, begin, std::min(begin + BLOCK_SIZE, vocab_size),
+              logits + t * sampled_stride, begin, std::min(begin + BLOCK_SIZE, vocab_size),
               temp, APPLY_TEMPERATURE, seed, pos);
           local_argmax[t * local_argmax_stride + blk] = token;
           local_max[t * local_max_stride + blk] = value;
@@ -785,6 +804,33 @@ void mrv2_gumbel_sample(
     else
       run(ptr<float>(local_max_ptr));
   });
+}
+
+void mrv2_gumbel_combine(std::vector<int64_t> grid, const torch::Tensor& local_argmax_ptr,
+                         int64_t local_argmax_stride, const torch::Tensor& local_max_ptr,
+                         int64_t local_max_stride, const torch::Tensor& sampled_ptr,
+                         int64_t num_blocks, int64_t PADDED_NUM_BLOCKS) {
+  // torch.argmax over the blocks' maxima: the first NaN wins, else the first maximum.
+  const int64_t* local_argmax = ptr<int64_t>(local_argmax_ptr);
+  int64_t* sampled = ptr<int64_t>(sampled_ptr);
+  auto run = [&](const auto* local_max) {
+    for (int64_t r = 0; r < grid[0]; ++r) {
+      const auto* values = local_max + r * local_max_stride;
+      int64_t winner = 0;
+      for (int64_t b = 0; b < num_blocks; ++b) {
+        if (std::isnan(values[b])) {
+          winner = b;
+          break;
+        }
+        if (values[b] > values[winner]) winner = b;
+      }
+      sampled[r] = local_argmax[r * local_argmax_stride + winner];
+    }
+  };
+  if (local_max_ptr.scalar_type() == at::kDouble)
+    run(ptr<double>(local_max_ptr));
+  else
+    run(ptr<float>(local_max_ptr));
 }
 
 void mrv2_min_p(std::vector<int64_t> grid, const torch::Tensor& logits_ptr,
@@ -1414,6 +1460,36 @@ void mrv2_trace_replay(std::vector<int64_t> grid, const torch::Tensor& sampled_p
   }
 }
 
+void mrv2_trace_replay_verified(
+    std::vector<int64_t> grid, const torch::Tensor& sampled_ptr, int64_t sampled_stride,
+    const torch::Tensor& num_sampled_ptr, const torch::Tensor& draft_sampled_ptr,
+    const torch::Tensor& cu_num_logits_ptr, const torch::Tensor& idx_mapping_ptr,
+    const torch::Tensor& trace_token_ids_ptr, int64_t trace_token_ids_stride,
+    const torch::Tensor& trace_len_ptr, const torch::Tensor& total_len_ptr,
+    const torch::Tensor& prompt_len_ptr) {
+  // Replace the verified tokens with the trace, accepting a draft only while it matches.
+  const Ints sampled(sampled_ptr), num_sampled(num_sampled_ptr), drafts(draft_sampled_ptr),
+      cu(cu_num_logits_ptr), idx(idx_mapping_ptr), trace(trace_token_ids_ptr),
+      trace_lens(trace_len_ptr), total_lens(total_len_ptr), prompt_lens(prompt_len_ptr);
+  for (int64_t b = 0; b < grid[0]; ++b) {
+    const int64_t req = idx[b];
+    if (req < 0 || trace_lens[req] <= 0) continue;
+    const int64_t step = total_lens[req] - prompt_lens[req];
+    if (step < 0 || step >= trace_lens[req]) continue;
+    const int64_t start = cu[b];
+    const int64_t num_drafts = cu[b + 1] - start - 1;
+    const int64_t num_replayed = std::min(num_drafts + 1, trace_lens[req] - step);
+    int64_t num_accepted = 0;
+    for (int64_t i = 0; i < num_replayed; ++i) {
+      const int64_t token = trace[req * trace_token_ids_stride + step + i];
+      sampled.set(b * sampled_stride + i, token);
+      num_accepted = i + 1;
+      if (i >= num_drafts || drafts[start + i + 1] != token) break;
+    }
+    num_sampled.set(b, num_accepted);
+  }
+}
+
 namespace {
 
 bool marker_at(const Ints& tokens, int64_t row, int64_t i, const Ints& marker,
@@ -1924,6 +2000,8 @@ void mrv2_draft_step(
     const int64_t req = next_req[row];
     const float temperature = req >= 0 ? temps[req] : 0.0f;
     bool active = enabled[row] && temperature != 0.0f;
+    // A context still holding a -1 placeholder (too short a history) is not watermarked.
+    for (int64_t o = 0; o < CONTEXT_WIDTH; ++o) active = active && contexts[ctx + o] >= 0;
     if (DEDUPLICATE) {
       if (req < 0) {
         active = false;
@@ -1991,8 +2069,10 @@ TORCH_LIBRARY_FRAGMENT(_spyre_C, ops) {
   ops.impl("mrv2_apply_write", torch::kCPU, &mrv2_apply_write);
   ops.def("mrv2_temperature(int[] grid, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor temperature_ptr, int vocab_size, int BLOCK_SIZE) -> ()");
   ops.impl("mrv2_temperature", torch::kCPU, &mrv2_temperature);
-  ops.def("mrv2_gumbel_sample(int[] grid, Tensor local_argmax_ptr, int local_argmax_stride, Tensor local_max_ptr, int local_max_stride, Tensor? logits_cache_ptr, int logits_cache_stride_0, int logits_cache_stride_1, Tensor? logits_cache_col_ptr, Tensor? logits_cache_source_ptr, int logits_cache_source_stride, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor seeds_ptr, Tensor pos_ptr, Tensor temp_ptr, int vocab_size, int BLOCK_SIZE, bool IS_DRAFTING, bool APPLY_TEMPERATURE, bool USE_FP64, bool PER_TOKEN_COL) -> ()");
+  ops.def("mrv2_gumbel_sample(int[] grid, Tensor local_argmax_ptr, int local_argmax_stride, Tensor local_max_ptr, int local_max_stride, Tensor? logits_cache_ptr, int logits_cache_stride_0, int logits_cache_stride_1, Tensor? logits_cache_col_ptr, Tensor? logits_cache_source_ptr, int logits_cache_source_stride, Tensor? logits_cache_row_mapping_ptr, Tensor logits_ptr, int logits_stride, Tensor? bias_ptr, int bias_stride, Tensor expanded_idx_mapping_ptr, Tensor seeds_ptr, Tensor pos_ptr, Tensor temp_ptr, int vocab_size, int BLOCK_SIZE, bool IS_DRAFTING, bool APPLY_TEMPERATURE, bool USE_FP64, bool PER_TOKEN_COL, bool HAS_BIAS) -> ()");
   ops.impl("mrv2_gumbel_sample", torch::kCPU, &mrv2_gumbel_sample);
+  ops.def("mrv2_gumbel_combine(int[] grid, Tensor local_argmax_ptr, int local_argmax_stride, Tensor local_max_ptr, int local_max_stride, Tensor sampled_ptr, int num_blocks, int PADDED_NUM_BLOCKS) -> ()");
+  ops.impl("mrv2_gumbel_combine", torch::kCPU, &mrv2_gumbel_combine);
   ops.def("mrv2_min_p(int[] grid, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor min_p_ptr, int vocab_size, int BLOCK_SIZE) -> ()");
   ops.impl("mrv2_min_p", torch::kCPU, &mrv2_min_p);
   ops.def("mrv2_penalties(int[] grid, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor token_ids_ptr, Tensor expanded_local_pos_ptr, Tensor repetition_penalty_ptr, Tensor frequency_penalty_ptr, Tensor presence_penalty_ptr, Tensor prompt_bin_mask_ptr, int prompt_bin_mask_stride, Tensor output_bin_counts_ptr, int output_bin_counts_stride, int vocab_size, int BLOCK_SIZE) -> ()");
@@ -2019,6 +2099,8 @@ TORCH_LIBRARY_FRAGMENT(_spyre_C, ops) {
   ops.impl("mrv2_compact_sampling_mask", torch::kCPU, &mrv2_compact_sampling_mask);
   ops.def("mrv2_trace_replay(int[] grid, Tensor sampled_ptr, Tensor idx_mapping_ptr, Tensor trace_token_ids_ptr, int trace_token_ids_stride, Tensor trace_len_ptr, Tensor total_len_ptr, Tensor prompt_len_ptr) -> ()");
   ops.impl("mrv2_trace_replay", torch::kCPU, &mrv2_trace_replay);
+  ops.def("mrv2_trace_replay_verified(int[] grid, Tensor sampled_ptr, int sampled_stride, Tensor num_sampled_ptr, Tensor draft_sampled_ptr, Tensor cu_num_logits_ptr, Tensor idx_mapping_ptr, Tensor trace_token_ids_ptr, int trace_token_ids_stride, Tensor trace_len_ptr, Tensor total_len_ptr, Tensor prompt_len_ptr) -> ()");
+  ops.impl("mrv2_trace_replay_verified", torch::kCPU, &mrv2_trace_replay_verified);
   ops.def("mrv2_update_committed_marker_cache(int[] grid, Tensor req_ids_ptr, Tensor thinking_token_budget_ptr, Tensor all_token_ids_ptr, int all_token_ids_stride, Tensor total_len_ptr, Tensor cached_last_start_ptr, Tensor cached_last_end_ptr, Tensor cached_scan_pos_ptr, Tensor reasoning_start_token_ids_ptr, Tensor natural_reasoning_end_token_ids_ptr, int START_LEN, int NATURAL_END_LEN, int MAX_LEN, int BLOCK) -> ()");
   ops.impl("mrv2_update_committed_marker_cache", torch::kCPU, &mrv2_update_committed_marker_cache);
   ops.def("mrv2_thinking_budget(int[] grid, Tensor logits_ptr, int logits_stride, Tensor expanded_idx_mapping_ptr, Tensor thinking_token_budget_ptr, Tensor all_token_ids_ptr, int all_token_ids_stride, Tensor total_len_ptr, Tensor input_ids_ptr, Tensor expanded_local_pos_ptr, Tensor cached_last_start_ptr, Tensor cached_last_end_ptr, Tensor reasoning_start_token_ids_ptr, Tensor natural_reasoning_end_token_ids_ptr, Tensor reasoning_end_token_ids_ptr, int START_LEN, int NATURAL_END_LEN, int END_LEN) -> ()");

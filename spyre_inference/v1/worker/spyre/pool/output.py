@@ -48,7 +48,6 @@ def pool_sync(runner: "SpyreModelRunnerV2") -> ModelRunnerOutput | None:
     )
     output = ModelRunnerOutput(
         req_ids=input_batch.req_ids,
-        req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
         kv_connector_output=kv_connector_output,
         ec_connector_output=state.ec_connector_output,
     )

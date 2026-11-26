@@ -318,6 +318,13 @@ void mrv2_gather_draft_sampled(std::vector<int64_t> grid, const torch::Tensor& d
 
 // ------------------------------------------------------- rejection_sampler_utils.py
 
+// draft_logits_row, clamped at 0 as its callers clamp it: the request's row in the
+// draft logits cache, or its row_mapping entry for a sharded cache.
+static int64_t draft_row(const std::optional<torch::Tensor>& row_mapping, int64_t req) {
+  if (!row_mapping.has_value()) return req;
+  return std::max<int64_t>(Ints(*row_mapping)[req], 0);
+}
+
 void mrv2_compute_local_logits_stats(
     std::vector<int64_t> grid, const torch::Tensor& target_local_argmax_ptr,
     int64_t target_local_argmax_stride, const torch::Tensor& target_local_max_ptr,
@@ -327,6 +334,7 @@ void mrv2_compute_local_logits_stats(
     int64_t draft_local_sumexp_stride, const torch::Tensor& target_logits_ptr,
     int64_t target_logits_stride, const std::optional<torch::Tensor>& draft_logits_ptr,
     int64_t draft_logits_stride_0, int64_t draft_logits_stride_1,
+    const std::optional<torch::Tensor>& draft_logits_row_mapping_ptr,
     const torch::Tensor& expanded_idx_mapping_ptr, const torch::Tensor& expanded_local_pos_ptr,
     const torch::Tensor& temp_ptr, int64_t vocab_size, int64_t num_logits, int64_t BLOCK_SIZE,
     bool HAS_DRAFT_LOGITS) {
@@ -365,7 +373,8 @@ void mrv2_compute_local_logits_stats(
                                    &t_max[i * target_local_max_stride + blk],
                                    &t_sum[i * target_local_sumexp_stride + blk]);
         if (HAS_DRAFT_LOGITS) {
-          const int64_t drow = req * draft_logits_stride_0 + local_pos[i] * draft_logits_stride_1;
+          const int64_t drow = draft_row(draft_logits_row_mapping_ptr, req) * draft_logits_stride_0 +
+                               local_pos[i] * draft_logits_stride_1;
           mrv2_vx::max_sumexp<true>(d32 + drow, begin, end, temp,
                                     &d_max[i * draft_local_max_stride + blk],
                                     &d_sum[i * draft_local_sumexp_stride + blk]);
@@ -402,7 +411,8 @@ void mrv2_compute_local_logits_stats(
                  &t_max[i * target_local_max_stride + blk],
                  &t_sum[i * target_local_sumexp_stride + blk]);
       if (HAS_DRAFT_LOGITS) {
-        const int64_t drow = req * draft_logits_stride_0 + local_pos[i] * draft_logits_stride_1;
+        const int64_t drow = draft_row(draft_logits_row_mapping_ptr, req) * draft_logits_stride_0 +
+                             local_pos[i] * draft_logits_stride_1;
         max_sumexp([&](int64_t v) { return (*draft)[drow + v] / temp; },
                    &d_max[i * draft_local_max_stride + blk],
                    &d_sum[i * draft_local_sumexp_stride + blk]);
@@ -420,7 +430,8 @@ void mrv2_rejection(
     int64_t target_local_max_stride, const torch::Tensor& target_local_sumexp_ptr,
     int64_t target_local_sumexp_stride, const torch::Tensor& draft_sampled_ptr,
     const std::optional<torch::Tensor>& draft_logits_ptr, int64_t draft_logits_stride_0,
-    int64_t draft_logits_stride_1, const torch::Tensor& draft_local_max_ptr,
+    int64_t draft_logits_stride_1, const std::optional<torch::Tensor>& draft_logits_row_mapping_ptr,
+    const torch::Tensor& draft_local_max_ptr,
     int64_t draft_local_max_stride, const torch::Tensor& draft_local_sumexp_ptr,
     int64_t draft_local_sumexp_stride, const torch::Tensor& cu_num_logits_ptr,
     const torch::Tensor& idx_mapping_ptr, const torch::Tensor& temp_ptr,
@@ -485,7 +496,8 @@ void mrv2_rejection(
         float draft_logprob = 0.0f, d_lse = 0.0f;
         if (HAS_DRAFT_LOGITS) {
           const float d_logit =
-              valid ? (*draft)[req * draft_logits_stride_0 + i * draft_logits_stride_1 + token] /
+              valid ? (*draft)[draft_row(draft_logits_row_mapping_ptr, req) * draft_logits_stride_0 +
+                               i * draft_logits_stride_1 + token] /
                           temp
                     : kNegInf;
           d_lse = global_lse(d_max + logit * draft_local_max_stride,
@@ -513,7 +525,8 @@ void mrv2_resample(
     int64_t resampled_local_max_stride, const torch::Tensor& target_logits_ptr,
     int64_t target_logits_stride, const torch::Tensor& target_rejected_logsumexp_ptr,
     const std::optional<torch::Tensor>& draft_logits_ptr, int64_t draft_logits_stride_0,
-    int64_t draft_logits_stride_1, const torch::Tensor& draft_rejected_logsumexp_ptr,
+    int64_t draft_logits_stride_1, const std::optional<torch::Tensor>& draft_logits_row_mapping_ptr,
+    const torch::Tensor& draft_rejected_logsumexp_ptr,
     const torch::Tensor& rejected_step_ptr, const torch::Tensor& cu_num_logits_ptr,
     const torch::Tensor& expanded_idx_mapping_ptr, const torch::Tensor& draft_sampled_ptr,
     const torch::Tensor& temp_ptr, const torch::Tensor& seed_ptr, const torch::Tensor& pos_ptr,
@@ -523,7 +536,7 @@ void mrv2_resample(
     const std::optional<torch::Tensor>& watermarking_skip_mask_ptr, int64_t watermark_key_0,
     int64_t watermark_key_1, int64_t vocab_size, int64_t BLOCK_SIZE, bool HAS_DRAFT_LOGITS,
     bool USE_FP64, bool USE_BLOCK_VERIFICATION, int64_t CONTEXT_WIDTH, bool WATERMARK,
-    bool DEDUPLICATE_CONTEXTS) {
+    bool DEDUPLICATE_CONTEXTS, bool SKIP_MASKED_BLOCKS) {
   TORCH_CHECK(!USE_BLOCK_VERIFICATION && !WATERMARK,
               "MRV2 host resample: block verification and watermarking are not supported "
               "with speculative decoding on Spyre");
@@ -546,13 +559,14 @@ void mrv2_resample(
     const bool bonus = token_idx == cu[r + 1] - 1;
     if (temp == 0.0f && !bonus) continue;
     const int64_t rejected_token = bonus ? 0 : draft_sampled[token_idx + 1];
+    const int64_t drow = draft_row(draft_logits_row_mapping_ptr, req);
     std::vector<float> residual(vocab_size);
     int64_t v0 = 0;
 #if defined(__s390x__)
     // The draft-ratio residual of fp32 rows, 4 tokens a step.
     if (!bonus && rejected_token >= 0 && HAS_DRAFT_LOGITS && target.f32() && draft->f32()) {
       const float* t = target.f32() + token_idx * target_logits_stride;
-      const float* d = draft->f32() + req * draft_logits_stride_0 + step * draft_logits_stride_1;
+      const float* d = draft->f32() + drow * draft_logits_stride_0 + step * draft_logits_stride_1;
       const vf32 vt = vec_splats(temp), vtl = vec_splats(t_lse[r]), vdl = vec_splats(d_lse[r]);
       const vf32 one = vec_splats(1.0f), ninf = vec_splats(kNegInf);
       for (; v0 + 4 <= vocab_size; v0 += 4) {
@@ -568,7 +582,7 @@ void mrv2_resample(
         residual[v] = t;
       } else if (HAS_DRAFT_LOGITS) {
         const float d =
-            (*draft)[req * draft_logits_stride_0 + step * draft_logits_stride_1 + v] / temp;
+            (*draft)[drow * draft_logits_stride_0 + step * draft_logits_stride_1 + v] / temp;
         const float tl = t - t_lse[r];
         const float ratio = std::exp((d - d_lse[r]) - tl);
         residual[v] = ratio < 1.0f ? tl + std::log1p(-ratio) : kNegInf;
@@ -578,6 +592,21 @@ void mrv2_resample(
     }
     for (int64_t blk = 0; blk < num_blocks; ++blk) {
       const int64_t begin = blk * BLOCK_SIZE, end = std::min(begin + BLOCK_SIZE, vocab_size);
+      if (SKIP_MASKED_BLOCKS) {
+        // No target token survives in the block, so neither does the residual.
+        bool masked = true;
+        for (int64_t v = begin; v < end && masked; ++v)
+          masked = target[token_idx * target_logits_stride + v] == kNegInf;
+        if (masked) {
+          out_argmax.set(r * resampled_local_argmax_stride + blk, begin);
+          if (USE_FP64)
+            ptr<double>(resampled_local_max_ptr)[r * resampled_local_max_stride + blk] =
+                -std::numeric_limits<double>::infinity();
+          else
+            ptr<float>(resampled_local_max_ptr)[r * resampled_local_max_stride + blk] = kNegInf;
+          continue;
+        }
+      }
       if (USE_FP64) {
         const auto [i, value] =
             gumbel_block<double>(residual, begin, end, temp, seeds[req], positions[token_idx]);
@@ -650,8 +679,9 @@ void mrv2_prepare_dflash_inputs(
     const torch::Tensor& block_table_ptr, int64_t block_table_stride,
     int64_t parallel_drafting_token_id, int64_t block_size, int64_t num_query_per_req,
     int64_t num_speculative_steps, int64_t max_num_reqs, int64_t max_num_tokens,
-    int64_t max_model_len, int64_t cp_rank, bool SAMPLE_FROM_ANCHOR, int64_t PAD_SLOT_ID,
-    int64_t CP_SIZE, int64_t CP_INTERLEAVE, int64_t BLOCK_SIZE) {
+    int64_t max_model_len, int64_t cp_rank, int64_t num_reqs, bool SAMPLE_FROM_ANCHOR,
+    int64_t PAD_SLOT_ID, int64_t CP_SIZE, int64_t CP_INTERLEAVE, int64_t BLOCK_SIZE,
+    int64_t NUM_PAD_PROGRAMS) {
   TORCH_CHECK(CP_SIZE == 1, "MRV2 host prepare_dflash_inputs: context parallelism is not "
               "supported on Spyre");
   const Ints input_ids(out_input_ids_ptr), q_pos(out_query_positions_ptr),
@@ -666,7 +696,6 @@ void mrv2_prepare_dflash_inputs(
       table(block_table_ptr);
   float* temps_out = ptr<float>(out_temperature_ptr);
   const float* temps = ptr<float>(temperature_ptr);
-  const int64_t num_reqs = grid[0];
   const int64_t span = grid[1] * BLOCK_SIZE;
   auto slot = [&](int64_t r, int64_t p, bool mask) -> int64_t {
     if (!mask) return PAD_SLOT_ID;
@@ -735,14 +764,14 @@ TORCH_LIBRARY_FRAGMENT(_spyre_C, ops) {
   ops.impl("mrv2_flatten_sampled", torch::kCPU, &mrv2_flatten_sampled);
   ops.def("mrv2_gather_draft_sampled(int[] grid, Tensor draft_sampled_ptr, Tensor pos_ptr, Tensor input_ids_ptr, Tensor positions_ptr, Tensor logits_indices_ptr, Tensor expanded_idx_mapping_ptr, Tensor expanded_local_pos_ptr, Tensor prefill_len_ptr, int num_logits, int BLOCK_SIZE) -> ()");
   ops.impl("mrv2_gather_draft_sampled", torch::kCPU, &mrv2_gather_draft_sampled);
-  ops.def("mrv2_compute_local_logits_stats(int[] grid, Tensor target_local_argmax_ptr, int target_local_argmax_stride, Tensor target_local_max_ptr, int target_local_max_stride, Tensor target_local_sumexp_ptr, int target_local_sumexp_stride, Tensor draft_local_max_ptr, int draft_local_max_stride, Tensor draft_local_sumexp_ptr, int draft_local_sumexp_stride, Tensor target_logits_ptr, int target_logits_stride, Tensor? draft_logits_ptr, int draft_logits_stride_0, int draft_logits_stride_1, Tensor expanded_idx_mapping_ptr, Tensor expanded_local_pos_ptr, Tensor temp_ptr, int vocab_size, int num_logits, int BLOCK_SIZE, bool HAS_DRAFT_LOGITS) -> ()");
+  ops.def("mrv2_compute_local_logits_stats(int[] grid, Tensor target_local_argmax_ptr, int target_local_argmax_stride, Tensor target_local_max_ptr, int target_local_max_stride, Tensor target_local_sumexp_ptr, int target_local_sumexp_stride, Tensor draft_local_max_ptr, int draft_local_max_stride, Tensor draft_local_sumexp_ptr, int draft_local_sumexp_stride, Tensor target_logits_ptr, int target_logits_stride, Tensor? draft_logits_ptr, int draft_logits_stride_0, int draft_logits_stride_1, Tensor? draft_logits_row_mapping_ptr, Tensor expanded_idx_mapping_ptr, Tensor expanded_local_pos_ptr, Tensor temp_ptr, int vocab_size, int num_logits, int BLOCK_SIZE, bool HAS_DRAFT_LOGITS) -> ()");
   ops.impl("mrv2_compute_local_logits_stats", torch::kCPU, &mrv2_compute_local_logits_stats);
-  ops.def("mrv2_rejection(int[] grid, Tensor sampled_ptr, int sampled_stride, Tensor rejected_steps_ptr, Tensor target_rejected_logsumexp_ptr, Tensor draft_rejected_logsumexp_ptr, Tensor target_logits_ptr, int target_logits_stride, Tensor target_local_argmax_ptr, int target_local_argmax_stride, Tensor target_local_max_ptr, int target_local_max_stride, Tensor target_local_sumexp_ptr, int target_local_sumexp_stride, Tensor draft_sampled_ptr, Tensor? draft_logits_ptr, int draft_logits_stride_0, int draft_logits_stride_1, Tensor draft_local_max_ptr, int draft_local_max_stride, Tensor draft_local_sumexp_ptr, int draft_local_sumexp_stride, Tensor cu_num_logits_ptr, Tensor idx_mapping_ptr, Tensor temp_ptr, Tensor seed_ptr, Tensor pos_ptr, Tensor? synthetic_conditional_rates_ptr, Tensor? cumulative_log_p_ptr, Tensor? local_residual_mass_ptr, int local_residual_mass_stride, Tensor? fly_entropy_ptr, float fly_entropy_threshold, int vocab_num_blocks, int PADDED_VOCAB_NUM_BLOCKS, bool HAS_DRAFT_LOGITS, bool SYNTHETIC_MODE, bool USE_BLOCK_VERIFICATION, int FLY_WINDOW_SIZE) -> ()");
+  ops.def("mrv2_rejection(int[] grid, Tensor sampled_ptr, int sampled_stride, Tensor rejected_steps_ptr, Tensor target_rejected_logsumexp_ptr, Tensor draft_rejected_logsumexp_ptr, Tensor target_logits_ptr, int target_logits_stride, Tensor target_local_argmax_ptr, int target_local_argmax_stride, Tensor target_local_max_ptr, int target_local_max_stride, Tensor target_local_sumexp_ptr, int target_local_sumexp_stride, Tensor draft_sampled_ptr, Tensor? draft_logits_ptr, int draft_logits_stride_0, int draft_logits_stride_1, Tensor? draft_logits_row_mapping_ptr, Tensor draft_local_max_ptr, int draft_local_max_stride, Tensor draft_local_sumexp_ptr, int draft_local_sumexp_stride, Tensor cu_num_logits_ptr, Tensor idx_mapping_ptr, Tensor temp_ptr, Tensor seed_ptr, Tensor pos_ptr, Tensor? synthetic_conditional_rates_ptr, Tensor? cumulative_log_p_ptr, Tensor? local_residual_mass_ptr, int local_residual_mass_stride, Tensor? fly_entropy_ptr, float fly_entropy_threshold, int vocab_num_blocks, int PADDED_VOCAB_NUM_BLOCKS, bool HAS_DRAFT_LOGITS, bool SYNTHETIC_MODE, bool USE_BLOCK_VERIFICATION, int FLY_WINDOW_SIZE) -> ()");
   ops.impl("mrv2_rejection", torch::kCPU, &mrv2_rejection);
-  ops.def("mrv2_resample(int[] grid, Tensor resampled_local_argmax_ptr, int resampled_local_argmax_stride, Tensor resampled_local_max_ptr, int resampled_local_max_stride, Tensor target_logits_ptr, int target_logits_stride, Tensor target_rejected_logsumexp_ptr, Tensor? draft_logits_ptr, int draft_logits_stride_0, int draft_logits_stride_1, Tensor draft_rejected_logsumexp_ptr, Tensor rejected_step_ptr, Tensor cu_num_logits_ptr, Tensor expanded_idx_mapping_ptr, Tensor draft_sampled_ptr, Tensor temp_ptr, Tensor seed_ptr, Tensor pos_ptr, Tensor? cumulative_log_p_ptr, Tensor? contexts_ptr, int contexts_stride, Tensor? watermarking_ptr, Tensor? watermarking_skip_mask_ptr, int watermark_key_0, int watermark_key_1, int vocab_size, int BLOCK_SIZE, bool HAS_DRAFT_LOGITS, bool USE_FP64, bool USE_BLOCK_VERIFICATION, int CONTEXT_WIDTH, bool WATERMARK, bool DEDUPLICATE_CONTEXTS) -> ()");
+  ops.def("mrv2_resample(int[] grid, Tensor resampled_local_argmax_ptr, int resampled_local_argmax_stride, Tensor resampled_local_max_ptr, int resampled_local_max_stride, Tensor target_logits_ptr, int target_logits_stride, Tensor target_rejected_logsumexp_ptr, Tensor? draft_logits_ptr, int draft_logits_stride_0, int draft_logits_stride_1, Tensor? draft_logits_row_mapping_ptr, Tensor draft_rejected_logsumexp_ptr, Tensor rejected_step_ptr, Tensor cu_num_logits_ptr, Tensor expanded_idx_mapping_ptr, Tensor draft_sampled_ptr, Tensor temp_ptr, Tensor seed_ptr, Tensor pos_ptr, Tensor? cumulative_log_p_ptr, Tensor? contexts_ptr, int contexts_stride, Tensor? watermarking_ptr, Tensor? watermarking_skip_mask_ptr, int watermark_key_0, int watermark_key_1, int vocab_size, int BLOCK_SIZE, bool HAS_DRAFT_LOGITS, bool USE_FP64, bool USE_BLOCK_VERIFICATION, int CONTEXT_WIDTH, bool WATERMARK, bool DEDUPLICATE_CONTEXTS, bool SKIP_MASKED_BLOCKS) -> ()");
   ops.impl("mrv2_resample", torch::kCPU, &mrv2_resample);
   ops.def("mrv2_insert_resampled(int[] grid, Tensor sampled_ptr, int sampled_stride, Tensor num_sampled_ptr, Tensor resampled_local_argmax_ptr, int resampled_local_argmax_stride, Tensor resampled_local_max_ptr, int resampled_local_max_stride, int resample_num_blocks, Tensor cu_num_logits_ptr, Tensor expanded_idx_mapping_ptr, Tensor temp_ptr, int PADDED_RESAMPLE_NUM_BLOCKS) -> ()");
   ops.impl("mrv2_insert_resampled", torch::kCPU, &mrv2_insert_resampled);
-  ops.def("mrv2_prepare_dflash_inputs(int[] grid, Tensor out_input_ids_ptr, Tensor out_query_positions_ptr, Tensor out_is_padding_ptr, Tensor out_query_start_loc_ptr, Tensor out_seq_lens_ptr, Tensor out_query_slot_mapping_ptr, Tensor out_context_positions_ptr, Tensor out_context_slot_mapping_ptr, Tensor out_sample_indices_ptr, Tensor out_sample_pos_ptr, Tensor out_sample_idx_mapping_ptr, Tensor out_temperature_ptr, Tensor out_seeds_ptr, Tensor target_positions_ptr, Tensor target_query_start_loc_ptr, Tensor idx_mapping_ptr, Tensor last_sampled_ptr, Tensor next_prefill_tokens_ptr, Tensor num_sampled_ptr, Tensor num_rejected_ptr, Tensor temperature_ptr, Tensor seeds_ptr, Tensor block_table_ptr, int block_table_stride, int parallel_drafting_token_id, int block_size, int num_query_per_req, int num_speculative_steps, int max_num_reqs, int max_num_tokens, int max_model_len, int cp_rank, bool SAMPLE_FROM_ANCHOR, int PAD_SLOT_ID, int CP_SIZE, int CP_INTERLEAVE, int BLOCK_SIZE) -> ()");
+  ops.def("mrv2_prepare_dflash_inputs(int[] grid, Tensor out_input_ids_ptr, Tensor out_query_positions_ptr, Tensor out_is_padding_ptr, Tensor out_query_start_loc_ptr, Tensor out_seq_lens_ptr, Tensor out_query_slot_mapping_ptr, Tensor out_context_positions_ptr, Tensor out_context_slot_mapping_ptr, Tensor out_sample_indices_ptr, Tensor out_sample_pos_ptr, Tensor out_sample_idx_mapping_ptr, Tensor out_temperature_ptr, Tensor out_seeds_ptr, Tensor target_positions_ptr, Tensor target_query_start_loc_ptr, Tensor idx_mapping_ptr, Tensor last_sampled_ptr, Tensor next_prefill_tokens_ptr, Tensor num_sampled_ptr, Tensor num_rejected_ptr, Tensor temperature_ptr, Tensor seeds_ptr, Tensor block_table_ptr, int block_table_stride, int parallel_drafting_token_id, int block_size, int num_query_per_req, int num_speculative_steps, int max_num_reqs, int max_num_tokens, int max_model_len, int cp_rank, int num_reqs, bool SAMPLE_FROM_ANCHOR, int PAD_SLOT_ID, int CP_SIZE, int CP_INTERLEAVE, int BLOCK_SIZE, int NUM_PAD_PROGRAMS) -> ()");
   ops.impl("mrv2_prepare_dflash_inputs", torch::kCPU, &mrv2_prepare_dflash_inputs);
 }

@@ -72,11 +72,7 @@ def _patched(runner: "SpyreModelRunnerV2") -> Iterator[None]:
                 kernel_block_sizes,
             )
         bindable = {name: c for name, c in kv_caches.items() if name in forward_context}
-        bind_kv_cache_to_layers(
-            bindable,  # ty: ignore[invalid-argument-type]
-            forward_context,
-            kv_cache_groups=kv_cache_config.kv_cache_groups,
-        )
+        bind_kv_cache_to_layers(bindable, forward_context)  # ty: ignore[invalid-argument-type]
         runner.spyre_kv_caches = dict(kv_caches)
         return {}
 

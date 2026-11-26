@@ -81,9 +81,9 @@ def test_greedy_takes_first_non_nan_max_per_block(vocab: int) -> None:
     zeros = torch.zeros(3, dtype=torch.int64)
     torch.ops._spyre_C.mrv2_gumbel_sample(
         [3, num_blocks], argmax, num_blocks, local_max, num_blocks,
-        None, 0, 0, None, None, 0,
-        logits, vocab, torch.arange(3, dtype=torch.int32), zeros, zeros, torch.zeros(3),
-        vocab, block, False, True, False, False,
+        None, 0, 0, None, None, 0, None,
+        logits, vocab, None, 0, torch.arange(3, dtype=torch.int32), zeros, zeros, torch.zeros(3),
+        vocab, block, False, True, False, False, False,
     )  # fmt: skip
     for b in range(num_blocks):
         lo = b * block
@@ -278,9 +278,9 @@ def test_gumbel_sample_noisy(vocab: int) -> None:
     local_max = torch.zeros(4, num_blocks)
     torch.ops._spyre_C.mrv2_gumbel_sample(
         [4, num_blocks], argmax, num_blocks, local_max, num_blocks,
-        None, 0, 0, None, None, 0,
-        logits, vocab, torch.arange(4, dtype=torch.int32), seeds, pos, temps,
-        vocab, block, False, True, False, False,
+        None, 0, 0, None, None, 0, None,
+        logits, vocab, None, 0, torch.arange(4, dtype=torch.int32), seeds, pos, temps,
+        vocab, block, False, True, False, False, False,
     )  # fmt: skip
     for r in range(4):
         x = logits[r]
@@ -427,7 +427,7 @@ def test_local_logits_stats(vocab: int) -> None:
     t_max, t_sum, d_max, d_sum = (torch.full((6, nb), 7.0) for _ in range(4))
     torch.ops._spyre_C.mrv2_compute_local_logits_stats(
         [6, nb], t_arg, nb, t_max, nb, t_sum, nb, d_max, nb, d_sum, nb, target, vocab,
-        draft, 3 * vocab, vocab, req, local_pos, temps, vocab, 6, block, True,
+        draft, 3 * vocab, vocab, None, req, local_pos, temps, vocab, 6, block, True,
     )  # fmt: skip
     for i in (0, 1, 3, 4):
         for b in range(nb):
@@ -467,8 +467,8 @@ def test_resample(vocab: int) -> None:
     out_max = torch.zeros(2, nb)
     torch.ops._spyre_C.mrv2_resample(
         [2, nb], out_arg, nb, out_max, nb, target, vocab, t_lse, draft, 3 * vocab, vocab,
-        d_lse, rejected, cu, req, draft_sampled, temps, seeds, pos, None, None, 0, None,
-        None, 0, 0, vocab, block, True, False, False, 0, False, False,
+        None, d_lse, rejected, cu, req, draft_sampled, temps, seeds, pos, None, None, 0, None,
+        None, 0, 0, vocab, block, True, False, False, 0, False, False, False,
     )  # fmt: skip
     tl = target[1] - t_lse[0]
     ratio = ((draft[0, 1] / temps[0] - d_lse[0]) - tl).exp()

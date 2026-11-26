@@ -239,9 +239,7 @@ class SpyreWorkerV2(Worker):
         device_shims.install()  # torch.cuda Stream/Event placeholders
         kernels.bind_or_raise()  # host ops in place of MRV2's Triton kernels
 
-        # Worker.model_runner is typed to V1's GPUModelRunner; upstream's gpu_worker.py
-        # carries the same ignore for its V2 runner.
-        self.model_runner = SpyreModelRunnerV2(  # ty: ignore[invalid-assignment]
+        self.model_runner = SpyreModelRunnerV2(
             self.vllm_config,
             torch.device("spyre"),
         )

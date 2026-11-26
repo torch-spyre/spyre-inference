@@ -70,13 +70,11 @@ def test_triton_is_not_installed() -> None:
 
 
 def _run(script: str, **env: str) -> list[str]:
-    # Without the VLLM_USE_V2_MODEL_RUNNER an earlier in-process VllmConfig pinned.
-    base = {k: v for k, v in os.environ.items() if k != "VLLM_USE_V2_MODEL_RUNNER"}
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
         capture_output=True,
         text=True,
-        env={**base, **env},
+        env={**os.environ, **env},
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.split()
@@ -139,20 +137,20 @@ from vllm.config import VllmConfig
 
 try:
     config = VllmConfig()
-    print(config.use_v2_model_runner, config.parallel_config.worker_cls)
+    print(config.parallel_config.worker_cls)
 except Exception as e:
     print("refused", "requires Triton" in str(e) or "needs triton-cpu" in str(e))
 """
 
 
-_V2_WORKER = ["True", "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"]
+_V2_WORKER = ["spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"]
 
 
 @pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("machine", ["ppc64le", "s390x", "x86_64"])
 def test_v2_on_host_kernels_builds_without_triton(machine: str) -> None:
     out = _run(_V2_CONFIG_WITHOUT_TRITON.format(machine=machine))
-    assert out[-2:] == _V2_WORKER
+    assert out[-1:] == _V2_WORKER
 
 
 @pytest.mark.subprocess_isolated

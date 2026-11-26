@@ -40,7 +40,7 @@ class SpyreBlip2QFormerMultiHeadAttention(blip2.Blip2QFormerMultiHeadAttention):
     It adds no state, so ``use_spyre_qformer_attention`` can swap it onto a built module.
     """
 
-    def forward(  # ty: ignore[invalid-method-override]
+    def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,

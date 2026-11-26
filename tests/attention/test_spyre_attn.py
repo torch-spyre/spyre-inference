@@ -1772,6 +1772,7 @@ def _fp8_layer(k_scale, v_scale, **attrs):
         num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
     )
     layer._k_scale_float, layer._v_scale_float = k_scale, v_scale
+    layer.kv_sharing_target_layer_name = None
     for name, value in attrs.items():
         setattr(layer, name, value)
     return layer

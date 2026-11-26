@@ -54,8 +54,10 @@ def _config(
             # A GPU-style config: the manager must ignore it, not capture these.
             cudagraph_capture_sizes=[1, 2, 4, 8],
             max_cudagraph_capture_size=8,
+            use_breakable_cudagraph=False,
         ),
         speculative_config=None,
+        get_decode_cudagraph_query_lens=lambda query_len: {query_len: max_num_seqs},
     )
 
 

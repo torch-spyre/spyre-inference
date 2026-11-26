@@ -110,6 +110,7 @@ def upstream_xpress_model(monkeypatch):
         self.hidden_norm = torch.nn.RMSNorm(128)
         self.norm = torch.nn.RMSNorm(128)
         self.layers = torch.nn.ModuleList()
+        self._context_kv_proj = None
 
     monkeypatch.setattr(DFlashQwen3Model, "__init__", backbone_init)
     monkeypatch.setattr(qwen3_xpress, "ParallelLMHead", lambda *a, **k: torch.nn.Identity())

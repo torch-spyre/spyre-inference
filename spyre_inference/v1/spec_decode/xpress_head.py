@@ -46,8 +46,9 @@ class XPressRefinerHead(_UpstreamHead):
     _hidden_proj_t: torch.Tensor | None = None
     _token_proj_t: torch.Tensor | None = None
 
-    def build_fused_buffers(self) -> None:
-        # Only the Triton kernels read these; prepare_for_spyre builds the device layouts.
+    def process_weights_after_loading(self) -> None:
+        # Upstream builds the Triton kernels' fused buffers here, which Spyre never reads;
+        # prepare_for_spyre builds the device layouts.
         pass
 
     def prepare_for_spyre(self) -> None:

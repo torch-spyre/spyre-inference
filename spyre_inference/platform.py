@@ -349,6 +349,12 @@ class TorchSpyrePlatform(CpuPlatform):
         pass
 
     @classmethod
+    def uses_standalone_cpu_model_runner(cls) -> bool:
+        # CpuPlatform picks upstream's Triton-free runner on non-x86 hosts without
+        # Triton; Spyre runs its own MRV2 subclass on host kernels everywhere.
+        return False
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 
@@ -1033,7 +1039,6 @@ class TorchSpyrePlatform(CpuPlatform):
         configure_threading(parallel_config.world_size)
 
         # ---- worker ----
-        from spyre_inference import pin_model_runner
         from spyre_inference.v1.worker.spyre import triton_gate
 
         # Read fresh, not from envs' cache, so a value set after `import vllm` is caught.
@@ -1047,8 +1052,10 @@ class TorchSpyrePlatform(CpuPlatform):
         if mrv2_kernels not in ("host", "triton"):
             raise ValueError(f"SPYRE_MRV2_KERNELS={mrv2_kernels!r} is not host or triton.")
         triton_gate.check(mrv2_kernels)
-        # Again, for a value set after `import vllm` that child processes would inherit.
-        pin_model_runner()
+        if mrv2_kernels == "host":
+            from spyre_inference.v1.worker.spyre import kernels
+
+            kernels.check_launch_sites()
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.rejection_sample_method == "fly":
@@ -1058,16 +1065,6 @@ class TorchSpyrePlatform(CpuPlatform):
                 "kernels are Triton-only and have no host implementation."
             )
         cls._reject_unsupported_v2_features(vllm_config)
-
-        # The pin holds only if the resolved property agrees; anything new that outranks
-        # the env var must fail here rather than at the first runner-specific code path.
-        # A raise, not an assert: -O would strip the tripwire.
-        if not vllm_config.use_v2_model_runner:
-            raise RuntimeError(
-                "use_v2_model_runner is False although VLLM_USE_V2_MODEL_RUNNER=1 is pinned: "
-                "a config field now forces the V1 model runner, which Spyre no longer has. "
-                "Reject it in TorchSpyrePlatform.check_and_update_config."
-            )
 
         worker_class = "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
         if parallel_config.worker_cls == "auto":
@@ -1104,8 +1101,8 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform turns "uni" into "mp"; remember what was asked for (see _maybe_uniproc).
         requested_backend = parallel_config.distributed_executor_backend
 
-        # call CpuPlatform.check_and_update_config()
-        super().check_and_update_config(vllm_config)
+        with triton_gate.cpu_platform_check():
+            super().check_and_update_config(vllm_config)
         _maybe_uniproc(parallel_config, requested_backend)
 
         # Must run after super(), which sets a block_size default of its own.

@@ -71,7 +71,11 @@ class SpyreModelRunnerV2(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
+        extensible: bool = False,
     ) -> None:
+        if extensible:
+            # VllmConfig only enables it on CUDA/ROCm.
+            raise NotImplementedError("Spyre does not support an extensible KV cache.")
         kv_cache.init(
             self,
             kv_cache_config,

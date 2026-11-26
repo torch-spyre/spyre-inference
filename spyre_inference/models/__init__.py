@@ -55,11 +55,11 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.granite4_vision:SpyreGranite4VisionForConditionalGeneration"
     ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
-    "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MuseGlimmerForCausalLM": "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM",
     "MuseGlimmerForConditionalGeneration": (
         "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM"
     ),
+    "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (
         "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"
@@ -167,6 +167,9 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
 
     register_models()
     hf_config = load_hf_config(engine_args)
+    if hf_config is not None:
+        # The Spyre vision towers embed patches themselves, so the processor must normalize.
+        engine_args.mm_device_do_normalize = False
     gemma4.force_text_backbone(engine_args, hf_config)
     clip.force_disable_chunked_prefill(engine_args, hf_config)
     muse_glimmer.disable_vision(engine_args, hf_config)

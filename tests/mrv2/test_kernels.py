@@ -25,9 +25,40 @@ from spyre_inference.v1.worker.spyre import kernels
 
 def test_host_kernel_launches_by_position_and_keyword_and_drops_launch_options() -> None:
     calls = []
-    kernel = kernels.HostKernel("k", lambda *args: calls.append(args), ["a", "b", "C"])
+    kernel = kernels.HostKernel(
+        "k", lambda *args: calls.append(args), ["a", "b", "C"], ["a", "b", "C"]
+    )
     kernel[(3, 2)](1, b=2, C=3, num_warps=4, num_stages=1)
     assert calls == [([3, 2], 1, 2, 3)]
+
+
+def test_host_kernel_binds_positionals_by_the_upstream_kernels_names() -> None:
+    """An argument inserted upstream mid-signature lands in its own slot, not the next."""
+    calls = []
+    kernel = kernels.HostKernel(
+        "k", lambda *args: calls.append(args), ["a", "new", "b"], ["a", "b", "new"]
+    )
+    kernel[(1,)](1, 2, 3)
+    assert calls == [([1], 1, 3, 2)]
+
+
+def test_host_kernel_refuses_a_signature_its_op_does_not_take() -> None:
+    with pytest.raises(RuntimeError, match="port the signature change"):
+        kernels.HostKernel("k", lambda *args: None, ["a", "new", "b"], ["a", "b"])
+
+
+def test_host_kernel_refuses_unknown_launch_arguments() -> None:
+    kernel = kernels.HostKernel("k", lambda *args: None, ["a"], ["a"])
+    with pytest.raises(TypeError, match="unknown arguments"):
+        kernel[(1,)](a=1, b=2)
+    with pytest.raises(TypeError, match="positional"):
+        kernel[(1,)](1, 2)
+
+
+def test_an_unlisted_launch_site_is_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delitem(kernels.HOST_KERNELS, "gpu.sample.gumbel._gumbel_combine_kernel")
+    with pytest.raises(RuntimeError, match="gumbel_combine_kernel.*neither binds"):
+        kernels.check_launch_sites()
 
 
 def test_unsupported_kernel_names_the_feature() -> None:
@@ -53,10 +84,28 @@ def test_bind_then_unbind_restores_upstream() -> None:
     original = input_batch._post_update_kernel
     try:
         kernels.bind(force_host=True)
-        assert isinstance(input_batch._post_update_kernel, kernels.HostKernel)
+        assert input_batch._post_update_kernel is not original
+        assert kernels.original("gpu.input_batch._post_update_kernel") is original
     finally:
         kernels.unbind()
     assert input_batch._post_update_kernel is original
+
+
+def test_bind_also_replaces_a_copy_imported_by_name() -> None:
+    """mamba_hybrid launches mamba_utils' kernel through `from mamba_utils import ...`."""
+    from vllm.v1.worker import mamba_utils
+    from vllm.v1.worker.gpu.model_states import mamba_hybrid
+
+    original = mamba_utils.preprocess_mamba_align_fused_kernel
+    try:
+        kernels.bind(force_host=True)
+        stand_in = mamba_hybrid.preprocess_mamba_align_fused_kernel
+        assert stand_in is not original
+        assert mamba_utils.preprocess_mamba_align_fused_kernel is stand_in
+    finally:
+        kernels.unbind()
+    assert mamba_utils.preprocess_mamba_align_fused_kernel is original
+    assert mamba_hybrid.preprocess_mamba_align_fused_kernel is original
 
 
 def test_unbind_restores_top_k_top_p_and_triton_placeholder() -> None:

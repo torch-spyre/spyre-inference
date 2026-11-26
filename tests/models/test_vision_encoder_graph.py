@@ -99,6 +99,7 @@ def _vllm_config(budgets=None, tp_mode="weights", videos=0, max_items=0, max_mod
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             encoder_cudagraph_token_budgets=budgets or [],
+            encoder_cudagraph_max_token_budget=5120,
             encoder_cudagraph_max_vision_items_per_batch=max_items,
             encoder_cudagraph_max_frames_per_batch=None,
         ),
@@ -164,11 +165,29 @@ def test_execute_packs_pads_per_block_and_splits_per_item():
     model.forward_patches.clear()
     outputs = manager.execute({"tokens": [10, 30]})
 
-    # Upstream splits rather than pad both items into 64: the 16 and 32 budgets sum to less.
-    assert model.forward_patches == [16 * MERGE_PATCHES, 32 * MERGE_PATCHES]
+    # One replay at the smallest budget that holds the batch, as upstream runs it.
+    assert model.forward_patches == [64 * MERGE_PATCHES]
     assert [o.shape[0] for o in outputs] == [10, 30]
     for i, out in enumerate(outputs):
         assert out.device.type == "cpu"
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def test_a_batch_past_the_largest_budget_is_split_rather_than_run_eagerly():
+    """Upstream runs it eagerly in one forward: on Spyre, a shape warmup never compiled."""
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    model.forward_patches.clear()
+    largest = manager.token_budgets[-1]
+
+    outputs = manager.execute({"tokens": [200, 200, 30]})
+
+    assert all(p <= largest * MERGE_PATCHES for p in model.forward_patches)
+    assert len(model.forward_patches) == 2
+    assert (manager.graph_hits, manager.graph_misses) == (3, 0)
+    assert [o.shape[0] for o in outputs] == [200, 200, 30]
+    for i, out in enumerate(outputs):
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
 
 

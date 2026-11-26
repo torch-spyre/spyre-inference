@@ -143,6 +143,7 @@ EXCLUDED = {
     # Upstream Dependabot GHSA floors on transitive test deps; no collected/run test imports them
     "black",
     "fonttools",
+    "graphql-core",
     "h2",
     "hpack",
     "lxml",

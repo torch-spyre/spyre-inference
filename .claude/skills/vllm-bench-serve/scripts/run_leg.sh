@@ -15,7 +15,7 @@
 #                 (BENCH_SERVE_COMPILE_CACHE=cold-warm); default: one start on the default
 #                 cache path, its cache state reported
 #   --env K=V     env var for this leg, repeatable; SPYRE_KERNEL_CACHE=1 unless given. An
-#                 env var that disables a compile cache is rejected
+#                 env var that disables a compile cache is allowed, with a warning
 # Writes DIR/NAME/{leg.json,env.txt,sync.log,run.log,results/}.
 # Exit: 0 valid leg; 1 the run or the validity check failed; 2 bad usage or setup failure.
 # The harness .venv is restored from the harness checkout's lock, so a package installed by
@@ -43,12 +43,12 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$BENCH" ] && [ -n "$LEG" ] && [ -n "$REF" ] || die "--bench, --leg and --ref are required"
 [[ $ROLE == target || $ROLE == baseline ]] || die "--role must be target or baseline"
-# Startup is measured cold and warm, never with a cache off: no deployment runs that way.
+# No deployment runs with a cache off, so its startup times are not representative.
 for kv in "${ENVS[@]}"; do
   case "$kv" in
     SPYRE_KERNEL_CACHE=1|TORCHINDUCTOR_FORCE_DISABLE_CACHES=0|VLLM_DISABLE_COMPILE_CACHE=0) ;;
     SPYRE_KERNEL_CACHE=*|TORCHINDUCTOR_FORCE_DISABLE_CACHES=*|VLLM_DISABLE_COMPILE_CACHE=*)
-      die "--env $kv disables a compile cache; use --startup for cold startup times" ;;
+      echo "run_leg.sh: WARNING: --env $kv disables a compile cache; startup times are not representative; use --startup for cold startup times" >&2 ;;
     BENCH_SERVE_COMPILE_CACHE=*) die "use --startup instead of --env $kv" ;;
   esac
 done

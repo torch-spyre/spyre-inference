@@ -5741,7 +5741,7 @@ triton-cpu = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", specifier = "==2.14.1", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.14.1" },
-    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=222595761ef3c17eecd38cc574327469eadf0fe9" },
+    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=b178bcd9008069a25ca1a5aa3cff974514ca47bd" },
     { name = "torchvision", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'", specifier = "==0.29.1", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'", git = "https://github.com/pytorch/vision?tag=v0.29.1" },
     { name = "transformers", specifier = "<5.17" },
@@ -6103,8 +6103,8 @@ wheels = [
 
 [[package]]
 name = "torch-spyre"
-version = "0.6.0.dev664+master.g22259576"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=222595761ef3c17eecd38cc574327469eadf0fe9#222595761ef3c17eecd38cc574327469eadf0fe9" }
+version = "0.6.0.dev690+master.gb178bcd9"
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=b178bcd9008069a25ca1a5aa3cff974514ca47bd#b178bcd9008069a25ca1a5aa3cff974514ca47bd" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },

@@ -1237,15 +1237,6 @@ def main():
             "compiled and eager variants need separate runs (the compilation mode "
             "is fixed for the process). Re-run with --variants one at a time."
         )
-    # SPYRE_BATCHED_DECODE is cached on first read and sets the builder's
-    # reorder_batch_threshold, so it cannot vary within a process either.
-    batched_modes = {VARIANT_REGISTRY[v]["batched"] for v in variants}
-    if len(batched_modes) > 1:
-        raise SystemExit(
-            "batched and per-seq decode variants need separate runs "
-            "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
-        )
-    os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries, cfg["max_num_batched_tokens"])

@@ -266,8 +266,8 @@ num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
 `SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
 less warmup.
 
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), warmup
-records eligible KV-length × num-sequences combinations.
+For the batched-decode kernel, warmup records eligible KV-length × num-sequences
+combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 

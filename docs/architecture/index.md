@@ -458,8 +458,7 @@ bucket, at the page count of `max_model_len`, and that kernel runs every page co
 it. When prefill gets its own range of multiples of 8 pages, a prefill variant is traced
 at that page count rounded up to a multiple of 8. Failed recordings are logged and compile
 on first use instead.
-When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
-enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
+For the batched-decode kernel, warmup enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
 declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
 one dynamic variant, at the chunk count of `max_model_len`, that runs every batch, a
@@ -481,8 +480,7 @@ Decode rows run the batched decode kernel, even for one sequence. It gathers who
 which stay in the LX scratchpad from the gather to their last use instead of round-tripping
 through HBM. The per-sequence loop runs `page_attn_prefill`: batched GQA over the cache, one
 whole page per gather, the page transfer amortised over every query row. It also serves the
-decode rows batched decode declines (`SPYRE_BATCHED_DECODE=0`, or a cache too small for the
-gather), at query width 1.
+decode rows batched decode declines (a cache too small for the gather), at query width 1.
 
 Batched decode's page gather is a subscript, which lowers to `aten.index` and fails eager
 on Spyre by upcasting its int32 index (torch-spyre#4334, tracked by
@@ -538,8 +536,7 @@ Key constraints:
   KV head on one page leaves the decode kernel no spare dim for the stick
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
-- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
-  default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
+- **Num-sequences bucketing** (batched-decode kernel only): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
   eligible `(num_blocks, num_seqs)` combinations are recorded during warmup
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)

@@ -622,9 +622,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             declare_pages=self.sliding_window is None and not self._encoder_only,
         )
 
-        self._init_reorder_batch_threshold(
-            reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
-        )
+        self._init_reorder_batch_threshold(reorder_batch_threshold=1)
 
     @property
     def attn_bucketer(self) -> SpyreAttnBucketer:
@@ -1136,7 +1134,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         num_decode_seqs, _, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             # A one-token extend is a decode to attention: its causal mask is the kv cutoff.
-            decode_threshold=self.reorder_batch_threshold or 1,
+            decode_threshold=1,
         )
         padded_num_seqs = None
         padded_batch_blocks = None
@@ -1147,7 +1145,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         chunk_range = None
         decode_groups = None
         decode_uniformity = 0.0
-        if not per_seq_only and envs.SPYRE_BATCHED_DECODE and num_decode_seqs > 0:
+        if not per_seq_only and num_decode_seqs > 0:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
@@ -1703,16 +1701,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
-    def _batched_decode_supported(self) -> bool:
-        """The batch-independent preconditions, so the warmup recorder can share them."""
-        # Set SPYRE_BATCHED_DECODE=0 to force the per-seq loop for all sizes.
-        return envs.SPYRE_BATCHED_DECODE
-
     def _batched_decode_preconditions_met(
         self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
     ) -> bool:
-        if not self._batched_decode_supported():
-            return False
         # Layer 0's builder gates on the decode count and the bucket lattice.
         if attn_metadata.padded_num_seqs is None:
             return False
@@ -1799,11 +1790,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         num_pages = kv_cache[0].shape[0]
         variants = builder.attn_bucketer.variants()
-        decode_variants = (
-            builder.attn_bucketer.batched_decode_variants()
-            if self._batched_decode_supported()
-            else []
-        )
+        decode_variants = builder.attn_bucketer.batched_decode_variants()
         t_start = time.time()
 
         # Belt-and-suspenders: platform._raise_dynamo_recompile_limits already
@@ -2242,7 +2229,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
     ) -> bool:
         groups = attn_metadata.decode_groups
-        if groups is None or not self._batched_decode_supported():
+        if groups is None:
             return False
         # The recorder's bound, per group (torch-spyre#4033).
         return all(g.padded_num_seqs * g.blocks_per_chunk < kv_pages.shape[0] for g in groups)

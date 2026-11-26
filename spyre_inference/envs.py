@@ -101,8 +101,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1" (default), enables the batched multi-sequence decode kernel.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
-    # When "1" (default), a decode batch of very different context lengths runs one
-    # batched dispatch per length group instead of padding every sequence to the longest.
+    # When "1" (default), a decode batch spanning several KV buckets runs one batched
+    # dispatch per bucket group instead of padding every sequence to the longest.
     "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the

@@ -14,15 +14,14 @@
 
 """Bucketer for the attention kernel's compiled variants.
 
-Dynamo specializes the per-sequence attention kernel on its padded query length,
+Dynamo specializes the attention kernel on ``(num_blocks, padded_query_len)``,
 compiling on first use, which would put a full Inductor compile in the serving
-path. This module enumerates the query buckets a run can reach so warmup can record
-them all up front. The page count is not bucketed: each sequence walks its own pages,
-copied to the device with a declared page range, so one kernel per query bucket runs
-every page count up to the context.
+path. This module enumerates the pairs a run can reach so warmup can record them
+all up front.
 
 Separate from ``SpyreShapeBucketer``, which dispatches a single ``num_tokens``
-int for the model graph.
+int for the model graph; a per-sequence attention variant is 2-D (kv_len and
+query_len buckets).
 
 The batched decode kernel runs all decode sequences of a step in one call and
 specializes on its own key, ``(num_seqs, blocks_per_chunk, num_chunks)``, hence a
@@ -56,7 +55,6 @@ from typing import NamedTuple, TypedDict
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 
 from spyre_inference import envs
 from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
@@ -88,6 +86,18 @@ def _chunk_width(b_seqs: int) -> int:
     return max(1, _SPYRE_CORE_COUNT // b_seqs)
 
 
+def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
+    """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
+
+    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
+    them, more than one stick's worth hits a backend axis-merge limit. The block
+    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+    """
+    blocks_per_chunk = min(_chunk_width(b_seqs), b_blocks)
+    num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+    return blocks_per_chunk, num_chunks
+
+
 @dataclass(frozen=True)
 class SpyreAttnBucket:
     """One recordable per-sequence attention kernel variant.
@@ -107,8 +117,9 @@ class SpyreAttnBatchedDecodeBucket:
     The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
     ``num_chunks`` (derived from the logical block-axis tensor extent). A dynamic kernel
     (``dynamic_chunks``) runs every chunk count in its range; ``num_chunks`` is then the
-    count warmup records it at. ``num_blocks`` is the page count the variant is recorded
-    at.
+    count warmup records it at.
+    ``num_blocks`` is the bucket they were derived from, kept so the recorder can
+    skip a bucket that outruns the KV allocation.
     """
 
     num_seqs: int
@@ -121,10 +132,10 @@ class SpyreAttnBatchedDecodeBucket:
 class BatchedDecodePlan(NamedTuple):
     """How ``build()`` splits one batched decode call into chunks.
 
-    ``num_blocks`` is the page count the call covers: the longest sequence's own page
-    count for a dynamic kernel, otherwise ``num_chunks`` whole chunks. The call runs
-    ``num_chunks`` chunks of ``blocks_per_chunk`` pages. ``chunk_range`` is the range of
-    chunk counts a dynamic kernel runs, None for a fixed one.
+    ``num_blocks`` is the page count the call covers: the padded count for a kernel with a
+    fixed chunk count, the longest sequence's own page count for a dynamic one. The call
+    runs ``num_chunks`` chunks of ``blocks_per_chunk`` pages. ``chunk_range`` is the
+    range of chunk counts a dynamic kernel runs, None for a fixed one.
     """
 
     num_blocks: int
@@ -178,11 +189,8 @@ def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
 def _declared_page_range(max_pages: int) -> DynamicRange | None:
     """Return the range of page counts one per-sequence kernel is compiled for.
 
-    Returns None when ``max_pages`` is not above ``MIN_RESERVED_DIM_SIZE``: the range would
-    hold a single count, and every sequence then runs at ``max_pages``.
-
-    Raises:
-        ValueError: ``MAX_BUCKETS`` was exported below ``max_pages``.
+    Returns None, and logs why, when ``max_pages`` does not fit torch-spyre's limits; the
+    kernels then pad every sequence to ``max_pages`` instead.
     """
     from torch_spyre._inductor import config as ts_config
     from torch_spyre._inductor import pass_utils
@@ -203,21 +211,16 @@ def _declared_page_range(max_pages: int) -> DynamicRange | None:
         ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
     min_pages = ts_config.min_reserved_dim_size
     # With min == max the size is a constant, which fails to trace.
-    if max_pages <= min_pages:
-        logger.info_once(
-            "%d pages per sequence is not above MIN_RESERVED_DIM_SIZE=%d, so every sequence "
-            "pads to %d pages and the per-sequence attention kernels use a static page count.",
+    if not min_pages < max_pages <= ts_config.max_buckets:
+        logger.warning_once(
+            "A dynamic page count needs the %d pages per sequence to be above "
+            "MIN_RESERVED_DIM_SIZE=%d and at most MAX_BUCKETS=%d, so the per-sequence "
+            "attention kernels pad every sequence to that many pages instead.",
             max_pages,
             min_pages,
-            max_pages,
+            ts_config.max_buckets,
         )
         return None
-    if max_pages > ts_config.max_buckets:
-        raise ValueError(
-            f"MAX_BUCKETS={ts_config.max_buckets} is below the {max_pages} pages one sequence "
-            "can span, which one per-sequence attention kernel walks as many loop steps. "
-            f"Unset MAX_BUCKETS or raise it to at least {max_pages}."
-        )
     return {"min": min_pages, "max": max_pages, "granularity": 1}
 
 
@@ -245,26 +248,24 @@ def _prefill_page_range(page_range: DynamicRange) -> DynamicRange:
     return {"min": min_pages, "max": max_pages, "granularity": g}
 
 
-def _multi_chunk_plans(
-    max_chunks_by_seqs: dict[int, int], page_range: DynamicRange | None
-) -> tuple[dict[int, DynamicRange], dict[int, int]]:
-    """How each num_seqs bucket runs a batched decode call longer than one chunk.
+def _declared_chunk_ranges(
+    page_range: DynamicRange, num_seqs_buckets: list[int]
+) -> dict[int, DynamicRange]:
+    """For each num_seqs bucket, the chunk counts its dynamic batched decode kernel runs:
+    from ``page_range["min"]`` up to the count ``max_model_len`` needs.
 
-    ``max_chunks_by_seqs`` is each bucket's chunk count at the longest context, for the
-    buckets that can need more than one chunk. Returns ``(chunk_ranges, static_chunks)``:
-    a bucket in ``chunk_ranges`` takes its chunk count at run time, from
-    ``page_range["min"]`` up; one in ``static_chunks`` pads every such call to that count,
-    because a range with min == max does not compile (or, without a ``page_range``,
-    nothing is dynamic).
+    A bucket that never needs more than ``page_range["min"]`` chunks gets no entry and
+    pads every call longer than one chunk to the page count of ``max_model_len``.
     """
     ranges: dict[int, DynamicRange] = {}
-    static: dict[int, int] = {}
-    for num_seqs, max_chunks in max_chunks_by_seqs.items():
-        if page_range is None or max_chunks <= page_range["min"]:
-            static[num_seqs] = max_chunks
-        else:
+    for num_seqs in num_seqs_buckets:
+        max_chunks = -(-page_range["max"] // _chunk_width(num_seqs))
+        # A range needs at least two sizes; a range with min == max does not compile.
+        # With page_range["min"] at 2, a bucket whose max_model_len fits in two chunks
+        # therefore gets no range.
+        if page_range["min"] < max_chunks:
             ranges[num_seqs] = {"min": page_range["min"], "max": max_chunks, "granularity": 1}
-    return ranges, static
+    return ranges
 
 
 def _resolve_buckets(
@@ -305,10 +306,9 @@ def _resolve_buckets(
 class SpyreAttnBucketer:
     """Enumerates the attention variants to record, and rounds lengths onto them.
 
-    Query lengths and batch sizes round *up* onto their buckets, matching
-    ``SpyreShapeBucketer.find_bucket``; over-max returns None, and the caller falls back to
-    compiling on demand. Page counts are not bucketed: a sequence runs at its own count,
-    within the declared ``page_range``.
+    Both axes round *up*: a runtime length lands on the smallest recorded
+    bucket that fits it, matching ``SpyreShapeBucketer.find_bucket``. Over-max
+    returns None, and the caller falls back to compiling on demand.
     """
 
     def __init__(
@@ -326,8 +326,9 @@ class SpyreAttnBucketer:
         # A pooling request's query_len is its own context_len, so it can't
         # exceed max_model_len even when max_num_batched_tokens is larger (unlike
         # a decoder's chunked-prefill step). Without this cap, warmup could record
-        # a query bucket no sequence can reach. Stick-aligned via _align_up_pow2 to match
-        # the encoder shape ladder's padding (CLIP: 77 -> 128).
+        # a query bucket with no matching num_blocks bucket, crashing with
+        # "num_blocks=N exceeds the largest recorded bucket". Stick-aligned via
+        # _align_up_pow2 to match the encoder shape ladder's padding (CLIP: 77 -> 128).
         if vllm_config.model_config.runner_type == "pooling":
             max_batched = min(max_batched, _align_up_pow2(max_model_len))
 
@@ -352,48 +353,49 @@ class SpyreAttnBucketer:
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
 
-        # The block table holds every page of a max_model_len sequence. A sliding window
-        # walks only the pages its widest query's windows touch: ceil(span / B) + 1 for a
-        # span of W + query_len - 1 positions that need not start on a page boundary.
-        self._context_pages = cdiv(max_model_len, block_size)
-        max_pages = self._context_pages
-        if sliding_window is not None:
-            span = sliding_window + self._query_buckets[-1] - 1
-            max_pages = min(max_pages, cdiv(span, block_size) + 1)
-
         # One KV head on one page leaves torch-spyre's codegen no spare dim for the stick
         # dim, so the decode kernel will not compile there. A second, fully masked page
-        # does.
+        # does, and it lifts the SWA bound _max_active_blocks derives from it.
         self._min_blocks = 2 if _min_num_kv_heads(vllm_config) == 1 else 1
-        self._max_pages = max(max_pages, self._min_blocks)
 
-        # The per-sequence kernels take the page count at run time, so they compile once
-        # per query bucket. Without a range every sequence pads to max_pages.
+        # num_blocks is what the kernel specializes on. Without a page range, every
+        # sequence pads to the block count of max_model_len. A sliding window has no page
+        # range, so it keeps power-of-two buckets and a short sequence pads to its own.
+        max_blocks = (max_model_len + block_size - 1) // block_size
+        self._num_blocks_buckets: list[int] = [max(max_blocks, self._min_blocks)]
+        self._batched_blocks_buckets = self._num_blocks_buckets
+        if sliding_window is not None:
+            self._num_blocks_buckets = sorted(
+                {max(n, self._min_blocks) for n in _powers_of_two_up_to(max_blocks)}
+            )
+            # Batched decode runs one-token queries, whose window spans at most this many
+            # pages (_max_active_blocks), so it pads no further.
+            window_blocks = (sliding_window + block_size - 1) // block_size + 1
+            self._batched_blocks_buckets = sorted(
+                {min(n, window_blocks) for n in self._num_blocks_buckets}
+            )
+
+        # With a page range, the per-sequence kernels take the page count at run time
+        # instead of padding to the bucket.
         self._page_range: DynamicRange | None = None
         self._prefill_page_range: DynamicRange | None = None
         if declare_pages:
-            self._page_range = _declared_page_range(self._max_pages)
+            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
         if self._page_range is not None:
             self._prefill_page_range = _prefill_page_range(self._page_range)
 
-        # Batched decode runs a call within one chunk as that one chunk, and a longer one at
-        # a chunk count taken at run time.
-        max_chunks_by_seqs = {}
-        for num_seqs in self._num_seqs_buckets:
-            max_chunks = self._chunks_needed(num_seqs, self._max_pages)
-            if max_chunks > 1:
-                max_chunks_by_seqs[num_seqs] = max_chunks
-        self._chunk_ranges, self._static_chunks = _multi_chunk_plans(
-            max_chunks_by_seqs, self._page_range
-        )
+        # Batched decode gets one dynamic kernel per num_seqs bucket for batches longer
+        # than one chunk.
+        self._chunk_ranges: dict[int, DynamicRange] = {}
+        if self._page_range is not None:
+            self._chunk_ranges = _declared_chunk_ranges(self._page_range, self._num_seqs_buckets)
 
         logger.info(
-            "SpyreAttnBucketer: %d query buckets [%d..%d], %d num_seqs buckets, pages %s",
+            "SpyreAttnBucketer: %d query buckets [%d..%d], max num_blocks=%d",
             len(self._query_buckets),
             self._query_buckets[0],
             self._query_buckets[-1],
-            len(self._num_seqs_buckets),
-            self._page_range or f"static at {self._max_pages}",
+            self._num_blocks_buckets[-1],
         )
 
     @property
@@ -401,13 +403,12 @@ class SpyreAttnBucketer:
         return self._query_buckets
 
     @property
-    def num_seqs_buckets(self) -> list[int]:
-        return self._num_seqs_buckets
+    def num_blocks_buckets(self) -> list[int]:
+        return self._num_blocks_buckets
 
     @property
-    def max_pages(self) -> int:
-        """The most pages one sequence's kernel walks."""
-        return self._max_pages
+    def num_seqs_buckets(self) -> list[int]:
+        return self._num_seqs_buckets
 
     def find_query_bucket(self, query_len: int) -> int | None:
         return self._round_up(query_len, self._query_buckets)
@@ -415,10 +416,13 @@ class SpyreAttnBucketer:
     def find_sequence_bucket(self, num_seqs: int) -> int | None:
         return self._round_up(num_seqs, self._num_seqs_buckets)
 
+    def find_blocks_bucket(self, num_blocks: int) -> int | None:
+        return self._round_up(num_blocks, self._num_blocks_buckets)
+
     @property
     def page_range(self) -> DynamicRange | None:
         """The ``min``, ``max`` and ``granularity`` of the page count one per-sequence
-        kernel runs. None when every sequence runs at ``max_pages``."""
+        kernel runs. None when page counts are rounded up to ``num_blocks_buckets``."""
         return self._page_range
 
     @property
@@ -427,53 +431,60 @@ class SpyreAttnBucketer:
         multiples of ``PREFILL_PAGE_GRANULARITY``."""
         return self._prefill_page_range
 
-    def find_pages(self, num_blocks: int, prefill: bool = False) -> int:
+    def find_declared_pages(self, num_blocks: int, prefill: bool = False) -> int:
         """The page count a sequence of ``num_blocks`` pages runs at: its own, rounded up
-        to the range granularity, or the range minimum if that is larger; ``max_pages``
-        without a range."""
-        assert num_blocks <= self._max_pages, (
-            f"num_blocks={num_blocks} exceeds the {self._max_pages} pages a sequence can span"
-        )
+        to the range granularity, or the range minimum if that is larger."""
         page_range = self._prefill_page_range if prefill else self._page_range
-        if page_range is None:
-            return self._max_pages
+        assert page_range is not None
         g = page_range["granularity"]
         return max(-(-num_blocks // g) * g, page_range["min"])
 
-    def chunk_width(self, num_seqs_bucket: int) -> int:
-        """Pages per sequence in one batched decode chunk: ``_chunk_width``, even past the
-        longest context, since a narrower chunk is a gather torch-spyre may not lay out."""
-        return _chunk_width(num_seqs_bucket)
+    def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
+        """The num_blocks buckets batched decode records and dispatches onto at this batch size."""
+        return self._batched_blocks_buckets
 
-    def _chunks_needed(self, num_seqs_bucket: int, num_blocks: int) -> int:
-        """Chunks a call of ``num_blocks`` blocks needs. A one-block chunk takes a second,
-        masked one where one KV head needs two pages."""
-        width = self.chunk_width(num_seqs_bucket)
-        return max(cdiv(num_blocks, width), self._min_blocks if width < self._min_blocks else 1)
+    def find_batched_blocks_bucket(self, num_blocks: int, num_seqs_bucket: int) -> int | None:
+        return self._round_up(num_blocks, self.batched_blocks_buckets(num_seqs_bucket))
 
     def batched_decode_plan(
         self, num_seqs_bucket: int, num_blocks: int
     ) -> BatchedDecodePlan | None:
         """How to run a batched decode call whose longest sequence has ``num_blocks`` pages.
 
-        - If the call fits in one chunk, it runs the one-chunk kernel.
-        - If this bucket has a static chunk count, the call pads to it.
+        - If the call fits in one chunk and this bucket has a one-chunk kernel, it runs
+          that kernel.
+        - If this bucket has no chunk range, the call is padded to its num_blocks bucket and
+          runs the kernel compiled for that bucket.
         - Otherwise it runs the bucket's dynamic kernel with just enough chunks for
           ``num_blocks``, and at least ``chunk_range["min"]``.
 
-        Returns None past ``max_pages``.
+        Returns None if no num_blocks bucket holds ``num_blocks``.
         """
-        if num_blocks > self._max_pages:
+        b_blocks = self.find_batched_blocks_bucket(num_blocks, num_seqs_bucket)
+        if b_blocks is None:
             return None
-        width = self.chunk_width(num_seqs_bucket)
-        needed = self._chunks_needed(num_seqs_bucket, num_blocks)
-        if needed == 1:
+        chunk_range = self._chunk_ranges.get(num_seqs_bucket)
+        width = _chunk_width(num_seqs_bucket)
+        if num_blocks <= width and self._has_one_chunk_kernel(num_seqs_bucket):
             return BatchedDecodePlan(width, width, 1, None)
-        static = self._static_chunks.get(num_seqs_bucket)
-        if static is not None:
-            return BatchedDecodePlan(static * width, width, static, None)
-        chunk_range = self._chunk_ranges[num_seqs_bucket]
-        return BatchedDecodePlan(num_blocks, width, max(needed, chunk_range["min"]), chunk_range)
+        if chunk_range is None:
+            return BatchedDecodePlan(
+                b_blocks, *batched_decode_chunking(num_seqs_bucket, b_blocks), None
+            )
+        num_chunks = max(-(-num_blocks // width), chunk_range["min"])
+        return BatchedDecodePlan(num_blocks, width, num_chunks, chunk_range)
+
+    def _has_one_chunk_kernel(self, num_seqs_bucket: int) -> bool:
+        """Whether a bucket also has a fixed one-chunk kernel, for the calls that fit in one
+        chunk, so they do not pad to the bucket's longest call.
+
+        That kernel reads ``_chunk_width`` pages per sequence, so the bucket's longest call
+        must be longer and the smallest page count no longer. With one KV head the smallest page
+        count is 2, because the decode kernel does not compile on a single page. At 32
+        sequences a chunk is 1 page, so there is no one-chunk kernel and every call runs the
+        dynamic kernel.
+        """
+        return self._min_blocks <= _chunk_width(num_seqs_bucket) < self._batched_blocks_buckets[-1]
 
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
@@ -486,48 +497,60 @@ class SpyreAttnBucketer:
         return buckets[idx] if idx < len(buckets) else None
 
     def variants(self) -> list[SpyreAttnBucket]:
-        """Every variant worth recording, largest first: one per query bucket.
+        """Every variant worth recording, largest first.
 
-        Each is requested at ``max_pages``, or at the context its smallest real query
-        needs if that is longer, and ``build()`` realizes its own page count: rounded into
-        the range, or under a sliding window the pages the window touches. A query bucket
-        no context up to max_model_len can hold is left out. The bound is on the
-        *smallest real* query_len that reaches a bucket, not the bucket itself, since a
-        2-token query on a 1-block sequence still dispatches to a large padded bucket;
-        bounding by the bucket would prune that variant and put a compile back in the
-        serving path.
+        The two size axes aren't independent: ``kv_len >= query_len`` always, so
+        a query bucket only pairs with block counts that can hold it -- the full
+        cross product would record many unreachable variants at a long context.
+        Requires the backend to round each sequence's own query_len, so the bound
+        holds per sequence and not against a batch max.
+        The bound is on the *smallest real* query_len that reaches a bucket, not
+        the bucket itself, since a 2-token query on a 1-block sequence still
+        dispatches to a large padded bucket; bounding by the bucket would prune
+        that variant and put a compile back in the serving path.
         """
-        out = []
-        for padded_query_len in sorted(self._query_buckets, reverse=True):
-            needed = cdiv(self.min_real_query_len(padded_query_len), self.block_size)
-            if needed > self._context_pages:
-                continue
-            num_blocks = max(self._max_pages, needed)
-            out.append(SpyreAttnBucket(num_blocks=num_blocks, padded_query_len=padded_query_len))
+        out: list[SpyreAttnBucket] = []
+        # With a page range, one kernel per query bucket runs every page count in it.
+        blocks_buckets = self._num_blocks_buckets
+        if self._page_range is not None:
+            blocks_buckets = [blocks_buckets[-1]]
+        for num_blocks in sorted(blocks_buckets, reverse=True):
+            max_query_here = num_blocks * self.block_size
+            for padded_query_len in sorted(self._query_buckets, reverse=True):
+                if self.min_real_query_len(padded_query_len) > max_query_here:
+                    continue
+                out.append(
+                    SpyreAttnBucket(num_blocks=num_blocks, padded_query_len=padded_query_len)
+                )
         return out
 
     def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
-        Per num_seqs bucket, the one-chunk kernel and the one past it: its dynamic kernel,
-        recorded at ``max_pages``, or its static chunk count.
+        Each num_seqs bucket against its own ``batched_blocks_buckets``, plus its one-chunk
+        kernel where there is one: unlike ``variants()`` there is no inter-axis bound to
+        exploit, since a decode batch of any size can sit at any context length. With a chunk
+        range, the bucket's variant is its dynamic kernel at the chunk count of max_model_len.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
-        out: dict[tuple[int, int, int, bool], SpyreAttnBatchedDecodeBucket] = {}
+        pairs = []
         for num_seqs in self._num_seqs_buckets:
-            for num_blocks in (self.chunk_width(num_seqs), self._max_pages):
-                plan = self.batched_decode_plan(num_seqs, num_blocks)
-                if plan is None:
-                    continue
-                bucket = SpyreAttnBatchedDecodeBucket(
+            blocks_buckets = set(self.batched_blocks_buckets(num_seqs))
+            if self._has_one_chunk_kernel(num_seqs):
+                blocks_buckets.add(_chunk_width(num_seqs))
+            pairs.extend((nb, num_seqs) for nb in blocks_buckets)
+        out: list[SpyreAttnBatchedDecodeBucket] = []
+        for num_blocks, num_seqs in sorted(pairs, reverse=True):
+            plan = self.batched_decode_plan(num_seqs, num_blocks)
+            assert plan is not None
+            out.append(
+                SpyreAttnBatchedDecodeBucket(
                     num_seqs=num_seqs,
-                    # Recorded at a context a sequence can have; the chunks still pad past it.
-                    num_blocks=min(plan.num_blocks, self._max_pages),
+                    num_blocks=plan.num_blocks,
                     blocks_per_chunk=plan.blocks_per_chunk,
                     num_chunks=plan.num_chunks,
                     dynamic_chunks=plan.chunk_range is not None,
                 )
-                key = (num_seqs, plan.blocks_per_chunk, plan.num_chunks, bucket.dynamic_chunks)
-                out.setdefault(key, bucket)
-        return sorted(out.values(), key=lambda b: (b.num_blocks, b.num_seqs), reverse=True)
+            )
+        return out

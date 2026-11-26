@@ -306,7 +306,7 @@ separately because `residual is None` there, so a Llama-shaped stack yields two
 artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
 and full attention, giving four. A fresh `num_tokens` bucket then costs one block recompile
 rather than a whole-model one. For decoder attention, `num_tokens` is the block graph's
-only shape dependence: kv-cache length and its page count live inside
+only shape dependence: kv-cache length and its block-count buckets live inside
 `unified_attention_with_output`, which is opaque to this graph and compiles its own
 kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)). Inline rectangular
 encoder attention also specializes the block graph by rectangle.
@@ -426,7 +426,7 @@ materialized contiguously first.
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` onto its bucket and each block count into the page range (each sequence keeps its own count, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
+| 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets (the per-sequence kernels usually keep each sequence's own block count instead, see the configuration guide), builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
 | 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter, one per KV head, through a row view of the paged cache (fused into one kernel); only the row-index vectors are computed host-side and copied over |
 | 3. Page attention | Spyre | Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 4. Write-back | Spyre | Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy |
@@ -451,17 +451,19 @@ leaving the retained config's specs, and so its `page_size_bytes`, physical. YOC
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
 per-sequence variants from `SpyreAttnBucketer.variants()`: one per query bucket, at the
-page count of `max_model_len` (a sliding window's at the pages its window touches), and
-that kernel runs every page count up to it, since the page count is copied to the device
-with `tensor.to(dynamic=...)`. A query bucket no context can hold is left out, and
-variants exceeding the allocated page count are skipped. When prefill gets its own range
-of multiples of 8 pages from 16, a prefill variant is traced at that page count rounded up
-to a multiple of 8. Failed recordings are logged and compile on first use instead.
+page count of `max_model_len`; variants exceeding the allocated page count are skipped.
+When the per-sequence page count is dynamic (copied to the device with
+`tensor.to(dynamic=...)`), that kernel runs every page count up to it; otherwise every
+sequence pads to it. A sliding-window layer has no page range and records one variant per
+(power-of-two page count, query bucket) pair instead. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
+traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
+compile on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
-enumerates its variants: per num-sequences bucket, one for a batch that fits in a single
-chunk, and one dynamic variant, recorded at the chunk count of `max_model_len`, that runs
-every longer batch; variants that reach or exceed the allocated page count are skipped and
-declined at dispatch. A single step can carry a mix of prefill
+enumerates its variants, one per num-sequences bucket at the page count of `max_model_len`, or
+at each power-of-two count up to its window for a sliding-window layer; variants that reach or exceed the allocated page count are skipped and
+declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
+just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
+recorded at the chunk count of `max_model_len`, that runs every longer batch. A single step can carry a mix of prefill
 and decode sequences; each sequence is padded to its own query bucket (decodes use the
 length-1 bucket) before dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
@@ -538,15 +540,16 @@ calibrated one.
 
 Key constraints:
 
-- **KV length**: not bucketed. Each sequence walks its own page count, at least two
-  pages, within a page range declared up to `max_model_len` (or the pages a sliding window
-  touches), so one compiled kernel serves every length. One KV head on one page would leave
-  the decode kernel no spare dim for the stick, which the two-page minimum avoids
+- **KV length**: not bucketed. Each sequence keeps its own block count within a page range
+  up to `max_model_len`, or pads to that count where there is no range (see the
+  configuration guide). Sliding-window layers keep power-of-two block counts, capped at the
+  pages their window touches. A layer with one KV head floors it at two blocks: one
+  KV head on one page leaves the decode kernel no spare dim for the stick
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
-  each bucket's single-chunk and multi-chunk kernels are recorded during warmup
+  eligible `(num_blocks, num_seqs)` combinations are recorded during warmup
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a

@@ -16,7 +16,7 @@ In addition to the generic table in `SKILL.md`:
 
 | Limitation | Workaround |
 |---|---|
-| KV length without buckets | each sequence's page table and mask stack go to the device with a declared page range (`tensor.to(dynamic=...)`), at least two pages, so the same compiled kernel is reused as KV grows |
+| KV length without buckets | each sequence's page table and mask stack go to the device with a declared page range (`tensor.to(dynamic=...)`), at least two pages, so the same compiled kernel is reused as KV grows; sliding-window layers keep power-of-two block counts instead |
 | Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1] + multiples of min(512, max_num_batched_tokens)`; each sequence's query is padded up to its own bucket |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
 | The page gather is a 2-D subscript (`aten.index`), which fails eager on Spyre (torch-spyre#4334) | Attention always compiles, even under `--enforce-eager` |

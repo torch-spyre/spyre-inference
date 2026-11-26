@@ -212,35 +212,41 @@ Warmup records one per-sequence kernel per query bucket and, with the batched-de
 enabled (`SPYRE_BATCHED_DECODE=1`, the default), up to two batched kernels per num-sequences
 bucket.
 
-### One kernel for every page count
+### One per-sequence kernel for every page count
 
-The KV length is not bucketed. The per-sequence kernels (prefill, and any decode that batched
-decode does not take) run any sequence length up to `--max-model-len` with the one kernel of
-their query bucket. Each kernel call covers at least two pages: a sequence that fits in one
-page also gets a masked copy of it as a second page.
+The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
+bucket the KV length. Warmup compiles one kernel per query bucket, and that kernel runs any
+sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
+sequence that fits in one page also gets a masked copy of it as a second page.
 
 Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
 prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
-their own page count. A sliding-window layer walks only the pages its window touches, at most
-`ceil((window + largest query bucket - 1) / block_size) + 1`, so its page range ends there
-rather than at `--max-model-len`.
+their own page count.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
 export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
-`--max-model-len / block_size` rounded up to a multiple of 8. Startup refuses an exported
-`MAX_BUCKETS` below `--max-model-len / block_size`; below the rounded value, prefill reads one
-page per loop step instead. When `--max-model-len / block_size` is not above
-`MIN_RESERVED_DIM_SIZE`, every sequence pads to that many pages instead.
+`--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
+below that rounded value, prefill reads one page per loop step instead.
 
-The batched decode kernel takes its chunk count at run time in the same way. The kernel reads
-the KV cache one *chunk* per loop step: the next `32 / num_seqs` pages (at least one) of every
-sequence in the batch, so that each of the 32 cores reads one page. For example, a batch of 8
-sequences reads 4 pages of each per chunk, and if its longest sequence has 256 pages, the
-batch runs 64 chunks. Shorter sequences are masked past their own length. A batch that fits
-in one chunk runs a kernel compiled for one chunk. Warmup therefore compiles two batched
-kernels per num-sequences bucket. A num-sequences bucket whose `--max-model-len` fits in two
-chunks pads every longer batch to two.
+The per-sequence kernels pad every sequence to `--max-model-len / block_size` pages instead
+when `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above an
+exported `MAX_BUCKETS`; startup logs a warning.
+
+Sliding-window layers have no page range. Each sequence pads to the power of two at or above
+its page count, capped at the pages its window touches, with one kernel per (page count,
+query) bucket pair.
+
+The batched decode kernel takes its chunk count at run time in the same way, and under the
+same conditions. The kernel reads the KV cache one *chunk* per loop step: the next
+`32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
+cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
+and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
+masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
+chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
+num-sequences bucket whose `--max-model-len` fits in two chunks, or any bucket under the
+conditions above, pads every batch longer than one chunk to the same page count as the
+per-sequence kernels.
 
 ## KV cache size
 

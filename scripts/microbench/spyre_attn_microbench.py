@@ -689,14 +689,16 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
     declared_blocks = [(s + block_size - 1) // block_size for s in seq_lens]
     declared_query = [max(1, q) for q in query_lens]
     if builder is not None and builder.sliding_window is not None:
-        # A window drops out-of-window blocks, so the identity does not hold; only the
-        # per-sequence bound is meaningful. The bound comes from the builder rather than
-        # being restated here, so the check cannot drift from the padding it verifies.
-        bound = builder.attn_bucketer.max_pages
-        for s, realized in enumerate(realized_blocks):
+        # A window drops out-of-window blocks and pads back to its bucket maximum,
+        # so the identity does not hold; only the per-sequence bound is meaningful.
+        # The bound comes from the builder rather than being restated here, so the
+        # check cannot drift from the padding it verifies. It is asked for the same
+        # bucket build() used -- the padded block count, not the sequence's own.
+        for s, (realized, aligned) in enumerate(zip(realized_blocks, realized_query)):
+            bound = builder._max_active_blocks(builder._pad_num_blocks(declared_blocks[s]), aligned)
             if realized > bound:
                 row["error"] = (
-                    f"windowed active blocks {realized} exceed the window bound {bound} "
+                    f"windowed active blocks {realized} exceed the bucket bound {bound} "
                     f"for sequence {s}"
                 )
                 print(f"    -> {row['error']}", flush=True)
@@ -705,8 +707,7 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
             row["error"] = f"query padding is not the identity: {declared_query}->{realized_query}"
             print(f"    -> {row['error']}", flush=True)
         return
-    # A page count only rounds onto the page range: up to its minimum, and for a prefill
-    # to its granularity.
+    # A page count rounds onto the page range, or pads to the num_blocks bucket without one.
     if builder is not None:
         declared_blocks = [
             builder._pad_num_blocks(n, q > 1) for n, q in zip(declared_blocks, declared_query)

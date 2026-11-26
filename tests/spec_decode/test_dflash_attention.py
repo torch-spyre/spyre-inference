@@ -251,8 +251,7 @@ def test_draft_groups_keep_windows_and_causality(
     assert len(drafter.draft_attn_groups) == 2
     assert drafter.draft_model_config.max_model_len == 128
     for group in drafter.draft_attn_groups:
-        # The target's max_model_len, not the draft's.
-        assert group.metadata_builders[0].attn_bucketer.max_pages == 256 // 64
+        assert group.metadata_builders[0].attn_bucketer.num_blocks_buckets[-1] == 256 // 64
     kv_len = context + tokens
     common = CommonAttentionMetadata(
         query_start_loc=torch.tensor([0, tokens], dtype=torch.int32),

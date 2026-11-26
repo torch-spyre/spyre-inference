@@ -402,17 +402,13 @@ def drop_cpu_device_layouts(monkeypatch) -> None:
     monkeypatch.setattr(torch.Tensor, "to", to)
 
 
-def use_static_pages(monkeypatch) -> None:
-    """Make metadata builders run every sequence at one static page count rather than a
-    page range. On CPU a declared count is an ordinary shape, so a test counting graphs
-    would see one per page count."""
+def use_kv_buckets(monkeypatch) -> None:
+    """Make metadata builders pad to the num_blocks bucket rather than use a page range."""
     from spyre_inference.v1.attention.backends import spyre_attn
     from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
     monkeypatch.setattr(
         spyre_attn,
         "SpyreAttnBucketer",
-        lambda vllm_config, *, sliding_window=None, **_: SpyreAttnBucketer(
-            vllm_config, sliding_window=sliding_window
-        ),
+        lambda vllm_config, **kw: SpyreAttnBucketer(vllm_config, **kw | {"declare_pages": False}),
     )

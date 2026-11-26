@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from spyre_testing_plugin.attn_helpers import use_python_for_each_tile, use_static_pages
+from spyre_testing_plugin.attn_helpers import use_kv_buckets, use_python_for_each_tile
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
 from vllm.config import get_current_vllm_config
@@ -70,8 +70,8 @@ def compiles() -> int:
 
 @pytest.fixture()
 def impl(default_vllm_config, monkeypatch):
-    # These tests count graphs at a static page count, which a page range would replace.
-    use_static_pages(monkeypatch)
+    # These tests check the num_blocks bucket, which a page range would replace.
+    use_kv_buckets(monkeypatch)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
@@ -140,7 +140,8 @@ def builder(default_vllm_config):
 
 @pytest.fixture()
 def sliding_window_builder(default_vllm_config):
-    """A builder whose window realizes fewer pages than the variants are requested at."""
+    """A builder whose window leaves the active-block count unpadded, so several
+    requested buckets realize onto one kernel."""
     return _make_builder(
         FullAttentionSpec(
             block_size=BLOCK_SIZE,
@@ -176,7 +177,7 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
 def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
     from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-    use_static_pages(monkeypatch)
+    use_kv_buckets(monkeypatch)
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -387,10 +388,10 @@ class TestRecordGraphs:
                 if query_len > kv_len:
                     continue
                 padded_query_len = bucketer.find_query_bucket(query_len)
-                assert padded_query_len is not None
-                num_blocks = bucketer.find_pages(
-                    (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE, prefill=padded_query_len > 1
+                num_blocks = bucketer._round_up(
+                    (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE, bucketer.num_blocks_buckets
                 )
+                assert padded_query_len is not None and num_blocks is not None
                 if num_blocks > NUM_PAGES:
                     continue
                 _dispatch(impl, builder, kv_cache, num_blocks, padded_query_len)
@@ -440,17 +441,16 @@ class TestRecordGraphs:
         )
         assert sink_impl.graph_key() != impl.graph_key()
 
-    def test_sliding_window_variants_reach_a_traced_graph(
+    def test_buckets_collapsing_onto_one_kernel_record_once(
         self, impl, kv_cache, sliding_window_builder
     ):
-        """A window realizes fewer pages than a variant is requested at; each still records
-        the kernel its dispatch reaches."""
+        """Deduping on the realized bucket must not drop a graph dispatch needs."""
         bucketer = sliding_window_builder._attn_bucketer = make_bucketer(sliding_window=BLOCK_SIZE)
 
         recorded = _record(impl, kv_cache, sliding_window_builder)
 
         requested = _recordable(bucketer)
-        assert 0 < recorded == len(requested)
+        assert 0 < recorded < len(requested), "no buckets collapsed; nothing deduped"
 
         snapshot = compiles()
         for bucket in requested:
@@ -530,6 +530,9 @@ class TestRecordGraphs:
         """
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
+        # The builder's own bucketer, derived from the live config, since
+        # _padded_mask_metadata builds its metadata from that same config.
+        bucketer = builder.attn_bucketer
         _record(impl, kv_cache, builder)
 
         snapshot = compiles()
@@ -544,7 +547,9 @@ class TestRecordGraphs:
             )
             assert metadata.padded_num_blocks is not None
             num_blocks = metadata.padded_num_blocks[0]
-            assert num_blocks <= NUM_PAGES, "variant would have been skipped when recording"
+            assert num_blocks in bucketer.num_blocks_buckets, (
+                f"kv_len={kv_len} produced an unrecorded block count {num_blocks}"
+            )
             _dispatch(impl, builder, kv_cache, num_blocks, metadata.aligned_query_lens[0])
 
         assert compiles() == snapshot
@@ -776,16 +781,21 @@ class TestRecordBatchedDecode:
         assert _record(impl, wide_cache, builder) == first
         assert compiles() == snapshot
 
-    def test_sliding_window_batched_variants_reach_a_traced_graph(
+    def test_batched_buckets_collapsing_onto_one_kernel_record_once(
         self, impl, wide_cache, sliding_window_builder
     ):
         """Deduping on the realized key must not drop a graph dispatch needs."""
         bucketer = sliding_window_builder._attn_bucketer = make_bucketer(sliding_window=BLOCK_SIZE)
         requested = self._recordable_batched(bucketer)
 
-        assert _record(impl, wide_cache, sliding_window_builder) > 0
+        recorded = _record(impl, wide_cache, sliding_window_builder)
+        # The window collapses both axes, so the total is below what either
+        # enumeration asks for on its own.
+        assert recorded < self._expected(bucketer, len(requested)), (
+            "nothing collapsed; the dedupe path is untested"
+        )
 
-        # Every requested bucket must reach a traced graph.
+        # Every requested bucket must still reach a traced graph.
         snapshot = compiles()
         for bucket in requested:
             _dispatch_batched(impl, sliding_window_builder, wide_cache, bucket)

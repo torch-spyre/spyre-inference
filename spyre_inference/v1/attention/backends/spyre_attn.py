@@ -464,9 +464,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # (1 for a decoding sequence), for stable kernel compilation.
     aligned_query_lens: list[int] = field(default_factory=list)
 
-    # Per-sequence padded active-block count, rounded into the page range; equals
-    # attention_mask_stacks[s].shape[0]. None on the sliding-window path, which pads
-    # its active pages instead (see build()).
+    # Per-sequence padded active-block count, rounded up onto the recorder's
+    # buckets; equals attention_mask_stacks[s].shape[0]. None on the sliding-window
+    # path, which pads to its own tighter per-bucket maximum instead (see build()).
     padded_num_blocks: list[int] | None = None
 
     # Gather indices for the paged attention loop, one row per active block:
@@ -493,7 +493,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     attention_mask_stacks_device: list[torch.Tensor | None] | None = None
 
     # The range of page counts the page index tables and mask stacks are copied to the
-    # device with. None when every sequence runs at one static page count instead.
+    # device with. None when page counts are rounded up to the num_blocks buckets instead.
     page_range: DynamicRange | None = None
     # The same for a prefill sequence (aligned query length > 1), whose page counts are
     # multiples of the prefill page group.
@@ -610,11 +610,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._encoder_grid = install_encoder(own_layers)
 
         # record_graphs() enumerates this same instance, so the buckets warmup
-        # compiles are exactly the ones build() can round onto. A sliding window bounds
-        # the pages a sequence walks, and with it the page range.
+        # compiles are exactly the ones build() can round onto.
+        # Sliding window layers pad each sequence to a bound taken from its num_blocks
+        # bucket, so they keep the buckets.
         self._attn_bucketer = SpyreAttnBucketer(
             vllm_config,
-            declare_pages=not self._encoder_only,
+            declare_pages=self.sliding_window is None and not self._encoder_only,
             sliding_window=self.sliding_window,
         )
 
@@ -642,18 +643,46 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return tile
 
     def _pad_num_blocks(self, num_blocks: int, prefill: bool = False) -> int:
-        """The page count a sequence walking ``num_blocks`` pages runs at.
+        """Round an active-block count up onto the recorder's num_blocks buckets.
 
-        The scheduler bounds seq_lens by max_model_len, and a sliding window bounds the
-        active pages within it, so the count is within the bucketer's ``max_pages``.
-        Encoder-only builds, whose profiling seq_lens come from the token budget instead,
-        never reach here.
+        block_table is allocated at width ceil(max_model_len / block_size) for
+        the engine's lifetime, so the padded bucket always fits.
         """
         if num_blocks == 0:
             # A fully-masked padded tile would divide by a zero softmax
             # denominator, so zero real blocks must stay zero.
             return 0
-        return self._attn_bucketer.find_pages(num_blocks, prefill)
+        if self._attn_bucketer.page_range is not None:
+            return self._attn_bucketer.find_declared_pages(num_blocks, prefill)
+        padded = self._attn_bucketer.find_blocks_bucket(num_blocks)
+        # The buckets cover ceil(max_model_len / block_size), and the scheduler
+        # bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
+        # seq_lens come from the token budget instead, never reach here.
+        assert padded is not None, (
+            f"num_blocks={num_blocks} exceeds the largest recorded bucket "
+            f"{self._attn_bucketer.num_blocks_buckets[-1]}, which should cover "
+            f"ceil(max_model_len / block_size)."
+        )
+        assert padded >= num_blocks
+        return padded
+
+    def _max_active_blocks(self, num_blocks: int, aligned_query_len: int) -> int:
+        """Largest active-block count the (num_blocks, aligned_query_len) bucket admits.
+
+        ceil(kv_len / B) - floor(max(0, context_len - W + 1) / B), maximized over
+        every (kv_len, query_len) the bucket admits. The span term needs
+        aligned_query_len, not just the window: under chunked prefill a wide query
+        pushes context_len back and widens the active span.
+        """
+        if num_blocks == 0:
+            # A fully-masked padded tile would divide by a zero softmax denominator.
+            return 0
+        assert self.sliding_window is not None
+        block_size = self.block_size
+        span = self.sliding_window + aligned_query_len - 1
+        bound = min(num_blocks, (span + block_size - 1) // block_size + 1)
+        assert bound >= 1
+        return bound
 
     def _get_masked_tile(self, aligned_query_len: int) -> torch.Tensor:
         """Shared fully-masked tile for padded blocks, read-only like _get_zero_tile.
@@ -903,7 +932,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # tiles, page-index tables, batched-decode precomputes -- and
             # SpyreEncoderAttentionImpl reads none of it, deriving its own packed
             # grid from seq_lens and query_start_loc. Besides the per-step waste,
-            # _pad_num_blocks would reject the batch: its page limit comes from
+            # _pad_num_blocks would reject the batch: its bucket comes from
             # max_model_len while a pooling model's body buckets come from
             # max_num_batched_tokens, and warmup profiles every sequence at the full
             # body size (a 256-token sentence-transformer asks for 512).
@@ -1021,9 +1050,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # Sliding window: arithmetic block-skip. Blocks entirely outside
             # every query's window are dropped; interior blocks share a
             # zero mask tile; only boundary blocks get real per-query cutoffs.
-            # The count is padded into the page range, which the window bounds, so a
-            # sliding count reuses one kernel. padded_num_blocks stays None so forward()
-            # keeps gathering through active_block_indices.
+            # The count is padded up to _max_active_blocks so it stops sliding with
+            # the context, which would compile a new kernel inside the request. Not
+            # rounded onto the num_blocks ladder: that inflates the exact per-bucket
+            # bound several-fold. padded_num_blocks stays None so forward() keeps
+            # gathering through active_block_indices.
             active_block_indices = []
             query_lens_list = query_lens.tolist()
             seq_lens_list = seq_lens.tolist()
@@ -1044,11 +1075,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     # Repeat the last real block rather than inventing an index: the
                     # column is gathered from block_table, where out-of-range would
                     # fault. Its tile is fully masked, so the duplicate contributes
-                    # exp(finfo.min - max) == 0.
-                    padded_s = self._pad_num_blocks(len(active_bs), aligned_query_lens[s] > 1)
-                    if len(active_bs) < padded_s:
+                    # exp(finfo.min - max) == 0. Keyed on the bucket's block count,
+                    # not the sequence's, so one shape serves the whole bucket.
+                    max_active_s = self._max_active_blocks(
+                        self._pad_num_blocks((kv_len_s + block_size - 1) // block_size),
+                        aligned_query_lens[s],
+                    )
+                    # A bound below the real count would silently leave the count
+                    # sliding, i.e. the bug this padding fixes, with no signal.
+                    assert len(active_bs) <= max_active_s, (
+                        f"{len(active_bs)} active blocks exceed the bucket bound "
+                        f"{max_active_s} (kv_len={kv_len_s}, query_len={query_len_s})"
+                    )
+                    if len(active_bs) < max_active_s:
                         masked_tile = self._get_masked_tile(aligned_query_lens[s])
-                        pad = padded_s - len(active_bs)
+                        pad = max_active_s - len(active_bs)
                         active_bs = active_bs + [active_bs[-1]] * pad
                         tiles = tiles + [masked_tile] * pad
                 active_block_indices.append(active_bs)
@@ -1070,7 +1111,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 blocks_s = active_block_indices[s]
             else:
                 # Pad with the last real page, as forward() does: raising the count to the
-                # range minimum can take it past the block table's width.
+                # range minimum or the num_blocks bucket can take it past the block table's width.
                 real = real_num_blocks[s]
                 blocks_s = list(range(real)) + [real - 1] * (n - real)
             table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
@@ -1109,7 +1150,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             if b_seqs is not None and plan is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
-                # chunk round-up.
+                # bucket round-up.
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 prefix = list(range(num_decode_seqs))
                 (
@@ -1280,12 +1321,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             plan = group_plan(members)
             return None if plan is None else plan.num_chunks
 
-        # Seeded by power-of-two length class, which keeps the merge below to a handful of
-        # candidates; it joins neighbouring classes whose chunk counts barely differ.
-        by_class: dict[int, list[int]] = {}
+        # One seed group per power-of-two block count.
+        by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
-            by_class.setdefault((max(nb, 1) - 1).bit_length(), []).append(s)
-        groups = [by_class[k] for k in sorted(by_class, reverse=True)]
+            by_bucket.setdefault((max(nb, 1) - 1).bit_length(), []).append(s)
+        groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
         merged = True
         while merged and len(groups) > 1:
             merged = False
@@ -1369,7 +1409,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """Metadata for the all-decode batch that dispatches to ``bucket``.
 
         ``num_seqs`` sequences of one query token each, all at the same length, so
-        ``find_sequence_bucket`` and ``batched_decode_plan`` return the bucket's own
+        ``find_sequence_bucket`` and ``find_batched_blocks_bucket`` return the bucket's own
         values and ``decode_uniformity`` is 1.
         """
         num_seqs = bucket.num_seqs
@@ -1844,16 +1884,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_blocks=int(attn_metadata.attention_mask_stacks[0].shape[0]),
             padded_query_len=attn_metadata.aligned_query_lens[0],
         )
-        # A sliding window realizes the pages its window touches, below the context the
-        # variant is requested at. Without one build() rounds the context into the page
-        # range, so a mismatch means the two have drifted and dispatch can ask for a
-        # kernel warmup never recorded.
-        if builder.sliding_window is None and realized != replace(
-            bucket,
-            num_blocks=builder.attn_bucketer.find_pages(
-                bucket.num_blocks, prefill=bucket.padded_query_len > 1
-            ),
-        ):
+        # Several requested buckets realize onto one kernel: a sliding window pads the
+        # block count to its own per-bucket maximum, below the num_blocks bucket.
+        # Without a window build() rounds onto the bucketer's own buckets, or with a page
+        # range onto its page counts, so a mismatch means the two have drifted and
+        # dispatch can ask for a kernel warmup never recorded.
+        expected = bucket
+        if builder.attn_bucketer.page_range is not None:
+            expected = replace(
+                bucket,
+                num_blocks=builder.attn_bucketer.find_declared_pages(
+                    bucket.num_blocks, prefill=bucket.padded_query_len > 1
+                ),
+            )
+        if realized != expected and builder.sliding_window is None:
             logger.warning(
                 "Attention variant %s realized as %s without a sliding window; the "
                 "bucketer and build() have diverged and some shapes will compile on "
@@ -1949,10 +1993,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.chunk_page_ids_cpu.shape[0] // attn_metadata.blocks_per_chunk,
             attn_metadata.chunk_range is not None,
         )
-        # A sliding window realizes the pages its window touches, which can need fewer
-        # chunks than requested. Without one build() lays the call out as the bucketer
-        # does, so a mismatch means the two have drifted and dispatch can ask for a
-        # kernel warmup never recorded.
+        # Several requested buckets realize onto one kernel: a sliding window pads the
+        # block count to its own per-bucket maximum, below the num_blocks bucket.
+        # Without a window build() rounds onto the bucketer's own buckets, so a
+        # mismatch means the two have drifted and dispatch can ask for a kernel
+        # warmup never recorded.
         requested = (
             bucket.num_seqs,
             bucket.blocks_per_chunk,

@@ -43,6 +43,17 @@ def test_copy_accepts_a_per_request_list() -> None:
     assert [tuple(t.shape) for t in host] == [(3, 2), (1, 2)]
 
 
+def test_copy_with_nothing_finished_returns_no_outputs() -> None:
+    assert output.copy_pooler_output_to_cpu(torch.zeros(2, 2), [False, False]) == [None, None]
+    assert output.copy_pooler_output_to_cpu([torch.zeros(2), None], [False, True]) == [None, None]
+
+
+@pytest.mark.parametrize("pooled", [torch.zeros(3, 2), [torch.zeros(2)] * 3])
+def test_copy_rejects_a_batch_the_mask_does_not_cover(pooled) -> None:
+    with pytest.raises(ValueError, match="does not match finished mask size"):
+        output.copy_pooler_output_to_cpu(pooled, [True, True])
+
+
 def _runner(pooler_output, finished_mask, num_reqs=2):
     calls = []
     state = types.SimpleNamespace(

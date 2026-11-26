@@ -55,8 +55,6 @@ find_isa(${CPUINFO} "S390" S390_FOUND)
 set(SPYRE_EXT_SRC
   "csrc/cpu/mrv2_kernels.cpp"
   "csrc/cpu/mrv2_spec_decode_kernels.cpp"
-  "csrc/cpu/sampling_kernels.cpp"
-  "csrc/cpu/spec_decode_utils.cpp"
   "csrc/cpu/topk_topp_sampler.cpp"
   "csrc/cpu/torch_bindings.cpp")
 

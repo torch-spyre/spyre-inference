@@ -115,10 +115,19 @@ def test_placeholder_next_power_of_2() -> None:
     assert powers == [1, 1, 2, 4, 1024, 1024]
 
 
+@pytest.mark.parametrize("csrc_filters", [True, False], ids=["csrc", "sort_free"])
 @pytest.mark.parametrize("use_k", [True, False])
 @pytest.mark.parametrize("use_p", [True, False])
-def test_sort_free_top_k_top_p_keeps_the_same_tokens(use_k: bool, use_p: bool) -> None:
+def test_sort_free_top_k_top_p_keeps_the_same_tokens(
+    use_k: bool, use_p: bool, csrc_filters: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from spyre_inference.v1.sample import sampling_kernels
+
+    if csrc_filters and not sampling_kernels.has_topk_topp_kernels():
+        pytest.skip("the csrc/ top-k/top-p filters are not built")
+    monkeypatch.setattr(sampling_kernels, "has_topk_topp_kernels", lambda: csrc_filters)
 
     # Not torch.manual_seed: seeding every device's generator initializes Spyre.
     logits = torch.randn(4, 1000, generator=torch.Generator().manual_seed(0))

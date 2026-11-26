@@ -1,4 +1,7 @@
 clickhouse-connect>=0.7.0
 # Shared v2 schema model, identity and write path; the same package the composite
 # ingest action installs, so both entry points run one implementation.
-spyre-clickhouse-ingest @ git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest
+# Pinned to the rev that added the ch_mgmt schema (#6715); the other three install
+# sites (action.yml:143, pre-commit.yml:79, push-to-clickhouse.yaml:124) live in
+# workflow/composite files and need a human to pin. Tracked on #1541.
+spyre-clickhouse-ingest @ git+https://github.com/torch-spyre/torch-spyre@f99177f10908b7afec681e8d16ade58faf3934f5#subdirectory=extensions/clickhouse-ingest

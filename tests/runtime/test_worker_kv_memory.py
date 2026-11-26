@@ -16,8 +16,8 @@
 (spyre-inference#901), with every block the measured memory pays for. Only the card is
 faked: torch.accelerator's memory view, with free bytes the test sets.
 
-The device cost per block comes from upstream's own KV cache grouping, and every layer's
-own page counts towards it, as allocate_spyre_kv_caches allocates them."""
+The device cost per block comes from upstream's own KV cache grouping and placement, as
+allocate_spyre_kv_caches allocates it."""
 
 import logging
 from types import SimpleNamespace
@@ -188,6 +188,26 @@ def test_a_mamba_hybrid_is_sized_by_its_per_layer_device_cost(monkeypatch):
     measured = worker.requested_memory - (TOTAL - 20 * GiB)
     assert blocks == measured // spyre_bytes_per_block
     assert blocks * spyre_bytes_per_block <= measured
+
+
+def test_a_hybrid_model_is_sized_at_upstreams_bytes_per_block(monkeypatch):
+    """Cache groups overlay one K/V pair per layer slot, so a block costs upstream's pool
+    bytes: here one full and one sliding layer share a slot, one page per block."""
+    specs = {
+        "layers.0.attn": _full(),
+        "layers.1.attn": SlidingWindowSpec(
+            block_size=128, num_kv_heads=4, head_size=128, dtype=torch.float16, sliding_window=512
+        ),
+    }
+    worker = _worker(
+        monkeypatch,
+        free_after_load=60 * GiB,
+        kv_cache_spec=specs,
+        hybrid_kv_cache_manager=True,
+        kv_cache_memory_bytes=3 * GiB,
+    )
+
+    assert worker.determine_available_memory() == (3 * GiB // BLOCK_BYTES) * BLOCK_BYTES
 
 
 @pytest.mark.parametrize(("spare_blocks", "warns"), [(-1, True), (0, False)])

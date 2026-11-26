@@ -48,6 +48,7 @@ Vocabulary:
 from __future__ import annotations
 
 import bisect
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -55,8 +56,10 @@ from typing import NamedTuple, TypedDict
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import max_decode_query_len
 
 from spyre_inference import envs
+from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
 from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
 
 logger = init_logger(__name__)
@@ -80,22 +83,66 @@ class DynamicRange(TypedDict):
     granularity: int
 
 
-def _chunk_width(b_seqs: int) -> int:
+def _verify_aligned(b_seqs: int, blocks_per_chunk: int, verify_len: int) -> int | None:
+    """``blocks_per_chunk`` rounded up so a verification's query gather fills whole sticks.
+
+    The gather holds ``entries * verify_len`` rows, ``entries = b_seqs * blocks_per_chunk``,
+    folded into the head axis; it compiles to wrong values on Spyre unless that count is a
+    multiple of an int32 stick. The extra slots read the masked padding page. None where
+    the rounding would push entries past the core target, which only a non-power-of-two
+    seq bucket does.
+    """
+    if verify_len == 1:
+        return blocks_per_chunk
+    step = INT32_ELEMS_PER_STICK // math.gcd(INT32_ELEMS_PER_STICK, b_seqs * verify_len)
+    blocks_per_chunk = -(-blocks_per_chunk // step) * step
+    if b_seqs * blocks_per_chunk > max(_SPYRE_CORE_COUNT, b_seqs):
+        return None
+    return blocks_per_chunk
+
+
+def _chunk_width(b_seqs: int, verify_len: int = 1) -> int | None:
     """The pages per sequence in one chunk: ``32 // b_seqs``, so that a chunk gives each
-    of the 32 cores one page, but at least 1."""
-    return max(1, _SPYRE_CORE_COUNT // b_seqs)
+    of the 32 cores one page, but at least 1. Under verification, rounded up as
+    ``_verify_aligned`` does; None where it cannot be."""
+    return _verify_aligned(b_seqs, max(1, _SPYRE_CORE_COUNT // b_seqs), verify_len)
 
 
-def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
+def batched_decode_chunking(
+    b_seqs: int, b_blocks: int, verify_len: int = 1
+) -> tuple[int, int] | None:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
     ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
     them, more than one stick's worth hits a backend axis-merge limit. The block
     axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+
+    A verification's query gather, ``entries * verify_len`` rows folded into the head
+    axis, compiles to wrong values on Spyre unless that count fills whole int32 sticks,
+    so ``blocks_per_chunk`` rounds up to make it; the extra slots read the masked
+    padding page. None where that would push entries past the target, which only a
+    non-power-of-two seq bucket does.
     """
-    blocks_per_chunk = min(_chunk_width(b_seqs), b_blocks)
+    blocks_per_chunk = _verify_aligned(
+        b_seqs, min(max(1, _SPYRE_CORE_COUNT // b_seqs), b_blocks), verify_len
+    )
+    if blocks_per_chunk is None:
+        return None
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
     return blocks_per_chunk, num_chunks
+
+
+def batched_decode_query_len(vllm_config: VllmConfig) -> int:
+    """Query width the batched decode kernel serves: 1, or 1 + k under spec decode.
+
+    The runner verifies all k drafts of every request, so a verification is 1 + k wide,
+    except under a per-batch-size k, which has no single width.
+    """
+    spec = vllm_config.speculative_config
+    if not envs.SPYRE_BATCHED_DECODE or spec is None or not spec.num_speculative_tokens:
+        return 1
+    width = 1 + spec.num_speculative_tokens
+    return 1 if spec.num_speculative_tokens_per_batch_size else width
 
 
 @dataclass(frozen=True)
@@ -114,10 +161,10 @@ class SpyreAttnBucket:
 class SpyreAttnBatchedDecodeBucket:
     """One recordable batched decode kernel variant.
 
-    The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
-    ``num_chunks`` (derived from the logical block-axis tensor extent). A dynamic kernel
-    (``dynamic_chunks``) runs every chunk count in its range; ``num_chunks`` is then the
-    count warmup records it at.
+    The kernel specializes on ``num_seqs``, ``blocks_per_chunk``, ``num_chunks``
+    (derived from the logical block-axis tensor extent) and ``verify_len``. A dynamic
+    kernel (``dynamic_chunks``) runs every chunk count in its range; ``num_chunks`` is
+    then the count warmup records it at.
     ``num_blocks`` is the bucket they were derived from, kept so the recorder can
     skip a bucket that outruns the KV allocation.
     """
@@ -127,6 +174,8 @@ class SpyreAttnBatchedDecodeBucket:
     blocks_per_chunk: int
     num_chunks: int
     dynamic_chunks: bool = False
+    # Query rows per sequence: 1, or 1 + k under speculative decoding.
+    verify_len: int = 1
 
 
 class BatchedDecodePlan(NamedTuple):
@@ -324,17 +373,20 @@ def _prefill_page_range(page_range: DynamicRange) -> DynamicRange:
 
 
 def _declared_chunk_ranges(
-    page_range: DynamicRange, num_seqs_buckets: list[int]
+    page_range: DynamicRange, num_seqs_buckets: list[int], verify_len: int = 1
 ) -> dict[int, DynamicRange]:
     """For each num_seqs bucket, the chunk counts its dynamic batched decode kernel runs:
     from ``page_range["min"]`` up to the count ``max_model_len`` needs.
 
     A bucket that never needs more than ``page_range["min"]`` chunks gets no entry and
-    keeps its KV buckets.
+    keeps its KV buckets, as does one with no chunk width at this ``verify_len``.
     """
     ranges: dict[int, DynamicRange] = {}
     for num_seqs in num_seqs_buckets:
-        max_chunks = -(-page_range["max"] // _chunk_width(num_seqs))
+        width = _chunk_width(num_seqs, verify_len)
+        if width is None:
+            continue
+        max_chunks = -(-page_range["max"] // width)
         # A range needs at least two sizes; a range with min == max does not compile.
         # With page_range["min"] at 2, a bucket whose max_model_len fits in two chunks
         # therefore gets no range.
@@ -391,6 +443,7 @@ class SpyreAttnBucketer:
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        self._max_num_batched_tokens = max_batched
 
         # A pooling request's query_len is its own context_len, so it can't
         # exceed max_model_len even when max_num_batched_tokens is larger (unlike
@@ -424,14 +477,19 @@ class SpyreAttnBucketer:
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
-        # build()) then multiples of a step up to max_num_batched_tokens, the
-        # query lengths a prefill pads up to.
+        # build()), the speculative verification width, then multiples of a step up
+        # to max_num_batched_tokens, the query lengths a prefill pads up to.
+        # Verification queries are 2..1+k tokens wide. Without their own bucket they
+        # would round up onto the prefill step and run a prefill-width kernel (and
+        # build a prefill-width mask) per sequence for a handful of real rows.
+        # 1 when speculative decoding is off, which leaves the ladder unchanged.
+        verify_len = min(max_decode_query_len(vllm_config), max_batched)
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
         self._query_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_QUERY_BUCKETS,
             max_batched,
             "SPYRE_ATTN_QUERY_BUCKETS",
-            lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
+            lambda: sorted({1, verify_len, *range(step, max_batched + 1, step), max_batched}),
         )
 
         # Default: the SPYRE_ATTN_KV_LADDER preset. Sparse because the recorded set is a
@@ -442,6 +500,9 @@ class SpyreAttnBucketer:
             "SPYRE_ATTN_KV_BUCKETS",
             lambda: kv_ladder(envs.SPYRE_ATTN_KV_LADDER)(max_model_len, block_size),
         )
+
+        # One width, not a ladder: the runner verifies all k drafts of every request.
+        self._batched_decode_query_len = batched_decode_query_len(vllm_config)
 
         # num_blocks is what the kernel specializes on. Derived from the kv
         # buckets, one block count per kv bucket, rather than enumerating every
@@ -469,7 +530,9 @@ class SpyreAttnBucketer:
         # than one chunk.
         self._chunk_ranges: dict[int, DynamicRange] = {}
         if self._page_range is not None:
-            self._chunk_ranges = _declared_chunk_ranges(self._page_range, self._num_seqs_buckets)
+            self._chunk_ranges = _declared_chunk_ranges(
+                self._page_range, self._num_seqs_buckets, self._batched_decode_query_len
+            )
 
         validate_kv_ladder_env()
 
@@ -533,6 +596,10 @@ class SpyreAttnBucketer:
     def num_seqs_buckets(self) -> list[int]:
         return self._num_seqs_buckets
 
+    @property
+    def batched_decode_query_len(self) -> int:
+        return self._batched_decode_query_len
+
     def find_kv_bucket(self, kv_len: int) -> int | None:
         return self._round_up(kv_len, self._kv_buckets)
 
@@ -590,19 +657,22 @@ class SpyreAttnBucketer:
         - Otherwise it runs the bucket's dynamic kernel with just enough chunks for
           ``num_blocks``, and at least ``chunk_range["min"]``.
 
-        Returns None if no KV bucket holds ``num_blocks``.
+        Chunks are as wide as the bucketer's verification width needs. Returns None if no
+        KV bucket holds ``num_blocks``, or if no chunk fills whole sticks at that width.
         """
         b_blocks = self.find_batched_blocks_bucket(num_blocks, num_seqs_bucket)
         if b_blocks is None:
             return None
+        verify_len = self._batched_decode_query_len
         chunk_range = self._chunk_ranges.get(num_seqs_bucket)
-        width = _chunk_width(num_seqs_bucket)
+        if chunk_range is None:
+            chunking = batched_decode_chunking(num_seqs_bucket, b_blocks, verify_len)
+            return None if chunking is None else BatchedDecodePlan(b_blocks, *chunking, None)
+        width = _chunk_width(num_seqs_bucket, verify_len)
+        # _declared_chunk_ranges gives a range only to a bucket that has a width.
+        assert width is not None
         if num_blocks <= width and self._has_one_chunk_kernel(num_seqs_bucket):
             return BatchedDecodePlan(width, width, 1, None)
-        if chunk_range is None:
-            return BatchedDecodePlan(
-                b_blocks, *batched_decode_chunking(num_seqs_bucket, b_blocks), None
-            )
         num_chunks = max(-(-num_blocks // width), chunk_range["min"])
         return BatchedDecodePlan(num_blocks, width, num_chunks, chunk_range)
 
@@ -617,7 +687,8 @@ class SpyreAttnBucketer:
         """
         if num_seqs_bucket not in self._chunk_ranges:
             return False
-        return self._num_blocks_buckets[0] <= _chunk_width(num_seqs_bucket)
+        width = _chunk_width(num_seqs_bucket, self._batched_decode_query_len)
+        return width is not None and self._num_blocks_buckets[0] <= width
 
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
@@ -672,14 +743,20 @@ class SpyreAttnBucketer:
         for num_seqs in self._num_seqs_buckets:
             blocks_buckets = self.batched_blocks_buckets(num_seqs)
             if num_seqs in self._chunk_ranges:
-                one_chunk = self._has_one_chunk_kernel(num_seqs)
-                blocks_buckets = [_chunk_width(num_seqs)] if one_chunk else []
+                width = _chunk_width(num_seqs, self._batched_decode_query_len)
+                one_chunk = width is not None and self._has_one_chunk_kernel(num_seqs)
+                blocks_buckets = [width] if one_chunk else []
                 blocks_buckets.append(self._num_blocks_buckets[-1])
             pairs.extend((nb, num_seqs) for nb in blocks_buckets)
         out: list[SpyreAttnBatchedDecodeBucket] = []
         for num_blocks, num_seqs in sorted(pairs, reverse=True):
+            # Wider than a step can schedule, so dispatch never reaches it.
+            if num_seqs * self._batched_decode_query_len > self._max_num_batched_tokens:
+                continue
             plan = self.batched_decode_plan(num_seqs, num_blocks)
-            assert plan is not None
+            if plan is None:
+                # No stick-aligned chunk at this verification width.
+                continue
             out.append(
                 SpyreAttnBatchedDecodeBucket(
                     num_seqs=num_seqs,
@@ -687,6 +764,7 @@ class SpyreAttnBucketer:
                     blocks_per_chunk=plan.blocks_per_chunk,
                     num_chunks=plan.num_chunks,
                     dynamic_chunks=plan.chunk_range is not None,
+                    verify_len=self._batched_decode_query_len,
                 )
             )
         return out

@@ -452,6 +452,8 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
+                from vllm.v1.attention.backend import max_decode_query_len
+
                 # Decode packs one token per running sequence; prefill lands on
                 # the largest bucket. Denser sizes only cost warmup time. The budget
                 # is the user's only if it still equals what they passed: a config
@@ -472,14 +474,24 @@ class TorchSpyrePlatform(CpuPlatform):
                         max_capture_size,
                     )
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                sizes = {max_capture_size, num_seqs}
+                seq_ladder = {num_seqs}
+                size = 1
+                while size < num_seqs:
+                    seq_ladder.add(size)
+                    size *= 2
+                sizes = {max_capture_size, *seq_ladder}
                 # Short prefills keep a default-size bucket instead of padding up.
                 if max_capture_size > prefill:
                     sizes.add(prefill)
-                size = 1
-                while size < num_seqs:
-                    sizes.add(size)
-                    size *= 2
+                # Speculative decoding: a decode step packs up to 1 + k tokens per
+                # running sequence, so n sequences fill n..n*(1+k) rows. Without
+                # buckets in that range such a step pads up to the prefill bucket,
+                # running the whole body at 512 rows for a few dozen real ones.
+                # One bucket per sequence-ladder rung keeps the padding bounded by
+                # that rung's width. 1 (a no-op here) when speculation is off.
+                verify_len = max_decode_query_len(vllm_config)
+                if verify_len > 1:
+                    sizes |= {min(n * verify_len, max_capture_size) for n in seq_ladder}
                 compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
@@ -799,9 +811,10 @@ class TorchSpyrePlatform(CpuPlatform):
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
         unsupported = {
-            "speculative decoding other than DFlash/XPress": (
+            "speculative decoding other than DFlash/XPress and suffix": (
                 vllm_config.speculative_config is not None
                 and not vllm_config.speculative_config.use_dflash()
+                and vllm_config.speculative_config.method != "suffix"
             ),
             # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
             "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),
@@ -1049,6 +1062,10 @@ class TorchSpyrePlatform(CpuPlatform):
         triton_gate.check(mrv2_kernels)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner()
+        # Every process, ahead of the V2 validation that follows this hook in __post_init__.
+        from spyre_inference.v1.spec_decode.config import allow_suffix_on_v2
+
+        allow_suffix_on_v2()
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.rejection_sample_method == "fly":

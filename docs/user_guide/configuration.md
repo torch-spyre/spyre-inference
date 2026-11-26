@@ -200,6 +200,21 @@ device memory (#1302). At a long `--max-model-len`, a 2048-token bucket can push
 largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
 they are left to compile on first use (torch-spyre#5250 makes that limit configurable).
 
+**Speculative decoding.** A verification step packs up to `1 + num_speculative_tokens`
+tokens per running sequence, so the one-token decode ladder above would pad it all the way
+up to the prefill bucket. When `speculative_config` is set and `compile_sizes` is left
+unset, the default ladder therefore also gets one bucket per sequence-count rung times
+`1 + num_speculative_tokens`, clamped to the prefill bucket. For `--max-num-seqs 5` with
+`num_speculative_tokens=3` that is `[1, 2, 4, 5, 8, 16, 20, 512]`. The same width is added
+to the default attention query buckets (`[1, 4, 512]` in that case), so a verification
+request runs a 4-wide attention kernel instead of a 512-wide one. Both follow
+`num_speculative_tokens` automatically; an explicit `compile_sizes` or
+`SPYRE_ATTN_QUERY_BUCKETS` still wins, and then needs to include the verification widths
+yourself. Each extra body bucket adds a warmup compile.
+Suffix decoding (`"method": "suffix"`) always verifies all `num_speculative_tokens`
+drafts, as upstream's ngram speculator does: when the suffix cache speculates fewer, the
+rest repeat the last sampled token, so every verification has the same width.
+
 **Attention (KV length × query length).** Set the buckets directly as comma-separated
 lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
 `--max-num-batched-tokens` (query) are dropped, and the limit is appended if missing, so
@@ -368,7 +383,7 @@ Differences from the removed V1 runner:
 
 - Seeded sampling draws a different token sequence for the same seed, because MRV2
   seeds each position rather than one generator per request. Greedy output is unchanged.
-- These are refused at startup: speculative decoding other than DFlash/XPress,
+- These are refused at startup: speculative decoding other than DFlash/XPress and suffix,
   batch-sharded sampling, `cudagraph_mm_encoder`, prefill context parallelism, and,
   untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).
 

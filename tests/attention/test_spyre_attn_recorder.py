@@ -153,9 +153,22 @@ def sliding_window_builder(default_vllm_config):
 
 
 def make_bucketer(
-    max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8, declare_pages=False
+    max_model_len=256,
+    max_num_batched_tokens=64,
+    max_num_seqs=8,
+    num_speculative_tokens=None,
+    declare_pages=False,
 ):
     config = MagicMock()
+    config.speculative_config = (
+        None
+        if num_speculative_tokens is None
+        else SimpleNamespace(
+            num_speculative_tokens=num_speculative_tokens,
+            num_speculative_tokens_per_batch_size=None,
+            parallel_drafting=False,
+        )
+    )
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
@@ -918,6 +931,93 @@ class TestRecordBatchedDecode:
                     metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
+
+
+class TestRecordBatchedVerify:
+    """Speculative verification at k = 3: every batched variant is 4 query rows wide."""
+
+    K = 3
+    PAGES = 64
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        yield
+        envs.clear_env_cache()
+
+    @pytest.fixture()
+    def spec_builder(self, speculative_decoding):
+        # Before the builder: its decode threshold comes from the config.
+        speculative_decoding(self.K)
+        builder = _make_builder(
+            AttentionSpec(
+                block_size=BLOCK_SIZE,
+                num_kv_heads=NUM_KV_HEADS,
+                head_size=HEAD_SIZE,
+                dtype=torch.float16,
+            )
+        )
+        builder._attn_bucketer = make_bucketer(num_speculative_tokens=self.K)
+        return builder
+
+    @pytest.fixture()
+    def wide_cache(self, spyre_device):
+        return SpyreAttentionImpl.allocate_pages(self.PAGES, SPEC, spyre_device)
+
+    def test_verify_dispatch_after_recording_compiles_nothing(self, impl, wide_cache, spec_builder):
+        bucketer = spec_builder._attn_bucketer
+        variants = bucketer.batched_decode_variants()
+        assert {v.verify_len for v in variants} == {self.K + 1}
+        _record(impl, wide_cache, spec_builder)
+
+        snapshot = compiles()
+        for bucket in variants:
+            if bucket.num_seqs * bucket.blocks_per_chunk < self.PAGES:
+                _dispatch_batched(impl, spec_builder, wide_cache, bucket)
+        assert compiles() == snapshot
+
+    def test_real_verify_batch_lands_on_a_recorded_key(self, spec_builder):
+        """Built by the builder whose bucketer is enumerated, as warmup records it."""
+        from vllm.v1.attention.backend import CommonAttentionMetadata
+
+        verify_len = self.K + 1
+        keys = {
+            (v.num_seqs, v.blocks_per_chunk, None if v.dynamic_chunks else v.num_chunks)
+            for v in spec_builder._attn_bucketer.batched_decode_variants()
+        }
+        for num_seqs in (1, 3):
+            for kv_len in (65, 200):
+                query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32) * verify_len
+                seq_lens = torch.full((num_seqs,), kv_len, dtype=torch.int32)
+                metadata = spec_builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=CommonAttentionMetadata(
+                        query_start_loc=query_start_loc,
+                        query_start_loc_cpu=query_start_loc,
+                        seq_lens=seq_lens,
+                        num_reqs=num_seqs,
+                        num_actual_tokens=num_seqs * verify_len,
+                        max_query_len=verify_len,
+                        max_seq_len=kv_len,
+                        block_table_tensor=torch.arange(
+                            num_seqs * NUM_PAGES, dtype=torch.int32
+                        ).reshape(num_seqs, NUM_PAGES),
+                        slot_mapping=torch.zeros(num_seqs * verify_len, dtype=torch.int64),
+                        causal=True,
+                        is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+                    ),
+                )
+                assert metadata.padded_num_seqs is not None, "builder declined the batched path"
+                assert metadata.chunk_page_ids_cpu is not None
+                assert metadata.decode_query_len == verify_len
+                num_chunks = metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk
+                key = (
+                    metadata.padded_num_seqs,
+                    metadata.blocks_per_chunk,
+                    None if metadata.chunk_range is not None else num_chunks,
+                )
+                assert key in keys, f"{key} was never recorded"
 
 
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])

@@ -14,8 +14,7 @@
 
 """Per-sequence paged attention over a head-major KV cache.
 
-Batched GQA over ``[kv_head, group, query, D]``, one accumulator, store fuses. Decode rows
-run ``batched_decode`` instead; this kernel serves one only when that path is declined.
+Batched GQA over ``[kv_head, group, query, D]``, one accumulator, store fuses.
 """
 
 import torch

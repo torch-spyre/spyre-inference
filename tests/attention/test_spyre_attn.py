@@ -951,8 +951,7 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
 
 
 def test_one_token_extend_joins_the_batched_decode_prefix(default_vllm_config, monkeypatch):
-    """MRV2 marks a one-token extend (the recomputed last token of a fully cached prompt)
-    as prefilling. To attention it is a decode, and the batched kernel serves it."""
+    """A one-token extend, which MRV2 marks as prefilling, joins the batched decode prefix."""
     torch.set_default_device("cpu")
     query_start_loc = torch.tensor([0, 1, 2, 66], dtype=torch.int32)
     metadata = _build_metadata(
@@ -2529,7 +2528,6 @@ def test_spyre_attn_soft_cap(
 @pytest.mark.parametrize(
     ("seq_lens", "sliding_window"),
     [
-        # Batched decode for the decode row, the per-seq loop for the prefill.
         pytest.param([(1, 300), (64, 200)], None, id="mixed"),
         pytest.param([(1, 300), (64, 200)], 128, id="mixed_sliding_window(128)"),
         # kv 512 at block 64 spans several chunks, so the batched kernel's per-slot merge

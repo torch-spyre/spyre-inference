@@ -24,15 +24,11 @@ from vllm.model_executor.models.idefics2_vision_model import Idefics2VisionAtten
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
-    SEGMENT_ITEMS,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
     fold_conv_patch_embedding,
     offset_major,
-    one_hot_segments,
-    segment_buffer,
-    segment_mask,
     split_weight_by_group,
 )
 from spyre_inference.multimodal.utils import (
@@ -64,11 +60,21 @@ def tile_position_ids(patch_mask: torch.Tensor, side: int) -> torch.Tensor:
     return torch.where(patch_mask.flatten(1), bucket_h * side + bucket_w, 0)
 
 
+def tile_offset_major(t: torch.Tensor, tiles: int, merge: int) -> torch.Tensor:
+    """``[tiles * hp, wp, ...]`` -> ``[tiles * hp * wp, ...]``, each tile's patches offset-major.
+
+    A tile is ``[merge**2 offsets, tokens, ...]``, flattened, and tiles follow each other. Tiles
+    are stacked along the height, so with ``hp % merge == 0`` a merge window never crosses one.
+    """
+    groups = offset_major(t, merge)
+    groups = groups.reshape(merge**2, tiles, -1, *groups.shape[2:])
+    return groups.transpose(0, 1).reshape(-1, *t.shape[2:])
+
+
 class SpyreIdefics2VisionAttention(Idefics2VisionAttention):
     """Upstream's vision attention with the stick-aligned SDPA in place of ``MMEncoderAttention``.
 
-    Always takes the additive same-tile ``attention_mask``, which ``vision_embed`` builds once per
-    encoder call, so upstream's mask-free ``MMEncoderAttention`` branch is never used.
+    Tiles are the batch axis, so each attends to its own patches only and takes no mask.
     """
 
     def forward(  # ty: ignore[invalid-method-override]
@@ -77,6 +83,7 @@ class SpyreIdefics2VisionAttention(Idefics2VisionAttention):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, patches, _ = hidden_states.shape
+        assert attention_mask is None, "tiles are batched, so attention takes no mask"
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = (
             t.reshape(batch, patches, self.num_heads_per_partition, self.head_dim).transpose(1, 2)
@@ -91,8 +98,6 @@ class SpyreIdefics2VisionAttention(Idefics2VisionAttention):
 class SpyreIdefics3ForConditionalGeneration(
     SpyreVisionEncoderMixin, idefics3.Idefics3ForConditionalGeneration
 ):
-    vision_max_items_per_call = SEGMENT_ITEMS
-
     # --- construction ---
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -106,9 +111,9 @@ class SpyreIdefics3ForConditionalGeneration(
         # One image token is a pixel-shuffle window of scale_factor**2 patches.
         self.patches_per_token = self.config.scale_factor**2
         self.out_hidden_size = self.config.text_config.hidden_size
+        self._tile_patches = (vision.image_size // vision.patch_size) ** 2
         self.vision_buffers = {
             "patches": VisionBuffer(align_up(vision.num_channels * vision.patch_size**2)),
-            "segments": segment_buffer(),
             # Index into the learned position embedding.
             "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
@@ -141,6 +146,15 @@ class SpyreIdefics3ForConditionalGeneration(
             requires_grad=False,
         )
 
+    # Whole tiles pad at the end of the budget: tiles attend within themselves.
+    @property
+    def vision_pad_groups(self) -> int:
+        return 1
+
+    @property
+    def vision_patch_multiple(self) -> int:
+        return self._tile_patches
+
     # --- SpyreVisionEncoderMixin hooks ---
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
@@ -148,18 +162,14 @@ class SpyreIdefics3ForConditionalGeneration(
         return [n * self.model.image_seq_len for n in self._get_num_patches_list(mm_kwargs)]
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Offset-major patches of every tile, each flattened as ``(c, py, px)`` like the conv
-        weight, with its one-hot tile and its position-embedding index.
-
-        Upstream attends within a tile, so the tile, not the image, is the segment.
-        """
+        """Every tile's patches, each flattened as ``(c, py, px)`` like the conv weight, with
+        its position-embedding index. A tile is ``[scale_factor**2 offsets, tokens]``, flattened,
+        so ``vision_project``'s merge is a view and the tiles are the attention's batch axis."""
         vision = self.config.vision_config
         p, m = vision.patch_size, self.config.scale_factor
         pixel_values = convert(mm_kwargs["pixel_values"], device="cpu")
         pixel_mask = convert(mm_kwargs["pixel_attention_mask"], device="cpu")
         tiles, c, h, w = pixel_values.shape
-        if tiles > SEGMENT_ITEMS:
-            raise ValueError(f"{tiles} tiles in one call; at most {SEGMENT_ITEMS} fit the one-hot")
         if h % (p * m) or w % (p * m):
             raise ValueError(f"{h}x{w} is not a multiple of {p * m}")
         hp, wp = h // p, w // p
@@ -168,19 +178,16 @@ class SpyreIdefics3ForConditionalGeneration(
         pos = tile_position_ids(
             self.model.get_patch_attention_mask(pixel_mask), vision.image_size // p
         )
-        # All tiles at once: stacked along the height, a merge window (m rows, hp % m == 0) never
-        # crosses a tile, so ``offset_major`` yields each group's tokens tile by tile.
-        patches = offset_major(grids.reshape(tiles * hp, wp, -1), m)
-        positions = offset_major(pos.reshape(tiles * hp, wp), m)
-        tokens_per_tile = (hp // m) * (wp // m)
-        tile_ids = torch.arange(tiles).repeat_interleave(tokens_per_tile).repeat(m * m)
+        # Attention has no RoPE and the positions are gathered by index, so a tile's patch order
+        # is free: offset-major here, on the host, leaves the graph no regrouping to do.
+        patches = tile_offset_major(grids.reshape(tiles * hp, wp, -1), tiles, m)
+        positions = tile_offset_major(pos.reshape(tiles * hp, wp), tiles, m)
 
-        flat = patches.flatten(0, 1).to(torch.float16)
+        flat = patches.to(torch.float16)
         width = cast(int, self.vision_buffers["patches"].width)
         return {
             "patches": F.pad(flat, (0, width - flat.shape[1])),
-            "segments": one_hot_segments(tile_ids),
-            "positions": positions.flatten().to(torch.int64),
+            "positions": positions.to(torch.int64),
         }
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -189,18 +196,22 @@ class SpyreIdefics3ForConditionalGeneration(
         patch_weight_t = cast(torch.Tensor, embeddings.patch_embedding.weight)
         bias = cast(torch.Tensor, embeddings.patch_embedding.bias)
         position = self.spyre_position_table.gather(values["positions"])
-        x = (torch.matmul(values["patches"], patch_weight_t) + bias + position).unsqueeze(0)
-        # No pre-norm and no RoPE: the blocks take only the same-tile mask.
-        return x, {"attention_mask": segment_mask(values["segments"], x.dtype)}
+        x = torch.matmul(values["patches"], patch_weight_t) + bias + position
+        # Tiles are the batch axis, so no pre-norm, no RoPE and no mask.
+        return x.view(-1, self._tile_patches, x.shape[-1]), {}
 
     def vision_blocks(self) -> nn.ModuleList:
         return self.model.vision_model.encoder.layers
 
     def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
-        x = self.model.vision_model.post_layernorm(x.squeeze(0))
+        x = self.model.vision_model.post_layernorm(x)
         # Upstream's pixel_shuffle concatenates a window's patches as (hi, wi, D), the offset-major
-        # group order, so the projection is one [tokens, D] matmul per group, summed.
-        x = x.reshape(self.patches_per_token, -1, x.shape[-1])
+        # group order, so the projection is one [tokens, D] matmul per group, summed. Each tile
+        # is [groups, tokens, D]: swap the tile and group axes to put the groups first.
+        groups = self.patches_per_token
+        tokens = self._tile_patches // groups
+        width = x.shape[-1]
+        x = x.reshape(-1, groups, tokens, width).transpose(0, 1).reshape(groups, -1, width)
         # [scale_factor**2, D, D_out] since process_weights_after_loading.
         proj_weight = cast(torch.Tensor, self.model.connector.modality_projection.proj.weight)
         return torch.matmul(x, proj_weight).sum(dim=0)

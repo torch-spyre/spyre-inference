@@ -14,10 +14,11 @@
 
 """``SpyreIdefics3ForConditionalGeneration``'s vision pipeline against upstream Idefics3.
 
-The pipeline reorders patches offset-major, folds the conv into a linear, turns the learned
-position embedding into a gather table, splits the connector's weight per pixel-shuffle offset
-and pads to a bucket; these tests pin each of those to the upstream result on CPU. The on-card
-twins at the bottom skip without a device.
+The pipeline reorders each tile's patches offset-major, batches the tiles for mask-free
+attention, folds the conv into a linear, turns the learned position embedding into a gather
+table, splits the connector's weight per pixel-shuffle offset and pads to a bucket of whole
+tiles; these tests pin each of those to the upstream result on CPU. The on-card twins at the
+bottom skip without a device.
 """
 
 import inspect
@@ -187,8 +188,8 @@ def test_pipeline_matches_upstream(tp_group, num_images):
 
 
 def test_padding_does_not_leak_into_tiles(tp_group):
-    """Bucket padding must not change any tile's embedding: padding slots have their own
-    segment, and each offset group is padded separately."""
+    """Bucket padding must not change any tile's embedding: padding is whole tiles, which
+    attend only to themselves."""
     model = _spyre_model(_config(num_layers=1))
     mm_kwargs = _mm_kwargs()
     values = model.prepare_encoder_cudagraph_replay_buffers(mm_kwargs, 0, 0).values
@@ -214,6 +215,26 @@ def test_item_tokens_match_patches_per_token(tp_group):
 
     assert tokens == [n * (SIDE // SCALE) ** 2 for n in TILES_PER_IMAGE]
     assert sum(tokens) * model.patches_per_token == patches
+
+
+def test_tiles_are_whole_padding_units(tp_group):
+    model = _spyre_model(_config(num_layers=1))
+
+    assert model.vision_pad_groups == 1
+    assert model.vision_patch_multiple == SIDE * SIDE
+    assert "segments" not in model.vision_buffers
+
+
+def test_tile_offset_major_orders_each_tile_alone():
+    from spyre_inference.models._vision_encoder import offset_major
+    from spyre_inference.models.idefics3 import tile_offset_major
+
+    tiles = 3
+    t = torch.randn(tiles * SIDE, SIDE, 5)
+    expected = torch.cat(
+        [offset_major(tile, SCALE).flatten(0, 1) for tile in t.reshape(tiles, SIDE, SIDE, 5)]
+    )
+    torch.testing.assert_close(tile_offset_major(t, tiles, SCALE), expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("partial", [False, True])
@@ -344,10 +365,9 @@ def test_block_compile_is_honoured(tp_group):
         return gm.forward
 
     block.compile(backend=backend, fullgraph=True, dynamic=False)
-    # As in the pipeline: a whole stick of patches and an additive mask at the input's dtype,
-    # which `padded_sdpa` takes as is (any other length needs a bool keep-mask).
-    x = torch.randn(1, STICK, HIDDEN)
-    block(x, attention_mask=torch.zeros(1, 1, STICK, STICK))
+    # As in the pipeline: tiles on the batch axis, each a whole stick of patches, no mask.
+    x = torch.randn(2, STICK, HIDDEN)
+    block(x)
     assert graphs
 
 

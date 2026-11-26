@@ -25,7 +25,8 @@ query_len buckets).
 
 The batched decode kernel runs all decode sequences of a step in one call and
 specializes on its own key, ``(num_seqs, blocks_per_chunk, num_chunks)``, hence a
-second bucket type and enumerator.
+second bucket type and enumerator. Packed onto lanes (see ``packed_lanes``), only
+``num_chunks`` varies.
 
 Vocabulary:
 
@@ -35,7 +36,7 @@ Vocabulary:
 - A *page* (also *block*) is one KV cache block: ``block_size`` tokens of one sequence.
 - A *chunk* is what the batched decode kernel reads in one loop step: the next
   ``blocks_per_chunk`` pages of every sequence in the batch. ``_chunk_width`` picks
-  ``blocks_per_chunk`` so that a chunk holds about 32 pages, one per core, and at least
+  ``blocks_per_chunk`` so that a chunk holds about 64 pages, two per core, and at least
   one page of each sequence. A batch runs as many chunks as its longest sequence needs;
   shorter sequences are masked past their end. The per-sequence prefill kernel's
   counterpart is its *page group*, ``page_group`` pages of one sequence per loop step.
@@ -66,8 +67,38 @@ logger = init_logger(__name__)
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 
-# Cores available to split a gather's entry axis across.
-_SPYRE_CORE_COUNT = 32
+# Gathered pages per batched-decode trip, two per core. Each trip has a fixed cost, so a
+# long context pays for its trip count; 64 entries measured faster than 32 at long context
+# and no slower at short.
+BATCHED_DECODE_ENTRIES = 64
+
+
+def packed_lanes(blocks: list[int], entries: int = BATCHED_DECODE_ENTRIES) -> list[int]:
+    """How many of a trip's entries each sequence's pages get, as lanes.
+
+    One lane each, then the rest one at a time to whichever sequence needs the most trips,
+    which minimizes the longest one's. A sequence gets no more lanes than it has pages;
+    lanes left over sit idle. Splitting a trip by page count rather than evenly is what
+    keeps a short sequence from padding up to the longest one in the batch.
+    """
+    lanes = [1] * len(blocks)
+    for _ in range(entries - len(blocks)):
+        trips = [-(-b // n) if n < b else 0 for b, n in zip(blocks, lanes)]
+        i = max(range(len(blocks)), key=lambda k: trips[k])
+        if not trips[i]:
+            break
+        lanes[i] += 1
+    return lanes
+
+
+def _quarter_octaves_up_to(n: int) -> list[int]:
+    """1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, ...: four steps per doubling, plus n."""
+    out = {n}
+    v = 1
+    while v < n:
+        out.update(x for x in (v, v * 5 // 4, v * 3 // 2, v * 7 // 4) if 0 < x < n)
+        v *= 2
+    return sorted(out)
 
 
 class DynamicRange(TypedDict):
@@ -81,17 +112,17 @@ class DynamicRange(TypedDict):
 
 
 def _chunk_width(b_seqs: int) -> int:
-    """The pages per sequence in one chunk: ``32 // b_seqs``, so that a chunk gives each
-    of the 32 cores one page, but at least 1."""
-    return max(1, _SPYRE_CORE_COUNT // b_seqs)
+    """The pages per sequence in one chunk: ``BATCHED_DECODE_ENTRIES // b_seqs``, but at
+    least 1."""
+    return max(1, BATCHED_DECODE_ENTRIES // b_seqs)
 
 
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
-    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
-    them, more than one stick's worth hits a backend axis-merge limit. The block
-    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+    ``entries = b_seqs * blocks_per_chunk`` targets ``BATCHED_DECODE_ENTRIES``: fewer
+    takes more trips. The block axis pads up to a whole chunk, so
+    ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
     blocks_per_chunk = min(_chunk_width(b_seqs), b_blocks)
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
@@ -127,6 +158,8 @@ class SpyreAttnBatchedDecodeBucket:
     blocks_per_chunk: int
     num_chunks: int
     dynamic_chunks: bool = False
+    # Lanes (see packed_lanes): num_seqs is the lane count and blocks_per_chunk 1.
+    packed: bool = False
 
 
 class BatchedDecodePlan(NamedTuple):
@@ -565,6 +598,37 @@ class SpyreAttnBucketer:
         g = page_range["granularity"]
         return max(-(-num_blocks // g) * g, page_range["min"])
 
+    @property
+    def packed_out_seqs(self) -> int:
+        """Output rows of a packed decode: one seq bucket every packed batch shares.
+
+        The smallest bucket holding a full trip of one-lane sequences, else the widest.
+        """
+        widest = self._round_up(
+            min(BATCHED_DECODE_ENTRIES, self._num_seqs_buckets[-1]), self._num_seqs_buckets
+        )
+        assert widest is not None
+        return widest
+
+    def packed_eligible(self, num_seqs: int) -> bool:
+        """Whether a decode batch this wide fits one trip's lanes, one each at least."""
+        return num_seqs <= min(BATCHED_DECODE_ENTRIES, self.packed_out_seqs)
+
+    @property
+    def packed_chunk_buckets(self) -> list[int]:
+        """Trip counts a packed decode rounds up onto.
+
+        At most a full-length sequence sharing the lanes evenly with as many others as a
+        trip can hold; packed_lanes never does worse than an even share. Four steps per
+        doubling: the count no longer multiplies with the seq buckets, so it can be dense.
+        """
+        widest = min(BATCHED_DECODE_ENTRIES, self.packed_out_seqs)
+        share = max(1, BATCHED_DECODE_ENTRIES // widest)
+        return _quarter_octaves_up_to(-(-self._num_blocks_buckets[-1] // share))
+
+    def find_packed_chunks(self, trips: int) -> int | None:
+        return self._round_up(trips, self.packed_chunk_buckets)
+
     def batched_blocks_buckets(self, num_seqs_bucket: int) -> list[int]:
         """The num_blocks buckets batched decode records and dispatches onto at this batch size.
 
@@ -612,7 +676,7 @@ class SpyreAttnBucketer:
 
         That kernel reads ``_chunk_width`` pages per sequence, so the smallest KV bucket
         must be no larger. With one KV head the smallest KV bucket is 2 pages, because the
-        decode kernel does not compile on a single page. At 32 sequences a chunk is 1
+        decode kernel does not compile on a single page. At 64 sequences a chunk is 1
         page, so there is no one-chunk kernel and every call runs the dynamic kernel.
         """
         if num_seqs_bucket not in self._chunk_ranges:
@@ -657,26 +721,41 @@ class SpyreAttnBucketer:
                 )
         return out
 
-    def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
+    def batched_decode_variants(self, packed: bool = False) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
         Each num_seqs bucket against its own ``batched_blocks_buckets``: unlike
         ``variants()`` there is no inter-axis bound to exploit, since a decode
         batch of any size can sit at any context length. A num_seqs bucket with a chunk
         range records just two variants instead: the one-chunk kernel, where there is one,
-        and its dynamic kernel at the chunk count of max_model_len.
+        and its dynamic kernel at the chunk count of max_model_len. ``packed`` (a builder
+        without a sliding window) replaces every bucket a packed trip covers with the
+        trip-count ladder, keeping the grid only for batches too wide for it.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
+        out: list[SpyreAttnBatchedDecodeBucket] = []
+        if packed:
+            out = [
+                SpyreAttnBatchedDecodeBucket(
+                    num_seqs=BATCHED_DECODE_ENTRIES,
+                    num_blocks=c,
+                    blocks_per_chunk=1,
+                    num_chunks=c,
+                    packed=True,
+                )
+                for c in reversed(self.packed_chunk_buckets)
+            ]
         pairs = []
         for num_seqs in self._num_seqs_buckets:
+            if packed and self.packed_eligible(num_seqs):
+                continue
             blocks_buckets = self.batched_blocks_buckets(num_seqs)
             if num_seqs in self._chunk_ranges:
                 one_chunk = self._has_one_chunk_kernel(num_seqs)
                 blocks_buckets = [_chunk_width(num_seqs)] if one_chunk else []
                 blocks_buckets.append(self._num_blocks_buckets[-1])
             pairs.extend((nb, num_seqs) for nb in blocks_buckets)
-        out: list[SpyreAttnBatchedDecodeBucket] = []
         for num_blocks, num_seqs in sorted(pairs, reverse=True):
             plan = self.batched_decode_plan(num_seqs, num_blocks)
             assert plan is not None

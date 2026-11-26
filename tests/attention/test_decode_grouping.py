@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Card-free tests for splitting a batched decode into length groups."""
+"""Card-free tests for splitting a batched decode into length groups.
+
+Grouping belongs to the grid path, which a batch too wide for a packed trip and a sliding
+window still take; ``decode_config`` sends every batch here down it.
+"""
 
 import pytest
 import torch
@@ -26,7 +30,10 @@ KV_HEADS, HEAD = 2, 64
 def decode_config(default_vllm_config, monkeypatch):
     from vllm.config import get_current_vllm_config
 
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setattr(SpyreAttnBucketer, "packed_eligible", lambda self, num_seqs: False)
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 32768
@@ -124,7 +131,7 @@ def test_each_group_matches_its_own_batch(decode_config, monkeypatch, kv_lens):
 
 @pytest.mark.parametrize(("group_cost", "split"), [(2, True), (8, False)])
 def test_groups_merge_within_the_dispatch_cost(decode_config, monkeypatch, group_cost, split):
-    """256 + 2 blocks: 8 + 1 chunks apart, 16 as one batch, so a dispatch worth 8
+    """256 + 2 blocks: 4 + 1 chunks apart, 8 as one batch, so a dispatch worth 8
     chunks merges them and one worth 2 does not."""
     from spyre_inference.v1.attention.backends import spyre_attn
 

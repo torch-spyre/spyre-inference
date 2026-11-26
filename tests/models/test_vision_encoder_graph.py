@@ -527,8 +527,8 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it(monkeypatch):
     )
     merged = []
     merge = model.vision_merge
-    model.vision_merge = lambda text, image, mask: merged.append(text.shape[0]) or merge(
-        text, image, mask
+    model.vision_merge = lambda text, image, mask: (
+        merged.append(text.shape[0]) or merge(text, image, mask)
     )
 
     warmup._record_vision_graphs(runner, [1, 4, 16])
@@ -647,10 +647,8 @@ def test_upstream_returns_text_alone_when_handed_no_image_tokens():
     host = SimpleNamespace(
         _has_oov_mm_tokens=False,
         get_language_model=lambda: SimpleNamespace(embed_input_ids=lambda ids: text),
-        _embed_text_input_ids=lambda ids,
-        embed,
-        is_multimodal: SupportsMultiModal._embed_text_input_ids(
-            host, ids, embed, is_multimodal=is_multimodal
+        _embed_text_input_ids=lambda ids, embed, is_multimodal: (
+            SupportsMultiModal._embed_text_input_ids(host, ids, embed, is_multimodal=is_multimodal)
         ),
     )
     original = vllm_utils._merge_multimodal_embeddings

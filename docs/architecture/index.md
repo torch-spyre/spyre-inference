@@ -477,30 +477,22 @@ walk over block chunks. The kernels carry the online softmax as a
 
 ### LX-resident pages
 
-The per-sequence decode kernel (`page_attn_decode`, one query row) keeps a
-gathered page in the LX scratchpad from its gather to its last use instead of
-round-tripping through HBM. A query wider than one row amortises the page transfer over
-every row, so it takes `page_attn_prefill` instead: batched GQA over the unfolded
-cache, one whole page per gather. Two shape choices get the decode kernel to LX residency. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
-gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
-behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
-groups fold into the query's row axis — a reshape, since heads are KV-major — so each
-matmul carries a single batch dim: the batched GQA form leaves the page with two batch dims
-and Inductor clones it out to a query-group axis it does not have (torch-spyre#4123). The
-cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
-`[num_blocks * KV, block_size, D]` — but the cache is allocated with that folded axis at
-device dim 0, which is where an indexed axis has to sit for the gather to cost one page
-rather than the whole tensor.
+Decode rows run the batched decode kernel, even for one sequence. It gathers whole pages,
+which stay in the LX scratchpad from the gather to their last use instead of round-tripping
+through HBM. The per-sequence loop runs `page_attn_prefill`: batched GQA over the cache, one
+whole page per gather, the page transfer amortised over every query row. It also serves the
+decode rows batched decode declines (`SPYRE_BATCHED_DECODE=0`, or a cache too small for the
+gather), at query width 1.
 
-Two things follow from those choices. The gather is a 2-D subscript, which lowers to
-`aten.index` and fails eager on Spyre by upcasting its int32 index (torch-spyre#4334,
-tracked by `test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is
-always compiled on Spyre, even under `--enforce-eager` — attention compiles in its own
-domain, so the rest of the model still runs eager. Because the bmm's
-output axes (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling
-them would mean K-splitting a reduction a gather cannot mirror, the attention compile alone
-is capped at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's
-page index is uploaded one entry per stick, which is what the tiled walk needs.
+Batched decode's page gather is a subscript, which lowers to `aten.index` and fails eager
+on Spyre by upcasting its int32 index (torch-spyre#4334, tracked by
+`test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is always compiled
+on Spyre, even under `--enforce-eager` — attention compiles in its own domain, so the rest
+of the model still runs eager. Because a narrow query's bmm output axes
+(`num_kv_heads * padded_query_len`) cannot fill 32 cores, and filling them would mean
+K-splitting a reduction a gather cannot mirror, such an attention compile alone is capped
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's page index is
+uploaded one entry per stick, which is what the tiled walk needs.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
 planner's own verdicts. Read those from the allocation — `LifetimeBoundBuffer.address`, where
@@ -511,8 +503,7 @@ transpose to a restickify, whose cross-frame barrier bars an LX-resident input w
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
 
-Batched decode needs none of this. Its whole-page gather is LX-resident as it stands, so the
-per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding anyway divides
+Folding the cache on `(page, kv_head)` would buy batched decode nothing: it divides
 `blocks_per_chunk` by `num_kv_heads` and multiplies the chunk trips, which measured roughly
 1.5–2x more kernel time across the decode batches and contexts tried.
 
@@ -525,7 +516,7 @@ The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first 
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
 has no device lowering and falls back to CPU, which writes bytes in sequential order
 while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `QFP8CH` in
-`head_major_kv_layout`. The three read kernels cast a gathered page back to the model
+`head_major_kv_layout`. The two read kernels cast a gathered page back to the model
 dtype and apply `v_scale` to the output; `k_scale` is folded into the softmax scale the
 impl passes them. The attention math itself stays fp16.
 

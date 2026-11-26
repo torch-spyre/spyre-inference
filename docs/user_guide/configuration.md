@@ -273,8 +273,8 @@ extra lever there, and the same keep-it-short advice applies.
 
 #### One per-sequence kernel for every page count
 
-The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
-use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+The per-sequence kernels (`page_attn_prefill`, which also runs any decode that batched decode
+does not take) do not use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
 sequence length up to `--max-model-len`.
 
 Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages

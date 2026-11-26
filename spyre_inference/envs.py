@@ -111,7 +111,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
-    # When "1" (default), enables the batched multi-sequence decode kernel.
+    # When "1" (default), decode rows run the batched decode kernel. "0" sends them
+    # through the per-sequence prefill kernel, for debugging the batched path.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.

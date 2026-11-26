@@ -117,6 +117,8 @@ def _vision_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
     Only the ``[rows, 1]`` statistics come back from fp32. A full tensor cast from fp32
     keeps a staggered element order, which Spyre cannot combine with a full fp16 operand
     such as the weight ("Multi-arg pointwise with mixed EA"); a broadcast one it can.
+    Not ``_layer_norm_kernel`` (custom_ops/layer_norm.py) for the same reason: it casts its
+    full fp32 result back, which works as its own graph but not inside the tower's.
     """
     xf = x.float()
     mean = xf.mean(dim=-1, keepdim=True)
@@ -389,7 +391,8 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
             patches = patches.reshape(hp * wp, -1).to(torch.float16)
             row = patches.new_zeros(1, patches.shape[1])
             flat_patches += [row, patches, row.expand(tail, -1)]
-            seg += [torch.full((self._image_rows,), i), torch.full((tail,), SEGMENT_ITEMS)]
+            if not self._class_layout:
+                seg += [torch.full((self._image_rows,), i), torch.full((tail,), SEGMENT_ITEMS)]
             pos += [torch.arange(self._image_rows), torch.zeros(tail, dtype=torch.int64)]
         flat = torch.cat(flat_patches)
         values = {

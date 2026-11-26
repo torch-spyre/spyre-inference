@@ -43,7 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     publish_encoder_grid,
 )
 from spyre_inference.v1.worker.encoder_grid import EncoderDispatchStats
-from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_rectangles, encoder_shape_tables
+from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_rectangles
 
 pytestmark = pytest.mark.runtime
 
@@ -415,56 +415,3 @@ class TestEncoderDispatchStats:
         stats.record(None, 128)
         assert (stats.rect_steps, stats.ragged_steps) == (1, 1)
         assert (stats.real_tokens, stats.body_rows, stats.seqs) == (19, 256, 4)
-
-
-class TestBuildAttentionMetadata:
-    """The V1 runner's per-step glue around ``plan_encoder_step``."""
-
-    @staticmethod
-    def _runner(monkeypatch, steps):
-        from vllm.config import CompilationMode
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-        outputs = iter(steps)
-        monkeypatch.setattr(
-            GPUModelRunner, "_build_attention_metadata", lambda self, *a, **kw: next(outputs)
-        )
-        config = _config()
-        runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-        runner.model_config = SimpleNamespace(runner_type="pooling", dtype=torch.float16)
-        runner.compilation_config = SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE)
-        runner._encoder_rectangles = encoder_rectangles(config)
-        runner._encoder_width_caps_by_rows = {}
-        runner._encoder_budget = encoder_shape_tables(config).budget
-        runner._encoder_buffer_rows = 0
-        runner._encoder_grid = None
-        runner._forced_encoder_rect = None
-        runner._force_encoder_ragged = False
-        runner._spyre_device = torch.device("cpu")
-        runner.spyre_encoder_stats = EncoderDispatchStats()
-        return runner
-
-    def test_a_non_rectangle_step_clears_the_last_grid(self, monkeypatch):
-        """A stale grid would make ``_preprocess`` lay this step's tokens out wrongly."""
-        steps = [({"layer": _encoder_md([5, 7])}, None), ({"layer": _encoder_md([5, 7])}, None)]
-        runner = self._runner(monkeypatch, steps)
-
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
-        assert runner._encoder_grid is not None
-        assert runner._encoder_grid[2] == [5, 7]
-
-        runner._build_attention_metadata(num_tokens_padded=12)
-        assert runner._encoder_grid is None
-        stats = runner.spyre_encoder_stats
-        assert (stats.rect_steps, stats.ragged_steps) == (1, 1)
-
-    def test_a_step_without_encoder_metadata_clears_the_grid(self, monkeypatch):
-        steps = [({"layer": _encoder_md([5, 7])}, None), ({"layer": SimpleNamespace()}, None)]
-        runner = self._runner(monkeypatch, steps)
-
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
-        assert runner._encoder_grid is None
-        assert runner.spyre_encoder_stats.rect_steps == 1

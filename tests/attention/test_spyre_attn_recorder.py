@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from spyre_testing_plugin.attn_helpers import use_kv_buckets, use_python_for_each_tile
+from spyre_testing_plugin.attn_helpers import use_python_for_each_tile, use_static_pages
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
 from vllm.config import get_current_vllm_config
@@ -71,7 +71,7 @@ def compiles() -> int:
 @pytest.fixture()
 def impl(default_vllm_config, monkeypatch):
     # These tests check the num_blocks bucket, which a page range would replace.
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
@@ -177,7 +177,7 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
 def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
     from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -871,9 +871,9 @@ class TestRecordBatchedDecode:
 
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
 def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
-    """With a chunk range, every decode batch runs a kernel that warmup recorded: the
-    one-chunk kernel if it fits in one chunk, else the dynamic kernel at a chunk count in
-    its range."""
+    """Every decode batch runs a kernel that warmup recorded: the dynamic kernel at a chunk
+    count in its range, a single chunk included, or the num_blocks bucket's kernel for a batch
+    size without a chunk range."""
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 

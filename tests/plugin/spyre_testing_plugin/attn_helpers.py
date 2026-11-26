@@ -383,27 +383,32 @@ def split_by_chunk(chunk_page_ids, mask_by_chunk, blocks_per_chunk):
 
 
 def drop_cpu_device_layouts(monkeypatch) -> None:
-    """Transfer to CPU without the Spyre device layout, which only Spyre can build.
+    """Transfer to CPU without the Spyre device layout or dynamic range, which only Spyre
+    can build.
 
-    The batched decode index upload places one; the plain transfer carries the same values.
+    The batched decode index upload places both; the plain transfer carries the same values.
     """
     orig_to = torch.Tensor.to
 
-    def to(tensor, *args, device_layout=None, **kwargs):
-        if device_layout is None:
+    def to(tensor, *args, device_layout=None, dynamic=None, **kwargs):
+        if device_layout is None and dynamic is None:
             return orig_to(tensor, *args, **kwargs)
         target = kwargs.get("device", args[0] if args else None)
         if not isinstance(target, (str, torch.device)):
             target = tensor.device
         if torch.device(target).type != "spyre":
             return orig_to(tensor, *args, **kwargs)
-        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
+        if device_layout is not None:
+            kwargs["device_layout"] = device_layout
+        if dynamic is not None:
+            kwargs["dynamic"] = dynamic
+        return orig_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", to)
 
 
-def use_kv_buckets(monkeypatch) -> None:
-    """Make metadata builders pad to the num_blocks bucket rather than use a page range."""
+def use_static_pages(monkeypatch) -> None:
+    """Make metadata builders pad to the num_blocks buckets rather than use a page range."""
     from spyre_inference.v1.attention.backends import spyre_attn
     from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 

@@ -130,7 +130,6 @@ def _both_engines(case_name: str) -> dict:
 def _generate(case_name: str) -> dict:
     env = {
         **os.environ,
-        "SPYRE_MODEL_RUNNER": "v2",
         "SPYRE_ATTN_KV_LAYOUT": "head_major",
         "SPYRE_COMPILE_GUARD": "error",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "36000",

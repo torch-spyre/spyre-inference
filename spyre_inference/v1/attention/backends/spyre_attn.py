@@ -33,7 +33,8 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
-from vllm.config import VllmConfig, get_current_vllm_config
+from torch.fx.experimental import _config as fx_config
+from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
@@ -49,6 +50,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
@@ -153,7 +155,7 @@ class SpyrePagedKVCache(NamedTuple):
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
     attribute access on a custom object.
 
-    Allocated by `TorchSpyreModelRunner.initialize_kv_cache_tensors` and
+    Allocated by the runner's KV cache init (`v1/worker/spyre/kv_cache.py`) and
     consumed by `SpyreAttentionImpl.forward`. vLLM's `bind_kv_cache` types
     the relay path as `dict[str, torch.Tensor]`; see the suppression at the
     `bind_kv_cache(...)` call site for why that type-hole is benign.
@@ -309,16 +311,42 @@ def batched_decode(
     # the same checks bound a dynamic chunk count.
     _walked_pages(chunk_page_ids, mask_by_chunk, chunk_range)
     return batched_decode_kernel(
-        chunk_page_ids=chunk_page_ids, mask_by_chunk=mask_by_chunk, **kwargs
+        chunk_page_ids=chunk_page_ids,
+        mask_by_chunk=mask_by_chunk,
+        entry_local=chunk_range is not None or chunk_page_ids.shape[0] > 1,
+        **kwargs,
     )
+
+
+def _compile_with_dynamic_count(
+    fn: Callable[..., torch.Tensor], range_arg: str
+) -> Callable[..., torch.Tensor]:
+    """``torch.compile`` ``fn``, whose trip count may vary over its ``range_arg`` range.
+
+    Dynamo traces a size of 1 as a constant, so a graph traced at another size guards the
+    count at 2 or more and recompiles for one page or chunk. With a range, ``fn`` therefore
+    traces size-obliviously: the count starts at 0 and only the range's own checks bound
+    it. The count is the only size these kernels leave dynamic. The inductor caches do not
+    key on this setting, so an artifact traced without it keeps the floor.
+    """
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+
+    @functools.wraps(fn)
+    def run(**kwargs: Any) -> torch.Tensor:
+        if kwargs[range_arg] is None:
+            return compiled(**kwargs)
+        with fx_config.patch(backed_size_oblivious=True):
+            return compiled(**kwargs)
+
+    return run
 
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
 # Compiled even under --enforce-eager: the eager page gather fails (torch-spyre#4334).
-_page_attn_prefill_compiled = torch.compile(page_attn_prefill, dynamic=False, fullgraph=True)
-_page_attn_decode_compiled = torch.compile(page_attn_decode, dynamic=False, fullgraph=True)
-_batched_decode_compiled = torch.compile(batched_decode, dynamic=False, fullgraph=True)
+_page_attn_prefill_compiled = _compile_with_dynamic_count(page_attn_prefill, "page_range")
+_page_attn_decode_compiled = _compile_with_dynamic_count(page_attn_decode, "page_range")
+_batched_decode_compiled = _compile_with_dynamic_count(batched_decode, "chunk_range")
 
 
 # Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
@@ -643,7 +671,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return tile
 
     def _pad_num_blocks(self, num_blocks: int, prefill: bool = False) -> int:
-        """Round an active-block count up onto the recorder's num_blocks buckets.
+        """Round an active-block count up onto the recorder's num_blocks buckets, or onto
+        the declared page count with a page range.
 
         block_table is allocated at width ceil(max_model_len / block_size) for
         the engine's lifetime, so the padded bucket always fits.
@@ -652,16 +681,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # A fully-masked padded tile would divide by a zero softmax
             # denominator, so zero real blocks must stay zero.
             return 0
-        if self._attn_bucketer.page_range is not None:
-            return self._attn_bucketer.find_declared_pages(num_blocks, prefill)
-        padded = self._attn_bucketer.find_blocks_bucket(num_blocks)
-        # The buckets cover ceil(max_model_len / block_size), and the scheduler
-        # bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
+        bucketer = self._attn_bucketer
+        if bucketer.page_range is not None:
+            page_range = bucketer.prefill_page_range if prefill else bucketer.page_range
+            assert page_range is not None
+            padded: int | None = bucketer.find_declared_pages(num_blocks, prefill)
+            largest = page_range["max"]
+        else:
+            padded = bucketer.find_blocks_bucket(num_blocks)
+            largest = bucketer.num_blocks_buckets[-1]
+        # The buckets and the page range cover ceil(max_model_len / block_size), and the
+        # scheduler bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
         # seq_lens come from the token budget instead, never reach here.
-        assert padded is not None, (
-            f"num_blocks={num_blocks} exceeds the largest recorded bucket "
-            f"{self._attn_bucketer.num_blocks_buckets[-1]}, which should cover "
-            f"ceil(max_model_len / block_size)."
+        assert padded is not None and padded <= largest, (
+            f"num_blocks={num_blocks} exceeds the largest recorded bucket {largest}, which "
+            f"should cover ceil(max_model_len / block_size)."
         )
         assert padded >= num_blocks
         return padded
@@ -1052,7 +1086,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # zero mask tile; only boundary blocks get real per-query cutoffs.
             # The count is padded up to _max_active_blocks so it stops sliding with
             # the context, which would compile a new kernel inside the request. Not
-            # rounded onto the num_blocks ladder: that inflates the exact per-bucket
+            # rounded onto the num_blocks buckets: that inflates the exact per-bucket
             # bound several-fold. padded_num_blocks stays None so forward() keeps
             # gathering through active_block_indices.
             active_block_indices = []
@@ -1110,8 +1144,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             if active_block_indices is not None:
                 blocks_s = active_block_indices[s]
             else:
-                # Pad with the last real page, as forward() does: raising the count to the
-                # range minimum or the num_blocks bucket can take it past the block table's width.
+                # Pad with the last real page, as forward() does: rounding the count up to
+                # the range's minimum or granularity, or to the num_blocks bucket, can take
+                # it past the block table's width.
                 real = real_num_blocks[s]
                 blocks_s = list(range(real)) + [real - 1] * (n - real)
             table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
@@ -1470,11 +1505,19 @@ class SpyreAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
-        # `kv_cache_spec` is ignored: the stick constraint is the same for every spec.
-        # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
-        # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
-        # This matches the constraint on head_size in supports_head_size().
-        return [MultipleOf(64)]
+        # Pages, buckets and recorded kernels exist for cache_config.block_size only;
+        # upstream splits a larger manager block into it. Without a config, the 128-byte
+        # stick (64 fp16 elements) is the only constraint.
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return [MultipleOf(64)]
+        return [config.cache_config.block_size]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # allocate_spyre_kv_caches and the sizing replay take a KVCacheTensor's block
+        # stride as one layer's page, which holds only for a layer-outer layout.
+        return (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC)
 
     @staticmethod
     def get_name() -> str:
@@ -1706,7 +1749,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk < kv_pages.shape[0]
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
-    # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
+    # which the runner's KV cache init (`v1/worker/spyre/kv_cache.py`) allocates
     # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
@@ -2031,17 +2074,54 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
-        # Upstream sizes an fp8 cache as uint8 bytes; the pages hold e4m3 values.
-        dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
-        layout = head_major_kv_layout(
-            num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
-        )
-        shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
+        dtype, shape, layout = cls._page_geometry(num_blocks, spec)
 
         def _zeroed():
             return torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_()  # ty: ignore[no-matching-overload]
 
         return SpyrePagedKVCache(_zeroed(), _zeroed())
+
+    @classmethod
+    def view_pages(
+        cls, pages: SpyrePagedKVCache, num_blocks: int, spec: AttentionSpec
+    ) -> SpyrePagedKVCache:
+        """``pages``' storage in this impl's page layout for ``spec``.
+
+        Page rows are outermost and dense, so block ``b`` covers the same bytes in every
+        page shape of the same size, as upstream's KV cache group overlay requires.
+        """
+        from torch_spyre._C import (
+            as_strided_with_layout,
+            get_device_size_in_bytes,
+            get_spyre_tensor_layout,
+        )
+
+        dtype, shape, layout = cls._page_geometry(num_blocks, spec)
+        stride = torch.empty(shape, device="meta").stride()
+
+        def _view(base: torch.Tensor) -> torch.Tensor:
+            have = get_device_size_in_bytes(get_spyre_tensor_layout(base))
+            need = get_device_size_in_bytes(layout)
+            if base.dtype != dtype or have != need:
+                raise ValueError(
+                    f"KV pages {tuple(base.shape)} {base.dtype} ({have} device bytes) cannot "
+                    f"be viewed as {shape} {dtype} ({need} device bytes)."
+                )
+            return as_strided_with_layout(base, shape, stride, 0, layout)
+
+        return SpyrePagedKVCache(
+            k_pages=_view(pages.k_pages),
+            v_pages=_view(pages.v_pages),
+        )
+
+    @staticmethod
+    def _page_geometry(num_blocks: int, spec: AttentionSpec):
+        # Upstream sizes an fp8 cache as uint8 bytes; the pages hold e4m3 values.
+        dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
+        layout = head_major_kv_layout(
+            num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
+        )
+        return dtype, (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size), layout
 
     def _kernel_kv_scales(self) -> tuple[float | None, float | None]:
         """The (k_scale, v_scale) store arguments; both None for a model-dtype cache."""

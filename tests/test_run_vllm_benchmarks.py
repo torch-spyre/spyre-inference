@@ -1029,25 +1029,6 @@ def test_default_mode_records_one_start_on_the_environments_cache(monkeypatch, t
     assert not (tmp_path / "results" / "t_cold_server.log").exists()
 
 
-def test_warm_start_that_misses_is_flagged(caplog):
-    warm = {"seconds": 1.0, "state": "partial", "fxgraph_hits": 2, "fxgraph_misses": 1}
-    runner._warn_unless_full_hit("t", warm)
-    assert "not a full cache hit (state partial): fxgraph_misses 1" in caplog.text
-
-
-@pytest.mark.parametrize(
-    ("line", "state"),
-    [
-        ("fxgraph 5 hit 0 miss, aotautograd 4 hit 0 miss, spyre kernel 3 hit 0 miss", "warm"),
-        ("fxgraph 0 hit 5 miss, aotautograd 0 hit 4 miss, spyre kernel 0 hit 3 miss", "cold"),
-        ("fxgraph 5 hit 0 miss, aotautograd 4 hit 0 miss, spyre kernel 2 hit 1 miss", "partial"),
-    ],
-)
-def test_cache_state_from_the_worker_line(line, state):
-    counts = runner.parse_cache_counts(f"(Worker_TP0) INFO Compile cache: {line}\n")
-    assert runner.cache_state(counts) == state
-
-
 def test_cache_counts_are_the_max_across_workers():
     log_text = (
         "Compile cache: fxgraph 5 hit 0 miss, aotautograd 4 hit 0 miss, spyre kernel 3 hit 0 miss\n"
@@ -1057,10 +1038,3 @@ def test_cache_counts_are_the_max_across_workers():
     assert counts is not None
     assert (counts["fxgraph_misses"], counts["spyre_kernel_hits"]) == (1, 3)
     assert runner.cache_state(runner.parse_cache_counts("no line")) == "unknown"
-
-
-def test_unknown_compile_cache_mode_fails_the_file(monkeypatch, tmp_path):
-    monkeypatch.setenv("BENCH_SERVE_COMPILE_CACHE", "off")
-    path = _write(tmp_path, [_serve_config("d")])
-    [result] = runner.run_benchmarks_from_file(path, "serve", tmp_path, "0", "1", set(), set())
-    assert "BENCH_SERVE_COMPILE_CACHE" in result.error

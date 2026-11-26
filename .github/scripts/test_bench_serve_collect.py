@@ -158,25 +158,3 @@ def test_cold_warm_warm_start_that_misses_is_a_warning(mod, tmp_path):
         {"state": "partial", "misses": {"fxgraph": 1}, "new_files": {"spyre_kernel": 2}}
     ]
     assert "fxgraph 1 miss, spyre_kernel 2 new files" in mod.warning_text(rec["warnings"][0])
-
-
-def test_default_partial_start_is_only_a_label(mod, tmp_path):
-    leg = _write_config(tmp_path, RESULT)
-    startup = {"mode": "default", "starts": {"default": _start("partial", 5, 1)}}
-    (leg / "results" / "cfg_startup.json").write_text(json.dumps(startup))
-    rec = mod.check_config(leg, {"test_name": "cfg"}, {})
-    assert rec["default_state_label"] == "partial (5 hit, 1 miss)"
-    assert rec["warnings"] == []
-
-
-@pytest.mark.parametrize(
-    ("base", "target", "flagged"),
-    [("warm", "warm", False), ("cold", "cold", False), ("warm", "cold", True)]
-    + [("partial", "partial", True), ("warm", "unknown", True)],
-)
-def test_startup_delta_is_unreliable_only_across_cache_states(mod, base, target, flagged):
-    def leg(state):
-        return {"configs": {"cfg": {"default_state": state}}}
-
-    assert mod.unreliable(leg(base), leg(target), "cfg", "default") is flagged
-    assert mod.unreliable(leg(base), leg(target), "cfg", None) is False

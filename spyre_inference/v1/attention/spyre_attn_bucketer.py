@@ -84,12 +84,6 @@ _MAX_SLOTS_PER_CORE = 2
 # second page per core turns slower than one: the largest row measured faster at two.
 _CORE_ROW_BUDGET = 2 * 8 * 128
 
-# The most pages one dynamic shared-slot call covers (chunks times slots), unless one
-# max_model_len sequence needs more. Every launch fills one program correction per chunk the
-# kernel could run, so a larger range costs every call; a batch past it splits into grouped
-# calls.
-_SHARED_SLOT_CALL_PAGES = 32 * _SPYRE_CORE_COUNT
-
 
 def shared_block_slots(num_kv_heads: int, head_size: int) -> int:
     """Block slots per shared-slot chunk for a layer group of this per-card KV shape: two
@@ -411,23 +405,18 @@ def _shared_slot_chunk_range(
     page_range: DynamicRange, num_seqs: int, slots: int, single_chunk_kernel: bool
 ) -> DynamicRange | None:
     """The chunk counts the dynamic shared-slot kernel runs: up to what ``num_seqs``
-    sequences of ``page_range["max"]`` pages need, capped at ``_SHARED_SLOT_CALL_PAGES`` pages
-    or the count one such sequence needs.
+    sequences of ``page_range["max"]`` pages need, so one call serves every such batch.
 
-    It starts past one chunk when ``single_chunk_kernel`` takes the calls within one chunk.
-    None, and logged, when the range would hold one count; batched decode then keeps one
-    kernel per num_seqs bucket.
+    It starts at ``MIN_RESERVED_DIM_SIZE``, and past one chunk when ``single_chunk_kernel``
+    takes the calls within one chunk. None, and logged, when the range would hold one count;
+    batched decode then keeps one kernel per num_seqs bucket.
     """
     from torch_spyre._inductor import config as ts_config
 
     min_chunks = ts_config.min_reserved_dim_size
     if single_chunk_kernel:
         min_chunks = max(min_chunks, 2)
-    one_seq = -(-page_range["max"] // slots)
-    max_chunks = min(
-        -(-page_range["max"] // (slots // num_seqs)),
-        max(_SHARED_SLOT_CALL_PAGES // slots, one_seq),
-    )
+    max_chunks = -(-page_range["max"] // (slots // num_seqs))
     if not min_chunks < max_chunks:
         logger.info_once(
             "No shared-slot batched decode: %d sequences of %d pages fit in %d chunks, not "
@@ -759,19 +748,10 @@ class SpyreAttnBucketer:
         """The ``min``, ``max`` and ``granularity`` of the dynamic shared-slot kernel's chunks."""
         return self._shared_slot_chunk_range
 
-    @property
-    def splits_shared_slot_calls(self) -> bool:
-        """Whether some batch of up to ``shared_slot_seqs`` sequences needs several calls."""
-        if self._shared_slot_chunk_range is None:
-            return False
-        assert self._page_range is not None
-        return self.shared_slot_plan([self._page_range["max"]] * self._shared_slot_seqs) is None
-
     def shared_slot_plan(self, blocks: list[int]) -> SharedSlotPlan | None:
         """The layout of a shared-slot call over sequences of ``blocks`` blocks each, or None
-        without shared-slot kernels, when the call has more than ``shared_slot_seqs``
-        sequences, or when it needs more chunks than one call runs (see
-        ``shared_slot_call_groups``).
+        without shared-slot kernels or when the call has more than ``shared_slot_seqs``
+        sequences.
 
         A call whose blocks fill at most one chunk takes the single-chunk kernel unless
         ``SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0``; any other takes the dynamic kernel, at no fewer
@@ -783,31 +763,11 @@ class SpyreAttnBucketer:
         # A sequence with no blocks still takes a block slot, fully masked, so its row is
         # finite.
         num_chunks, slots = share_block_slots([max(1, b) for b in blocks], self.shared_slots)
-        if num_chunks > chunk_range["max"]:
-            return None
+        # The range covers shared_slot_seqs sequences at max_model_len.
+        assert num_chunks <= chunk_range["max"], (num_chunks, chunk_range)
         if num_chunks == 1 and self._single_chunk_kernel:
             return SharedSlotPlan(1, None, slots)
         return SharedSlotPlan(max(num_chunks, chunk_range["min"]), chunk_range, slots)
-
-    def shared_slot_call_groups(self, blocks: list[int]) -> list[list[int]] | None:
-        """The indices of ``blocks`` split into shared-slot calls, longest sequences first,
-        each taking the first call it fits; None without shared-slot kernels or when there
-        are more than ``shared_slot_seqs`` sequences.
-
-        A single sequence always fits one call, since the chunk range reaches what one
-        max_model_len sequence needs.
-        """
-        if self._shared_slot_chunk_range is None or len(blocks) > self._shared_slot_seqs:
-            return None
-        groups: list[list[int]] = []
-        for i in sorted(range(len(blocks)), key=lambda i: -blocks[i]):
-            for group in groups:
-                if self.shared_slot_plan([blocks[j] for j in (*group, i)]) is not None:
-                    group.append(i)
-                    break
-            else:
-                groups.append([i])
-        return groups
 
     def min_real_query_len(self, padded_query_len: int) -> int:
         """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
@@ -884,14 +844,13 @@ class SpyreAttnBucketer:
 
     def shared_slot_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """The shared-slot kernels, largest first: the dynamic one, recorded at
-        ``shared_slot_seqs`` sequences filling its most chunks, and the single-chunk one unless
+        ``shared_slot_seqs`` sequences of max_model_len, and the single-chunk one unless
         ``SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0``. Empty without shared-slot kernels."""
         num_seqs = self.shared_slot_seqs
         if not envs.SPYRE_BATCHED_DECODE or num_seqs is None:
             return []
         assert self._page_range is not None and self._shared_slot_chunk_range is not None
-        full_call_blocks = self._shared_slot_chunk_range["max"] * (self.shared_slots // num_seqs)
-        blocks_per_seq = [min(self._page_range["max"], full_call_blocks)]
+        blocks_per_seq = [self._page_range["max"]]
         if self._single_chunk_kernel:
             blocks_per_seq.append(1)
         out = []

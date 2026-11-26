@@ -340,7 +340,9 @@ def test_temp_split_layout_fields():
     assert list(layout.stride_map) == [8, 0, 1, 0]
 
 
-def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0, slots=32):
+def _shared_slot_case(
+    blocks, rows, kv, num_chunks=None, first_block_offset=0.0, slots=32, dtype=torch.float32
+):
     """Distinct pages per sequence and a part-filled last block, laid out by the builder.
 
     ``first_block_offset`` is added to sequence 0's block-0 scores through its mask.
@@ -356,13 +358,13 @@ def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0,
     for s, b in enumerate(blocks):
         block_table[s, :b] = torch.arange(first, first + b)
         first += b
-        tiles = torch.zeros(b, 1, BLOCK)
+        tiles = torch.zeros(b, 1, BLOCK, dtype=dtype)
         tiles[-1, 0, 2:] = float("-inf")
         stacks.append(tiles)
     stacks[0][0] += first_block_offset
     owner = SimpleNamespace(
         block_size=BLOCK,
-        model_dtype=torch.float32,
+        model_dtype=dtype,
         num_kv_heads=kv,
         _attn_bucketer=SimpleNamespace(shared_slot_seqs=rows, shared_slots=slots),
     )
@@ -405,6 +407,29 @@ def _run_shared_slots(query, k_pages, v_pages, fields, kv, q, **kwargs):
         slot_onehot=onehot,
         **kwargs,
     )
+
+
+def test_idle_shared_slots_stay_out_of_every_row_when_their_sums_overflow():
+    """An idle block slot reads page 0 fully masked, and after the clamp each of its masked
+    positions counts with weight 1, so its fp16 sums grow with every chunk. Large values in
+    page 0 overflow them to inf; the merge must still leave that slot out of every row
+    instead of multiplying it by zero."""
+    kv, q, blocks = 2, 4, [3, 2]
+    # 24 chunks of 4 positions at 1000 per value: 96000, past fp16's 65504.
+    fields, block_table, stacks, num_pages = _shared_slot_case(
+        blocks, 2, kv, num_chunks=24, dtype=torch.float16
+    )
+    k_pages, v_pages = _slot_pages(num_pages, kv)
+    # No sequence owns page 0, so only the idle slots read it.
+    v_pages[0] = 1000.0
+    query = torch.randn(len(blocks), kv, q, HEAD)
+    got = _run_shared_slots(query.half(), k_pages.half(), v_pages.half(), fields, kv, q).float()
+    assert torch.isfinite(got).all()
+    want = _per_seq_reference(
+        query, k_pages, v_pages, block_table, [t.float() for t in stacks], kv, q
+    )
+    # fp16 inputs and accumulation against an fp32 reference.
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
 def _per_seq_reference(query, k_pages, v_pages, block_table, stacks, kv, q, cap=0.0, sinks=None):

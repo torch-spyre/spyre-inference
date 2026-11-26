@@ -902,7 +902,6 @@ class TestSharedSlotDecode:
             for v in b.shared_slot_variants()
         ] == [(8, 128, 32, 32, True, True), (8, 1, 32, 1, False, True)]
         assert b.batched_decode_variants() == []
-        assert not b.splits_shared_slot_calls
 
     def test_without_the_single_chunk_kernel_one_dynamic_kernel_starts_at_one_chunk(
         self, monkeypatch
@@ -925,39 +924,23 @@ class TestSharedSlotDecode:
             kv_row=WIDE_KV_ROW,
         )
         assert b.shared_slot_seqs == 32
-        assert b.shared_slot_chunk_range == {"min": 2, "max": 32, "granularity": 1}
+        # 32 sequences of 128 pages, one block slot each.
+        assert b.shared_slot_chunk_range == {"min": 2, "max": 128, "granularity": 1}
         assert {v.num_seqs for v in b.batched_decode_variants()} == {64, 128}
         assert b.shared_slot_plan([1] * 33) is None
 
-    def test_a_batch_past_one_call_splits_into_calls_that_fit(self):
-        # 32 slots of 128 pages need 128 chunks; one call runs at most 32, 8 such sequences.
+    def test_one_call_serves_every_batch_up_to_the_sequence_limit(self):
+        # 32 slots for 32 sequences of 128 pages: 128 chunks at max_model_len.
         b = SpyreAttnBucketer(
             make_config(max_model_len=8192, max_num_seqs=32), declare_pages=True, kv_row=WIDE_KV_ROW
         )
-        assert b.shared_slot_chunk_range == {"min": 2, "max": 32, "granularity": 1}
-        assert b.splits_shared_slot_calls
-        # Recorded at the most chunks one call runs.
+        assert b.shared_slot_chunk_range == {"min": 2, "max": 128, "granularity": 1}
         assert [(v.num_seqs, v.num_blocks, v.num_chunks) for v in b.shared_slot_variants()] == [
-            (32, 32, 32),
+            (32, 128, 128),
             (32, 1, 1),
         ]
-        blocks = [128] * 31 + [1]
-        assert b.shared_slot_plan(blocks) is None
-        groups = b.shared_slot_call_groups(blocks)
-        assert groups == [list(range(i, i + 8)) for i in range(0, 24, 8)] + [[*range(24, 31), 31]]
-        for group in groups:
-            plan = b.shared_slot_plan([blocks[i] for i in group])
-            assert plan is not None and plan.num_chunks <= 32
-
-    def test_one_max_model_len_sequence_always_fits_one_call(self):
-        # 2048 pages: one sequence needs 64 chunks, past the usual 32.
-        b = SpyreAttnBucketer(
-            make_config(max_model_len=131072, max_num_seqs=32),
-            declare_pages=True,
-            kv_row=WIDE_KV_ROW,
-        )
-        assert b.shared_slot_chunk_range["max"] == 64
-        assert b.shared_slot_plan([2048]) is not None
+        assert b.shared_slot_plan([128] * 32).num_chunks == 128
+        assert b.shared_slot_plan([128] * 31 + [1]).num_chunks == 128
 
     @pytest.mark.parametrize(
         "blocks", [[1], [32], [33], [128], [128] * 8, [100, 3, 3], [5] * 6 + [128], [0, 2]]
@@ -1011,7 +994,7 @@ def test_shared_block_slots_take_two_pages_per_core_while_the_kv_row_fits(
 
 
 class TestSharedSlotWidth:
-    """The shared-slot chunk takes the layer group's slot count; a call covers the same pages."""
+    """The shared-slot chunk takes the layer group's slot count."""
 
     @pytest.fixture(autouse=True)
     def _declarable(self, monkeypatch):
@@ -1021,22 +1004,23 @@ class TestSharedSlotWidth:
         with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
             yield
 
-    def test_64_slots_halve_the_chunks_and_the_call_range(self):
+    def test_64_slots_halve_the_chunks_and_the_range(self):
         cfg = make_config(max_model_len=32768, max_num_seqs=32)
         # Two pages per core for the narrow row, one for the wide one.
         two = SpyreAttnBucketer(cfg, declare_pages=True, kv_row=NARROW_KV_ROW)
         one = SpyreAttnBucketer(cfg, declare_pages=True, kv_row=WIDE_KV_ROW)
         assert (two.shared_slots, one.shared_slots) == (64, 32)
         assert (two.shared_slot_seqs, one.shared_slot_seqs) == (32, 32)
-        assert two.shared_slot_chunk_range["max"] == 16
-        assert one.shared_slot_chunk_range["max"] == 32
+        # 32 sequences of 512 pages, two block slots or one each.
+        assert two.shared_slot_chunk_range["max"] == 256
+        assert one.shared_slot_chunk_range["max"] == 512
         blocks = [256, 64, 16, 8, 8]
         two_plan, one_plan = two.shared_slot_plan(blocks), one.shared_slot_plan(blocks)
         assert two_plan.num_chunks == share_block_slots(blocks, 64)[0]
         assert one_plan.num_chunks == share_block_slots(blocks, 32)[0]
         assert two_plan.num_chunks < one_plan.num_chunks
         variant = two.shared_slot_variants()[0]
-        assert (variant.blocks_per_chunk, variant.num_chunks) == (64, 16)
+        assert (variant.blocks_per_chunk, variant.num_chunks) == (64, 256)
 
     def test_a_page_range_needs_the_kv_row(self):
         with pytest.raises(AssertionError, match="declare_pages needs the KV row"):

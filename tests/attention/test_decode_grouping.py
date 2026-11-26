@@ -226,10 +226,9 @@ def test_shared_slot_call_keeps_a_jagged_batch_that_fits_its_slots(shared_slot_c
 
 
 def test_shared_slot_grouping_splits_one_long_sequence_from_many_short(shared_slot_config):
-    """1 x 256 + 31 x 8 blocks: one block slot each over 256 chunks together, past one call's 32;
-    8 + 8 apart."""
+    """1 x 256 + 31 x 8 blocks: one block slot each over 256 chunks together; 8 + 8 apart."""
     md = _build([256 * BLOCK] + [8 * BLOCK] * 31)
-    assert md.padded_num_seqs is None
+    assert md.padded_batch_blocks == 256 * 32
     assert _members(md) == [[0], list(range(1, 32))]
     assert [(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups] == [
         (32, 8),
@@ -237,19 +236,25 @@ def test_shared_slot_grouping_splits_one_long_sequence_from_many_short(shared_sl
     ]
 
 
-@pytest.mark.parametrize("jagged", ["1", "0"])
-def test_a_shared_slot_batch_past_one_call_splits_into_calls_that_fit(
-    shared_slot_config, monkeypatch, jagged
-):
-    """32 x 256 blocks need 256 chunks in one call; 8 calls of 4 sequences need 32 each, the
-    most one call runs. Splitting is not jagged grouping, so it happens with that off too."""
-    monkeypatch.setenv("SPYRE_JAGGED_DECODE", jagged)
-    md = _build([256 * BLOCK] * 32)
-    assert md.padded_num_seqs is None
-    assert _members(md) == [list(range(i, i + 4)) for i in range(0, 32, 4)]
-    assert {(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups} == {
-        (32, 32)
-    }
+def test_jagged_grouping_off_keeps_one_shared_slot_call(shared_slot_config, monkeypatch):
+    """With ``SPYRE_JAGGED_DECODE=0`` the batch above runs as its one call of 256 chunks."""
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
+    md = _build([256 * BLOCK] + [8 * BLOCK] * 31)
+    assert md.decode_groups is None
+    assert md.padded_batch_blocks == 256 * 32
+
+
+def test_a_short_shared_slot_call_skips_the_group_search(shared_slot_config, monkeypatch):
+    """A call of 4 chunks or fewer beats every split, so build() does not search for one."""
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("searched for groups")
+
+    monkeypatch.setattr(SpyreAttentionMetadataBuilder, "_batched_decode_groups", unexpected)
+    md = _build([100 * BLOCK] + [1 * BLOCK] * 4)
+    assert md.padded_batch_blocks == 4 * 32
+    assert md.decode_groups is None
 
 
 def test_each_shared_slot_group_matches_its_own_batch(shared_slot_config):
@@ -287,7 +292,7 @@ def test_shared_slot_groups_store_every_row_once(shared_slot_config):
     store = torch.zeros(staging_rows, 1)
     for g in md.decode_groups:
         rows = g.rows_cpu.tolist()
-        dst = SpyreAttentionImpl._group_store_rows(owner, rows, g.out_rows)
+        dst = SpyreAttentionImpl._group_store_rows(owner, rows, g.shared_slot_seqs)
         assert dst.shape == (32,)
         assert set(dst[len(rows) :].tolist()) <= {staging_rows - 1}
         out = torch.full((32, 1), -1.0)

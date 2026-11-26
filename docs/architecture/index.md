@@ -478,11 +478,9 @@ block slots into its output row, as the per-bucket kernel sums a sequence's bloc
 Output rows past the batch copy row 0, so they stay finite.
 
 Two variants serve every batch of up to `S` sequences: a single-chunk one and a dynamic one.
-The dynamic one runs at most 1024 pages per call (16 chunks of 64, or 32 of 32), or as many
-as one `max_model_len` sequence needs if that is more. This keeps its launches cheap, because
-every launch of a dynamic kernel prepares host data for every chunk in its range. A batch that
-needs more chunks runs as several grouped calls. `SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` records
-only the dynamic variant, whose range then starts at one chunk.
+The dynamic one runs up to the chunks `S` sequences at `max_model_len` need, so one call
+serves every such batch. `SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` records only the dynamic variant,
+whose range then starts at one chunk, or at `MIN_RESERVED_DIM_SIZE` if you export it.
 
 A single step can carry a mix of prefill and decode sequences; each sequence is padded to its
 own query bucket (decodes use the length-1 bucket) before dispatch.

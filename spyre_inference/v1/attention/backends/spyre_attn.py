@@ -147,10 +147,6 @@ class BatchedDecodeGroup:
     rows_dev: torch.Tensor | None = None
     metadata: "SpyreAttentionMetadata | None" = None
 
-    @property
-    def out_rows(self) -> int:
-        return self.shared_slot_seqs or self.padded_num_seqs
-
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
@@ -1201,25 +1197,20 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             plan = self._batched_decode_call_plan(decode_blocks)
-            rest = (
-                blocks_per_seq,
-                block_table,
-                query_start_loc,
-                active_block_indices,
-                attention_mask_stacks,
-            )
-            # Mean/max block count: how uniform the contexts are, independent of
-            # bucket round-up (which padding the denser ladder addresses instead).
-            uniformity = (sum(decode_blocks) / num_decode_seqs) / max(1, max(decode_blocks))
-
-            if plan is None:
-                # More chunks than one shared-slot call runs.
-                decode_groups = self._batched_decode_groups(decode_blocks, *rest)
-                if decode_groups is not None:
-                    decode_uniformity = uniformity
-            else:
-                decode_uniformity = uniformity
+            if plan is not None:
+                # Mean/max block count: how uniform the contexts are, independent of
+                # bucket round-up (which padding the denser ladder addresses instead).
+                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(
+                    1, max(decode_blocks)
+                )
                 prefix = list(range(num_decode_seqs))
+                rest = (
+                    blocks_per_seq,
+                    block_table,
+                    query_start_loc,
+                    active_block_indices,
+                    attention_mask_stacks,
+                )
                 if isinstance(plan, SharedSlotPlan):
                     shared_slot_seqs = self._attn_bucketer.shared_slot_seqs
                     fields, slot_onehot_cpu = self._shared_slot_tensors(prefix, plan, *rest)
@@ -1236,7 +1227,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 chunk_range = plan.chunk_range
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
-                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
+                if (
+                    envs.SPYRE_JAGGED_DECODE
+                    and decode_uniformity < 1.0
+                    and self._grouping_may_split(plan)
+                ):
                     decode_groups = self._batched_decode_groups(decode_blocks, *rest)
 
         return SpyreAttentionMetadata(
@@ -1275,12 +1270,25 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             decode_groups=decode_groups,
         )
 
+    @staticmethod
+    def _grouping_may_split(plan: BatchedDecodePlan | SharedSlotPlan) -> bool:
+        """Whether the jagged grouping can split a call of ``plan``.
+
+        It keeps two groups apart only when together they take more than
+        ``_GROUP_DISPATCH_CHUNKS`` chunks over their own, and a shared-slot call over some of
+        a batch's sequences takes no more chunks than the whole. So a shared-slot call of at
+        most ``2 + _GROUP_DISPATCH_CHUNKS`` chunks stays one call, and the search is skipped.
+        """
+        return not isinstance(plan, SharedSlotPlan) or (
+            plan.num_chunks > 2 + _GROUP_DISPATCH_CHUNKS
+        )
+
     def _batched_decode_call_plan(
         self, blocks: list[int]
     ) -> BatchedDecodePlan | SharedSlotPlan | None:
         """How to run one batched call over sequences of ``blocks`` pages: on the shared-slot
         kernels when they take this many sequences, else on its num_seqs bucket's kernels.
-        None when neither runs it in one call."""
+        None when its bucket has no kernel for it."""
         bucketer = self._attn_bucketer
         slot_plan = bucketer.shared_slot_plan(blocks)
         if slot_plan is not None or len(blocks) <= (bucketer.shared_slot_seqs or 0):
@@ -1442,10 +1450,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         active_block_indices: list | None,
         attention_mask_stacks: list[torch.Tensor],
     ) -> "list[BatchedDecodeGroup] | None":
-        """The decode sequences in groups of one batched call each: by KV bucket, a bucket
-        past one shared-slot call's chunks split, then neighbours merged while one call runs them
-        in at most ``_GROUP_DISPATCH_CHUNKS`` more chunks than two. None for a single group,
-        or when a group has no kernel."""
+        """The decode sequences in groups of one batched call each: by KV bucket, then
+        neighbours merged while one call runs them in at most ``_GROUP_DISPATCH_CHUNKS`` more
+        chunks than two. None for a single group, or when a group has no kernel."""
         bucketer = self._attn_bucketer
 
         def group_plan(members: list[int]) -> BatchedDecodePlan | SharedSlotPlan | None:
@@ -1458,17 +1465,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
             by_bucket.setdefault(bucketer.find_blocks_bucket(nb) or 0, []).append(s)
-        groups = []
-        for k in sorted(by_bucket, reverse=True):
-            members = by_bucket[k]
-            if group_plan(members) is not None:
-                groups.append(members)
-                continue
-            # A bucket past one shared-slot call's chunks splits into calls that fit.
-            parts = bucketer.shared_slot_call_groups([decode_blocks[m] for m in members])
-            if parts is None:
-                return None
-            groups.extend([members[j] for j in part] for part in parts)
+        groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
         merged = True
         while merged and len(groups) > 1:
             merged = False
@@ -1478,9 +1475,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     chunks(groups[i + 1]),
                     chunks(groups[i] + groups[i + 1]),
                 )
-                if ca is None or cb is None:
+                if ca is None or cb is None or cab is None:
                     return None
-                if cab is not None and cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
+                if cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
                     groups[i : i + 2] = [groups[i] + groups[i + 1]]
                     merged = True
                     break
@@ -2141,7 +2138,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 realized,
                 time.time() - t0,
             )
-        if envs.SPYRE_JAGGED_DECODE or builder.attn_bucketer.splits_shared_slot_calls:
+        if envs.SPYRE_JAGGED_DECODE:
             self._record_group_scatter(sorted({v.num_seqs for v in variants}), kv_cache)
         return len(recorded)
 
@@ -2409,12 +2406,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # The kernel's store writes out[:out_rows] -- the seq bucket or the shared-slot rows,
         # not the real count -- so the destination needs that many rows and a
-        # plain offset-0 layout; the scatter below covers every other case, including
-        # a query buffer narrower than the seq bucket. Re-checked per call: vLLM hands
-        # out a fresh buffer per layer.
+        # plain offset-0 layout; the scatter below covers every other case. Re-checked per
+        # call: vLLM hands out a fresh buffer per layer.
         store_out = (
-            query_dev.shape[0] >= out_rows
-            and output.shape[0] >= out_rows
+            output.shape[0] >= out_rows
             and output.dtype == query_dev.dtype
             and output.storage_offset() == 0
             and output.is_contiguous()
@@ -2491,7 +2486,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
                 self._mirror_batched_decode_indices(group.metadata, device)
                 group.rows_dev = convert(
-                    self._group_store_rows(group.rows_cpu.tolist(), group.out_rows),
+                    self._group_store_rows(
+                        group.rows_cpu.tolist(), group.shared_slot_seqs or group.padded_num_seqs
+                    ),
                     device=device,
                 )
             self._run_batched_decode_dispatch(
@@ -2735,6 +2732,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         aligned_query_lens = attn_metadata.aligned_query_lens
 
         num_decode_seqs = attn_metadata.num_decode_seqs
+        # The batched kernels and the per-sequence loop all read the query staging buffer, so
+        # it is copied once. attn_layer stages inside the traced graph where it can be; then
+        # the buffers arrive here already staged and the copy is already done.
+        q_staging, out_staging = self._staging_buffers(_target_device)
+        pre_staged = query_dev is q_staging
+        batch_rows = self.staging_rows
+        if not pre_staged:
+            batch_rows = self._stage_query(query_dev)
+            query_dev = q_staging
         batched_done = False
         if self._grouped_decode_preconditions_met(attn_metadata, k_pages):
             self._run_grouped_decode(
@@ -2757,14 +2763,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # prefix was already served by the batched kernel and needs no mask transfer.
         # Mirrors the batch layout row for row, so the absolute query_start_loc
         # offsets in the row tables still apply.
-        q_staging, out_staging = self._staging_buffers(_target_device)
-        # attn_layer stages inside the traced graph where it can be; then the
-        # buffers arrive here already staged and both copies are already done.
-        pre_staged = query_dev is q_staging
-        batch_rows = self.staging_rows
-        if not pre_staged:
-            batch_rows = self._stage_query(query_dev)
-
         self._assert_query_fits_staging(max(aligned_query_lens, default=1))
 
         # In a mixed batch, skip the decode rows already written by the batched kernel.

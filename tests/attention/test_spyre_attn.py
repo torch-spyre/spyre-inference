@@ -2751,45 +2751,6 @@ def test_spyre_attn_narrow_kv_row_shares_64_slots_and_matches_reference(
     assert widths == {64}, widths
 
 
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_spyre_attn_shared_slot_batch_past_one_call_splits_and_matches_reference(
-    default_vllm_config, monkeypatch, configure_compilation, configure_device
-):
-    """With shared-slot calls capped at 4 chunks, 8 decode sequences that need 7 together run as
-    two calls of 4 chunks or fewer, with jagged grouping off."""
-    from vllm.config import get_current_vllm_config
-
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
-    envs.clear_env_cache()
-    # 4 chunks of 32 slots per call.
-    monkeypatch.setattr(
-        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
-    )
-    monkeypatch.setattr(spyre_attn_bucketer, "_SHARED_SLOT_CALL_PAGES", 4 * 32)
-    cfg = get_current_vllm_config()
-    cfg.scheduler_config.max_num_seqs = 8
-    cfg.model_config.max_model_len = 4096
-    groups_run = _spy_grouped_decode(monkeypatch)
-
-    _run_spyre_attn_test(
-        seq_lens=[(1, 4000)] * 4 + [(1, 3000), (1, 2000), (1, 1000), (1, 100)],
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-    )
-
-    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
-
-
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",

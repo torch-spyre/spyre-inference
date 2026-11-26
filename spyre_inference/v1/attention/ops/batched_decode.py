@@ -109,8 +109,11 @@ def _merge_shared_slots(*, tile_max, tile_sum, tile_output, slot_onehot, sinks=N
     row_max = torch.amax(a * tile_max + (1 - a) * neg, dim=0, keepdim=True)
     slot_ref = torch.amax(a * row_max + (1 - a) * neg, dim=1, keepdim=True)
     weight = torch.exp(-torch.relu(slot_ref - tile_max))
-    row_sum = torch.sum(a * (weight * tile_sum), dim=0)
-    row_out = torch.sum(a * (weight * tile_output), dim=0)
+    # Selected, not multiplied out: an idle slot reads a fully masked page, so its sums grow
+    # with every chunk and can overflow, and 0 * inf would carry NaN into every row.
+    in_row = a > 0
+    row_sum = torch.sum(torch.where(in_row, weight * tile_sum, 0.0), dim=0)
+    row_out = torch.sum(torch.where(in_row, weight * tile_output, 0.0), dim=0)
     return normalize(row_max[0], row_sum, row_out, sinks)
 
 

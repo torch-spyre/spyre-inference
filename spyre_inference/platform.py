@@ -281,6 +281,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Largest item a request may carry per vision modality, in tokens.
     _vision_token_limits: ClassVar[dict[str, int]] = {}
+    # Modalities whose encoder passes are spread over steps (SPYRE_VISION_BLOCKS_PER_STEP).
+    _sliced_modalities: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -903,6 +905,17 @@ class TorchSpyrePlatform(CpuPlatform):
             return
         from vllm.exceptions import VLLMValidationError
 
+        for modality in cls._sliced_modalities:
+            # ``None`` is a processor-cache hit, checked when it was first sent.
+            for item in processed_inputs["mm_kwargs"].get(modality, ()):
+                pixels = item.get("pixel_values") if item is not None else None
+                if item is not None and (pixels is None or pixels.data is None):
+                    raise VLLMValidationError(
+                        f"With SPYRE_VISION_BLOCKS_PER_STEP set, an {modality} must come as "
+                        "pixels, not as pre-computed embeddings.",
+                        parameter=modality,
+                    )
+
         for modality, limit in cls._vision_token_limits.items():
             for placeholder in processed_inputs["mm_placeholders"].get(modality, ()):
                 tokens = placeholder.get_num_embeds()
@@ -1123,6 +1136,29 @@ class TorchSpyrePlatform(CpuPlatform):
 
         if vllm_config.model_config is not None:
             cls._set_vision_token_limit(vllm_config)
+            cls._install_vision_slicing(vllm_config)
+
+    @classmethod
+    def _install_vision_slicing(cls, vllm_config: VllmConfig) -> None:
+        """Install the connector that spreads encoder passes (SPYRE_VISION_BLOCKS_PER_STEP)."""
+        from dataclasses import asdict
+
+        from vllm.config import ECTransferConfig
+
+        from spyre_inference.v1.core.vision_slices import SpyreVisionSliceConnector, vision_slicing
+
+        slicing = vision_slicing(vllm_config)
+        cls._sliced_modalities = slicing.modalities if slicing is not None else ()
+        if slicing is None:
+            return
+        # As a consumer, vLLM also lets requests carry pre-computed embeddings or none at
+        # all; validate_request turns those away.
+        vllm_config.ec_transfer_config = ECTransferConfig(
+            ec_connector=SpyreVisionSliceConnector.__name__,
+            ec_connector_module_path=SpyreVisionSliceConnector.__module__,
+            ec_role="ec_consumer",
+            ec_connector_extra_config={**asdict(slicing), "modalities": list(slicing.modalities)},
+        )
 
     @staticmethod
     def _is_pooling_model(vllm_config: VllmConfig) -> bool:

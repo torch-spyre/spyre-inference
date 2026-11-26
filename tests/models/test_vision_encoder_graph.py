@@ -26,7 +26,7 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
 from spyre_inference.v1.core.vision_slices import (
-    VISION_SLICES_ATTR,
+    SpyreVisionSliceConnector,
     VisionSlices,
     VisionSliceStart,
 )
@@ -850,7 +850,8 @@ def test_start_item_then_finish_item_matches_execute():
 
 
 def test_run_slices_spreads_a_pass_and_drops_a_cancelled_one(monkeypatch):
-    """The runner hook both model runners call: one pass over two steps, another cancelled."""
+    """What the slicing connector runs on each worker: one pass over two steps, another
+    cancelled."""
     monkeypatch.setattr(
         encoder_graph_module,
         "group_and_batch_mm_kwargs",
@@ -873,22 +874,28 @@ def test_run_slices_spreads_a_pass_and_drops_a_cancelled_one(monkeypatch):
     assert not manager._slice_passes
 
 
-def _hooked_runner(manager: SpyreEncoderGraphManager, monkeypatch) -> Any:
-    """A bare runner whose upstream execute_model returns the encoder cache it sees."""
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+def _active_connector(manager: SpyreEncoderGraphManager, monkeypatch) -> Any:
+    """MRV2's own EC connector hook, around the slicing connector on this manager."""
+    from vllm.config import ECTransferConfig
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+    from vllm.v1.worker.gpu import ec_connector as mrv2_ec_connector
 
-    from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+    config = SimpleNamespace(
+        ec_transfer_config=ECTransferConfig(
+            ec_connector=SpyreVisionSliceConnector.__name__,
+            ec_connector_module_path=SpyreVisionSliceConnector.__module__,
+            ec_role="ec_consumer",
+            ec_connector_extra_config={"blocks_per_step": 2, "steps": 2, "modalities": ["image"]},
+        )
+    )
+    connector = SpyreVisionSliceConnector(cast(Any, config), ECConnectorRole.WORKER)
+    connector.bind_encoder(manager, torch.device("cpu"))
+    monkeypatch.setattr(mrv2_ec_connector, "get_ec_transfer", lambda: connector)
+    return mrv2_ec_connector.ActiveECConnector(cast(Any, config), {})
 
-    runner: Any = SpyreModelRunnerV2.__new__(SpyreModelRunnerV2)
-    runner.model_state = SimpleNamespace(encoder_runner=SimpleNamespace(cudagraph_manager=manager))
-    runner.encoder_cache = SimpleNamespace(encoder_outputs={})
-    cache = runner.encoder_cache.encoder_outputs
-    runner.device = torch.device("cpu")
-    monkeypatch.setattr(GPUModelRunner, "execute_model", lambda self, *a, **k: dict(cache))
-    return runner
 
-
-def test_runner_caches_a_finished_pass_before_upstream_runs(monkeypatch):
+def test_mrv2_caches_a_finished_pass_before_it_gathers(monkeypatch):
+    """MRV2 loads around the step's gather, and on a step with no tokens through no_forward."""
     monkeypatch.setattr(
         encoder_graph_module,
         "group_and_batch_mm_kwargs",
@@ -899,20 +906,25 @@ def test_runner_caches_a_finished_pass_before_upstream_runs(monkeypatch):
     manager = _manager(model)
     manager.capture(graph_pool=None)
     (expected,) = manager.execute({"tokens": [30]})
-    runner = _hooked_runner(manager, monkeypatch)
+    active = _active_connector(manager, monkeypatch)
 
-    def step(slices: VisionSlices | None):
-        scheduler_output = SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[])
-        if slices is not None:
-            setattr(scheduler_output, VISION_SLICES_ATTR, slices)
-        return runner.execute_model(scheduler_output)
+    def output(slices: VisionSlices) -> Any:
+        return SimpleNamespace(ec_connector_metadata=slices, finished_req_ids=set())
 
-    start = VisionSliceStart("a", "image", cast(Any, {"tokens": [30]}))
-    assert step(VisionSlices(start=[start], run={"a": 2})) == {}
+    def step(slices: VisionSlices) -> dict[str, torch.Tensor]:
+        with active.maybe_get_output(output(slices)):
+            # Where MRV2 gathers the step's encoder outputs.
+            return dict(active.encoder_cache)
+
+    data = cast(Any, {"tokens": [30]})
+    assert step(VisionSlices(start=[VisionSliceStart("a", "image", data)], run={"a": 2})) == {}
     seen = step(VisionSlices(run={"a": None}))
     assert list(seen) == ["a"]
     torch.testing.assert_close(seen["a"], expected)
-    assert step(None) == seen
+
+    active.no_forward(output(VisionSlices(start=[VisionSliceStart("b", "image", data)])))
+    active.no_forward(output(VisionSlices(run={"b": None})))
+    torch.testing.assert_close(active.encoder_cache["b"], expected)
 
 
 def test_start_item_needs_a_compiled_budget():

@@ -18,9 +18,9 @@ The cap lowers ``max_num_active_reqs`` around the upstream waiting loop, so thes
 drive that real loop and count the prefills it admits per step. Stubbing ``schedule``
 would leave the cap free to degrade into a no-op under an upstream change.
 
-The vision-pass tests (SPYRE_VISION_BLOCKS_PER_STEP) drive the same loop, with the slicing
-gate patched on for a text model and an encoder cache installed by hand, and read the plan
-each step attaches.
+The vision-pass tests (SPYRE_VISION_BLOCKS_PER_STEP) drive the same loop with the slicing
+connector installed for a text model and an encoder cache installed by hand, and read the
+plan each step ships as its connector metadata.
 """
 
 from __future__ import annotations
@@ -29,10 +29,18 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig, CompilationMode, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    CompilationMode,
+    ECTransferConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.request import Request, RequestStatus
@@ -40,10 +48,10 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from spyre_inference import envs
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
-from spyre_inference.v1.core import scheduler as scheduler_module
 from spyre_inference.v1.core.scheduler import TorchSpyreScheduler
 from spyre_inference.v1.core.vision_slices import (
-    VISION_SLICES_ATTR,
+    SpyreVisionSliceConnector,
+    VisionSlices,
     VisionSlicing,
     vision_slicing,
 )
@@ -56,7 +64,11 @@ BLOCK_SIZE = 64
 NUM_BLOCKS = 512
 
 
-def _scheduler(runner_type: str = "generate", max_num_seqs: int = 4) -> TorchSpyreScheduler:
+def _scheduler(
+    runner_type: str = "generate",
+    max_num_seqs: int = 4,
+    ec_transfer_config: ECTransferConfig | None = None,
+) -> TorchSpyreScheduler:
     model_config = ModelConfig(
         model="Qwen/Qwen3-0.6B",
         max_model_len=2048,
@@ -76,6 +88,7 @@ def _scheduler(runner_type: str = "generate", max_num_seqs: int = 4) -> TorchSpy
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
         ),
+        ec_transfer_config=ec_transfer_config,
     )
     spec = FullAttentionSpec(
         block_size=BLOCK_SIZE, num_kv_heads=8, head_size=128, dtype=torch.float16
@@ -179,21 +192,29 @@ CACHE_SIZE = 1000
 IMAGE_TOKENS = 40
 
 
-def _sliced_scheduler(monkeypatch, max_num_seqs: int = 4) -> TorchSpyreScheduler:
-    monkeypatch.setattr(
-        scheduler_module,
-        "vision_slicing",
-        lambda vllm_config: VisionSlicing(blocks_per_step=2, steps=3, modalities=("image",)),
+def _sliced_scheduler(max_num_seqs: int = 4, steps: int = 3) -> TorchSpyreScheduler:
+    """Two blocks a step; every pass but the last slice runs ahead of its prefill."""
+    sched = _scheduler(
+        max_num_seqs=max_num_seqs,
+        ec_transfer_config=ECTransferConfig(
+            ec_connector=SpyreVisionSliceConnector.__name__,
+            ec_connector_module_path=SpyreVisionSliceConnector.__module__,
+            ec_role="ec_consumer",
+            ec_connector_extra_config={
+                "blocks_per_step": 2,
+                "steps": steps,
+                "modalities": ["image"],
+            },
+        ),
     )
-    sched = _scheduler(max_num_seqs=max_num_seqs)
     sched.encoder_cache_manager = EncoderCacheManager(cache_size=CACHE_SIZE)
     sched.max_num_encoder_input_tokens = CACHE_SIZE
     return sched
 
 
 @pytest.fixture
-def scheduler(monkeypatch):
-    return _sliced_scheduler(monkeypatch)
+def scheduler():
+    return _sliced_scheduler()
 
 
 def _text(request_id: str) -> Request:
@@ -205,11 +226,13 @@ def _text(request_id: str) -> Request:
     )
 
 
-def _image(request_id: str, *mm_hashes: str) -> Request:
+def _image(
+    request_id: str, *mm_hashes: str, prompt_len: int = PROMPT_LEN, offset: int = 10
+) -> Request:
     """One image per hash (``h`` if none), each ``IMAGE_TOKENS`` long, 10 tokens apart."""
     return Request(
         request_id=request_id,
-        prompt_token_ids=list(range(PROMPT_LEN)),
+        prompt_token_ids=list(range(prompt_len)),
         sampling_params=SamplingParams(max_tokens=8),
         pooling_params=None,
         mm_features=[
@@ -218,7 +241,7 @@ def _image(request_id: str, *mm_hashes: str) -> Request:
                 modality="image",
                 identifier=mm_hash,
                 mm_position=PlaceholderRange(
-                    offset=10 + i * (IMAGE_TOKENS + 10), length=IMAGE_TOKENS
+                    offset=offset + i * (IMAGE_TOKENS + 10), length=IMAGE_TOKENS
                 ),
             )
             for i, mm_hash in enumerate(mm_hashes or ("h",))
@@ -226,12 +249,13 @@ def _image(request_id: str, *mm_hashes: str) -> Request:
     )
 
 
-def _step(scheduler):
+def _step(scheduler) -> tuple[SchedulerOutput, VisionSlices]:
     """One schedule() plus the bookkeeping execute_model + update_from_output would do."""
     output = scheduler.schedule()
     for rid, num_tokens in output.num_scheduled_tokens.items():
         scheduler.requests[rid].num_computed_tokens += num_tokens
-    return output, getattr(output, VISION_SLICES_ATTR, None)
+    assert isinstance(output.ec_connector_metadata, VisionSlices)
+    return output, output.ec_connector_metadata
 
 
 def _with_running_decode(scheduler) -> None:
@@ -254,53 +278,57 @@ def test_pass_spreads_over_steps_and_the_prefill_waits_for_it(scheduler):
     assert slices.run == {"h": 2}
     assert "img" not in out.num_scheduled_tokens
 
-    # The last slice and the prefill share a step: the runner caches before it gathers.
+    # Upstream allocates the entry as an external load, and the last slice runs in that
+    # step: the worker caches before it gathers.
     out, slices = _step(scheduler)
     assert slices.run == {"h": None}
     assert "img" in out.num_scheduled_tokens
     assert "img" not in out.scheduled_encoder_inputs
 
     out, slices = _step(scheduler)
-    assert slices is None
+    assert slices == VisionSlices()
 
 
 def test_with_nothing_running_upstream_encodes_in_one_step(scheduler):
     scheduler.add_request(_image("img"))
     out, slices = _step(scheduler)
-    assert slices is None
+    assert slices == VisionSlices()
     assert out.scheduled_encoder_inputs == {"img": [0]}
 
 
-def test_pass_finishes_at_once_when_the_running_requests_drain(scheduler):
+def test_a_step_with_nothing_else_scheduled_runs_the_rest_of_the_pass():
+    scheduler = _sliced_scheduler(steps=4)
     _with_running_decode(scheduler)
     scheduler.add_request(_image("img"))
     _step(scheduler)
 
     scheduler.finish_requests("t", RequestStatus.FINISHED_ABORTED)
     out, slices = _step(scheduler)
+    assert slices.run == {"h": 4}
+    assert not out.num_scheduled_tokens
+
+    out, slices = _step(scheduler)
     assert slices.run == {"h": None}
     assert "img" in out.num_scheduled_tokens
 
 
-def test_abort_mid_pass_cancels_it_and_frees_its_cache_entry(scheduler):
+def test_abort_mid_pass_cancels_it(scheduler):
     _with_running_decode(scheduler)
     scheduler.add_request(_image("img"))
     _step(scheduler)
-    manager = scheduler.encoder_cache_manager
-    assert "h" in manager.cached
 
     scheduler.finish_requests("img", RequestStatus.FINISHED_ABORTED)
     out, slices = _step(scheduler)
 
     assert slices.cancel == ["h"]
     assert not slices.run
+    # The entry is allocated only once the pass is done, so there is nothing to free.
+    manager = scheduler.encoder_cache_manager
     assert "h" not in manager.cached
     assert manager.num_free_slots == CACHE_SIZE
-    assert "h" in out.free_encoder_mm_hashes
 
 
-def test_an_aborted_pass_never_reads_as_cached_to_the_same_image(scheduler):
-    """The next request with that image gets a pass of its own, not a missing embedding."""
+def test_the_next_request_with_an_aborted_image_gets_a_pass_of_its_own(scheduler):
     _with_running_decode(scheduler)
     scheduler.add_request(_image("a"))
     _step(scheduler)
@@ -313,6 +341,18 @@ def test_an_aborted_pass_never_reads_as_cached_to_the_same_image(scheduler):
     assert "b" not in out.num_scheduled_tokens
 
 
+def test_a_pass_outlives_its_first_request_while_another_waits_on_it(scheduler):
+    _with_running_decode(scheduler)
+    scheduler.add_request(_image("a"))
+    scheduler.add_request(_image("b"))
+    _step(scheduler)
+
+    scheduler.finish_requests("a", RequestStatus.FINISHED_ABORTED)
+    out, slices = _step(scheduler)
+    assert not slices.cancel
+    assert slices.run == {"h": 2}
+
+
 def test_the_same_image_waits_for_the_running_pass(scheduler):
     _with_running_decode(scheduler)
     scheduler.add_request(_image("a"))
@@ -322,9 +362,8 @@ def test_the_same_image_waits_for_the_running_pass(scheduler):
     scheduled = set()
     for _ in range(6):
         out, slices = _step(scheduler)
-        if slices is not None:
-            starts += slices.start
-        if slices is not None and slices.run.get("h") == 2:
+        starts += slices.start
+        if slices.run.get("h") == 2:
             assert not {"a", "b"} & set(out.num_scheduled_tokens)
         scheduled |= set(out.num_scheduled_tokens)
         assert "b" not in out.scheduled_encoder_inputs
@@ -337,20 +376,31 @@ def test_passes_run_one_at_a_time_in_waiting_order(scheduler):
     scheduler.add_request(_image("a", "ha"))
     scheduler.add_request(_image("b", "hb"))
 
-    plans = [_step(scheduler)[1] for _ in range(6)]
-    runs = [p.run for p in plans if p is not None]
+    runs = [_step(scheduler)[1].run for _ in range(6)]
     assert runs == [{"ha": 2}, {"ha": 2}, {"ha": None}, {"hb": 2}, {"hb": 2}, {"hb": None}]
 
 
+def test_a_deferred_request_keeps_its_place_in_the_waiting_queue(scheduler):
+    _with_running_decode(scheduler)
+    scheduler.add_request(_image("img", "h"))
+    scheduler.add_request(_image("img2", "h2"))
+
+    out, slices = _step(scheduler)
+    assert slices.run == {"h": 2}
+    assert not {"img", "img2"} & set(out.num_scheduled_tokens)
+    assert [r.request_id for r in scheduler.waiting] == ["img", "img2"]
+
+
 def test_images_that_never_fit_the_cache_together_go_to_upstream(scheduler):
-    """Held, they would wait forever for space, and so would every image request behind them."""
+    """Deferred, they would wait forever for space, and so would every image request behind
+    them."""
     scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=60)
     scheduler.max_num_encoder_input_tokens = 60
     _with_running_decode(scheduler)
     scheduler.add_request(_image("img", "ha", "hb"))
 
     out, slices = _step(scheduler)
-    assert slices is None
+    assert slices == VisionSlices()
     assert out.scheduled_encoder_inputs == {"img": [0]}
 
 
@@ -366,24 +416,34 @@ def test_a_request_holding_kv_blocks_waits_for_the_pass_of_its_image(scheduler):
     out, slices = _step(scheduler)
     assert slices.run == {"h": 2}
     assert "session" not in out.num_scheduled_tokens
-    assert session in scheduler.kv_holding_waiting
 
     out, slices = _step(scheduler)
     assert slices.run == {"h": None}
     assert "session" in out.num_scheduled_tokens
+    assert "session" not in out.scheduled_encoder_inputs
 
 
-def test_a_hold_keeps_the_waiting_order(monkeypatch):
-    """A held request goes back behind an older one upstream didn't admit, not ahead of it."""
-    scheduler = _sliced_scheduler(monkeypatch, max_num_seqs=1)
-    _with_running_decode(scheduler)
-    scheduler.add_request(_text("t0"))
+def test_a_running_prefill_with_an_image_mid_pass_ahead_waits_for_the_pass(monkeypatch):
+    """Upstream defers it from its running loop; without that it would encode the image in
+    one step once its prefill got there."""
+    monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "2")
+    scheduler = _sliced_scheduler()
+    # Short chunks leave budget for the image request; the image sits far into the prompt.
+    scheduler.scheduler_config.long_prefill_token_threshold = 100
+    scheduler.add_request(_image("long", prompt_len=1000, offset=700))
+    _step(scheduler)
     scheduler.add_request(_image("img"))
 
     out, slices = _step(scheduler)
-    assert slices.run == {"h": 2}
-    assert not {"t0", "img"} & set(out.num_scheduled_tokens)
-    assert [r.request_id for r in scheduler.waiting] == ["t0", "img"]
+    assert [s.mm_hash for s in slices.start] == ["h"]
+    assert "long" in out.num_scheduled_tokens
+
+    out, slices = _step(scheduler)
+    assert "long" not in out.num_scheduled_tokens
+
+    out, slices = _step(scheduler)
+    assert slices.run == {"h": None}
+    assert "long" in out.num_scheduled_tokens
 
 
 def test_reset_encoder_cache_cancels_the_pass_and_starts_it_again(scheduler):
@@ -399,17 +459,6 @@ def test_reset_encoder_cache_cancels_the_pass_and_starts_it_again(scheduler):
     assert "img" not in out.num_scheduled_tokens
 
 
-def test_no_pass_for_an_image_a_running_request_may_still_reach(scheduler):
-    """That request's prefill would find the image cached mid-pass, so upstream encodes it."""
-    _with_running_decode(scheduler)
-    scheduler.requests["t"].mm_features.append(_image("unused").mm_features[0])
-    scheduler.add_request(_image("img"))
-
-    out, slices = _step(scheduler)
-    assert slices is None
-    assert out.scheduled_encoder_inputs == {"img": [0]}
-
-
 def test_text_requests_are_not_held_behind_a_pass(scheduler):
     _with_running_decode(scheduler)
     scheduler.add_request(_image("img"))
@@ -420,8 +469,7 @@ def test_text_requests_are_not_held_behind_a_pass(scheduler):
 
 
 def test_off_by_default():
-    sched = _scheduler()
-    assert sched._vision_slicing is None
+    assert _scheduler().ec_connector is None
 
 
 class _SlicedVisionModel(SpyreVisionEncoderMixin):
@@ -464,7 +512,10 @@ def test_vision_slicing_spreads_the_tower_over_ceil_depth_by_k_steps(slicing_con
             lambda c: setattr(c.model_config.multimodal_config, "mm_processor_cache_type", "shm"),
         ),
         ("LoRA", lambda c: setattr(c, "lora_config", object())),
-        ("encoder cache transfer connector", lambda c: setattr(c, "ec_transfer_config", object())),
+        (
+            "another encoder cache connector",
+            lambda c: setattr(c, "ec_transfer_config", SimpleNamespace(ec_connector="Other")),
+        ),
         (
             "custom encoder cache manager",
             lambda c: setattr(c.ec_manager_config, "get_encoder_cache_manager_obj", lambda: object),
@@ -475,6 +526,14 @@ def test_vision_slicing_refuses_features_that_break_the_plan(slicing_config, fea
     turn_on(slicing_config)
     with pytest.raises(ValueError, match=feature):
         vision_slicing(slicing_config)
+
+
+def test_vision_slicing_accepts_its_own_connector(slicing_config):
+    """The platform's hook can run again on a config it already installed it in."""
+    slicing_config.ec_transfer_config = SimpleNamespace(
+        ec_connector=SpyreVisionSliceConnector.__name__
+    )
+    assert vision_slicing(slicing_config) == VisionSlicing(6, 4, ("image",))
 
 
 def test_vision_slicing_needs_the_tower_depth(slicing_config):

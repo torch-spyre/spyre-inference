@@ -3055,7 +3055,9 @@ def test_spyre_attn_batched_decode_uses_plain_page_ids(default_vllm_config, conf
         num_kv_heads=num_kv_heads,
     )
 
-    pages = torch.empty(1 + num_seqs * blocks_per_seq)
+    # More pages than one chunk's 64 block slots gather: a gather of the whole cache faults the
+    # device (torch-spyre#4033), so dispatch declines it.
+    pages = torch.empty(2 * 64 + 1)
     assert impl._batched_decode_supported()
     assert impl._batched_decode_preconditions_met(attn_metadata, pages), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"

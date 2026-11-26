@@ -2732,15 +2732,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         aligned_query_lens = attn_metadata.aligned_query_lens
 
         num_decode_seqs = attn_metadata.num_decode_seqs
-        # The batched kernels and the per-sequence loop all read the query staging buffer, so
-        # it is copied once. attn_layer stages inside the traced graph where it can be; then
-        # the buffers arrive here already staged and the copy is already done.
-        q_staging, out_staging = self._staging_buffers(_target_device)
-        pre_staged = query_dev is q_staging
-        batch_rows = self.staging_rows
-        if not pre_staged:
-            batch_rows = self._stage_query(query_dev)
-            query_dev = q_staging
         batched_done = False
         if self._grouped_decode_preconditions_met(attn_metadata, k_pages):
             self._run_grouped_decode(
@@ -2763,6 +2754,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # prefix was already served by the batched kernel and needs no mask transfer.
         # Mirrors the batch layout row for row, so the absolute query_start_loc
         # offsets in the row tables still apply.
+        q_staging, out_staging = self._staging_buffers(_target_device)
+        # attn_layer stages inside the traced graph where it can be; then the buffers arrive
+        # here already staged and both copies are already done. Otherwise a batched dispatch
+        # above has already staged the whole query, prefill rows included, and the loop
+        # reads that copy.
+        pre_staged = query_dev is q_staging
+        batch_rows = self.staging_rows
+        if not pre_staged:
+            batch_rows = query_dev.shape[0] if batched_done else self._stage_query(query_dev)
+
         self._assert_query_fits_staging(max(aligned_query_lens, default=1))
 
         # In a mixed batch, skip the decode rows already written by the batched kernel.

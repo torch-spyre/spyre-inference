@@ -179,11 +179,7 @@ def _to_device_with_page_range(
         return convert(host, device=device)
     padded = host.new_zeros((page_range["max"], *host.shape[1:]))
     padded[: host.shape[0]] = host
-    dev = convert(padded, device=device, dynamic={0: page_range})
-    # Drain as the blocking upload did: without it TP>1 greedy output changes at
-    # near-ties, an all-reduce ordering issue in torch-spyre (see #1759).
-    torch.spyre.synchronize()
-    return dev.resize_(host.shape)
+    return convert(padded, device=device, dynamic={0: page_range}).resize_(host.shape)
 
 
 def _mirror_mask_stack(

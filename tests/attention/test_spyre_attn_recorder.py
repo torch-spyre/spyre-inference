@@ -1089,14 +1089,13 @@ def _batched_key(md) -> tuple[int, int, int, bool, bool]:
     )
 
 
-@pytest.fixture(params=["1", "0"], ids=["single_chunk", "dynamic_only"])
-def shared_slot_builder(builder, monkeypatch, request):
-    """The shared-slot kernels over 128 pages: 8 rows, the dynamic kernel runs up to 32 chunks,
-    with and without the single-chunk kernel."""
+@pytest.fixture()
+def shared_slot_builder(builder, monkeypatch):
+    """The shared-slot kernel over 128 pages: 8 rows, one dynamic kernel for every chunk
+    count."""
     from torch_spyre._inductor import config as ts_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", request.param)
     envs.clear_env_cache()
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -1134,44 +1133,36 @@ def _decode_batch(builder, seq_lens: list[int], max_blocks: int, num_pages: int)
 
 @pytest.mark.parametrize("num_seqs", [1, 3, 8])
 def test_shared_slot_dispatch_lands_on_a_recorded_shared_slot_kernel(shared_slot_builder, num_seqs):
-    """Every decode batch of up to shared_slot_seqs sequences, at any lengths, realizes one of
-    the shared-slot kernels warmup records, and so does each of its groups."""
+    """Every decode batch of up to shared_slot_seqs sequences, at any lengths, realizes the
+    shared-slot kernel warmup records, and so does each of its groups."""
     bucketer = shared_slot_builder.attn_bucketer
-    single_chunk = envs.SPYRE_ATTN_SINGLE_CHUNK_KERNEL
-    recorded = {}
-    for v in bucketer.shared_slot_variants():
-        key = _batched_key(shared_slot_builder.build_for_batched_decode_variant(v))
-        assert key == (
-            v.num_seqs,
-            v.blocks_per_chunk,
-            v.num_chunks,
-            v.dynamic_chunks,
-            v.shared_slots,
-        )
-        recorded[key[3]] = key
-    assert set(recorded) == ({False, True} if single_chunk else {True})
+    (variant,) = bucketer.shared_slot_variants()
+    dynamic = _batched_key(shared_slot_builder.build_for_batched_decode_variant(variant))
+    assert dynamic == (
+        variant.num_seqs,
+        variant.blocks_per_chunk,
+        variant.num_chunks,
+        True,
+        True,
+    )
     chunk_range = bucketer.shared_slot_chunk_range
-    assert chunk_range is not None and chunk_range["min"] == (2 if single_chunk else 1)
+    assert chunk_range is not None and chunk_range["min"] == 1
 
     for kv_len in range(1, 8193, 331):
         seq_lens = [max(1, kv_len - 997 * i) for i in range(num_seqs)]
         md = _decode_batch(shared_slot_builder, seq_lens, 128, 1 << 20)
         for call in [md, *(md.decode_groups or [])]:
             key = _batched_key(call)
-            dynamic = recorded[True]
-            if key[3]:
-                assert key[:2] + key[3:] == dynamic[:2] + dynamic[3:], f"{seq_lens=} {key}"
-                assert call.chunk_range == chunk_range
-                assert chunk_range["min"] <= key[2] <= chunk_range["max"]
-            else:
-                assert key == recorded.get(False), f"{seq_lens=} {key}"
+            assert key[:2] + key[3:] == dynamic[:2] + dynamic[3:], f"{seq_lens=} {key}"
+            assert call.chunk_range == chunk_range
+            assert chunk_range["min"] <= key[2] <= chunk_range["max"]
 
 
 @pytest.mark.usefixtures("stub_forward")
 def test_shared_slot_mode_records_its_kernels_and_the_buckets_above(
     impl, shared_slot_builder, spyre_device
 ):
-    """Two shared-slot kernels serve up to shared_slot_seqs sequences; only the buckets above
+    """One shared-slot kernel serves up to shared_slot_seqs sequences; only the buckets above
     keep theirs."""
     pages = 128
     cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
@@ -1180,7 +1171,7 @@ def test_shared_slot_mode_records_its_kernels_and_the_buckets_above(
     )
     shared = bucketer.shared_slot_variants()
     above = bucketer.batched_decode_variants()
-    assert [v.num_seqs for v in shared] == [32] * (2 if envs.SPYRE_ATTN_SINGLE_CHUNK_KERNEL else 1)
+    assert [v.num_seqs for v in shared] == [32]
     assert {v.num_seqs for v in above} == {64}
 
     assert _record(impl, cache, shared_slot_builder) == len(_recordable(bucketer, pages)) + len(
@@ -1192,9 +1183,9 @@ def test_shared_slot_dispatch_after_recording_compiles_nothing(
     impl, shared_slot_builder, spyre_device
 ):
     """The acceptance criterion in shared-slot mode: once warmup has recorded its kernels,
-    decode batches of any size up to shared_slot_seqs and any lengths compile nothing. Without the
-    single-chunk kernel the dynamic one runs every chunk count, one chunk included."""
-    # 16 pages: the dynamic shared-slot kernel runs 2 (or 1) to 4 chunks of 8 sequences.
+    decode batches of any size up to shared_slot_seqs and any lengths compile nothing: the one
+    dynamic kernel runs every chunk count, one chunk included."""
+    # 16 pages: the dynamic shared-slot kernel runs 1 to 4 chunks of 8 sequences.
     shared_slot_builder._attn_bucketer = make_bucketer(max_model_len=1024, declare_pages=True)
     assert shared_slot_builder.attn_bucketer.shared_slot_chunk_range["max"] == 4
     pages = 64

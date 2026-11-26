@@ -324,20 +324,12 @@ For example, take one sequence of 235 pages and four of 5 pages. The kernel for 
 reading nothing but padding. Shared by length over 32 block slots, the long sequence gets 27
 and each short one gets 1, and the batch runs 9 chunks; over 64, it runs 5.
 
-Warmup compiles two of these kernels for every batch size up to 64, instead of two per
-num-sequences bucket:
-
-- one for a batch that fits in a single chunk;
-- one for every other batch, up to every sequence at `--max-model-len`.
+Warmup compiles a single such kernel for all batch sizes up to 64, instead of one per
+num-sequences bucket. It runs every chunk count, from a batch that fits in a single chunk up to
+every sequence at `--max-model-len`.
 
 Batches of more than 64 sequences keep their per-bucket kernels, and sliding-window layers keep
 their KV buckets. These kernels need the same torch-spyre as the dynamic chunk count above.
-
-`SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` skips the single-chunk kernel, which saves one compile at
-warmup. A batch that fits in one chunk then runs on the other kernel, which is slower to launch:
-before every call, it prepares data on the host for every chunk it could run. That kernel's
-chunk count then starts at one, or at `MIN_RESERVED_DIM_SIZE` if you export it. The default,
-`1`, keeps both kernels.
 
 ## KV cache size
 

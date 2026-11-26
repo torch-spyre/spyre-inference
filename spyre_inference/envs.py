@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
-    SPYRE_ATTN_SINGLE_CHUNK_KERNEL: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
@@ -117,12 +116,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.
     "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
-    # When "1" (default), a shared-slot batched decode call whose blocks fit in one chunk
-    # runs a static single-chunk kernel, one more warmup compile. "0" runs it on the dynamic
-    # chunk-count kernel too, whose launch costs more.
-    "SPYRE_ATTN_SINGLE_CHUNK_KERNEL": lambda: bool(
-        int(os.getenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", "1"))
-    ),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
     # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.

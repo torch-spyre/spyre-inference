@@ -477,10 +477,9 @@ its block `c * slots + k`. After the last chunk, an `[E, S]` one-hot sums each s
 block slots into its output row, as the per-bucket kernel sums a sequence's block slots.
 Output rows past the batch copy row 0, so they stay finite.
 
-Two variants serve every batch of up to `S` sequences: a single-chunk one and a dynamic one.
-The dynamic one runs up to the chunks `S` sequences at `max_model_len` need, so one call
-serves every such batch. `SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0` records only the dynamic variant,
-whose range then starts at one chunk, or at `MIN_RESERVED_DIM_SIZE` if you export it.
+One dynamic variant serves every batch of up to `S` sequences. Its chunk count runs from one
+chunk, or from `MIN_RESERVED_DIM_SIZE` if you export it, up to what `S` sequences at
+`max_model_len` need, so one call serves every such batch.
 
 A single step can carry a mix of prefill and decode sequences; each sequence is padded to its
 own query bucket (decodes use the length-1 bucket) before dispatch.

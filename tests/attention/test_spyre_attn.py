@@ -2372,7 +2372,7 @@ def test_spyre_attn_one_page_masks_stale_slots(
 
 
 # Which batched decode kernels a decode batch of up to 32 sequences runs on.
-_BATCHED_DECODE_KERNELS = ["per_bucket", "shared_slots", "shared_slots_without_single_chunk"]
+_BATCHED_DECODE_KERNELS = ["per_bucket", "shared_slots"]
 
 
 def _use_batched_decode_kernels(monkeypatch, kernels: str) -> None:
@@ -2383,8 +2383,6 @@ def _use_batched_decode_kernels(monkeypatch, kernels: str) -> None:
     )
     if kernels == "per_bucket":
         use_per_bucket_decode(monkeypatch)
-    elif kernels == "shared_slots_without_single_chunk":
-        monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", "0")
 
 
 @pytest.mark.parametrize("num_seqs", [8, 32])
@@ -2400,9 +2398,9 @@ def _use_batched_decode_kernels(monkeypatch, kernels: str) -> None:
 def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
     default_vllm_config, monkeypatch, num_seqs, configure_compilation, configure_device, kernels
 ):
-    """Batched decode at one chunk masks its pages' stale slots too: at one chunk of a dynamic
-    chunk count, or on the shared-slot single-chunk kernel. At 32 sequences a per-bucket chunk
-    is a single page of each."""
+    """Batched decode at one chunk of its dynamic chunk count masks its pages' stale slots too,
+    on the per-bucket kernel and on the shared-slot one. At 32 sequences a per-bucket chunk is
+    a single page of each."""
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     envs.clear_env_cache()
     _use_batched_decode_kernels(monkeypatch, kernels)
@@ -2444,7 +2442,7 @@ def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
         num_kv_heads=2,
         stale_cache=True,
     )
-    assert chunks == [(1, kernels != "shared_slots")], chunks
+    assert chunks == [(1, True)], chunks
 
 
 @pytest.mark.parametrize(
@@ -2482,17 +2480,16 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     _use_batched_decode_kernels(monkeypatch, kernels)
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
     # chunk holds 4 pages of each, so the kernel runs 1 to 4 chunks: compiled at 4, then
-    # reused at the others. The shared-slot kernels split these batches into 1 to 4 chunks
-    # too, but with their single-chunk kernel a batch that fits one chunk runs that one,
-    # which test_spyre_attn_short_decode_batches_share_one_full_width_chunk covers.
-    one_chunk = kernels != "shared_slots"
+    # reused at the others. The shared-slot kernel splits these batches into 1 to 4 chunks
+    # too.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         for seq_lens in (
             [(1, 2048)] * 8,
-            *([[(1, 100)] * 8, [(1, 500 - 50 * i) for i in range(8)]] if one_chunk else []),
+            [(1, 100)] * 8,
+            [(1, 500 - 50 * i) for i in range(8)],
             [(1, 600)] * 8,
             [(1, 1100 - 60 * i) for i in range(8)],
             [(1, 1600), (1, 520)] * 4,
@@ -2509,62 +2506,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert set(chunk_counts) == ({1, 2, 3, 4} if one_chunk else {2, 3, 4}), chunk_counts
-
-
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-@pytest.mark.parametrize("kernels", _BATCHED_DECODE_KERNELS)
-def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
-    default_vllm_config,
-    monkeypatch,
-    batched_decode_calls,
-    configure_compilation,
-    configure_device,
-    kernels,
-):
-    """Every decode batch that fits in one chunk runs the same compiled kernel and matches
-    the reference: the shared-slot single-chunk kernel, or else the dynamic kernel."""
-    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
-    from torch_spyre._C import get_reserved_dims
-    from torch_spyre._inductor import config as ts_config
-
-    chunk_shapes: set[tuple[int, int, bool]] = set()
-    run = SpyreAttentionImpl._run_batched_decode
-
-    def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
-        dynamic = bool(get_reserved_dims(chunk_page_ids))
-        chunk_shapes.add((*chunk_page_ids.shape[:2], dynamic))
-        return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
-
-    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    _use_batched_decode_kernels(monkeypatch, kernels)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so batches of 1 to 4 pages all run as one chunk.
-    kernel_code = spyre_attn.batched_decode.__code__
-    # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
-    # config-module entry, hiding it for later tests.
-    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
-        for seq_lens in ([(1, 100)] * 8, [(1, 500 - 50 * i) for i in range(8)]):
-            batched_decode_calls.clear()
-            _run_spyre_attn_test(
-                seq_lens=seq_lens,
-                block_size=128,
-                sliding_window=None,
-                configure_compilation=configure_compilation,
-                configure_device=configure_device,
-                num_query_heads=8,
-                num_kv_heads=2,
-            )
-            assert batched_decode_calls, "the batch fell back to the per-seq loop"
-            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert chunk_shapes == {(1, 32, kernels != "shared_slots")}, chunk_shapes
+    assert set(chunk_counts) == {1, 2, 3, 4}, chunk_counts
 
 
 @pytest.mark.parametrize(

@@ -41,11 +41,18 @@ rtp = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = rtp  # @dataclass looks its module up here
 _spec.loader.exec_module(rtp)
 
+# Under `make test-smoke-shard-N` (CI), MAKEFLAGS carries the outer command-line vars
+# (PYTEST_ARGS with the shard flags) into any nested make.
+_CLEAN_MAKE_ENV = {
+    k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")
+}
+
 
 def _make_targets() -> list[str]:
     out = subprocess.run(
         ["make", "-s", "--no-print-directory", "print-test-targets"],
         cwd=_REPO,
+        env=_CLEAN_MAKE_ENV,
         capture_output=True,
         text=True,
         check=True,
@@ -245,6 +252,7 @@ def _leaf_pytest(target: str) -> str:
     out = subprocess.run(
         ["make", "-n", "--no-print-directory", target, "JUNIT_XML="],
         cwd=_REPO,
+        env=_CLEAN_MAKE_ENV,
         capture_output=True,
         text=True,
         check=True,

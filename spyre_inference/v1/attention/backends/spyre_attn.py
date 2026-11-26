@@ -335,12 +335,8 @@ def _compile_with_dynamic_count(
     def run(**kwargs: Any) -> torch.Tensor:
         if kwargs[range_arg] is None:
             return compiled(**kwargs)
-        prior = fx_config.backed_size_oblivious
-        fx_config.backed_size_oblivious = True  # ty: ignore[invalid-assignment]
-        try:
+        with fx_config.patch(backed_size_oblivious=True):
             return compiled(**kwargs)
-        finally:
-            fx_config.backed_size_oblivious = prior
 
     return run
 

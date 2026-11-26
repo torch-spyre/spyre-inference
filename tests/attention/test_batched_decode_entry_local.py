@@ -68,10 +68,25 @@ def _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, 
 
 
 def _kernel(
-    query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q, cap=0.0, sinks=None, **kwargs
+    query,
+    rep,
+    k_pages,
+    v_pages,
+    page_ids,
+    mask,
+    b,
+    bpc,
+    kv,
+    q,
+    cap=0.0,
+    sinks=None,
+    entry_local=None,
 ):
+    # The kernel's own rule: per-slot state past one chunk.
+    if entry_local is None:
+        entry_local = page_ids.shape[0] > 1
     return bdhm.batched_decode_kernel(
-        **kwargs,
+        entry_local=entry_local,
         query=query,
         rep_row_ids=rep,
         k_pages=k_pages,

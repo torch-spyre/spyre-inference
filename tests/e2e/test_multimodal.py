@@ -23,6 +23,7 @@ import io
 import sys
 
 import pytest
+import torch
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
 # Pixtral vision encoder + multimodal projector + Ministral-3 text decoder.
@@ -201,6 +202,68 @@ def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     assert output.outputs[0].text.strip(), "empty generation from the Gemma 4 vision path"
     with pytest.raises(VLLMValidationError, match="encoder_cudagraph_token_budgets"):
         llm.chat(conversation, params, mm_processor_kwargs={"max_soft_tokens": 560})
+
+
+@pytest.mark.multimodal
+@pytest.mark.gemma4_vision
+@pytest.mark.uses_subprocess
+@pytest.mark.timeout(3600)
+def test_gemma4_sliced_vision_pass_matches_one_shot(monkeypatch):
+    """With SPYRE_VISION_BLOCKS_PER_STEP, an image arriving behind a decode is encoded over
+    several steps, through graphs compiled at warmup, to what one encoder call gives.
+
+    The CPU tests use a fake tower in one process; this checks the plan's trip to the worker
+    and the pass's activations held on the card between steps.
+    """
+    _skip_without_gemma4()
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("SPYRE_VISION_BLOCKS_PER_STEP", "4")
+    # One prefill per step, so the text request is decoding by the time the image is scanned.
+    monkeypatch.setenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")
+    # collective_rpc ships the probes below to the engine process with cloudpickle.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    from vllm import SamplingParams
+
+    def record_slices(worker):
+        manager = worker.model_runner.model_state.encoder_runner.cudagraph_manager
+        manager.advances, manager.finished = 0, []
+        run_slices, finish_item = manager.run_slices, manager.finish_item
+
+        def recording_run(slices, device):
+            manager.advances += sum(n is not None for n in slices.run.values())
+            return run_slices(slices, device)
+
+        def recording_finish(state, mm_kwargs):
+            output = finish_item(state, mm_kwargs)
+            (one_shot,) = manager.execute(mm_kwargs)
+            manager.finished.append((output.cpu(), one_shot.cpu()))
+            return output
+
+        manager.run_slices, manager.finish_item = recording_run, recording_finish
+
+    def recorded_slices(worker):
+        manager = worker.model_runner.model_state.encoder_runner.cudagraph_manager
+        return manager.advances, manager.finished
+
+    llm = _llm(
+        False, max_num_seqs=2, model=GEMMA4_MODEL, config_format="hf", revision=GEMMA4_REVISION
+    )
+    llm.collective_rpc(record_slices)
+    outputs = llm.chat(
+        [_conversation(), _conversation(_synthetic_image_data_uri())],
+        [
+            # Long enough to keep decoding until the image's pass finishes.
+            SamplingParams(max_tokens=64, temperature=0.0),
+            SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0),
+        ],
+    )
+
+    assert all(o.outputs[0].text.strip() for o in outputs), "empty generation"
+    ((advances, finished),) = llm.collective_rpc(recorded_slices)
+    assert advances > 0, "the image was encoded in one step, not sliced"
+    ((sliced, one_shot),) = finished
+    torch.testing.assert_close(sliced, one_shot)
 
 
 @pytest.mark.multimodal

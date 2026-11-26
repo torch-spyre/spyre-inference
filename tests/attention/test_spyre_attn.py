@@ -2363,6 +2363,63 @@ def test_spyre_attn_one_page_masks_stale_slots(
     assert pages == walked, pages
 
 
+@pytest.mark.parametrize("num_seqs", [8, 32])
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
+    default_vllm_config, monkeypatch, num_seqs, configure_compilation, configure_device
+):
+    """Batched decode at one chunk of its dynamic chunk count masks its pages' stale slots
+    too. At 32 sequences a chunk is a single page of each."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+    chunks: list[tuple[int, bool]] = []
+    run = SpyreAttentionImpl._run_batched_decode
+
+    def recording(
+        self,
+        query_dev,
+        rep_row_ids,
+        k_pages,
+        v_pages,
+        chunk_page_ids,
+        mask_by_chunk,
+        chunk_range,
+        *args,
+    ):
+        chunks.append((chunk_page_ids.shape[0], chunk_range is not None))
+        return run(
+            self,
+            query_dev,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_page_ids,
+            mask_by_chunk,
+            chunk_range,
+            *args,
+        )
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    _run_spyre_attn_test(
+        seq_lens=[(1, 100)] * num_seqs,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=2,
+        stale_cache=True,
+    )
+    assert chunks == [(1, True)], chunks
+
+
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],

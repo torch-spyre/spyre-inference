@@ -670,7 +670,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return tile
 
     def _pad_num_blocks(self, num_blocks: int, prefill: bool = False) -> int:
-        """Round an active-block count up onto the recorder's num_blocks buckets.
+        """Round an active-block count up onto the recorder's num_blocks buckets, or onto
+        the declared page count with a page range.
 
         block_table is allocated at width ceil(max_model_len / block_size) for
         the engine's lifetime, so the padded bucket always fits.
@@ -679,16 +680,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # A fully-masked padded tile would divide by a zero softmax
             # denominator, so zero real blocks must stay zero.
             return 0
-        if self._attn_bucketer.page_range is not None:
-            return self._attn_bucketer.find_declared_pages(num_blocks, prefill)
-        padded = self._attn_bucketer.find_blocks_bucket(num_blocks)
-        # The buckets cover ceil(max_model_len / block_size), and the scheduler
-        # bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
+        bucketer = self._attn_bucketer
+        if bucketer.page_range is not None:
+            page_range = bucketer.prefill_page_range if prefill else bucketer.page_range
+            assert page_range is not None
+            padded: int | None = bucketer.find_declared_pages(num_blocks, prefill)
+            largest = page_range["max"]
+        else:
+            padded = bucketer.find_blocks_bucket(num_blocks)
+            largest = bucketer.num_blocks_buckets[-1]
+        # The buckets and the page range cover ceil(max_model_len / block_size), and the
+        # scheduler bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
         # seq_lens come from the token budget instead, never reach here.
-        assert padded is not None, (
-            f"num_blocks={num_blocks} exceeds the largest recorded bucket "
-            f"{self._attn_bucketer.num_blocks_buckets[-1]}, which should cover "
-            f"ceil(max_model_len / block_size)."
+        assert padded is not None and padded <= largest, (
+            f"num_blocks={num_blocks} exceeds the largest recorded bucket {largest}, which "
+            f"should cover ceil(max_model_len / block_size)."
         )
         assert padded >= num_blocks
         return padded

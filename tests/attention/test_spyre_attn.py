@@ -174,6 +174,7 @@ def _run_spyre_attn_test(
     kv_scales: tuple[float, float] = (1.0, 1.0),
     expect_query_widths: set[int] | None = None,
     num_blocks: int = 256,
+    stale_cache: bool = False,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation.
 
@@ -301,6 +302,11 @@ def _run_spyre_attn_test(
     k_pages, v_pages = _fresh_pages(
         num_blocks, num_kv_heads, block_size, head_size, cache_device, dtype, fp8
     )
+    if stale_cache:
+        # Another request's KV in every slot the store below leaves alone: a slot the masks
+        # miss then moves the output far from the reference.
+        k_pages.fill_(2.0)
+        v_pages.fill_(5.0)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
     # The attention layer, not forward(), owns the KV write (see attn_layer.py).
@@ -560,22 +566,34 @@ def test_spyre_attn_bfloat16(
     )
 
 
-def test_kernel_block_sizes_accept_the_layer_spec():
-    """vLLM's attention layer passes its `kv_cache_spec` positionally (sliding-window
-    layers included); every spec gets the same stick-aligned constraint."""
+def test_kernel_blocks_are_cache_block_size(monkeypatch):
+    """The kernels run at cache_config.block_size only: upstream keeps a block of that size
+    whole and splits a block the hybrid manager grew (gemma-4's 256-token global group)
+    into it, without padding either one's page."""
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.v1.attention.backend import MultipleOf
-    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.worker.utils import customize_attention_spec, select_common_block_size
 
+    from spyre_inference.v1.attention.backends import spyre_attn
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
 
-    spec = SlidingWindowSpec(
-        block_size=64, num_kv_heads=2, head_size=64, dtype=torch.float16, sliding_window=128
-    )
-    for sizes in (
-        SpyreAttentionBackend.get_supported_kernel_block_sizes(spec),
-        SpyreAttentionBackend.get_supported_kernel_block_sizes(),
-    ):
-        assert [s.base for s in sizes if isinstance(s, MultipleOf)] == [64]
+    backend = SpyreAttentionBackend
+    vllm_config = VllmConfig()
+    vllm_config.cache_config.block_size = 128
+    with set_current_vllm_config(vllm_config):
+        for block_size in (128, 256):
+            spec = customize_attention_spec(
+                backend,
+                FullAttentionSpec(
+                    block_size=block_size, num_kv_heads=2, head_size=512, dtype=torch.float16
+                ),
+            )
+            assert select_common_block_size(block_size, [backend], [spec]) == 128
+            assert spec.page_size_bytes % spec.get_block_stride_alignment() == 0
+    # Without a config only the stick constrains the block size.
+    monkeypatch.setattr(spyre_attn, "get_current_vllm_config_or_none", lambda: None)
+    assert backend.get_supported_kernel_block_sizes() == [MultipleOf(64)]
 
 
 def test_block_size_validation():
@@ -652,94 +670,6 @@ def test_block_size_validation():
             device=torch.device("cpu"),
         )
         assert builder.block_size == block_size
-
-
-def test_each_layer_in_one_kv_cache_tensor_gets_its_own_pages(monkeypatch):
-    """A KVCacheTensor packs *every* attention layer into one allocation.
-
-    One shared page buffer per tensor would alias all those layers onto the same block,
-    so a later layer's KV write clobbers an earlier layer's. Prefill still looks right --
-    each layer reads back its own fresh write -- and only decode is corrupted, which is
-    why this needs an allocation-level guard rather than an output check.
-
-    Card-free on purpose: `allocate_pages` is stubbed with per-call sentinels, so the
-    card-less CI shards run this instead of skipping past it.
-    """
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
-    from vllm.config.compilation import CompilationConfig
-    from vllm.v1.kv_cache_interface import (
-        AttentionSpec,
-        KVCacheConfig,
-        KVCacheGroupSpec,
-        KVCacheTensor,
-    )
-
-    from spyre_inference.v1.attention.backends import spyre_attn as spyre_attn_mod
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
-    layer_names = [f"layers.{i}.self_attn" for i in range(4)]
-
-    vllm_config = VllmConfig(
-        model_config=ModelConfig(
-            model="Qwen/Qwen3-0.6B",
-            max_model_len=1,
-            dtype=torch.float16,
-            trust_remote_code=True,
-        ),
-        cache_config=CacheConfig(block_size=block_size),
-        compilation_config=CompilationConfig(custom_ops=["all"]),
-    )
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
-
-    spec = AttentionSpec(
-        block_size=block_size,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        dtype=torch.float16,
-    )
-    # The shape under test: all four layers in a single KVCacheTensor, as vLLM packs them.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=spec.page_size_bytes * num_blocks * len(layer_names),
-                layers=layer_names,
-                layer_stride=spec.page_size_bytes * num_blocks,
-                block_stride=spec.page_size_bytes,
-            )
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
-    )
-
-    for layer_name in layer_names:
-        fake_layer = Mock()
-        fake_layer.kv_cache = None
-        runner.compilation_config.static_forward_context[layer_name] = fake_layer
-
-    calls = []
-
-    def _fake_allocate_pages(cls, blocks, allocate_spec, device):
-        calls.append((blocks, allocate_spec, device))
-        return Mock(name=f"pages-{len(calls)}")
-
-    monkeypatch.setattr(
-        spyre_attn_mod.SpyreAttentionImpl,
-        "allocate_pages",
-        classmethod(_fake_allocate_pages),
-    )
-
-    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
-
-    assert set(caches) == set(layer_names)
-    # The bug this guards against: one buffer handed to every layer.
-    assert len({id(caches[name]) for name in layer_names}) == len(layer_names), (
-        "layers packed into one KVCacheTensor must not share a page buffer"
-    )
-    # One allocation per layer, each sized for the full per-layer block count -- not one
-    # allocation carved up by layer_stride.
-    assert len(calls) == len(layer_names)
-    assert all(blocks == num_blocks for blocks, _, _ in calls)
 
 
 def test_supported_dtypes_includes_bfloat16():
@@ -1913,13 +1843,13 @@ def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch
     import contextlib
     from types import SimpleNamespace
 
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     from spyre_inference.v1.worker import compile_guard
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+    from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
     layer = _fp8_layer(0.25, 0.5)
-    runner = object.__new__(TorchSpyreModelRunner)
+    runner = object.__new__(SpyreModelRunnerV2)
     monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=[layer])))
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     _resolve([layer])
@@ -2122,6 +2052,7 @@ def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
         num_queries_per_kv=qpk,
         block_size=block_size,
         head_size=head_size,
+        entry_local=page_ids.shape[0] > 1,
     )
 
     got = batched_decode_kernel(
@@ -2331,8 +2262,8 @@ def test_spyre_attn_dispatches_by_query_width(
 
 
 @pytest.mark.parametrize(
-    ("query_len", "kernel_name"),
-    [(1, "page_attn_decode"), (64, "page_attn_prefill")],
+    ("query_len", "kernel_name", "page_counts"),
+    [(1, "page_attn_decode", {16, 1, 3, 8}), (64, "page_attn_prefill", {16, 8})],
     ids=["decode", "prefill"],
 )
 @pytest.mark.parametrize(
@@ -2348,18 +2279,28 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
     monkeypatch,
     query_len,
     kernel_name,
+    page_counts,
     configure_compilation,
     configure_device,
 ):
     """One compiled per-sequence kernel per query width serves every page count up to
-    max_model_len, a one-page sequence included, and matches the reference."""
+    max_model_len, one page included, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
     envs.clear_env_cache()
-    # The fixture's max_model_len 2048 at block size 128 gives a range of 2 to 16 pages. The
-    # kernel compiles at 16, as in warmup, and is reused at 1 page (run as 2), 3 and 8.
+    walked: set[int] = set()
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        walked.add(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    # The fixture's max_model_len 2048 at block size 128 gives a range of 1 to 16 pages. The
+    # kernel compiles at 16, as in warmup, and is reused at 1, 3 and 8 pages; prefill rounds
+    # them up to 8.
     kernel_code = getattr(spyre_attn, kernel_name).__code__
     # Restores the MIN_RESERVED_DIM_SIZE the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
@@ -2376,6 +2317,107 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
                 num_kv_heads=2,
             )
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
+    assert walked == page_counts
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "walked"), [((7, 7), [2]), ((1, 11), [1])], ids=["prefill", "decode"]
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_page_masks_stale_slots(
+    default_vllm_config, monkeypatch, seq_len, walked, configure_compilation, configure_device
+):
+    """At a max_model_len of two pages prefill takes the per-sequence page range. A one-page
+    sequence must still mask its page's stale slots: prefill covers two pages, decode one
+    (tests/e2e/test_kv_cache_determinism.py)."""
+    from vllm.config import get_current_vllm_config
+
+    get_current_vllm_config().model_config.max_model_len = 2 * 128
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    pages: list[int] = []
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        pages.append(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    _run_spyre_attn_test(
+        seq_lens=[seq_len],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=2,
+        stale_cache=True,
+    )
+    assert pages == walked, pages
+
+
+@pytest.mark.parametrize("num_seqs", [8, 32])
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
+    default_vllm_config, monkeypatch, num_seqs, configure_compilation, configure_device
+):
+    """Batched decode at one chunk of its dynamic chunk count masks its pages' stale slots
+    too. At 32 sequences a chunk is a single page of each."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+    chunks: list[tuple[int, bool]] = []
+    run = SpyreAttentionImpl._run_batched_decode
+
+    def recording(
+        self,
+        query_dev,
+        rep_row_ids,
+        k_pages,
+        v_pages,
+        chunk_page_ids,
+        mask_by_chunk,
+        chunk_range,
+        *args,
+    ):
+        chunks.append((chunk_page_ids.shape[0], chunk_range is not None))
+        return run(
+            self,
+            query_dev,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_page_ids,
+            mask_by_chunk,
+            chunk_range,
+            *args,
+        )
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    _run_spyre_attn_test(
+        seq_lens=[(1, 100)] * num_seqs,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=2,
+        stale_cache=True,
+    )
+    assert chunks == [(1, True)], chunks
 
 
 @pytest.mark.parametrize(
@@ -2393,8 +2435,8 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     configure_compilation,
     configure_device,
 ):
-    """Batches longer than one chunk all run one compiled kernel, at every chunk count up
-    to max_model_len and for ragged batches too, and match the reference."""
+    """Every decode batch runs one compiled kernel, at every chunk count from one up to
+    max_model_len and for ragged batches too, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._C import get_reserved_dims
     from torch_spyre._inductor import config as ts_config
@@ -2409,14 +2451,16 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks: compiled at 4, then
-    # reused at 2 and 3.
+    # chunk holds 4 pages of each, so the kernel runs 1 to 4 chunks: compiled at 4, then
+    # reused at the others.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         for seq_lens in (
             [(1, 2048)] * 8,
+            [(1, 100)] * 8,
+            [(1, 500 - 50 * i) for i in range(8)],
             [(1, 600)] * 8,
             [(1, 1100 - 60 * i) for i in range(8)],
             [(1, 1600), (1, 520)] * 4,
@@ -2433,57 +2477,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert set(chunk_counts) == {2, 3, 4}, chunk_counts
-
-
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
-    default_vllm_config,
-    monkeypatch,
-    batched_decode_calls,
-    configure_compilation,
-    configure_device,
-):
-    """Every decode batch that fits in one chunk runs the same compiled one-chunk kernel
-    and matches the reference."""
-    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
-    from torch_spyre._inductor import config as ts_config
-
-    chunk_shapes: set[tuple[int, int]] = set()
-    run = SpyreAttentionImpl._run_batched_decode
-
-    def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
-        chunk_shapes.add(tuple(chunk_page_ids.shape[:2]))
-        return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
-
-    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so batches of 1 to 4 pages all run as one chunk.
-    kernel_code = spyre_attn.batched_decode.__code__
-    # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
-    # config-module entry, hiding it for later tests.
-    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
-        for seq_lens in ([(1, 100)] * 8, [(1, 500 - 50 * i) for i in range(8)]):
-            batched_decode_calls.clear()
-            _run_spyre_attn_test(
-                seq_lens=seq_lens,
-                block_size=128,
-                sliding_window=None,
-                configure_compilation=configure_compilation,
-                configure_device=configure_device,
-                num_query_heads=8,
-                num_kv_heads=2,
-            )
-            assert batched_decode_calls, "the batch fell back to the per-seq loop"
-            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert chunk_shapes == {(1, 32)}, chunk_shapes
+    assert set(chunk_counts) == {1, 2, 3, 4}, chunk_counts
 
 
 @pytest.mark.parametrize(
@@ -2741,77 +2735,6 @@ def test_spyre_attn_head_configs(
     )
 
 
-def test_kv_cache_shape_matches_runner_allocation():
-    """The advertised shape, the runner's allocation and the kernels share one layout.
-
-    If get_kv_cache_shape drifts, vLLM code that allocates from the contract (KV
-    transfer, future tests) allocates a transposed cache."""
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
-    from vllm.config.compilation import CompilationConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
-
-    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
-    vllm_config = VllmConfig(
-        model_config=ModelConfig(
-            model="Qwen/Qwen3-0.6B", max_model_len=1, dtype=torch.float16, trust_remote_code=True
-        ),
-        cache_config=CacheConfig(block_size=block_size),
-        compilation_config=CompilationConfig(custom_ops=["all"]),
-    )
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
-    spec = AttentionSpec(
-        block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=spec.page_size_bytes * num_blocks,
-                layers=["layers.0.self_attn"],
-                layer_stride=spec.page_size_bytes * num_blocks,
-                block_stride=spec.page_size_bytes,
-            )
-        ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0.self_attn"], kv_cache_spec=spec)],
-    )
-
-    from vllm.config import set_current_vllm_config
-
-    with set_current_vllm_config(vllm_config):
-        impl = SpyreAttentionImpl(
-            num_heads=32, head_size=head_size, scale=head_size**-0.5, num_kv_heads=num_kv_heads
-        )
-    fake_layer = Mock()
-    fake_layer.kv_cache = None
-    fake_layer.impl = impl
-    runner.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
-
-    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
-    k_pages = caches["layers.0.self_attn"].k_pages
-    v_pages = caches["layers.0.self_attn"].v_pages
-
-    expected = SpyreAttentionBackend.get_kv_cache_shape(
-        num_blocks, block_size, num_kv_heads, head_size
-    )
-    assert k_pages.shape == expected == (num_blocks, num_kv_heads, block_size, head_size)
-    assert v_pages.shape == expected
-
-    # The kernel gathers a (page, kv_head) row, which has to stay whole at device
-    # position 0 (torch-spyre#3705) or the gather costs the whole cache, not one page.
-    for pages in (k_pages, v_pages):
-        device_size = pages.device_tensor_layout().device_size
-        assert device_size[0] == num_blocks * num_kv_heads
-        assert device_size[1] == block_size
-
-    del caches, k_pages, v_pages
-    gc.collect()
-
-
 def test_page_attn_decode_matches_fp32_reference():
     """The per-sequence decode kernel matches the suite's CPU reference."""
     from spyre_testing_plugin.attn_helpers import ref_attn
@@ -2957,6 +2880,7 @@ def test_multi_seq_decode_matches_fp32_reference(
         num_queries_per_kv=qpk,
         block_size=block_size,
         head_size=head_size,
+        entry_local=chunk_page_ids.shape[0] > 1,
     )
     expected = _decode_reference_fp32(
         query_padded,

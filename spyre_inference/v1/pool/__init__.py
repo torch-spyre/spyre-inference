@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Encoder / pooling helpers kept out of ``TorchSpyreModelRunner``."""
+"""Encoder / pooling helpers shared by the pooling runner, the encoder model state and the
+models."""
 
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,

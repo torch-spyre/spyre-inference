@@ -151,7 +151,10 @@ def test_spyre_gemma_rmsnorm_accumulates_the_variance_in_fp32(default_vllm_confi
 
 @pytest.mark.rmsnorm
 @pytest.mark.parametrize("use_residual", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32],
+)
 def test_gemma_rmsnorm_eager_support_is_fp32_only(default_vllm_config, dtype, use_residual):
     """Eager (uncompiled) ``forward_native`` lowers in both dtypes.
 

@@ -34,7 +34,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import interface as upstream_interface
 
 from spyre_inference.v1.worker.spyre.mm.encoder_runner import SpyreEncoderRunner
-from spyre_inference.v1.worker.spyre_model_runner import unwrap_model
+from spyre_inference.v1.worker.spyre.model_wrapper import unwrap_model
 
 
 class SpyreModelStateMixin:

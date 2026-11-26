@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-only tests for `make tests PARALLEL=...` (scripts/run_tests_parallel.py).
-
-The invariants: the parallel run walks the same targets as the serial run and CI, two
-shards never share a card, and a shard that drops or duplicates tests fails the run.
-"""
+"""CPU-only tests for `make tests PARALLEL=...` (scripts/run_tests_parallel.py)."""
 
 import importlib.util
 import json
@@ -60,16 +56,10 @@ def _make_targets() -> list[str]:
     return out.split()
 
 
-# ---------------------------------------------------------------------------
-# Same targets as CI and the serial run
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.skipif(shutil.which("make") is None, reason="needs make")
 @pytest.mark.parametrize("tier", ["regression", "trunk"])
 def test_targets_match_the_ci_matrix(tier):
-    """The Makefile's list is exactly CI's x86_64 legs for the tier, minus the legs that
-    need an extra dependency group (triton-cpu), which the serial run also leaves out."""
+    # Legs with extra_groups (triton-cpu) are not in the serial run either.
     doc = yaml.safe_load(_MATRIX.read_text())
     ci = {
         e["test_target"]
@@ -77,7 +67,6 @@ def test_targets_match_the_ci_matrix(tier):
         if tier in e["test_types"].split()
         and "x86_64" in e["runs_on"]
         and not e.get("extra_groups")
-        and e["test_target"] != "parallel-ab"  # TEMPORARY A/B leg
     }
     targets = _make_targets()
     assert len(targets) == len(set(targets))
@@ -92,11 +81,6 @@ def test_every_target_has_a_card_count():
     assert needs["test-smoke-shard-0"] == 1
     assert needs["test-distributed-shard-0"] == 2
     assert needs["test-distributed-tp4"] == 4
-
-
-# ---------------------------------------------------------------------------
-# Card detection
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -129,11 +113,6 @@ def test_detect_devices(env, requested, want):
 def test_detect_devices_errors(env, requested, msg):
     with pytest.raises(ValueError, match=msg):
         rtp.detect_devices(env, requested)
-
-
-# ---------------------------------------------------------------------------
-# Scheduling: never two shards on one card
-# ---------------------------------------------------------------------------
 
 
 def test_card_pool_never_shares_a_card():
@@ -205,11 +184,6 @@ def test_run_order_widest_first():
     assert rtp.run_order(list(needs), needs) == ["b", "c", "a", "d"]
 
 
-# ---------------------------------------------------------------------------
-# Parity guard
-# ---------------------------------------------------------------------------
-
-
 def test_parse_collected_skips_annotations_and_summary():
     out = textwrap.dedent(
         """\
@@ -264,8 +238,7 @@ def _leaf_pytest(target: str) -> str:
 @pytest.mark.skipif(shutil.which("make") is None, reason="needs make")
 @pytest.mark.parametrize("prefix", sorted(rtp.FAMILIES))
 def test_family_unsharded_target_selects_the_same_tests(prefix):
-    """The parity guard compares a family's shards to its unsharded target, so the two
-    pytest command lines must differ only by the shard flags."""
+    # The parity guard compares a family's shards with its unsharded target.
     sharded = re.sub(r"--[a-z-]+-shards?(-id)?=\d+ ?", "", _leaf_pytest(f"{prefix}-0"))
     assert " ".join(sharded.split()) == " ".join(_leaf_pytest(rtp.FAMILIES[prefix]).split())
 
@@ -332,10 +305,6 @@ def test_cross_target_overlap_is_reported():
     collected = {"x": ["tests/t.py::a"], "y": ["tests/t.py::a", "tests/t.py::b"]}
     assert rtp.cross_target_overlap(collected, ["x", "y"]) == ["tests/t.py::a: in both x and y"]
 
-
-# ---------------------------------------------------------------------------
-# End to end, with a fake `make` that stands in for pytest
-# ---------------------------------------------------------------------------
 
 _FAKE_MAKE = textwrap.dedent(
     """\
@@ -461,11 +430,6 @@ def test_end_to_end_refuses_more_cards_than_the_host_has(tmp_path):
     proc, _ = _fake_run(tmp_path, _COLLECT, cards="8", world="4")
     assert proc.returncode == 2
     assert "PARALLEL=8 but only 4 card(s) detected" in proc.stdout
-
-
-# ---------------------------------------------------------------------------
-# The VFIO reaper only sees its own shard's processes
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="needs /proc")

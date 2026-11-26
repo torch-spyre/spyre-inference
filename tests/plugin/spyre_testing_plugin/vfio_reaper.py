@@ -54,14 +54,12 @@ def _read_cmdline(pid: int) -> str:
         return "<unknown>"
 
 
-# Set per shard by `make tests PARALLEL=...` (scripts/run_tests_parallel.py): concurrent
-# shards on other cards also hold /dev/vfio, so only a holder that carries our value is ours.
+# Set per shard by `make tests PARALLEL=...`: shards on other cards also hold /dev/vfio.
 CARD_SCOPE_ENV = "SPYRE_TEST_CARD_SCOPE"
 
 
 def _in_card_scope(pid: int, scope: str | None) -> bool:
-    """False only for a holder that belongs to another shard. A holder with no scope
-    (an orphan of an earlier serial or crashed run) stays ours to wait for and reap."""
+    # A holder with no scope (an orphan of an earlier run) stays ours to reap.
     if not scope:
         return True
     try:
@@ -76,8 +74,7 @@ def _in_card_scope(pid: int, scope: str | None) -> bool:
 
 def _pids_holding_vfio(exclude_pids: set[int]) -> list[tuple[int, str, str]]:
     """(pid, device, cmdline) for every process holding the Spyre card open,
-    found by scanning `/proc/*/fd` for `/dev/vfio/*` or `anon_inode:[vfio-device]`.
-    Under a card scope (see CARD_SCOPE_ENV), only processes of this shard count."""
+    found by scanning `/proc/*/fd` for `/dev/vfio/*` or `anon_inode:[vfio-device]`."""
     scope = os.environ.get(CARD_SCOPE_ENV)
     holders: dict[int, tuple[int, str, str]] = {}
     other_scope: set[int] = set()

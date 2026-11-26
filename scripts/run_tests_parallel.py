@@ -13,18 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run the CI shard targets of `make tests` concurrently, one shard per card set.
+"""Run `make tests`' CI shard targets at once, each on its own cards (`PARALLEL=auto|N`).
 
-`make tests TEST_TYPE=regression|trunk PARALLEL=auto|N` calls this with the same target
-list that the serial run walks (SINGLE_CARD_TARGETS + MULTI_CARD_TARGETS). Each target's
-card count comes from its `spyre_pf_x<N>` runner label in _test_matrix.yaml, so a shard
-gets the cards CI gives it. Two shards never share a card.
-
-Before the run, every target is collected (`--collect-only`). The run fails when a shard
-collects 0 tests, when two shards collect the same test, or when the shards of a family
-do not add up to the unsharded collection. After the run, each shard's JUnit file must
-hold as many test cases as the shard collected.
-"""
+Card counts come from the spyre_pf_x<N> runner labels in _test_matrix.yaml. Every target is
+collected first; empty, duplicated or dropped tests stop the run before it starts."""
 
 from __future__ import annotations
 
@@ -66,11 +58,6 @@ def log(msg: str) -> None:
     print(f"[parallel] {msg}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Inputs: card needs from the CI matrix, cards on this host
-# ---------------------------------------------------------------------------
-
-
 def card_needs_from_matrix(matrix_path: Path) -> dict[str, int]:
     """Map each x86_64 test_target in _test_matrix.yaml to its spyre_pf_x<N> card count."""
     import yaml
@@ -89,10 +76,7 @@ def card_needs_from_matrix(matrix_path: Path) -> dict[str, int]:
 
 
 def detect_devices(env: dict[str, str], requested: str) -> list[str]:
-    """Spyre device indices to spread shards over, or raise ValueError.
-
-    Order: SPYRE_DEVICES (a caller's restriction, kept as is), then the device plugin's
-    PCIDEVICE_IBM_COM_AIU_PF list, then AIU_WORLD_SIZE (set by ibm-aiu-setup.sh)."""
+    """SPYRE_DEVICES (kept as a restriction), else PCIDEVICE_IBM_COM_AIU_PF, else AIU_WORLD_SIZE."""
     if env.get("SPYRE_DEVICES", "").strip():
         found = [d.strip() for d in env["SPYRE_DEVICES"].split(",") if d.strip()]
     elif env.get("PCIDEVICE_IBM_COM_AIU_PF", "").strip():
@@ -120,22 +104,14 @@ def detect_devices(env: dict[str, str], requested: str) -> list[str]:
     return found[: int(requested)]
 
 
-# ---------------------------------------------------------------------------
-# Scheduling
-# ---------------------------------------------------------------------------
-
-
 class CardPool:
-    """Hands out disjoint sets of device indices; blocks until enough are free."""
-
     def __init__(self, devices: list[str]):
         self.devices = list(devices)
         self._free = list(devices)
         self._cv = threading.Condition()
 
     def effective_need(self, need: int) -> int:
-        # As in a serial run, a job that needs more cards than the host has gets them all
-        # (its tests skip on the missing cards).
+        # As in a serial run, a job wider than the host gets every card and its tests skip.
         return max(1, min(need, len(self.devices)))
 
     def acquire(self, need: int) -> list[str]:
@@ -158,8 +134,7 @@ def run_order(targets: list[str], needs: dict[str, int]) -> list[str]:
 
 
 def cache_dirs(base: dict[str, str]) -> dict[str, str]:
-    """The compile caches a shard writes, at their defaults when unset. The Inductor dir
-    also holds the Spyre kernel cache (SPYRE_KERNEL_CACHE)."""
+    # The Inductor dir also holds the Spyre kernel cache (SPYRE_KERNEL_CACHE).
     return {
         "TORCHINDUCTOR_CACHE_DIR": base.get("TORCHINDUCTOR_CACHE_DIR")
         or os.path.join(tempfile.gettempdir(), f"torchinductor_{getpass.getuser()}"),
@@ -184,7 +159,6 @@ def _link_or_copy(src: str, dst: str) -> None:
 
 
 def seed_card_caches(base: dict[str, str], devices: list[str]) -> None:
-    """Add the base caches' entries to each card's caches, so shards start warm."""
     for src in cache_dirs(base).values():
         if not os.path.isdir(src):
             continue
@@ -216,14 +190,8 @@ def job_env(base: dict[str, str], cards: list[str]) -> dict[str, str]:
     return env
 
 
-# ---------------------------------------------------------------------------
-# Parity guard
-# ---------------------------------------------------------------------------
-
-
 def parse_collected(output: str) -> list[str]:
-    """Node ids from `pytest --collect-only -q` output, up to the first `===` section
-    (the warnings summary lists `path::Name` locations that are not tests)."""
+    # Stop at the warnings summary: it lists `path::Name` locations that are not tests.
     ids = []
     for line in output.splitlines():
         line = line.strip()
@@ -244,16 +212,12 @@ def junit_key(node_id: str) -> tuple[str, str]:
 
 
 def shard_family(target: str) -> str | None:
-    """The unsharded target for a shard target, or None."""
     m = _SHARD_RE.match(target)
     return FAMILIES.get(m.group(1)) if m else None
 
 
 def check_collection(collected: dict[str, list[str]], families: dict[str, list[str]]) -> list[str]:
-    """Errors for empty shards, a test in two shards, or shards that miss family tests.
-
-    `collected` maps every shard target and every family's unsharded target to its ids;
-    `families` maps each unsharded target to its shard targets."""
+    """`families` maps each unsharded target to its shard targets."""
     errors = []
     for target, ids in collected.items():
         if not ids:
@@ -284,8 +248,7 @@ def check_collection(collected: dict[str, list[str]], families: dict[str, list[s
 
 
 def cross_target_overlap(collected: dict[str, list[str]], targets: list[str]) -> list[str]:
-    """Tests that two targets both select. Not an error: the serial run and CI also run
-    them twice; in parallel the two runs are on different cards."""
+    # Not an error: CI and the serial run also run these twice.
     owner: dict[str, str] = {}
     notes = []
     for t in targets:
@@ -301,8 +264,7 @@ def junit_keys(path: Path) -> set[tuple[str, str]]:
 
 
 def check_results(expected: dict[str, list[str]], junit_paths: dict[str, Path]) -> list[str]:
-    """Errors for a shard whose JUnit file lacks a test it collected. Extra entries (a
-    module-level skip, a teardown error after a failure) are not errors."""
+    # Extra JUnit entries (a module-level skip, a teardown error) are fine.
     errors = []
     for target, ids in expected.items():
         path = junit_paths[target]
@@ -321,11 +283,6 @@ def check_results(expected: dict[str, list[str]], junit_paths: dict[str, Path]) 
                 f"e.g. {missing[0]}"
             )
     return errors
-
-
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -373,9 +330,8 @@ def main(argv: list[str] | None = None) -> int:
     pool = CardPool(devices)
     log(f"{len(args.targets)} target(s) across {len(devices)} card(s): {','.join(devices)}")
 
-    # 1. Collect. The upstream family goes first, alone: a cold run clones vLLM into a
-    #    shared cache, and concurrent clones would race.
-    # A family is checked against its unsharded run only when all its shards run here.
+    # Upstream goes first, alone: a cold run clones vLLM into a shared cache.
+    # A family is checked only when all its shards run here.
     families: dict[str, list[str]] = {}
     for t in needs_all:
         fam = shard_family(t)
@@ -413,7 +369,6 @@ def main(argv: list[str] | None = None) -> int:
     if overlap:
         log(f"note: {len(overlap)} test(s) run by two targets (as in CI), e.g. {overlap[0]}")
 
-    # 2. Run, widest first, each on its own cards.
     t0 = time.monotonic()
     seed_card_caches(dict(os.environ), devices)
     log(f"seeded per-card compile caches in {time.monotonic() - t0:.0f}s")
@@ -447,7 +402,6 @@ def main(argv: list[str] | None = None) -> int:
         results = list(ex.map(run, run_order(args.targets, needs)))
     wall = time.monotonic() - start
 
-    # 3. Every shard ran what it collected.
     errors = check_results({t: collected[t] for t in args.targets}, junit)
     failed = [r for r in results if r.rc != 0]
     log(f"wall time {wall:.0f}s; sum of shard times {sum(r.seconds for r in results):.0f}s")

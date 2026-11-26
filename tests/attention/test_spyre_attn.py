@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import spyre_attn_bucketer
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
@@ -2375,6 +2376,11 @@ _BATCHED_DECODE_KERNELS = ["per_bucket", "shared_slots", "shared_slots_without_s
 
 
 def _use_batched_decode_kernels(monkeypatch, kernels: str) -> None:
+    """The chunk counts below assume 32 block slots per chunk, so the shared-slot kernels take
+    32 here; ``test_spyre_attn_narrow_kv_row_shares_64_slots_and_matches_reference`` covers 64."""
+    monkeypatch.setattr(
+        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+    )
     if kernels == "per_bucket":
         use_per_bucket_decode(monkeypatch)
     elif kernels == "shared_slots_without_single_chunk":
@@ -2678,10 +2684,15 @@ def _spy_grouped_decode(monkeypatch) -> list[int]:
 def test_spyre_attn_shared_slot_grouped_decode_matches_reference(
     default_vllm_config, monkeypatch, configure_compilation, configure_device
 ):
-    """One long sequence beside 31 short ones takes 32 chunks as one shared-slot call and
-    one chunk each as two. Each group writes all 32 rows; the store keeps every row."""
+    """One long sequence beside 31 short ones takes 32 chunks as one shared-slot call of 32
+    block slots and one chunk each as two. Each group writes all 32 rows; the store keeps every
+    row."""
     from vllm.config import get_current_vllm_config
 
+    # 64 slots would fit the batch in one chunk.
+    monkeypatch.setattr(
+        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+    )
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     envs.clear_env_cache()
@@ -2709,6 +2720,45 @@ def test_spyre_attn_shared_slot_grouped_decode_matches_reference(
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
+def test_spyre_attn_narrow_kv_row_shares_64_slots_and_matches_reference(
+    default_vllm_config, monkeypatch, batched_decode_calls, configure_compilation, configure_device
+):
+    """2 KV heads of 128 fit two pages per core, so a jagged decode batch shares 64 block
+    slots per chunk and matches the reference."""
+    from torch_spyre._inductor import config as ts_config
+
+    widths: set[int] = set()
+    run = SpyreAttentionImpl._run_batched_decode
+
+    def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
+        widths.add(chunk_page_ids.shape[1])
+        return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+        _run_spyre_attn_test(
+            seq_lens=[(1, 2048), (1, 1500), (1, 700), (1, 300), (1, 130)],
+            block_size=128,
+            sliding_window=None,
+            configure_compilation=configure_compilation,
+            configure_device=configure_device,
+            num_query_heads=8,
+            num_kv_heads=2,
+        )
+    assert batched_decode_calls, "the batch fell back to the per-seq loop"
+    assert widths == {64}, widths
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
 def test_spyre_attn_shared_slot_batch_past_one_call_splits_and_matches_reference(
     default_vllm_config, monkeypatch, configure_compilation, configure_device
 ):
@@ -2716,12 +2766,14 @@ def test_spyre_attn_shared_slot_batch_past_one_call_splits_and_matches_reference
     two calls of 4 chunks or fewer, with jagged grouping off."""
     from vllm.config import get_current_vllm_config
 
-    from spyre_inference.v1.attention import spyre_attn_bucketer
-
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
     envs.clear_env_cache()
-    monkeypatch.setattr(spyre_attn_bucketer, "_SHARED_SLOT_CALL_CHUNKS", 4)
+    # 4 chunks of 32 slots per call.
+    monkeypatch.setattr(
+        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+    )
+    monkeypatch.setattr(spyre_attn_bucketer, "_SHARED_SLOT_CALL_PAGES", 4 * 32)
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 4096
@@ -3320,7 +3372,11 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
-        builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=mode != "bucketed")
+        # A KV row too wide for two pages per core, so 32 shared slots: a 64-page gather
+        # would select the whole 64-page cache (torch-spyre#4033).
+        builder._attn_bucketer = SpyreAttnBucketer(
+            vllm_config, declare_pages=mode != "bucketed", kv_row=(16, 128)
+        )
         if mode == "dynamic":
             # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
             # pages each.

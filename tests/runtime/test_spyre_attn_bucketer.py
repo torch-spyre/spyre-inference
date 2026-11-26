@@ -27,9 +27,14 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _powers_of_two_up_to,
     batched_decode_chunking,
     share_block_slots,
+    shared_block_slots,
 )
 
 BLOCK_SIZE = 64
+# Per-card (num_kv_heads, head_size) rows for the shared-slot kernels: a narrow row fits two
+# pages per core, 64 block slots; a wide one takes one page per core, 32.
+NARROW_KV_ROW = (2, 128)
+WIDE_KV_ROW = (16, 128)
 
 
 def make_config(
@@ -659,26 +664,36 @@ class TestDeclaredPages:
             yield
 
     def test_one_variant_per_query_bucket(self):
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         variants = b.variants()
         assert {v.num_blocks for v in variants} == {b.num_blocks_buckets[-1]}
         assert [v.padded_query_len for v in variants] == sorted(b.query_buckets, reverse=True)
 
     def test_page_range_spans_one_page_to_max_model_len(self):
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range == {"min": 1, "max": 2048 // BLOCK_SIZE, "granularity": 1}
         assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [1, 2, 7, 32]
 
     def test_one_kv_head_keeps_two_pages_at_minimum(self):
         """The single-KV-head floor is a codegen limit of one page, not a compile limit."""
-        b = SpyreAttnBucketer(make_config(max_model_len=2048, num_kv_heads=1), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048, num_kv_heads=1),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
+        )
         assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
         assert b.find_declared_pages(1) == 2
 
     def test_prefill_page_counts_are_multiples_of_eight(self):
         from torch_spyre._inductor import config as ts_config
 
-        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range is not None
         assert b.page_range["max"] == 31
         assert b.prefill_page_range == {"min": 8, "max": 32, "granularity": 8}
@@ -696,14 +711,18 @@ class TestDeclaredPages:
 
         monkeypatch.setenv("MAX_BUCKETS", "31")
         ts_config.max_buckets = 31
-        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range is not None
         assert b.prefill_page_range == b.page_range
 
     def test_a_prefill_on_the_per_sequence_range_covers_two_pages(self):
         """Too short for multiples of eight, prefill takes the per-sequence range, but a
         one-page prefill still runs over two: one page lets its unused slots through."""
-        b = SpyreAttnBucketer(make_config(max_model_len=2 * BLOCK_SIZE), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2 * BLOCK_SIZE), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range == {"min": 1, "max": 2, "granularity": 1}
         assert b.prefill_page_range == b.page_range
         assert b.find_declared_pages(1, prefill=True) == 2
@@ -711,27 +730,35 @@ class TestDeclaredPages:
 
     def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range is not None
         assert b.page_range["min"] == 8
         assert b.find_declared_pages(3) == 8
 
     def test_a_context_at_an_exported_min_reserved_dim_size_keeps_the_buckets(self, monkeypatch):
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
-        b = SpyreAttnBucketer(make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range is None
         assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
 
     def test_max_buckets_grows_to_cover_max_model_len(self):
         from torch_spyre._inductor import config as ts_config
 
-        b = SpyreAttnBucketer(make_config(max_model_len=32768), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=32768), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range == {"min": 1, "max": 32768 // BLOCK_SIZE, "granularity": 1}
         assert ts_config.max_buckets == 32768 // BLOCK_SIZE
 
     def test_a_context_above_the_exported_max_buckets_keeps_the_buckets(self, monkeypatch):
         monkeypatch.setenv("MAX_BUCKETS", "32")
-        b = SpyreAttnBucketer(make_config(max_model_len=4096 + BLOCK_SIZE), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=4096 + BLOCK_SIZE), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert b.page_range is None
         assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
 
@@ -756,7 +783,9 @@ class TestDynamicChunks:
             yield
 
     def test_one_variant_covers_every_context_a_single_chunk_included(self):
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         max_pages = 8192 // BLOCK_SIZE
         for num_seqs in b.num_seqs_buckets:
             width = 32 // num_seqs
@@ -772,7 +801,9 @@ class TestDynamicChunks:
 
     def test_one_kv_head_covers_two_blocks_at_minimum(self):
         b = SpyreAttnBucketer(
-            make_config(max_model_len=8192, num_kv_heads=1, max_num_seqs=32), declare_pages=True
+            make_config(max_model_len=8192, num_kv_heads=1, max_num_seqs=32),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
         )
         # One block per chunk at 32 sequences, so two chunks; one chunk covers two elsewhere.
         assert b._chunk_ranges[32]["min"] == 2
@@ -786,7 +817,9 @@ class TestDynamicChunks:
 
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "3")
         ts_config.min_reserved_dim_size = 3
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         assert all(r["min"] == 3 for r in b._chunk_ranges.values())
         plan = b.batched_decode_plan(4, 1)
         assert plan is not None
@@ -794,7 +827,9 @@ class TestDynamicChunks:
 
     def test_a_batch_size_whose_context_fits_one_chunk_keeps_the_buckets(self):
         # 32 pages: one full chunk at one sequence, two at two sequences.
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048), declare_pages=True, kv_row=NARROW_KV_ROW
+        )
         variants = [v for v in b.batched_decode_variants() if v.num_seqs == 1]
         assert not any(v.dynamic_chunks for v in variants)
         assert {v.num_blocks for v in variants} == set(b.num_blocks_buckets)
@@ -820,18 +855,23 @@ class TestDynamicChunks:
     ],
 )
 def test_share_block_slots_takes_the_fewest_chunks(blocks, chunks, slots):
-    assert share_block_slots(blocks) == (chunks, slots)
+    assert share_block_slots(blocks, 32) == (chunks, slots)
     assert chunks == 1 or sum(-(-b // (chunks - 1)) for b in blocks) > 32
 
 
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8, 16, 32])
 @pytest.mark.parametrize("blocks", [1, 7, 32, 100, 256])
 def test_share_block_slots_matches_the_per_bucket_chunks_of_a_uniform_batch(num_seqs, blocks):
-    assert share_block_slots([blocks] * num_seqs)[0] == batched_decode_chunking(num_seqs, blocks)[1]
+    assert (
+        share_block_slots([blocks] * num_seqs, 32)[0]
+        == batched_decode_chunking(num_seqs, blocks)[1]
+    )
 
 
 class TestSharedSlotDecode:
-    """Up to shared_slot_seqs decode sequences share two kernels instead of per-bucket ones."""
+    """Up to shared_slot_seqs decode sequences share two kernels instead of per-bucket ones.
+
+    At 32 slots unless a test says otherwise; TestSharedSlotWidth covers the slot count."""
 
     @pytest.fixture(autouse=True)
     def _declarable(self, monkeypatch):
@@ -845,7 +885,9 @@ class TestSharedSlotDecode:
 
     def test_two_shared_slot_kernels_replace_every_bucket_up_to_their_sequence_limit(self):
         # 128 pages; 8 sequences of 4 block slots each need 32 chunks at max_model_len.
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, kv_row=WIDE_KV_ROW
+        )
         assert b.shared_slot_seqs == 8
         assert b.shared_slot_chunk_range == {"min": 2, "max": 32, "granularity": 1}
         assert [
@@ -866,7 +908,9 @@ class TestSharedSlotDecode:
         self, monkeypatch
     ):
         monkeypatch.setenv("SPYRE_ATTN_SINGLE_CHUNK_KERNEL", "0")
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, kv_row=WIDE_KV_ROW
+        )
         assert b.shared_slot_chunk_range == {"min": 1, "max": 32, "granularity": 1}
         assert [(v.num_chunks, v.dynamic_chunks) for v in b.shared_slot_variants()] == [(32, True)]
         assert b.shared_slot_plan([3, 3]) == (1, b.shared_slot_chunk_range, [3, 3])
@@ -875,7 +919,11 @@ class TestSharedSlotDecode:
         assert b.page_range == {"min": 1, "max": 128, "granularity": 1}
 
     def test_buckets_above_the_sequence_limit_keep_their_kernels(self):
-        b = SpyreAttnBucketer(make_config(max_model_len=8192, max_num_seqs=128), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, max_num_seqs=128),
+            declare_pages=True,
+            kv_row=WIDE_KV_ROW,
+        )
         assert b.shared_slot_seqs == 32
         assert b.shared_slot_chunk_range == {"min": 2, "max": 32, "granularity": 1}
         assert {v.num_seqs for v in b.batched_decode_variants()} == {64, 128}
@@ -883,7 +931,9 @@ class TestSharedSlotDecode:
 
     def test_a_batch_past_one_call_splits_into_calls_that_fit(self):
         # 32 slots of 128 pages need 128 chunks; one call runs at most 32, 8 such sequences.
-        b = SpyreAttnBucketer(make_config(max_model_len=8192, max_num_seqs=32), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, max_num_seqs=32), declare_pages=True, kv_row=WIDE_KV_ROW
+        )
         assert b.shared_slot_chunk_range == {"min": 2, "max": 32, "granularity": 1}
         assert b.splits_shared_slot_calls
         # Recorded at the most chunks one call runs.
@@ -902,7 +952,9 @@ class TestSharedSlotDecode:
     def test_one_max_model_len_sequence_always_fits_one_call(self):
         # 2048 pages: one sequence needs 64 chunks, past the usual 32.
         b = SpyreAttnBucketer(
-            make_config(max_model_len=131072, max_num_seqs=32), declare_pages=True
+            make_config(max_model_len=131072, max_num_seqs=32),
+            declare_pages=True,
+            kv_row=WIDE_KV_ROW,
         )
         assert b.shared_slot_chunk_range["max"] == 64
         assert b.shared_slot_plan([2048]) is not None
@@ -911,10 +963,12 @@ class TestSharedSlotDecode:
         "blocks", [[1], [32], [33], [128], [128] * 8, [100, 3, 3], [5] * 6 + [128], [0, 2]]
     )
     def test_every_batch_up_to_the_sequence_limit_runs_a_recorded_shared_slot_kernel(self, blocks):
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, kv_row=WIDE_KV_ROW
+        )
         shape = b.shared_slot_plan(blocks)
         assert shape is not None
-        chunks, slots = share_block_slots([max(1, n) for n in blocks])
+        chunks, slots = share_block_slots([max(1, n) for n in blocks], 32)
         assert shape.slots == slots
         if chunks == 1:
             assert (shape.num_chunks, shape.chunk_range) == (1, None)
@@ -929,9 +983,71 @@ class TestSharedSlotDecode:
             # 8 pages: 8 slots need 2 chunks, the range minimum.
             max_model_len = 512
         b = SpyreAttnBucketer(
-            make_config(max_model_len=max_model_len), declare_pages=why != "no_pages"
+            make_config(max_model_len=max_model_len),
+            declare_pages=why != "no_pages",
+            kv_row=WIDE_KV_ROW,
         )
         assert b.shared_slot_seqs is None
         assert b.shared_slot_variants() == []
         assert b.shared_slot_plan([1]) is None
         assert {v.num_seqs for v in b.batched_decode_variants()} == set(b.num_seqs_buckets)
+
+
+@pytest.mark.parametrize(
+    ("num_kv_heads", "head_size", "slots"),
+    [
+        (1, 128, 64),  # granite-8b at TP4/TP8
+        (2, 128, 64),
+        (8, 128, 64),  # granite-8b at TP1: the widest row measured faster at two pages
+        (4, 256, 64),
+        (8, 256, 32),  # the sliding-window row of gemma-4 at TP1, were it full attention
+        (16, 128, 32),
+    ],
+)
+def test_shared_block_slots_take_two_pages_per_core_while_the_kv_row_fits(
+    num_kv_heads, head_size, slots
+):
+    assert shared_block_slots(num_kv_heads, head_size) == slots
+
+
+class TestSharedSlotWidth:
+    """The shared-slot chunk takes the layer group's slot count; a call covers the same pages."""
+
+    @pytest.fixture(autouse=True)
+    def _declarable(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+            yield
+
+    def test_64_slots_halve_the_chunks_and_the_call_range(self):
+        cfg = make_config(max_model_len=32768, max_num_seqs=32)
+        # Two pages per core for the narrow row, one for the wide one.
+        two = SpyreAttnBucketer(cfg, declare_pages=True, kv_row=NARROW_KV_ROW)
+        one = SpyreAttnBucketer(cfg, declare_pages=True, kv_row=WIDE_KV_ROW)
+        assert (two.shared_slots, one.shared_slots) == (64, 32)
+        assert (two.shared_slot_seqs, one.shared_slot_seqs) == (32, 32)
+        assert two.shared_slot_chunk_range["max"] == 16
+        assert one.shared_slot_chunk_range["max"] == 32
+        blocks = [256, 64, 16, 8, 8]
+        two_plan, one_plan = two.shared_slot_plan(blocks), one.shared_slot_plan(blocks)
+        assert two_plan.num_chunks == share_block_slots(blocks, 64)[0]
+        assert one_plan.num_chunks == share_block_slots(blocks, 32)[0]
+        assert two_plan.num_chunks < one_plan.num_chunks
+        variant = two.shared_slot_variants()[0]
+        assert (variant.blocks_per_chunk, variant.num_chunks) == (64, 16)
+
+    def test_a_page_range_needs_the_kv_row(self):
+        with pytest.raises(AssertionError, match="declare_pages needs the KV row"):
+            SpyreAttnBucketer(make_config(), declare_pages=True)
+
+    def test_up_to_64_sequences_share_one_call(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, max_num_seqs=64),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
+        )
+        assert b.shared_slot_seqs == 64
+        assert b.shared_slot_plan([1] * 64) is not None
+        assert b.shared_slot_plan([1] * 65) is None

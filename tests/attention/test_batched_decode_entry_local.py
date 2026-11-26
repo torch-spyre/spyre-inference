@@ -340,7 +340,7 @@ def test_temp_split_layout_fields():
     assert list(layout.stride_map) == [8, 0, 1, 0]
 
 
-def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0):
+def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0, slots=32):
     """Distinct pages per sequence and a part-filled last block, laid out by the builder.
 
     ``first_block_offset`` is added to sequence 0's block-0 scores through its mask.
@@ -349,7 +349,7 @@ def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0)
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
     from spyre_inference.v1.attention.spyre_attn_bucketer import SharedSlotPlan, share_block_slots
 
-    chunks, slots = share_block_slots(blocks)
+    chunks, seq_slots = share_block_slots(blocks, slots)
     block_table = torch.zeros(len(blocks), max(blocks), dtype=torch.int32)
     stacks = []
     first = 1
@@ -364,12 +364,12 @@ def _shared_slot_case(blocks, rows, kv, num_chunks=None, first_block_offset=0.0)
         block_size=BLOCK,
         model_dtype=torch.float32,
         num_kv_heads=kv,
-        _attn_bucketer=SimpleNamespace(shared_slot_seqs=rows),
+        _attn_bucketer=SimpleNamespace(shared_slot_seqs=rows, shared_slots=slots),
     )
     fields = SpyreAttentionMetadataBuilder._shared_slot_tensors(
         owner,
         list(range(len(blocks))),
-        SharedSlotPlan(num_chunks or chunks, None, slots),
+        SharedSlotPlan(num_chunks or chunks, None, seq_slots),
         blocks,
         block_table,
         torch.arange(len(blocks) + 1),
@@ -440,11 +440,14 @@ def _per_seq_reference(query, k_pages, v_pages, block_table, stacks, kv, q, cap=
         pytest.param([40, 7], 4, 4, id="later_chunks_all_padding"),
     ],
 )
-def test_shared_slots_match_reference(blocks, rows, num_chunks):
+@pytest.mark.parametrize("slots", [32, 64])
+def test_shared_slots_match_reference(blocks, rows, num_chunks, slots):
     """Each row's block slots merge into its sequence's attention, and a padding row repeats
     row 0."""
     kv, q, n = 2, 4, len(blocks)
-    fields, block_table, stacks, num_pages = _shared_slot_case(blocks, rows, kv, num_chunks)
+    fields, block_table, stacks, num_pages = _shared_slot_case(
+        blocks, rows, kv, num_chunks, slots=slots
+    )
     k_pages, v_pages = _slot_pages(num_pages, kv)
     query = torch.randn(n, kv, q, HEAD)
     got = _run_shared_slots(query, k_pages, v_pages, fields, kv, q)
@@ -543,7 +546,7 @@ def test_shared_slots_walk_the_active_blocks():
         block_size=BLOCK,
         model_dtype=torch.float32,
         num_kv_heads=1,
-        _attn_bucketer=SimpleNamespace(shared_slot_seqs=1),
+        _attn_bucketer=SimpleNamespace(shared_slot_seqs=1, shared_slots=32),
     )
     (_, _, _, _, page_ids, mask), _ = SpyreAttentionMetadataBuilder._shared_slot_tensors(
         owner,

@@ -42,7 +42,8 @@ Vocabulary:
 - A *block slot* is one of a chunk's pages. Each block slot keeps its own running
   softmax across chunks, and a sequence's block slots merge after the last one. The
   per-bucket kernels give every sequence ``blocks_per_chunk`` of them. The *shared-slot*
-  kernels instead share all 32 among up to ``shared_slot_seqs`` sequences, each step and
+  kernels instead share ``shared_slots`` of them (64, or 32 for a layer group whose KV row is
+  too wide for two pages per core) among up to ``shared_slot_seqs`` sequences, each step and
   by length, so they do not depend on the batch size. The per-sequence prefill kernel's
   counterpart is its *page group*, ``page_group`` pages of one sequence per loop step.
   Neither is related to vLLM's chunked prefill, which splits a prompt's tokens across
@@ -75,10 +76,28 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
 
-# The most chunks one dynamic shared-slot call runs, unless one max_model_len sequence needs
-# more. Every launch fills one program correction per chunk the kernel could run, so a
-# larger range costs every call; a batch past it splits into grouped calls.
-_SHARED_SLOT_CALL_CHUNKS = 32
+# Block slots per shared-slot chunk, as whole pages per core: an uneven split costs a full
+# chunk for a partial gather. Each chunk has a fixed cost, so two pages per core halve a long
+# context's chunks, as long as both of a core's K and V pages fit on chip.
+_MAX_SLOTS_PER_CORE = 2
+# Head elements (num_kv_heads * head_size, per page) one core may gather per chunk before a
+# second page per core turns slower than one: the largest row measured faster at two.
+_CORE_ROW_BUDGET = 2 * 8 * 128
+
+# The most pages one dynamic shared-slot call covers (chunks times slots), unless one
+# max_model_len sequence needs more. Every launch fills one program correction per chunk the
+# kernel could run, so a larger range costs every call; a batch past it splits into grouped
+# calls.
+_SHARED_SLOT_CALL_PAGES = 32 * _SPYRE_CORE_COUNT
+
+
+def shared_block_slots(num_kv_heads: int, head_size: int) -> int:
+    """Block slots per shared-slot chunk for a layer group of this per-card KV shape: two
+    pages per core while both fit the core's budget, one otherwise."""
+    per_core = _MAX_SLOTS_PER_CORE
+    while per_core > 1 and per_core * num_kv_heads * head_size > _CORE_ROW_BUDGET:
+        per_core //= 2
+    return per_core * _SPYRE_CORE_COUNT
 
 
 class DynamicRange(TypedDict):
@@ -109,7 +128,7 @@ def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     return blocks_per_chunk, num_chunks
 
 
-def share_block_slots(blocks: list[int], slots: int = _SPYRE_CORE_COUNT) -> tuple[int, list[int]]:
+def share_block_slots(blocks: list[int], slots: int) -> tuple[int, list[int]]:
     """The fewest chunks C with ``sum(ceil(b / C)) <= slots``, and each sequence's block slots.
 
     Sequence i takes ``ceil(blocks[i] / C)`` consecutive block slots, so each of them reads at
@@ -389,11 +408,11 @@ def _declared_chunk_ranges(
 
 
 def _shared_slot_chunk_range(
-    page_range: DynamicRange, num_seqs: int, single_chunk_kernel: bool
+    page_range: DynamicRange, num_seqs: int, slots: int, single_chunk_kernel: bool
 ) -> DynamicRange | None:
     """The chunk counts the dynamic shared-slot kernel runs: up to what ``num_seqs``
-    sequences of ``page_range["max"]`` pages need, capped at ``_SHARED_SLOT_CALL_CHUNKS`` or
-    the count one such sequence needs.
+    sequences of ``page_range["max"]`` pages need, capped at ``_SHARED_SLOT_CALL_PAGES`` pages
+    or the count one such sequence needs.
 
     It starts past one chunk when ``single_chunk_kernel`` takes the calls within one chunk.
     None, and logged, when the range would hold one count; batched decode then keeps one
@@ -404,10 +423,10 @@ def _shared_slot_chunk_range(
     min_chunks = ts_config.min_reserved_dim_size
     if single_chunk_kernel:
         min_chunks = max(min_chunks, 2)
-    one_seq = -(-page_range["max"] // _SPYRE_CORE_COUNT)
+    one_seq = -(-page_range["max"] // slots)
     max_chunks = min(
-        -(-page_range["max"] // (_SPYRE_CORE_COUNT // num_seqs)),
-        max(_SHARED_SLOT_CALL_CHUNKS, one_seq),
+        -(-page_range["max"] // (slots // num_seqs)),
+        max(_SHARED_SLOT_CALL_PAGES // slots, one_seq),
     )
     if not min_chunks < max_chunks:
         logger.info_once(
@@ -465,7 +484,17 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig, *, declare_pages: bool = False) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        declare_pages: bool = False,
+        kv_row: tuple[int, int] | None = None,
+    ) -> None:
+        """``kv_row`` is the layer group's per-card ``(num_kv_heads, head_size)``, from which
+        ``shared_block_slots`` sets the shared-slot kernels' block slots. A page range is what
+        gives those kernels, so ``declare_pages`` needs it."""
+        assert kv_row is not None or not declare_pages, "declare_pages needs the KV row"
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
@@ -554,17 +583,27 @@ class SpyreAttnBucketer:
         # chunk runs a static single-chunk kernel unless SPYRE_ATTN_SINGLE_CHUNK_KERNEL=0:
         # the dynamic kernel's launch costs more.
         self._single_chunk_kernel = envs.SPYRE_ATTN_SINGLE_CHUNK_KERNEL
-        self._shared_slot_seqs = min(_SPYRE_CORE_COUNT, self._num_seqs_buckets[-1])
+        # Per layer group, so the builder that dispatches and the recorder that walks this
+        # instance agree on every group's chunks.
+        self._shared_slots: int | None = None
+        self._shared_slot_seqs = 0
         self._shared_slot_chunk_range: DynamicRange | None = None
         if self._page_range is not None:
+            assert kv_row is not None
+            self._shared_slots = shared_block_slots(*kv_row)
+            self._shared_slot_seqs = min(self._shared_slots, self._num_seqs_buckets[-1])
             self._shared_slot_chunk_range = _shared_slot_chunk_range(
-                self._page_range, self._shared_slot_seqs, self._single_chunk_kernel
+                self._page_range,
+                self._shared_slot_seqs,
+                self._shared_slots,
+                self._single_chunk_kernel,
             )
         if self._shared_slot_chunk_range is not None:
             logger.info(
-                "SpyreAttnBucketer: batched decode of up to %d sequences shares the block "
+                "SpyreAttnBucketer: batched decode of up to %d sequences shares the %d block "
                 "slots of %s%d to %d chunks per call.",
                 self._shared_slot_seqs,
+                self._shared_slots,
                 "1 chunk, or " if self._single_chunk_kernel else "",
                 self._shared_slot_chunk_range["min"],
                 self._shared_slot_chunk_range["max"],
@@ -704,6 +743,13 @@ class SpyreAttnBucketer:
         return BatchedDecodePlan(num_blocks, width, num_chunks, chunk_range)
 
     @property
+    def shared_slots(self) -> int:
+        """The block slots of one shared-slot chunk; only a bucketer with a page range has
+        them."""
+        assert self._shared_slots is not None, "no shared-slot kernels without a page range"
+        return self._shared_slots
+
+    @property
     def shared_slot_seqs(self) -> int | None:
         """The most decode sequences one shared-slot call serves, None without the kernels."""
         return None if self._shared_slot_chunk_range is None else self._shared_slot_seqs
@@ -736,7 +782,7 @@ class SpyreAttnBucketer:
             return None
         # A sequence with no blocks still takes a block slot, fully masked, so its row is
         # finite.
-        num_chunks, slots = share_block_slots([max(1, b) for b in blocks])
+        num_chunks, slots = share_block_slots([max(1, b) for b in blocks], self.shared_slots)
         if num_chunks > chunk_range["max"]:
             return None
         if num_chunks == 1 and self._single_chunk_kernel:
@@ -844,7 +890,7 @@ class SpyreAttnBucketer:
         if not envs.SPYRE_BATCHED_DECODE or num_seqs is None:
             return []
         assert self._page_range is not None and self._shared_slot_chunk_range is not None
-        full_call_blocks = self._shared_slot_chunk_range["max"] * (_SPYRE_CORE_COUNT // num_seqs)
+        full_call_blocks = self._shared_slot_chunk_range["max"] * (self.shared_slots // num_seqs)
         blocks_per_seq = [min(self._page_range["max"], full_call_blocks)]
         if self._single_chunk_kernel:
             blocks_per_seq.append(1)
@@ -856,7 +902,7 @@ class SpyreAttnBucketer:
                 SpyreAttnBatchedDecodeBucket(
                     num_seqs=num_seqs,
                     num_blocks=num_blocks,
-                    blocks_per_chunk=_SPYRE_CORE_COUNT,
+                    blocks_per_chunk=self.shared_slots,
                     num_chunks=plan.num_chunks,
                     dynamic_chunks=plan.chunk_range is not None,
                     shared_slots=True,

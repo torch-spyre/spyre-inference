@@ -184,14 +184,37 @@ def test_group_padding_never_overwrites_a_live_row(decode_config, monkeypatch, k
 
 @pytest.fixture()
 def shared_slot_config(default_vllm_config, monkeypatch):
+    """32 block slots per chunk, as for a wide KV row; ``test_a_narrow_kv_row_shares_64_slots``
+    covers the default."""
     from vllm.config import get_current_vllm_config
+
+    from spyre_inference.v1.attention import spyre_attn_bucketer
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    monkeypatch.setattr(
+        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+    )
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 32
     cfg.model_config.max_model_len = 32768
     return cfg
+
+
+def test_a_narrow_kv_row_shares_64_slots(default_vllm_config, monkeypatch):
+    """2 KV heads of 64 fit two pages per core: 1 x 235 + 4 x 5 blocks share 64 slots over 5
+    chunks, where 32 slots took 9."""
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 32
+    cfg.model_config.max_model_len = 32768
+    md = _build([235 * BLOCK] + [5 * BLOCK] * 4)
+    assert md.shared_slot_seqs == 32
+    assert md.blocks_per_chunk == 64
+    assert md.padded_batch_blocks == 5 * 64
+    assert md.decode_groups is None
 
 
 def test_shared_slot_call_keeps_a_jagged_batch_that_fits_its_slots(shared_slot_config):

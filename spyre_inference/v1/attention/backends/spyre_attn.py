@@ -557,10 +557,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # The chunk counts this batch's dynamic kernel runs; the chunk index and mask are
     # copied to the device with this range. None for a kernel with a fixed chunk count.
     chunk_range: DynamicRange | None = None
-    # Shared-slot mode: the gather is the B=1, J=32 one above, and the kernel writes
+    # Shared-slot mode: the gather is the B=1, J=slots one above, and the kernel writes
     # shared_slot_seqs output rows. None otherwise.
     shared_slot_seqs: int | None = None
-    # [32, shared_slot_seqs, 1, 1, 1] model dtype: the rows each block slot counts towards.
+    # [slots, shared_slot_seqs, 1, 1, 1] model dtype: the rows each block slot counts towards.
     slot_onehot_cpu: torch.Tensor | None = None
     slot_onehot_dev: torch.Tensor | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
@@ -666,6 +666,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._attn_bucketer = SpyreAttnBucketer(
             vllm_config,
             declare_pages=self.sliding_window is None and not self._encoder_only,
+            kv_row=(self.num_kv_heads, self.head_size),
         )
 
         self._init_reorder_batch_threshold(
@@ -1298,14 +1299,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         active_block_indices: list | None,
         attention_mask_stacks: list[torch.Tensor],
     ) -> tuple[tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
-        """The shared-slot kernel's inputs, in the batched kernel's layout at B=1 and J=32,
-        and the ``[slots, rows, 1, 1, 1]`` one-hot that merges them.
+        """The shared-slot kernel's inputs, in the batched kernel's layout at B=1 and
+        J=slots, and the ``[slots, rows, 1, 1, 1]`` one-hot that merges them.
 
         Member i takes ``plan.slots[i]`` consecutive block slots, and at chunk c its slot k
         reads block ``c * plan.slots[i] + k``. A spare slot reads page 0 under an all--inf
         mask and is in no row. A row past the members sums row 0's slots, so it is finite.
         """
-        slots = _SPYRE_CORES
+        slots = self._attn_bucketer.shared_slots
         rows = self._attn_bucketer.shared_slot_seqs
         assert rows is not None and len(members) <= rows
         num_chunks = plan.num_chunks

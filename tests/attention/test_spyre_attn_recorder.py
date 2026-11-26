@@ -157,14 +157,19 @@ def sliding_window_builder(default_vllm_config):
 
 
 def make_bucketer(
-    max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8, declare_pages=False
+    max_model_len=256,
+    max_num_batched_tokens=64,
+    max_num_seqs=8,
+    declare_pages=False,
+    # Too wide for two pages per core: 32 shared slots.
+    kv_row=(16, 128),
 ):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
-    return SpyreAttnBucketer(config, declare_pages=declare_pages)
+    return SpyreAttnBucketer(config, declare_pages=declare_pages, kv_row=kv_row)
 
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:

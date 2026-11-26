@@ -27,10 +27,10 @@ import contextlib
 import functools
 import math
 import time
-from collections.abc import Callable
-from contextvars import copy_context
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
@@ -345,6 +345,7 @@ _LX_ATTN_CORES = 8
 _PAGE_GROUP = 8
 _PAGE_GROUP_MAX_QUERY_WIDTH = 1024
 _T = TypeVar("_T")
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
@@ -391,6 +392,100 @@ def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], /, *args, *
 
     # Config overrides are context-local; leave the caller's unset state intact.
     return copy_context().run(run)
+
+
+def _page_index_tables(
+    block_table: torch.Tensor,
+    num_active: list[int],
+    active_block_indices: list[list[int]] | None,
+    real_num_blocks: list[int],
+    pad_with_last_page: bool,
+) -> list[torch.Tensor]:
+    tables = []
+    for s, n in enumerate(num_active):
+        if active_block_indices is not None:
+            blocks_s = active_block_indices[s]
+        elif pad_with_last_page:
+            # Pad with the last real page, as forward() does: raising the count to the
+            # range minimum can take it past the block table's width.
+            real = real_num_blocks[s]
+            blocks_s = list(range(real)) + [real - 1] * (n - real)
+        else:
+            blocks_s = slice(n)
+        table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+        table[:, 0] = block_table[s, blocks_s]
+        tables.append(table)
+    return tables
+
+
+def _chunk_page_ids(
+    members: list[int],
+    b_seqs: int,
+    padded_batch_blocks: int,
+    decode_blocks: list[int],
+    block_table: torch.Tensor,
+    active_block_indices: list | None,
+) -> torch.Tensor:
+    """[padded_batch_blocks, b_seqs] page IDs, block-slot major; padding gathers page 0."""
+    n = len(members)
+    block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
+    bt = block_table[members].to(torch.int32)
+    if active_block_indices is None:
+        n_use_list = [min(nb, padded_batch_blocks) for nb in decode_blocks]
+        w = min(padded_batch_blocks, bt.shape[1])
+        cols = torch.arange(w)
+        in_range = cols.unsqueeze(0) < torch.tensor(n_use_list, dtype=torch.int64).unsqueeze(1)
+        block_ids_padded[:w, :n] = (bt[:, :w] * in_range).t()
+    else:
+        # Position i is the i-th ACTIVE block, matching the mask tiles.
+        for s, m in enumerate(members):
+            abs_blocks = active_block_indices[m]
+            n_use = min(len(abs_blocks), padded_batch_blocks)
+            for b, abs_b in enumerate(abs_blocks[:n_use]):
+                block_ids_padded[b, s] = bt[s, abs_b]
+    return block_ids_padded
+
+
+# Until vLLM's V2 runner reuses metadata for every builder that sets
+# supports_update_block_table, not only for Mamba groups (vllm-project/vllm#70132).
+# Then delete this, reuse_metadata_across_groups and SpyreDefaultModelState.prepare_attn.
+_reused_metadata: ContextVar[dict | None] = ContextVar("spyre_reused_metadata", default=None)
+
+
+@contextlib.contextmanager
+def reuse_metadata_across_groups() -> Iterator[None]:
+    """Within the scope, build() derives a builder's metadata from the one an earlier
+    builder of the same spec and type built, as vLLM's build_attn_metadata would."""
+    token = _reused_metadata.set({})
+    try:
+        yield
+    finally:
+        _reused_metadata.reset(token)
+
+
+def _reuses_metadata_across_groups(build: _F) -> _F:
+    @functools.wraps(build)
+    def wrapper(
+        self: "SpyreAttentionMetadataBuilder",
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        per_seq_only: bool = False,
+    ) -> "SpyreAttentionMetadata":
+        reused = _reused_metadata.get()
+        if reused is None or per_seq_only or not self.supports_update_block_table:
+            return build(self, common_prefix_len, common_attn_metadata, fast_build, per_seq_only)
+        key = (self.kv_cache_spec, type(self))
+        if key in reused:
+            return self.update_block_table(
+                reused[key],
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.slot_mapping,
+            )
+        reused[key] = build(self, common_prefix_len, common_attn_metadata, fast_build)
+        return reused[key]
+
+    return cast(_F, wrapper)
 
 
 @dataclass
@@ -908,6 +1003,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         return active_bs, tiles
 
+    @_reuses_metadata_across_groups
     def build(
         self,
         common_prefix_len: int,
@@ -1105,20 +1201,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Sized per sequence, each its own allocation: a batch-max width becomes a
         # Dynamo guard the key cannot carry.
         num_active = [int(stack.shape[0]) for stack in attention_mask_stacks]
-        page_index_tables_cpu = []
-        for s, n in enumerate(num_active):
-            if active_block_indices is not None:
-                blocks_s = active_block_indices[s]
-            elif self._attn_bucketer.page_range is not None:
-                # Pad with the last real page, as forward() does: raising the count to the
-                # range minimum can take it past the block table's width.
-                real = real_num_blocks[s]
-                blocks_s = list(range(real)) + [real - 1] * (n - real)
-            else:
-                blocks_s = slice(n)
-            table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-            table[:, 0] = block_table[s, blocks_s]
-            page_index_tables_cpu.append(table)
+        page_index_tables_cpu = _page_index_tables(
+            block_table,
+            num_active,
+            active_block_indices,
+            real_num_blocks,
+            self._attn_bucketer.page_range is not None,
+        )
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
@@ -1246,24 +1335,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
         rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
 
-        block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
-        bt = block_table[members].to(torch.int32)
-        if active_block_indices is None:
-            n_use_list = [min(nb, b_blocks) for nb in decode_blocks]
-            w = min(b_blocks, bt.shape[1])
-            cols = torch.arange(w)
-            in_range = cols.unsqueeze(0) < torch.tensor(n_use_list, dtype=torch.int64).unsqueeze(1)
-            block_ids_padded[:w, :n] = (bt[:, :w] * in_range).t()
-        else:
-            # Position i is the i-th ACTIVE block, matching the mask tiles.
-            for s, m in enumerate(members):
-                abs_blocks = active_block_indices[m]
-                n_use = min(len(abs_blocks), b_blocks)
-                for b, abs_b in enumerate(abs_blocks[:n_use]):
-                    block_ids_padded[b, s] = bt[s, abs_b]
         # Kept whole at offset 0: both walks narrow the block axis in-graph, so
         # this is one transfer per step rather than one per chunk.
-        chunk_page_ids_cpu = block_ids_padded
+        chunk_page_ids_cpu = _chunk_page_ids(
+            members,
+            b_seqs,
+            padded_batch_blocks,
+            decode_blocks,
+            block_table,
+            active_block_indices,
+        )
 
         # -inf on padded rows/blocks and past-kv-len positions; 0 on
         # valid positions. The kernel broadcasts the mask to KV heads.
@@ -1373,6 +1454,74 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
         """Set the KV-write slots this builder's layers read on their next forward."""
         self._slot_mapping.publish(slot_mapping)
+
+    @property
+    def supports_update_block_table(self) -> bool:
+        # vLLM reuses metadata across groups keyed on spec and builder type, which
+        # leaves out a draft's causal_override.
+        return self.causal_override is None
+
+    def update_block_table(
+        self,
+        metadata: SpyreAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> SpyreAttentionMetadata:
+        """``metadata``, built for this batch by a builder of this one's spec and not yet
+        run, rebound to another group's block table: the page IDs are rebuilt as build()
+        builds them, the masks and row tables are shared."""
+        assert metadata.attention_mask_stacks is not None
+        assert metadata.num_kv_heads == self.num_kv_heads
+        assert (metadata.active_block_indices is None) == (self.sliding_window is None)
+        self.publish_slot_mapping(slot_mapping)
+        block_size = self.block_size
+        num_active = [int(stack.shape[0]) for stack in metadata.attention_mask_stacks]
+        active = metadata.active_block_indices
+        real_num_blocks = [
+            (int(n) + block_size - 1) // block_size
+            for n in metadata.seq_lens[: metadata.num_seqs].tolist()
+        ]
+        blocks_per_seq = real_num_blocks if active is None else num_active
+        chunk_page_ids_cpu = None
+        if metadata.padded_num_seqs is not None:
+            assert metadata.padded_batch_blocks is not None
+            n = metadata.num_decode_seqs
+            chunk_page_ids_cpu = _chunk_page_ids(
+                list(range(n)),
+                metadata.padded_num_seqs,
+                metadata.padded_batch_blocks,
+                blocks_per_seq[:n],
+                blk_table,
+                active,
+            )
+        decode_groups = None
+        if metadata.decode_groups is not None:
+            decode_groups = []
+            for g in metadata.decode_groups:
+                members = g.rows_cpu.tolist()
+                chunk_ids = _chunk_page_ids(
+                    members,
+                    g.padded_num_seqs,
+                    g.padded_batch_blocks,
+                    [blocks_per_seq[m] for m in members],
+                    blk_table,
+                    active,
+                )
+                decode_groups.append(replace(g, chunk_page_ids_cpu=chunk_ids))
+        return replace(
+            metadata,
+            block_table=blk_table,
+            slot_mapping=slot_mapping,
+            page_index_tables_cpu=_page_index_tables(
+                blk_table,
+                num_active,
+                active,
+                real_num_blocks,
+                self._attn_bucketer.page_range is not None,
+            ),
+            chunk_page_ids_cpu=chunk_page_ids_cpu,
+            decode_groups=decode_groups,
+        )
 
     def build_for_variant(
         self, bucket: SpyreAttnBucket, causal: bool = True

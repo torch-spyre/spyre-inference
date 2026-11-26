@@ -14,13 +14,22 @@
 
 """MRV2: decoder model state (vllm/v1/worker/gpu/model_states/default.py:DefaultModelState).
 
-Upstream's prepare_inputs / prepare_attn are used as-is; bucketing.py pads the body.
+Upstream's prepare_inputs is used as-is; bucketing.py pads the body.
 """
+
+from typing import Any
 
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
+from spyre_inference.v1.attention.backends.spyre_attn import reuse_metadata_across_groups
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
 
 
 class SpyreDefaultModelState(SpyreModelStateMixin, DefaultModelState):
     """MRV2: DefaultModelState, constructed with the Spyre device."""
+
+    def prepare_attn(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        # vLLM v0.33's build_attn_metadata reuses metadata across same-spec groups for
+        # Mamba groups only; the hybrid manager's sliding-window groups qualify too.
+        with reuse_metadata_across_groups():
+            return super().prepare_attn(*args, **kwargs)

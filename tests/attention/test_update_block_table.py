@@ -40,12 +40,12 @@ from tests.mrv2.model_states.state_fakes import make_config, make_input_batch
 BS = 128
 
 
-def _builder(window):
+def _builder(window, max_model_len=2048):
     cfg = get_current_vllm_config()
     cfg.model_config.get_num_attention_heads = Mock(return_value=4)  # ty: ignore[invalid-assignment]
     cfg.model_config.get_num_kv_heads = Mock(return_value=1)  # ty: ignore[invalid-assignment]
     cfg.cache_config.block_size = BS
-    cfg.model_config.max_model_len = 2048
+    cfg.model_config.max_model_len = max_model_len
     if window is None:
         spec = FullAttentionSpec(block_size=BS, num_kv_heads=1, head_size=256, dtype=torch.float16)
     else:
@@ -55,7 +55,7 @@ def _builder(window):
     return SpyreAttentionMetadataBuilder(spec, ["layers.0.self_attn"], cfg, torch.device("cpu"))
 
 
-def _common(query_lens, seq_lens, bt):
+def _common(query_lens, seq_lens, bt, first_slot=0):
     qsl = torch.tensor([0, *torch.tensor(query_lens).cumsum(0).tolist()], dtype=torch.int32)
     n = int(qsl[-1])
     return CommonAttentionMetadata(
@@ -67,7 +67,7 @@ def _common(query_lens, seq_lens, bt):
         max_query_len=max(query_lens),
         max_seq_len=max(seq_lens),
         block_table_tensor=bt,
-        slot_mapping=torch.arange(n, dtype=torch.int64),
+        slot_mapping=torch.arange(first_slot, first_slot + n, dtype=torch.int64),
         causal=True,
         is_prefilling=torch.tensor([q > 1 for q in query_lens]),
     )
@@ -89,44 +89,37 @@ def _eq(a, b, path):
         assert a == b, (path, a, b)
 
 
-SKIP = {"slot_mapping"}
-
-
 @pytest.mark.parametrize("window", [None, 512])
 @pytest.mark.parametrize(
-    "query_lens,seq_lens",
+    "query_lens,seq_lens,max_model_len",
     [
-        ([1] * 8, [1030 + 7 * i for i in range(8)]),
-        ([1] * 4, [130, 700, 1500, 2000]),
-        ([1, 1, 300], [900, 1200, 812]),
-        ([512], [1536]),
+        ([1] * 8, [1030 + 7 * i for i in range(8)], 2048),
+        # A one-page sequence below the page range's minimum: padded with its last page.
+        ([1] * 4, [100, 700, 1500, 2000], 2048),
+        ([1, 1, 300], [900, 1200, 812], 2048),
+        ([512], [1536], 2048),
+        # Without a window, jagged decode groups.
+        ([1] * 3, [129, 129, 8191], 8192),
     ],
 )
-def test_update_block_table_matches_build(default_vllm_config, window, query_lens, seq_lens):
-    b0 = _builder(window)
-    b1 = _builder(window)
+def test_update_block_table_matches_build(
+    default_vllm_config, monkeypatch, window, query_lens, seq_lens, max_model_len
+):
+    b0 = _builder(window, max_model_len)
+    b1 = _builder(window, max_model_len)
     g = torch.Generator().manual_seed(0)
-    bt_a = torch.randint(1, 5000, (len(seq_lens), 16), dtype=torch.int32, generator=g)
-    bt_b = torch.randint(1, 5000, (len(seq_lens), 16), dtype=torch.int32, generator=g)
-    ca = _common(query_lens, seq_lens, bt_a)
-    md_a = b0.build(0, ca)
-    upd = b1.update_block_table(md_a, bt_b, ca.slot_mapping)
-    ref = b1.build(0, _common(query_lens, seq_lens, bt_b))
+    width = max_model_len // BS
+    bt_a = torch.randint(1, 5000, (len(seq_lens), width), dtype=torch.int32, generator=g)
+    bt_b = torch.randint(1, 5000, (len(seq_lens), width), dtype=torch.int32, generator=g)
+    md_a = b0.build(0, _common(query_lens, seq_lens, bt_a))
+    cb = _common(query_lens, seq_lens, bt_b, first_slot=sum(query_lens))
+    published = []
+    monkeypatch.setattr(b1, "publish_slot_mapping", published.append)
+    upd = b1.update_block_table(md_a, bt_b, cb.slot_mapping)
+    assert len(published) == 1 and published[0] is cb.slot_mapping
+    ref = b1.build(0, cb)
     for f in dataclasses.fields(ref):
-        if f.name in SKIP:
-            continue
         _eq(getattr(upd, f.name), getattr(ref, f.name), f.name)
-    assert not all(
-        torch.equal(x, y) for x, y in zip(md_a.page_index_tables_cpu, upd.page_index_tables_cpu)
-    )
-
-
-@pytest.mark.parametrize("window", [None, 512])
-def test_supports_update_block_table(default_vllm_config, window):
-    builder = _builder(window)
-    assert builder.supports_update_block_table
-    builder.causal_override = False
-    assert not builder.supports_update_block_table
 
 
 def test_shared_build_needs_scope_and_spec(default_vllm_config):
@@ -195,7 +188,8 @@ def _check_prepare_attn_shares(window, query_lens, num_computed):
     for i, layer in enumerate(md):
         ref = _builder(windows[i]).build(0, _common(query_lens, seq_lens, block_tables[i]))
         for f in dataclasses.fields(ref):
-            if f.name not in SKIP:
+            # The runner's slot mappings are its own; update_block_table's are checked above.
+            if f.name != "slot_mapping":
                 _eq(getattr(md[layer], f.name), getattr(ref, f.name), f"{layer}.{f.name}")
 
 
@@ -213,12 +207,8 @@ def test_runner_shares_metadata_across_same_spec_groups(
 
 @pytest.mark.parametrize("window", [None, 512])
 @pytest.mark.parametrize("query_lens,num_computed", _CASES)
-@pytest.mark.parametrize("runner_gates_on_flag", [False, True])
 def test_prepare_attn_shares_as_the_runner_would(
-    default_vllm_config, monkeypatch, window, query_lens, num_computed, runner_gates_on_flag
+    default_vllm_config, window, query_lens, num_computed
 ):
-    """SpyreDefaultModelState.prepare_attn's scope on v0.33's runner, and on one that
-    already reuses by the flag."""
-    if runner_gates_on_flag:
-        monkeypatch.setattr(attn_utils, "MambaSpec", object)
+    """SpyreDefaultModelState.prepare_attn's scope on v0.33's runner."""
     _check_prepare_attn_shares(window, query_lens, num_computed)

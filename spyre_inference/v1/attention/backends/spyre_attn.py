@@ -27,10 +27,10 @@ import contextlib
 import functools
 import math
 import time
-from collections.abc import Callable
-from contextvars import copy_context
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
@@ -345,6 +345,7 @@ _LX_ATTN_CORES = 8
 _PAGE_GROUP = 8
 _PAGE_GROUP_MAX_QUERY_WIDTH = 1024
 _T = TypeVar("_T")
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _prefill_page_group(num_blocks: int, num_heads: int, head_size: int) -> int:
@@ -443,6 +444,48 @@ def _chunk_page_ids(
             for b, abs_b in enumerate(abs_blocks[:n_use]):
                 block_ids_padded[b, s] = bt[s, abs_b]
     return block_ids_padded
+
+
+# Until vLLM's V2 runner reuses metadata for every builder that sets
+# supports_update_block_table, not only for Mamba groups. Then delete this,
+# reuse_metadata_across_groups and SpyreDefaultModelState.prepare_attn.
+_reused_metadata: ContextVar[dict | None] = ContextVar("spyre_reused_metadata", default=None)
+
+
+@contextlib.contextmanager
+def reuse_metadata_across_groups() -> Iterator[None]:
+    """Within the scope, build() derives a builder's metadata from the one an earlier
+    builder of the same spec and type built, as vLLM's build_attn_metadata would."""
+    token = _reused_metadata.set({})
+    try:
+        yield
+    finally:
+        _reused_metadata.reset(token)
+
+
+def _reuses_metadata_across_groups(build: _F) -> _F:
+    @functools.wraps(build)
+    def wrapper(
+        self: "SpyreAttentionMetadataBuilder",
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        per_seq_only: bool = False,
+    ) -> "SpyreAttentionMetadata":
+        reused = _reused_metadata.get()
+        if reused is None or per_seq_only or not self.supports_update_block_table:
+            return build(self, common_prefix_len, common_attn_metadata, fast_build, per_seq_only)
+        key = (self.kv_cache_spec, type(self))
+        if key in reused:
+            return self.update_block_table(
+                reused[key],
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.slot_mapping,
+            )
+        reused[key] = build(self, common_prefix_len, common_attn_metadata, fast_build)
+        return reused[key]
+
+    return cast(_F, wrapper)
 
 
 @dataclass
@@ -960,6 +1003,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         return active_bs, tiles
 
+    @_reuses_metadata_across_groups
     def build(
         self,
         common_prefix_len: int,

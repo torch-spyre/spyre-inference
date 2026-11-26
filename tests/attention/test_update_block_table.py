@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """update_block_table(build(table A), table B) equals build(table B), field by field; only
-builders whose metadata vLLM can key on spec and builder type opt into it; and a runner that
-gates the reuse on that flag shares metadata across same-spec groups."""
+builders whose metadata vLLM can key on spec and builder type opt into it; and prepare_attn
+shares metadata across same-spec groups as vLLM's runner does once it gates on that flag."""
 
 import dataclasses
 from types import SimpleNamespace
@@ -30,7 +30,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.utils import AttentionGroup
 
-from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionMetadataBuilder,
+    reuse_metadata_across_groups,
+)
 from spyre_inference.v1.worker.spyre.model_states.default import SpyreDefaultModelState
 from tests.mrv2.model_states.state_fakes import make_config, make_input_batch
 
@@ -126,6 +129,20 @@ def test_supports_update_block_table(default_vllm_config, window):
     assert not builder.supports_update_block_table
 
 
+def test_shared_build_needs_scope_and_spec(default_vllm_config):
+    full, full2, swa, draft = _builder(None), _builder(None), _builder(512), _builder(None)
+    draft.causal_override = True
+    c = _common([1, 1], [1100, 1300], torch.randint(1, 5000, (2, 16), dtype=torch.int32))
+    with reuse_metadata_across_groups():
+        md = full.build(0, c)
+        assert full2.build(0, c).attention_mask_stacks is md.attention_mask_stacks
+        # Another window is another spec.
+        assert swa.build(0, c).attention_mask_stacks is not md.attention_mask_stacks
+        # A draft's builder opts out.
+        assert draft.build(0, c).attention_mask_stacks is not md.attention_mask_stacks
+    assert full2.build(0, c).attention_mask_stacks is not md.attention_mask_stacks
+
+
 def _prepare_attn(builders, batch, block_tables):
     state = SpyreDefaultModelState(
         make_config(),  # ty: ignore[invalid-argument-type]
@@ -190,4 +207,18 @@ def test_runner_shares_metadata_across_same_spec_groups(
     # A runner that gates the reuse on supports_update_block_table alone; v0.33's
     # also requires a Mamba spec.
     monkeypatch.setattr(attn_utils, "MambaSpec", object, raising=False)
+    monkeypatch.delattr(SpyreDefaultModelState, "prepare_attn", raising=False)
+    _check_prepare_attn_shares(window, query_lens, num_computed)
+
+
+@pytest.mark.parametrize("window", [None, 512])
+@pytest.mark.parametrize("query_lens,num_computed", _CASES)
+@pytest.mark.parametrize("runner_gates_on_flag", [False, True])
+def test_prepare_attn_shares_as_the_runner_would(
+    default_vllm_config, monkeypatch, window, query_lens, num_computed, runner_gates_on_flag
+):
+    """SpyreDefaultModelState.prepare_attn's scope on v0.33's runner, and on one that
+    already reuses by the flag."""
+    if runner_gates_on_flag:
+        monkeypatch.setattr(attn_utils, "MambaSpec", object)
     _check_prepare_attn_shares(window, query_lens, num_computed)

@@ -278,11 +278,9 @@ load-time constant such as a rope permutation becomes a non-persistent buffer on
 layer, lifted as a graph input, and a per-image one such as the attention mask is built
 once in the encoder forward and passed to each layer as an argument. A multimodal patch
 that has done that marks the layers with `mark_blocks_compilable` (`multimodal/utils.py`),
-and they are discovered like any other block stack; every other tower stays eager. CLIP's
-tower is marked (`multimodal/clip.py`): its attention is vLLM's `MMEncoderAttention`,
-which Spyre replaces out of tree (`custom_ops/vit_attn.py`) with a `padded_sdpa` call that
-traces into the block rather than running behind upstream's opaque SDPA wrapper, and its
-only mask is the key-padding row, which `padded_sdpa` keeps a graph input. Marked tower
+and they are discovered like any other block stack; every other tower stays eager. No
+registered model marks its tower any more: CLIP's (`models/clip.py`) runs on the vision
+encoder mixin below, and `multimodal/clip.py` is left until its removal. Marked tower
 blocks compile beside the decoder blocks but never stand in for them, so a model with no
 decoder blocks still falls back to the whole-model graph. Warmup runs a marked tower at
 every image-batch width up to `mm_max_items_per_batch`, for pooling and generative models
@@ -354,21 +352,21 @@ upstream: an *image token* is one position of `vision_project`'s output, counted
 budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
 `patches_per_token` per image token.
 
-| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) |
-|---|---|---|---|---|
-| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, key-padding row, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
-| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | one image's offset-major patches, a zero key-padding row, RoPE positions | valid patches only, offset-major by position; segments; x and y |
-| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, `[1, 1, 1, P]` key-padding mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
-| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses |
-| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` |
-| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default |
-| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
-| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
-| `vision_max_items_per_call` | no | layout bound on items per encoder call | 1 (so the mask only hides padding) | 63 (one-hot width) |
-| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` |
-| `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image |
-| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
+| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) | CLIP (`models/clip.py`) |
+|---|---|---|---|---|---|
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, key-padding row, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size | patches (zero class row), positions, one-hot segments (`full` only); the slot (`class`) or 1 (`full`); `projection_dim` |
+| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image | 1 (`class`) or `grid² + 1` (`full`) per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | one image's offset-major patches, a zero key-padding row, RoPE positions | valid patches only, offset-major by position; segments; x and y | per image: class row, raster patches, slot padding (`class` only); positions; segments (`full` only) |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, `[1, 1, 1, P]` key-padding mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask | patch linear plus class and position embeddings, gathered; `pre_layrnorm` with fp32 statistics; `class`: slots batched `[images, slot, D]` under one key-padding row, `full`: packed under the image mask |
+| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses | `SpyreCLIPEncoderLayer`s with `SpyreCLIPAttention` |
+| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` | each slot's class row by a one-hot weight (`class` only); `post_layernorm` with fp32 statistics; `visual_projection` |
+| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default | default |
+| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none | none |
+| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) | 1; the slot (`class`) or 64 (`full`) |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 1 (so the mask only hides padding) | 63 (one-hot width) | 63: one-hot width (`full`), bound on the largest budget (`class`) |
+| `vision_items_limited_by_tokens` | no | limit items per call by budget tokens and `vision_max_items_per_call` (then required) instead of upstream's smallest budget | `False` | `False` | `True` |
+| `vision_pack_tokens` | no | packing stops at the budget covering this; larger items run alone (default `None`: up to the largest budget) | default | the engine's largest image | default |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected | `("image",)` |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
 as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
@@ -377,7 +375,7 @@ host), and `get_encoder_cudagraph_budget_range` when the processor's largest ite
 in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
-upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. Gemma 4
+upstream Pixtral and CLIP do not, so their Spyre subclasses write them. Gemma 4
 overrides `postprocess_encoder_output` to run its tail on the host in fp32, as upstream does:
 the pooler's `sqrt(hidden_size)` scale can leave the fp16 range, so the scale, standardize and
 `embed_vision` never run on the card, and its graphs end at the pooled vision hidden size. The eager
@@ -449,19 +447,18 @@ leaving the retained config's specs, and so its `page_size_bytes`, physical. YOC
 (`kv_sharing_fast_prefill`) swaps in an attention backend Spyre does not provide and is rejected.
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
-rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
-per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
-block counts that fit its smallest real query length; variants exceeding the allocated
-page count are skipped. When the per-sequence page count is dynamic (copied to the device
-with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
-bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
-it. When prefill gets its own range of multiples of 8 pages, a prefill variant is traced
-at that page count rounded up to a multiple of 8. Failed recordings are logged and compile
-on first use instead.
-When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
-enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
-buckets; combinations that reach or exceed the allocated page count are skipped and
-declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
+rather than lazily on first use: warmup records per-sequence variants from
+`SpyreAttnBucketer.variants()`: one per query bucket, at the page count of
+`max_model_len`; variants exceeding the allocated page count are skipped.
+When the per-sequence page count is dynamic (copied to the device with
+`tensor.to(dynamic=...)`), that kernel runs every page count up to it; otherwise every
+sequence pads to it. A sliding-window layer has no page range and records one variant per
+(power-of-two page count, query bucket) pair instead. When prefill gets its own range of
+multiples of 8 pages, a prefill variant is traced at that page count rounded up to a
+multiple of 8. Failed recordings are logged and compile on first use instead.
+For the batched-decode kernel, warmup enumerates its variants, one per num-sequences bucket at the page count of `max_model_len`, or
+at each power-of-two count up to its window for a sliding-window layer; variants that reach
+or exceed the allocated page count are skipped and declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
 one dynamic variant, at the chunk count of `max_model_len`, that runs every batch, a
 single chunk included.
 
@@ -478,12 +475,12 @@ block slots into its output row, as the per-bucket kernel sums a sequence's bloc
 Output rows past the batch copy row 0, so they stay finite.
 
 One dynamic variant serves every batch of up to `S` sequences. Its chunk count runs from one
-chunk, or from `MIN_RESERVED_DIM_SIZE` if you export it, up to what `S` sequences at
-`max_model_len` need, so one call serves every such batch.
+chunk up to what `S` sequences at `max_model_len` need, so one call serves every such batch.
 
 A single step can carry a mix of prefill and decode sequences; each sequence is padded to its
 own query bucket (decodes use the length-1 bucket) before dispatch.
-`SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+Only `--enforce-eager` skips the recording; each attention variant then compiles on first
+use.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
@@ -494,30 +491,22 @@ walk over block chunks. The kernels carry the online softmax as a
 
 ### LX-resident pages
 
-The per-sequence decode kernel (`page_attn_decode`, one query row) keeps a
-gathered page in the LX scratchpad from its gather to its last use instead of
-round-tripping through HBM. A query wider than one row amortises the page transfer over
-every row, so it takes `page_attn_prefill` instead: batched GQA over the unfolded
-cache, one whole page per gather. Two shape choices get the decode kernel to LX residency. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
-gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
-behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
-groups fold into the query's row axis — a reshape, since heads are KV-major — so each
-matmul carries a single batch dim: the batched GQA form leaves the page with two batch dims
-and Inductor clones it out to a query-group axis it does not have (torch-spyre#4123). The
-cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
-`[num_blocks * KV, block_size, D]` — but the cache is allocated with that folded axis at
-device dim 0, which is where an indexed axis has to sit for the gather to cost one page
-rather than the whole tensor.
+Decode rows run the batched decode kernel, even for one sequence. It gathers whole pages,
+which stay in the LX scratchpad from the gather to their last use instead of round-tripping
+through HBM. The per-sequence loop runs `page_attn_prefill`: batched GQA over the cache, one
+whole page per gather, the page transfer amortised over every query row. It also serves the
+decode rows batched decode does not take, at query width 1: a cache too small for the
+gather, or a one-token row behind spec-decode verify rows, which MRV2 sorts first.
 
-Two things follow from those choices. The gather is a 2-D subscript, which lowers to
-`aten.index` and fails eager on Spyre by upcasting its int32 index (torch-spyre#4334,
-tracked by `test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is
-always compiled on Spyre, even under `--enforce-eager` — attention compiles in its own
-domain, so the rest of the model still runs eager. Because the bmm's
-output axes (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling
-them would mean K-splitting a reduction a gather cannot mirror, the attention compile alone
-is capped at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's
-page index is uploaded one entry per stick, which is what the tiled walk needs.
+Batched decode's page gather is an `[entries, 1]` subscript, which lowers to `aten.index`;
+eager `aten.index` takes only a 1-D index on Spyre (torch-spyre#4334, tracked by
+`test_spyre_indirect_page_gather_2d_index`), so attention is always compiled on Spyre,
+even under `--enforce-eager` — attention compiles in its own domain, so the rest of the
+model still runs eager. Because a narrow query's bmm output axes
+(`num_kv_heads * padded_query_len`) cannot fill 32 cores, and filling them would mean
+K-splitting a reduction a gather cannot mirror, such an attention compile alone is capped
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's page index is
+uploaded one entry per stick, which is what the tiled walk needs.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
 planner's own verdicts. Read those from the allocation — `LifetimeBoundBuffer.address`, where
@@ -528,8 +517,7 @@ transpose to a restickify, whose cross-frame barrier bars an LX-resident input w
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
 
-Batched decode needs none of this. Its whole-page gather is LX-resident as it stands, so the
-per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding anyway divides
+Folding the cache on `(page, kv_head)` would buy batched decode nothing: it divides
 `blocks_per_chunk` by `num_kv_heads` and multiplies the chunk trips, which measured roughly
 1.5–2x more kernel time across the decode batches and contexts tried.
 
@@ -549,7 +537,7 @@ The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first 
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
 has no device lowering and falls back to CPU, which writes bytes in sequential order
 while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `QFP8CH` in
-`head_major_kv_layout`. The three read kernels cast a gathered page back to the model
+`head_major_kv_layout`. The two read kernels cast a gathered page back to the model
 dtype and apply `v_scale` to the output; `k_scale` is folded into the softmax scale the
 impl passes them. The attention math itself stays fp16.
 
@@ -565,16 +553,16 @@ calibrated one.
 
 Key constraints:
 
-- **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
-  to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
-  selects a denser preset.
+- **KV length**: not bucketed. Each sequence keeps its own block count within a page range
+  up to `max_model_len`, or pads to that count where there is no range (see the
+  configuration guide). Sliding-window layers keep power-of-two block counts, capped at the
+  pages their window touches.
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
-- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
-  default): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);
-  eligible `(num_blocks, num_seqs)` combinations are recorded during warmup. With the
-  shared-slot kernels, only the buckets above `E` (64, or 32 for a wide KV row) sequences
-  are, since those kernels serve every batch of up to `E`
+- **Num-sequences bucketing** (batched-decode kernel only): powers of two from 1 to
+  `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); eligible `(num_blocks, num_seqs)` combinations
+  are recorded during warmup. With the shared-slot kernels, only the buckets above `E` (64, or
+  32 for a wide KV row) sequences are, since those kernels serve every batch of up to `E`
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
   — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a

@@ -210,3 +210,80 @@ def test_enclosing_graph_absorbs_lookup_and_split(ple_decoder):
     assert not decoder.spyre_compiled_kernels
     for i, row in enumerate(rows):
         torch.testing.assert_close(row.cpu(), expected[:, i, :], atol=0, rtol=0)
+
+
+class _RMSNorm(nn.Module):
+    def __init__(self, weight: torch.Tensor, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.variance_epsilon = eps
+
+    def forward(self, x):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.variance_epsilon) * self.weight
+
+
+class _Linear(nn.Module):
+    """Spyre's linear form: a stored ``Wᵀ``, ``[in, out]``, and a plain matmul."""
+
+    def __init__(self, weight_t: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight_t, requires_grad=False)
+
+    def forward(self, x):
+        return torch.matmul(x, self.weight)
+
+
+def _projecting_decoder(cls, *, projection_t, norm_weight, num_layers, width):
+    decoder = cls.__new__(cls)
+    nn.Module.__init__(decoder)
+    decoder.config = SimpleNamespace(num_hidden_layers=num_layers)
+    decoder.hidden_size_per_layer_input = width
+    decoder.per_layer_model_projection = _Linear(projection_t)
+    decoder.per_layer_projection_norm = _RMSNorm(norm_weight, eps=1e-6)
+    decoder.register_buffer("per_layer_input_scale", torch.rsqrt(torch.tensor(2.0)))
+    decoder.register_buffer(
+        "per_layer_projection_scale", torch.tensor(projection_t.shape[0] ** -0.5)
+    )
+    return decoder
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 64])
+def test_card_projection_is_one_graph_matching_upstream(monkeypatch, num_tokens):
+    """The projection, scale, norm and combine run as one compiled graph (eagerly, the
+    projection's TP all-gather takes the slow list-form path) and match upstream."""
+    from spyre_testing_plugin.pytest_plugin import spyre_available
+
+    if not spyre_available():
+        pytest.skip("Spyre hardware is required")
+    monkeypatch.setattr(
+        lazy_compile,
+        "get_cached_compilation_config",
+        lambda: SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    )
+    num_layers, width, hidden = 3, 256, 512
+    g = torch.Generator().manual_seed(0)
+    shape = dict(
+        projection_t=torch.randn(hidden, num_layers * width, generator=g) * 0.05,
+        norm_weight=torch.rand(width, generator=g) + 0.5,
+        num_layers=num_layers,
+        width=width,
+    )
+    embeds = torch.randn(num_tokens, hidden, generator=g)
+    lookups = torch.randn(num_tokens, num_layers, width, generator=g)
+
+    reference = _projecting_decoder(upstream.Gemma4SelfDecoderLayers, **shape)
+    expected = reference.project_per_layer_inputs(embeds, lookups)
+
+    decoder = _projecting_decoder(gemma4.SpyreGemma4SelfDecoderLayers, **shape)
+    decoder.arm_outer_compile()
+    decoder.to("spyre", torch.float16)
+    with torch.inference_mode():
+        rows = decoder.project_per_layer_inputs(
+            embeds.half().to("spyre"), lookups.half().to("spyre")
+        )
+
+    names = {kernel.__name__ for kernel in decoder.spyre_compiled_kernels}
+    assert "_spyre_project_per_layer_inputs" in names
+    for i, row in enumerate(rows.spyre_rows):
+        torch.testing.assert_close(row.cpu().float(), expected[:, i, :], atol=3e-2, rtol=3e-2)

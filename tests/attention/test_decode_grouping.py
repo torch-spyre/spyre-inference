@@ -27,7 +27,6 @@ def decode_config(default_vllm_config, monkeypatch):
     """The per-bucket kernels' grouping; ``shared_slot_config`` covers the shared-slot one's."""
     from vllm.config import get_current_vllm_config
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     use_per_bucket_decode(monkeypatch)
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
@@ -190,7 +189,6 @@ def shared_slot_config(default_vllm_config, monkeypatch):
 
     from spyre_inference.v1.attention import spyre_attn_bucketer
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     monkeypatch.setattr(
         spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
@@ -206,7 +204,6 @@ def test_a_narrow_kv_row_shares_64_slots(default_vllm_config, monkeypatch):
     chunks, where 32 slots took 9."""
     from vllm.config import get_current_vllm_config
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 32
     cfg.model_config.max_model_len = 32768

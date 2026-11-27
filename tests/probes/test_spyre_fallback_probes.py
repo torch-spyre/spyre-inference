@@ -476,7 +476,8 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     ],
 )
 def test_spyre_indirect_page_gather_2d_index(spyre_device, mode):
-    """`k_pages[kv_rows]` with a [KV, 1] int32 index, the page gather of page_attn_decode.
+    """`k_pages[kv_rows]` with a [KV, 1] int32 index, the 2-D form of batched decode's
+    [entries, 1] page gather.
 
     This is why SpyreAttentionImpl compiles attention on Spyre even under --enforce-eager.
     When the eager case XPASSes, attention can honor --enforce-eager on Spyre.
@@ -974,7 +975,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     ),
 )
 def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
-    """The same idea at the [KV, 1] entry shape ``page_attn_decode`` gathers with.
+    """The same idea at a [KV, 1] entry shape, the 2-D form batched decode gathers with.
 
     A 2-D entry cannot go through index_select, hence the subscript.
     """

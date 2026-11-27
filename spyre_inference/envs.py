@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
-    SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
@@ -85,10 +84,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
     "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
-    # When "1" (default), pre-compile every attention variant the run can need during
-    # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
-    # compiling each variant lazily on first use.
-    "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.

@@ -139,8 +139,10 @@ runs:
         source "${RUNNER_TEMP}/ingest-venv/bin/activate"
         uv pip install clickhouse-connect
         # Shared v2 identity, schema model and write path live in torch-spyre.
+        # Pinned to the rev that added the ch_mgmt schema (#6715); the requirements-benchmark
+        # pin and the two workflow-file installs move with it (tracked on #1541).
         uv pip install \
-          "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
+          "git+https://github.com/torch-spyre/torch-spyre@f99177f10908b7afec681e8d16ade58faf3934f5#subdirectory=extensions/clickhouse-ingest"
 
     - name: Ingest benchmark results into ClickHouse
       if: steps.gate.outputs.configured == 'true'

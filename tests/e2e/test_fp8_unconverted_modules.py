@@ -57,13 +57,19 @@ def test_hf_format_tower_stays_unquantized(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     def linears(model):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
         layers = {
             "tower": model.vision_tower.transformer.layers[0].attention.qkv_proj,
             "projector": model.multi_modal_projector.linear_1,
             "decoder": model.language_model.model.layers[0].self_attn.qkv_proj,
         }
+        # Spyre swaps in its own UnquantizedLinearMethod subclass after loading.
         return {
-            name: (type(layer.quant_method).__name__, str(layer.weight.dtype))
+            name: (
+                isinstance(layer.quant_method, UnquantizedLinearMethod),
+                str(layer.weight.dtype),
+            )
             for name, layer in layers.items()
         }
 
@@ -84,7 +90,7 @@ def test_hf_format_tower_stays_unquantized(monkeypatch: pytest.MonkeyPatch, tmp_
     assert freed, "Spyre devices were not released after LLM shutdown"
 
     assert methods == {
-        "tower": ("UnquantizedLinearMethod", "torch.float16"),
-        "projector": ("UnquantizedLinearMethod", "torch.float16"),
-        "decoder": ("SpyreFp8LinearMethod", "torch.float8_e4m3fn"),
+        "tower": (True, "torch.float16"),
+        "projector": (True, "torch.float16"),
+        "decoder": (False, "torch.float8_e4m3fn"),
     }

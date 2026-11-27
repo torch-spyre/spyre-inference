@@ -87,6 +87,7 @@ def _build_metadata(
     sliding_window: int | None = None,
     model_num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
+    is_prefilling: torch.Tensor | None = None,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata.
 
@@ -147,7 +148,7 @@ def _build_metadata(
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
         causal=True,
-        is_prefilling=(query_lens_per_seq > 1),
+        is_prefilling=(query_lens_per_seq > 1) if is_prefilling is None else is_prefilling,
     )
 
     return builder.build(
@@ -383,21 +384,25 @@ def split_by_chunk(chunk_page_ids, mask_by_chunk, blocks_per_chunk):
 
 
 def drop_cpu_device_layouts(monkeypatch) -> None:
-    """Transfer to CPU without the Spyre device layout, which only Spyre can build.
+    """Transfer to CPU without the Spyre-only device layout and dynamic reservation.
 
-    The batched decode index upload places one; the plain transfer carries the same values.
+    The batched decode index upload places both; the plain transfer carries the same values.
     """
     orig_to = torch.Tensor.to
 
-    def to(tensor, *args, device_layout=None, **kwargs):
-        if device_layout is None:
+    def to(tensor, *args, device_layout=None, dynamic=None, **kwargs):
+        if device_layout is None and dynamic is None:
             return orig_to(tensor, *args, **kwargs)
         target = kwargs.get("device", args[0] if args else None)
         if not isinstance(target, (str, torch.device)):
             target = tensor.device
         if torch.device(target).type != "spyre":
             return orig_to(tensor, *args, **kwargs)
-        return orig_to(tensor, *args, device_layout=device_layout, **kwargs)
+        if device_layout is not None:
+            kwargs["device_layout"] = device_layout
+        if dynamic is not None:
+            kwargs["dynamic"] = dynamic
+        return orig_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", to)
 

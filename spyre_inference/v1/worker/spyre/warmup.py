@@ -36,7 +36,6 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
-from spyre_inference import envs
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -225,9 +224,6 @@ def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> Non
 
 
 def _record_attention(runner: "SpyreModelRunnerV2") -> None:
-    if not envs.SPYRE_ATTN_RECORD:
-        logger.info("Attention graph recording disabled (SPYRE_ATTN_RECORD=0)")
-        return
     if runner.compilation_config.mode is CompilationMode.NONE:
         logger.info("Attention graph recording disabled (CompilationMode.NONE)")
         return

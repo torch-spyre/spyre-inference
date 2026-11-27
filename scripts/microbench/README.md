@@ -53,8 +53,8 @@ uv run --no-sync vllm bench latency \
 ```
 
 Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace;
-`SPYRE_BATCHED_DECODE=1` is the default; the batched decode path also depends on
-compilation, bucket coverage and allocated KV-cache pages.
+the batched decode path depends on compilation, bucket coverage and allocated KV-cache
+pages.
 
 ### Which scope to measure
 
@@ -144,11 +144,11 @@ is reported as a row with `error` set rather than an assertion mid-sweep.
 
 ### Batched decode
 
-The batched decode kernel needs the `batched_decode_compiled` variant, which sets
-`SPYRE_BATCHED_DECODE` for the process (so it cannot be mixed with a per-seq
-variant in one run). Even one decode sequence can use it, provided the build is
-compiled, the sequence/blocks bucket pair resolves, and the padded sequence count
-times blocks per chunk is strictly less than the allocated KV-cache page count.
+Every decode row runs the batched decode kernel, whichever variant is measured; the
+`batched_decode_compiled` variant additionally flags a run where it did not. Even one
+decode sequence uses it, provided the build is compiled, the sequence/blocks bucket
+pair resolves, and the padded sequence count times blocks per chunk is strictly less
+than the allocated KV-cache page count.
 
 The batch axis is bucketed like the other two — one bucket per captured batch size,
 so each of `granite33_8b_batched_decode.json`'s 4/8/16/32 captures dispatches to its
@@ -302,8 +302,8 @@ windows, i.e. whether an Inductor compile landed inside a measurement.
 - `block_size` 128 is what you get in practice: `platform.py` sets it whenever the user
   does not pass one; a user-supplied value is rounded up to a multiple of 64, then the
   result must be a power of two.
-- Compiled and eager variants need separate runs, as do batched and per-seq decode
-  variants — both are fixed per process.
+- Compiled and eager variants need separate runs: the compilation mode is fixed per
+  process.
 - The kernel specializes per `(num_blocks, aligned_max_query_len)`, so a sweep
   legitimately triggers many recompiles; the dynamo recompile limit is raised to
   4096. Warmup runs before the profiled windows so no compile lands inside a

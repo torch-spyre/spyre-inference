@@ -26,7 +26,6 @@ KV_HEADS, HEAD = 2, 64
 def decode_config(default_vllm_config, monkeypatch):
     from vllm.config import get_current_vllm_config
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8
     cfg.model_config.max_model_len = 32768

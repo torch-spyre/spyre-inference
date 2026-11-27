@@ -24,7 +24,7 @@ This skill measures end-to-end serving under load. To isolate prefill time (TTFT
 
 - **Targets** (positional, optional): any mix of PR numbers (`#1043` / `1043`), git refs/shas, or `.` (the working copy, including uncommitted changes). Default: `HEAD` of the current branch.
 - **`--baseline <ref>`**: default the merge base of the first target with upstream main (step 1).
-- **`--env KEY=v1,v2`**: compare env var values instead of (or in addition to) commits. With a single ref, each value is one leg; the first value listed is the target, the last is the baseline. E.g. `--env SPYRE_BATCHED_DECODE=1,0`.
+- **`--env KEY=v1,v2`**: compare env var values instead of (or in addition to) commits. With a single ref, each value is one leg; the first value listed is the target, the last is the baseline. E.g. `--env SPYRE_JAGGED_DECODE=1,0`.
 - **`--extended`**: 1000 prompts instead of 200, and add configs where more than one is relevant (e.g. sweep max-num-seqs 4/8/16).
 - The user can override any config axis in plain words ("at tp1", "with 32k context", ...).
 

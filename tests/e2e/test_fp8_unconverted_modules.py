@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 
 import pytest
-from spyre_testing_plugin.pytest_plugin import spyre_available
+from spyre_testing_plugin.pytest_plugin import spyre_device_count
 from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
 MODEL = "mistralai/Ministral-3-14B-Instruct-2512"
@@ -47,7 +47,7 @@ def _hf_format_checkpoint(dst: Path) -> Path:
 @pytest.mark.fp8
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@pytest.mark.skipif(not spyre_available(), reason="needs a Spyre card")
+@pytest.mark.skipif(spyre_device_count() == 0, reason="needs a Spyre card")
 def test_hf_format_tower_stays_unquantized(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from vllm import LLM
 

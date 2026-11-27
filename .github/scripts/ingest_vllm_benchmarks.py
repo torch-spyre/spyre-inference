@@ -28,6 +28,7 @@ import os
 import sys
 import uuid
 from argparse import ArgumentParser
+from collections.abc import Mapping
 from typing import Any
 
 import clickhouse_connect
@@ -366,6 +367,29 @@ def _write_v2_benchmarks(client, db: str, rows, run_id_value: str, leg_key: str 
         write_benchmarks(client, db, rows, run_id_value)
 
 
+def _use_tls(env: Mapping[str, str], port: int) -> bool:
+    """Whether the ClickHouse connection should negotiate TLS.
+
+    clickhouse-connect only infers TLS from the port (443/8443) when `secure` is
+    left unset, so a legacy `CLICKHOUSE_PORT=8123` fallback would carry the write
+    credential (``CLICKHOUSE_PASS``) and every row in the clear. TLS is enabled
+    when ``CLICKHOUSE_SECURE`` is set truthy, or implicitly when the port is one
+    of the conventional HTTPS interfaces (443/8443), so the default-443
+    connection and an operator who moved the port both get encryption without a
+    second knob. A falsey flag defers to the port; the default stays
+    cleartext-compatible only for an explicit 8123 with no flag, so an existing
+    trusted-network deployment keeps working unchanged.
+    """
+    flag = (env.get("CLICKHOUSE_SECURE") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off", ""):
+        return port in (443, 8443)
+    # Any other explicit value is treated as "on": an operator who bothered to
+    # set the knob wants TLS, not a silent cleartext fallback on a typo.
+    return True
+
+
 def insert_to_clickhouse(
     rows: list[dict[str, Any]],
     v2_run_id_value: str = "",
@@ -392,12 +416,14 @@ def insert_to_clickhouse(
         return
 
     v2db = clickhouse_env_vars["CLICKHOUSE_DB_V2"]
+    port = int(os.environ.get("CLICKHOUSE_PORT") or "443")
     client = clickhouse_connect.get_client(
         host=clickhouse_env_vars["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT") or "443"),
+        port=port,
         username=clickhouse_env_vars["CLICKHOUSE_USER"],
         password=clickhouse_env_vars["CLICKHOUSE_PASS"],
         database=v2db,
+        secure=_use_tls(os.environ, port),
     )
 
     # Logged whether or not it drifted: this is what attributes a row to the code that

@@ -63,19 +63,15 @@ def _kv_block_layout(
     """``(pool bytes per block, bytes per block of each Spyre KV tensor, blocks per full
     request)``, or None without a KV cache.
 
-    With ``disable_hybrid_kv_cache_manager`` every layer lands in one group and the pool
-    bytes match the tensors' sum. They differ for a Mamba hybrid, which keeps the hybrid
-    manager: upstream overlays its groups on one buffer and needs ``pool bytes`` per block, while
-    Spyre allocates every layer's own page per block, unpadded where upstream pads (a
-    Mamba state). The per-request count is upstream's grouping, so a Mamba group holds
-    one block and a sliding-window group its window.
+    The tensors are one K and one V per byte range of upstream's placement, as
+    ``allocate_spyre_kv_caches`` allocates them. A model with Mamba layers is sized per
+    layer instead, each layer's own unpadded page, the Mamba state as one tensor.
     """
     if not kv_cache_spec:
         return None
     builder = get_kv_cache_config_builder(vllm_config)
     # The engine groups the same specs in get_global_kv_cache_groups and logs from there;
-    # this replay would repeat its warnings (a hybrid model's disabled hybrid manager) on
-    # every worker.
+    # this replay would repeat its warnings on every worker.
     grouping_logger = logging.getLogger(get_kv_cache_groups_from_builder.__module__)
     was_disabled, grouping_logger.disabled = grouping_logger.disabled, True
     try:
@@ -85,11 +81,24 @@ def _kv_block_layout(
     if not groups:
         return None
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
-    # Attention and Mamba specs pad their page to a shared size; Spyre's pages do not.
-    tensors: list[int] = []
-    for group in groups:
-        for name in group.layer_names:
-            spec = _layer_spec(group, name)
+    layer_specs = [_layer_spec(group, name) for group in groups for name in group.layer_names]
+    if all(isinstance(spec, AttentionSpec) for spec in layer_specs):
+        # Offsets scale with the block count, which num_gpu_blocks_override may set.
+        placement = builder.get_kv_cache_config_from_groups(
+            vllm_config=vllm_config, kv_cache_groups=groups, num_blocks=1
+        )
+        page_bytes_by_offset: dict[int, int] = {}
+        for tensor in placement.kv_cache_tensors:
+            for index in range(len(tensor.layers)):
+                offset = (tensor.offset + index * tensor.layer_stride) // placement.num_blocks
+                if offset not in page_bytes_by_offset:
+                    page_bytes_by_offset[offset] = tensor.block_stride
+        # An attention page holds K and V, which allocate_pages allocates apart.
+        tensors = [page // 2 for page in page_bytes_by_offset.values() for _ in range(2)]
+    else:
+        # Attention and Mamba specs pad their page to a shared size; Spyre's pages do not.
+        tensors = []
+        for spec in layer_specs:
             page = getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
             # An attention page holds K and V, which allocate_pages allocates apart.
             tensors += [page // 2] * 2 if isinstance(spec, AttentionSpec) else [page]
@@ -249,11 +258,8 @@ class SpyreWorkerV2(Worker):
         consumed; a forward's activations come out of the 1 - gpu_memory_utilization
         headroom.
 
-        Upstream turns the returned bytes into blocks by its pool's bytes per block,
-        while Spyre gives every layer its own page per block (``allocate_spyre_kv_caches``),
-        which costs more wherever groups would share a page. So the measured device bytes
-        are converted into blocks at Spyre's cost per block and handed back in upstream's
-        units.
+        The allocator never splits a tensor across its regions, so the block count is
+        capped where the KV tensors still fit.
         """
         available = super().determine_available_memory()
         layout = _kv_block_layout(self.vllm_config, self.model_runner.get_kv_cache_spec())

@@ -20,9 +20,6 @@ from spyre_inference.v1.attention.ops.batched_decode import (
     _merge_entry_local,
     batched_decode_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn_decode import (
-    page_attn_decode_kernel,
-)
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
 )
@@ -35,7 +32,6 @@ from spyre_inference.v1.attention.ops.reshape_and_cache import (
     "kernel",
     [
         page_attn_prefill_kernel,
-        page_attn_decode_kernel,
         batched_decode_kernel,
         _merge_entry_local,
     ],

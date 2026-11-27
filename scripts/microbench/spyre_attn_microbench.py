@@ -111,9 +111,7 @@ def register_variant(name, impl_label, compiled=True, batched=False, available_f
 
 register_variant("online_softmax_compiled", "Implementation.SPYRE_ONLINE_SOFTMAX", True)
 register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EAGER", False)
-register_variant(
-    "batched_decode_compiled", "Implementation.SPYRE_BATCHED_DECODE", True, batched=True
-)
+register_variant("batched_decode_compiled", "Implementation.BATCHED_DECODE", True, batched=True)
 
 
 @contextlib.contextmanager
@@ -707,6 +705,11 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
             row["error"] = f"query padding is not the identity: {declared_query}->{realized_query}"
             print(f"    -> {row['error']}", flush=True)
         return
+    # A page count rounds onto the page range, or pads to the num_blocks bucket without one.
+    if builder is not None:
+        declared_blocks = [
+            builder._pad_num_blocks(n, q > 1) for n, q in zip(declared_blocks, declared_query)
+        ]
     if realized_blocks != declared_blocks or realized_query != declared_query:
         row["error"] = (
             f"padding is not the identity: blocks {declared_blocks}->{realized_blocks}, "
@@ -741,16 +744,12 @@ def expected_kernels(row, span):
 
     The loop runs one kernel per sequence; the batched path collapses the decode
     prefix's into one. Staging copies count as memory ops, so they are excluded.
-    The decode kernel emits its store as a second kernel per call, where the
-    batched-GQA prefill kernel fuses it into the attention one.
     """
     num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
     if row["attn_path"].startswith("batched"):
         attn = 1 + (num_seqs - num_decode)
     else:
         attn = num_seqs
-    if row["padded_query_len"] == 1:
-        attn *= 2
     write = 1 if row["kv_write"] else 0
     if span == SPANS["reshape_and_cache"]:
         return write
@@ -1071,10 +1070,10 @@ def _infer_type(query_lens):
 def derive_lattice(entries, max_batched_tokens):
     """The bucket lattice that makes the builder's padding the identity.
 
-    One bucket per declared length, so ``find_*_bucket`` returns it unchanged. The kv
-    ladder stays in tokens rather than block-aligned: ``num_blocks_buckets`` derives
-    from it through the builder's own ``ceil(len / block_size)``, so one lattice holds
-    for a whole ``block_sizes`` sweep, which ``envs`` caching on first read requires.
+    One bucket per declared length, so ``find_*_bucket`` returns it unchanged. Page counts
+    are not bucketed: each sequence walks its own, and ``max_model_len`` is the longest
+    declared one, so one lattice holds for a whole ``block_sizes`` sweep, which ``envs``
+    caching on first read requires.
     """
     kv = sorted({s for e in entries for s in e["seq_lens"]})
     # max_num_batched_tokens is pinned, not derived: staging_rows is it plus one and
@@ -1088,7 +1087,6 @@ def derive_lattice(entries, max_batched_tokens):
         "max_model_len": kv[-1],
         "max_num_batched_tokens": max_batched_tokens,
         "max_num_seqs": num_seqs[-1],
-        "SPYRE_ATTN_KV_BUCKETS": ",".join(map(str, kv)),
         "SPYRE_ATTN_QUERY_BUCKETS": ",".join(map(str, query)),
         "SPYRE_ATTN_NUM_SEQS_BUCKETS": ",".join(map(str, num_seqs)),
     }
@@ -1237,15 +1235,6 @@ def main():
             "compiled and eager variants need separate runs (the compilation mode "
             "is fixed for the process). Re-run with --variants one at a time."
         )
-    # SPYRE_BATCHED_DECODE is cached on first read and sets the builder's
-    # reorder_batch_threshold, so it cannot vary within a process either.
-    batched_modes = {VARIANT_REGISTRY[v]["batched"] for v in variants}
-    if len(batched_modes) > 1:
-        raise SystemExit(
-            "batched and per-seq decode variants need separate runs "
-            "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
-        )
-    os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries, cfg["max_num_batched_tokens"])
@@ -1271,7 +1260,6 @@ def main():
     print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
-    print(f"  kv buckets : {limits['SPYRE_ATTN_KV_BUCKETS']}")
     print(f"  q buckets  : {limits['SPYRE_ATTN_QUERY_BUCKETS']}")
     print(f"  seq buckets: {limits['SPYRE_ATTN_NUM_SEQS_BUCKETS']}")
     print(f"  iterations : {cfg.get('iterations', 10)} (warmup {cfg.get('warmup', 2)})")

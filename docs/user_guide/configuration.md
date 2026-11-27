@@ -275,16 +275,16 @@ extra lever there, and the same keep-it-short advice applies.
 
 The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
 use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
-sequence length up to `--max-model-len`. Each kernel call covers at least two pages: a
-sequence that fits in one page also gets a masked copy of it as a second page.
+sequence length up to `--max-model-len`.
 
-Prefill sequences are padded to a multiple of 8 pages, and to at least 16 pages, so the
-prefill kernel can read 8 pages per loop step at every sequence length. Decode sequences keep
-their own page count.
+Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
+per loop step at every sequence length. When `--max-model-len` is too short for that, prefill
+keeps its own page count, but covers at least two pages. Decode sequences keep their own page
+count.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
-export them yourself: `MIN_RESERVED_DIM_SIZE` to 2, and `MAX_BUCKETS` to at least
+export them yourself: `MIN_RESERVED_DIM_SIZE` to 1, and `MAX_BUCKETS` to at least
 `--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
 below that rounded value, prefill reads one page per loop step instead.
 
@@ -300,9 +300,9 @@ same conditions. The kernel reads the KV cache one *chunk* per loop step: the ne
 `32 / num_seqs` pages (at least one) of every sequence in the batch, so that each of the 32
 cores reads one page. For example, a batch of 8 sequences reads 4 pages of each per chunk,
 and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
-masked past their own length. A batch that fits in one chunk runs a kernel compiled for one
-chunk. Warmup therefore compiles two batched kernels per num-sequences bucket. A
-num-sequences bucket whose `--max-model-len` fits in two chunks keeps its KV buckets.
+masked past their own length. The same kernel runs a batch that fits in one chunk, so warmup
+compiles one batched kernel per num-sequences bucket. A num-sequences bucket whose
+`--max-model-len` fits in one chunk keeps its KV buckets.
 
 ## KV cache size
 
@@ -336,14 +336,19 @@ setting it to a size next to `--kv-cache-memory-bytes` is an error.
 
 ## FP8 KV cache
 
-Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
-each cached token takes:
+An FP8 model (FP8 linear weights: the `fp8` method, or a compressed-tensors checkpoint
+with 8-bit float weights) stores its KV cache in float8 (e4m3) by default, halving the
+bytes each cached token takes. Any other model opts in with `--kv-cache-dtype fp8`. An FP8
+model opts out with its checkpoint's 16-bit dtype, `float16` or `bfloat16`; either gives a
+float16 cache, the only 16-bit cache Spyre has:
 
 ```bash
-vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+vllm serve ibm-granite/granite-4.1-8b-fp8                             # FP8 KV cache
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype bfloat16   # float16 cache
 ```
 
-It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+It needs a head size that is a multiple of 128; with a smaller one an FP8 model keeps a
+model-dtype cache, and an explicit `--kv-cache-dtype fp8` is rejected. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
 ...) are rejected at startup. Since the KV cache is sized from free device memory (see
 [KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
 Attention still computes in the model dtype: pages are dequantized on read with the

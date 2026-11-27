@@ -300,7 +300,7 @@ def probe_compiled_all_reduce_padded(device, device_group, world_size, rank):
         padded = torch.nn.functional.pad(x, (0, 0, 0, 1))
         out = torch.ops._c10d_functional.all_reduce(padded, "sum", gn)
         out = torch.ops._c10d_functional.wait_tensor(out)
-        return select_rows(out, torch.arange(1, dtype=torch.int32))
+        return select_rows(out, torch.arange(1, dtype=torch.int32, device=out.device))
 
     def plain_block(x):
         out = torch.ops._c10d_functional.all_reduce(x, "sum", gn)

@@ -273,6 +273,9 @@ class SpyreVisionEncoderMixin:
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
     # the manager is built, and read by get_encoder_cudagraph_budget_range.
     max_tokens_per_item: int
+    # Most items of the vision modalities in one engine step, set by the runner alongside: for a
+    # budget range that covers a step rather than an item (e.g. one token per image).
+    max_items_per_step: int
 
     def compile_vision_graphs(self) -> None:
         """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with

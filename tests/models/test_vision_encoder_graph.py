@@ -511,7 +511,9 @@ def test_runner_warmup_builds_the_manager_and_serves_through_it(monkeypatch):
     monkeypatch.setattr(
         warmup,
         "MultiModalBudget",
-        lambda *args, **kwargs: SimpleNamespace(mm_max_toks_per_item={"image": 300}),
+        lambda *args, **kwargs: SimpleNamespace(
+            mm_max_toks_per_item={"image": 300}, mm_max_items_per_batch={"image": 2}
+        ),
     )
 
     wrapper = _SpyreModelWrapper(
@@ -579,6 +581,85 @@ def test_mrv2_encoder_runner_serves_through_the_captured_budgets(monkeypatch):
     assert (manager.graph_hits, manager.graph_misses) == (2, 0)
     manager.clear()
     assert not manager.is_captured()
+
+
+def test_mrv2_warmup_sets_both_item_limits_before_building_the_manager(monkeypatch):
+    """The manager's __init__ reads the budget range, which may read either limit (CLIP's
+    reads ``max_items_per_step``), so warmup sets both first."""
+    from spyre_inference.v1.worker.spyre import warmup
+
+    seen = {}
+
+    class _Manager:
+        def __init__(self, vllm_config, device, dtype, model):
+            seen.update(tokens=model.max_tokens_per_item, items=model.max_items_per_step)
+
+        def capture(self, graph_pool):
+            pass
+
+    monkeypatch.setattr(warmup, "SpyreEncoderGraphManager", _Manager)
+    monkeypatch.setattr(
+        warmup,
+        "MultiModalBudget",
+        lambda *a, **kw: SimpleNamespace(
+            mm_max_toks_per_item={"image": 300}, mm_max_items_per_batch={"image": 5}
+        ),
+    )
+    model = _FakeVisionModel()
+    del model.max_tokens_per_item
+    model.compile_vision_graphs = lambda: None
+    runner: Any = SimpleNamespace(
+        get_model=lambda: model,
+        supports_mm_inputs=True,
+        vllm_config=None,
+        mm_registry=None,
+        model_config=SimpleNamespace(dtype=torch.float16),
+        model_state=SimpleNamespace(encoder_runner=SimpleNamespace()),
+        spyre_device=torch.device("cpu"),
+        model=None,
+    )
+
+    warmup._record_vision_graphs(runner, sizes=[])
+
+    assert seen == {"tokens": 300, "items": 5}
+
+
+@pytest.mark.parametrize("mixin", [True, False], ids=["mixin", "marked"])
+def test_mrv2_pooling_warmup_runs_a_mixin_tower_per_budget_only(monkeypatch, mixin):
+    """A pooling model's mixin tower skips the per-width pass, which would run it
+    uncompiled at every width; any other tower keeps it."""
+    from spyre_inference.v1.worker.spyre import warmup
+
+    monkeypatch.setattr(
+        warmup,
+        "MultiModalBudget",
+        lambda *a, **kw: SimpleNamespace(
+            mm_max_items_per_batch={"image": 3},
+            get_dummy_encoder_profile_inputs=lambda modality, n: [None] * n,
+        ),
+    )
+    monkeypatch.setattr(
+        warmup, "group_and_batch_mm_kwargs", lambda items, **kw: [("image", len(items), {})]
+    )
+    widths = []
+    model = _FakeVisionModel() if mixin else nn.Module()
+    runner: Any = SimpleNamespace(
+        supports_mm_inputs=True,
+        is_pooling_model=True,
+        compiled_tower_blocks=False,
+        get_model=lambda: model,
+        model=SimpleNamespace(embed_multimodal=lambda **kw: widths.append(1)),
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False, multimodal_config=SimpleNamespace(mm_encoder_only=True)
+        ),
+        vllm_config=None,
+        mm_registry=None,
+        device=torch.device("cpu"),
+    )
+
+    warmup._warm_multimodal(runner, sizes=[16])
+
+    assert len(widths) == (0 if mixin else 3)
 
 
 def _prompt(mask_rows: list[int], num_tokens: int = 12):

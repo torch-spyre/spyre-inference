@@ -24,7 +24,8 @@ uses (``multimodal/utils.py``). Only the padded keys are masked, plus, for packe
 images, the keys outside each image's ``cu_seqlens`` block.
 
 ``padded_sdpa`` is called directly rather than behind the opaque wrapper, so a
-tower whose blocks are marked compilable traces attention into the block graph.
+``SpyreVisionEncoderMixin`` tower (Granite 4 Vision) traces attention into its
+per-budget block graph.
 """
 
 from __future__ import annotations

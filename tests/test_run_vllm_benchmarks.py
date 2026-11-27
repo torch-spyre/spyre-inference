@@ -1013,6 +1013,7 @@ def test_cold_warm_records_a_cold_then_a_warm_start(monkeypatch, tmp_path, caplo
     assert (cold["output_code_new_files"], cold["vllm_new_files"]) == (1, 1)
     assert all(v == 0 for k, v in warm.items() if k.endswith("_new_files"))
     assert (tmp_path / "results" / "t_cold_server.log").exists()
+    assert "TORCHINDUCTOR_CACHE_DIR=" in (tmp_path / "results" / "t_server.cmd").read_text()
     assert not (tmp_path / "results" / "t_compile_cache").exists()
     assert "not a full cache hit" not in caplog.text
 
@@ -1038,3 +1039,7 @@ def test_cache_counts_are_the_max_across_workers():
     assert counts is not None
     assert (counts["fxgraph_misses"], counts["spyre_kernel_hits"]) == (1, 3)
     assert runner.cache_state(runner.parse_cache_counts("no line")) == "unknown"
+    no_lookup = (
+        "Compile cache: fxgraph 0 hit 0 miss, aotautograd 0 hit 0 miss, spyre kernel 0 hit 0 miss"
+    )
+    assert runner.cache_state(runner.parse_cache_counts(no_lookup)) == "unknown"

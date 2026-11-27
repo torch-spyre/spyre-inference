@@ -158,3 +158,14 @@ def test_cold_warm_warm_start_that_misses_is_a_warning(mod, tmp_path):
         {"state": "partial", "misses": {"fxgraph": 1}, "new_files": {"spyre_kernel": 2}}
     ]
     assert "fxgraph 1 miss, spyre_kernel 2 new files" in mod.warning_text(rec["warnings"][0])
+
+
+def test_truncated_startup_record_is_a_warning(mod, tmp_path):
+    leg = _write_config(tmp_path, RESULT)
+    (leg / "results" / "cfg_startup.json").write_text('{"mode": "cold-')
+    rec = mod.check_config(leg, {"test_name": "cfg"}, {})
+    assert rec["valid"]
+    assert rec["default_state"] == "unknown"
+    assert mod.warning_text(rec["warnings"][0]) == (
+        "cfg_startup.json is not valid JSON: startup not recorded"
+    )

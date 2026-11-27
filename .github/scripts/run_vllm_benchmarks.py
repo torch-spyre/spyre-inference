@@ -403,7 +403,7 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
 def format_command(cmd: list[str], env_vars: dict[str, str]) -> str:
     """Render a command as a copy-pasteable shell line, prefixed by its env vars.
 
-    Only the config's own variables are shown, not the inherited environment.
+    Only `env_vars` are shown, not the inherited environment.
     """
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(env_vars.items()))
     line = shlex.join(cmd)
@@ -550,11 +550,14 @@ def parse_cache_counts(log_text: str) -> dict[str, int] | None:
 
 
 def cache_state(counts: dict[str, int] | None) -> str:
-    """warm (no miss), cold (no hit), partial (both), or unknown without the line."""
+    """warm (no miss), cold (no hit), partial (both), or unknown without the line or
+    with no cache lookup at all."""
     if counts is None:
         return "unknown"
     hits = sum(counts[f"{layer}_hits"] for layer in CACHE_LAYERS)
     misses = sum(counts[f"{layer}_misses"] for layer in CACHE_LAYERS)
+    if not hits and not misses:
+        return "unknown"
     if not misses:
         return "warm"
     return "cold" if not hits else "partial"
@@ -696,8 +699,9 @@ def run_serve_benchmark(
     server_cmd.extend(build_command_args(server_params))
     health_url = f"http://{host}:{port}/health"
 
+    server_env = {**config_env, **(_private_cache_env(cache_root) if cache_root else {})}
     server_cmd_line = record_command(
-        server_cmd, config_env, results_dir / f"{test_name}_server.cmd"
+        server_cmd, server_env, results_dir / f"{test_name}_server.cmd"
     )
 
     startup_file = results_dir / f"{test_name}_startup.json"
@@ -705,7 +709,9 @@ def run_serve_benchmark(
 
     def _write_startup() -> None:
         try:
-            startup_file.write_text(json.dumps(startup, indent=2) + "\n")
+            tmp = startup_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(startup, indent=2) + "\n")
+            os.replace(tmp, startup_file)
         except OSError as e:
             log.warning("Could not write %s: %s", startup_file.name, e)
 

@@ -191,7 +191,11 @@ def add_starts(rec: dict, results: Path, name: str, server_log: str) -> None:
     <name>_cold_server.log the cold_ ones.
     """
     path = results / f"{name}_startup.json"
-    startup = json.loads(path.read_text()) if path.exists() else {}
+    try:
+        startup = json.loads(path.read_text()) if path.exists() else {}
+    except json.JSONDecodeError:
+        startup = {}
+        rec["warnings"].append({"text": f"{path.name} is not valid JSON: startup not recorded"})
     mode = startup.get("mode", "default")
     starts = startup.get("starts", {})
     rec["compile_cache_mode"] = mode
@@ -278,6 +282,8 @@ def check_leg(bench: Path, leg: str) -> dict:
 
 
 def warning_text(warning: dict) -> str:
+    if "text" in warning:
+        return warning["text"]
     parts = [f"{layer} {n} miss" for layer, n in warning["misses"].items()]
     parts += [f"{layer} {n} new files" for layer, n in warning["new_files"].items()]
     return f"warm start not a full cache hit ({warning['state']}): " + (

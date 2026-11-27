@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_PREP_THREADS: int = 0
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_PROFILE_DIR: str | None = None
 
 _cache: dict[str, Any] = {}
 
@@ -147,6 +148,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # Overrides where a profiled run's phase timeline and engine limits are written.
+    # Unset (default) they go to the run's torch_profiler_dir, beside the trace they
+    # annotate, and nothing is written for a run that configures no profiler.
+    "SPYRE_PROFILE_DIR": lambda: os.getenv("SPYRE_PROFILE_DIR") or None,
 }
 # --8<-- [end:env-vars-definition]
 

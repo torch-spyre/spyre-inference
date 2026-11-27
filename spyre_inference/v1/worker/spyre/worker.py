@@ -45,7 +45,7 @@ from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
-from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker import compile_guard, profile_hooks
 from spyre_inference.v1.worker.spyre import device_shims, kernels, triton_gate
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
@@ -301,7 +301,19 @@ class SpyreWorkerV2(Worker):
         num_regions = cdiv(total, _SPYRE_REGION_BYTES)
         return free // (sum(tensor_bytes) + (num_regions - 1) * max(tensor_bytes))
 
+    def load_model(self, *args, **kwargs) -> None:
+        profile_hooks.configure(self.vllm_config)
+        profile_hooks.mark("weight_load")
+        super().load_model(*args, **kwargs)
+
+    def profile(self, is_start: bool = True, *args, **kwargs):
+        # Marked after the call, so the timeline records a profile that actually started:
+        # vLLM raises here when the run carries no --profiler-config.
+        super().profile(is_start, *args, **kwargs)
+        profile_hooks.mark("profiled" if is_start else "post")
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        profile_hooks.mark("compile_warmup")
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420
         # Ensure registration of Spyre decompositions before FX Graph tracing
         import time
@@ -321,6 +333,8 @@ class SpyreWorkerV2(Worker):
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
         # Arm right after warm-up, at the level init_device already validated.
         compile_guard.arm(self._compile_guard_level)
+        # Not in a finally: a timeline that stops at compile_warmup says warmup failed.
+        profile_hooks.mark("ready")
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

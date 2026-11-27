@@ -43,6 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     _build_query_row_tables,
     _mirror_mask_stack,
+    batched_decode,
 )
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
@@ -889,6 +890,24 @@ class TestRecordBatchedDecode:
         for bucket in self._recordable_batched(bucketer):
             _dispatch_batched(impl, builder, wide_cache, bucket)
         assert compiles() == snapshot
+
+    def test_unstaged_decode_reaches_the_recorded_batched_kernels(self, impl, wide_cache, builder):
+        """An unstaged decode reaches the batched kernels warmup recorded."""
+        # Only the kernel's graphs are counted: the eager staging copies compile per row count.
+        from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+
+        bucketer = builder._attn_bucketer = make_bucketer()
+        _record(impl, wide_cache, builder)
+        device = wide_cache[0].device
+
+        traced = len(_debug_get_cache_entry_list(batched_decode.__code__))
+        assert traced > 0
+        for bucket in self._recordable_batched(bucketer):
+            metadata = builder.build_for_batched_decode_variant(bucket)
+            rows = torch.zeros(bucket.num_seqs, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+            query, output = rows.to(device), rows.clone().to(device)
+            impl.forward(MagicMock(), query, query, query, wide_cache, metadata, output)
+        assert len(_debug_get_cache_entry_list(batched_decode.__code__)) == traced
 
     def test_real_decode_batch_lands_on_a_recorded_key(self, builder, monkeypatch):
         """A batch the scheduler could hand over must realize a key warmup enumerated."""

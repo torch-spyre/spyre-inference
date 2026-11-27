@@ -383,8 +383,7 @@ def split_by_chunk(chunk_page_ids, mask_by_chunk, blocks_per_chunk):
 
 
 def drop_cpu_device_layouts(monkeypatch) -> None:
-    """Transfer to CPU without the Spyre device layout or dynamic range, which only Spyre
-    can build.
+    """Transfer to CPU without the Spyre-only device layout and dynamic reservation.
 
     The batched decode index upload places both; the plain transfer carries the same values.
     """

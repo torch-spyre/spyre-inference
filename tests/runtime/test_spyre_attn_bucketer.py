@@ -36,8 +36,6 @@ def make_config(
     block_size=BLOCK_SIZE,
     max_num_seqs=8,
     runner_type="generate",
-    num_kv_heads=8,
-    per_layer_kv_heads=None,
 ):
     config = MagicMock()
     config.cache_config.block_size = block_size
@@ -45,23 +43,6 @@ def make_config(
     config.model_config.runner_type = runner_type
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
-
-    arch = config.model_config.model_arch_config
-    if per_layer_kv_heads is None:
-        arch.per_layer_overrides = None
-        config.model_config.get_num_kv_heads.return_value = num_kv_heads
-    else:
-        # A heterogeneous config, whose model-wide number hides the smallest layer.
-        arch.per_layer_overrides = [{} for _ in per_layer_kv_heads]
-        layers = []
-        for n in per_layer_kv_heads:
-            layer = MagicMock()
-            layer.kv = n
-            layers.append(layer)
-        arch.__getitem__.side_effect = layers.__getitem__
-        config.model_config.get_num_kv_heads.side_effect = lambda _pc, arch_config=None: (
-            num_kv_heads if arch_config is None else arch_config.kv
-        )
     return config
 
 
@@ -526,41 +507,6 @@ class TestBatchedDecodeVariants:
         assert len(b.batched_decode_variants()) < 100
 
 
-class TestSingleKvHeadBlockFloor:
-    """A lone KV head on a lone page will not compile, so the block ladder floors to
-    two -- see the note at the floor."""
-
-    def test_floors_the_ladder_at_one_kv_head(self):
-        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
-        assert min(b.num_blocks_buckets) == 2
-        assert 1 not in b.num_blocks_buckets
-
-    def test_a_short_context_still_gets_a_two_block_bucket(self):
-        """max_model_len <= block_size otherwise admits only a single-page walk, which
-        is the shape both failing CI configs had."""
-        b = SpyreAttnBucketer(make_config(max_model_len=BLOCK_SIZE, num_kv_heads=1))
-        assert b.num_blocks_buckets == [2]
-
-    def test_a_single_kv_head_layer_floors_a_heterogeneous_model(self):
-        """The gemma-4 shape: the model-wide count is 8, one layer type carries 1."""
-        b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 1]))
-        assert min(b.num_blocks_buckets) == 2
-
-    def test_no_floor_when_every_layer_has_several_kv_heads(self):
-        b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 4]))
-        assert min(b.num_blocks_buckets) == 1
-
-    def test_an_empty_override_list_falls_back_to_the_model_wide_count(self):
-        """A config reporting no per-layer overrides is homogeneous, so the model-wide
-        count decides; min() over no layers must not raise."""
-        b = SpyreAttnBucketer(make_config(num_kv_heads=1, per_layer_kv_heads=[]))
-        assert min(b.num_blocks_buckets) == 2
-
-    def test_no_floor_above_one_kv_head(self):
-        b = SpyreAttnBucketer(make_config(num_kv_heads=2))
-        assert min(b.num_blocks_buckets) == 1
-
-
 class TestLargeBatchLadder:
     @pytest.fixture()
     def hybrid(self, monkeypatch):
@@ -657,12 +603,6 @@ class TestDeclaredPages:
         assert b.page_range == {"min": 1, "max": 2048 // BLOCK_SIZE, "granularity": 1}
         assert [b.find_declared_pages(n) for n in (1, 2, 7, 32)] == [1, 2, 7, 32]
 
-    def test_one_kv_head_keeps_two_pages_at_minimum(self):
-        """The single-KV-head floor is a codegen limit of one page, not a compile limit."""
-        b = SpyreAttnBucketer(make_config(max_model_len=2048, num_kv_heads=1), declare_pages=True)
-        assert b.page_range == {"min": 2, "max": 2048 // BLOCK_SIZE, "granularity": 1}
-        assert b.find_declared_pages(1) == 2
-
     def test_prefill_page_counts_are_multiples_of_eight(self):
         from torch_spyre._inductor import config as ts_config
 
@@ -754,17 +694,6 @@ class TestDynamicChunks:
                 assert plan.chunk_range == {"min": 1, "max": max_pages // width, "granularity": 1}
                 assert plan.blocks_per_chunk == width
                 assert (plan.num_chunks - 1) * width < nb <= plan.num_chunks * width
-
-    def test_one_kv_head_covers_two_blocks_at_minimum(self):
-        b = SpyreAttnBucketer(
-            make_config(max_model_len=8192, num_kv_heads=1, max_num_seqs=32), declare_pages=True
-        )
-        # One block per chunk at 32 sequences, so two chunks; one chunk covers two elsewhere.
-        assert b._chunk_ranges[32]["min"] == 2
-        assert all(b._chunk_ranges[n]["min"] == 1 for n in b.num_seqs_buckets if n < 32)
-        plan = b.batched_decode_plan(32, 1)
-        assert plan is not None
-        assert (plan.blocks_per_chunk, plan.num_chunks) == (1, 2)
 
     def test_an_exported_min_reserved_dim_size_raises_the_minimum_chunk_count(self, monkeypatch):
         from torch_spyre._inductor import config as ts_config

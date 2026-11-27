@@ -324,6 +324,15 @@ def _compile_with_dynamic_count(
 _page_attn_prefill_compiled = _compile_with_dynamic_count(page_attn_prefill, "page_range")
 _batched_decode_compiled = _compile_with_dynamic_count(batched_decode, "chunk_range")
 
+if envs.SPYRE_ATTN_AOT_CACHE:
+    # Load these kernels from disk on a restart instead of tracing them again.
+    from spyre_inference.v1.attention.aot_kernel_cache import AotKernel
+
+    _page_attn_prefill_compiled = AotKernel(
+        page_attn_prefill, _page_attn_prefill_compiled, "page_range"
+    )
+    _batched_decode_compiled = AotKernel(batched_decode, _batched_decode_compiled, "chunk_range")
+
 
 # Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
 def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> torch.Tensor:

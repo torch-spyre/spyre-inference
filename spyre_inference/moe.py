@@ -694,6 +694,30 @@ def _region(layer: RoutedExperts, name: str, fn: Any) -> Any:
     return region
 
 
+def warm_opaque_regions(model: torch.nn.Module, sizes: list[int], device: torch.device) -> None:
+    """Compile the regions behind the opaque MoE op for the token counts that take it."""
+    layer = next(
+        (mod for mod in model.modules() if getattr(mod, "spyre_moe_regions", None) is not None),
+        None,
+    )
+    if layer is None:
+        return
+    from torch_spyre._C import get_elem_in_stick
+
+    dtype = layer.spyre_moe_gate.dtype
+    stick = get_elem_in_stick(dtype)
+    opaque = [size for size in sizes if size % stick]
+    if not opaque:
+        return
+    # The regions' inputs carry a compiled output's layout, so these do too.
+    same = torch.compile(lambda t: t * 1, backend="inductor", fullgraph=True, dynamic=False)
+    hidden, experts = layer.hidden_size, layer.global_num_experts
+    for size in opaque:
+        x = same(torch.zeros(size, hidden, dtype=dtype, device=device))
+        router_logits = same(torch.zeros(size, experts, dtype=dtype, device=device))
+        layer.quant_method.apply_monolithic(layer, x, router_logits)
+
+
 def _reset_named_dims() -> None:
     from torch_spyre._inductor.wsr.propagate_named_dims import reset
 

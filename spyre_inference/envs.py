@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
+    SPYRE_PARALLEL_ATTN_PRECOMPILE: int = 0
+    SPYRE_ATTN_AOT_CACHE: bool = False
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_MOE_PREP_THREADS: int = 0
     SPYRE_NUM_CPUS: int = 0
+    SPYRE_PARALLEL_WARMUP_PRECOMPILE: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
 _cache: dict[str, Any] = {}
@@ -79,6 +82,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
     "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
+    # Number of forked processes that compile the attention variants side by side
+    # during warmup (torch-spyre's fork_inner_compiles). "0" (default) compiles them
+    # one after another. Capped at this rank's CPU share (torch threads). A restart
+    # with warm caches skips it.
+    "SPYRE_PARALLEL_ATTN_PRECOMPILE": lambda: int(os.getenv("SPYRE_PARALLEL_ATTN_PRECOMPILE", "0")),
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
@@ -88,6 +96,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    # When "1", keep each compiled attention kernel on disk (in the Inductor cache dir) and
+    # load it on the next start instead of tracing it again with Dynamo. "0" (default)
+    # traces every attention kernel on every start.
+    "SPYRE_ATTN_AOT_CACHE": lambda: bool(int(os.getenv("SPYRE_ATTN_AOT_CACHE", "0"))),
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.
     "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
@@ -123,6 +135,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device at the same time during load. "0" (default) uses min(8, torch threads), this
     # worker's share of the CPU budget, at most 16; "1" prepares one layer after another.
     "SPYRE_MOE_PREP_THREADS": lambda: int(os.getenv("SPYRE_MOE_PREP_THREADS", "0")),
+    # Forked processes compiling the warm-up buckets' graphs side by side; "0" (default)
+    # compiles them in order. Capped at this rank's torch thread count.
+    "SPYRE_PARALLEL_WARMUP_PRECOMPILE": lambda: int(
+        os.getenv("SPYRE_PARALLEL_WARMUP_PRECOMPILE", "0")
+    ),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

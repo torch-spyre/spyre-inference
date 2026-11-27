@@ -1205,7 +1205,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     attention_mask_stacks,
                 )
                 chunk_range = plan.chunk_range
-                # The batched kernel writes decode row i to staging row i.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
                 if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
                     decode_groups = self._batched_decode_groups(

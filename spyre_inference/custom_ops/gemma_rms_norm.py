@@ -32,7 +32,7 @@ from .lazy_compile import CompileOutermost, maybe_compile
 class SpyreGemmaRMSNorm(CompileOutermost, GemmaRMSNorm):
     """Out-of-tree (OOT) GemmaRMSNorm implementation for IBM's Spyre."""
 
-    @maybe_compile(force=True)
+    @maybe_compile()
     def forward_oot(
         self,
         x: torch.Tensor,

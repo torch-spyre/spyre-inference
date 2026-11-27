@@ -28,16 +28,15 @@ import re
 
 import yaml
 
-_ACTION = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "actions/ingest-vllm-benchmarks/action.yml"
-)
+_ACTION = pathlib.Path(__file__).resolve().parents[1] / "actions/ingest-vllm-benchmarks/action.yml"
 
 
 def test_action_pinned_to_full_commit_sha():
     steps = yaml.safe_load(_ACTION.read_text())["runs"]["steps"]
     venv = next(s for s in steps if "uv pip install" in s.get("run", ""))
-    sources = re.findall(r"git\+https://github\.com/torch-spyre/torch-spyre@(\S+?)#subdirectory", venv["run"])
+    sources = re.findall(
+        r"git\+https://github\.com/torch-spyre/torch-spyre@(\S+?)#subdirectory", venv["run"]
+    )
     assert sources, "torch-spyre install not found in the action's venv step"
     for rev in sources:
         assert rev != "main", (

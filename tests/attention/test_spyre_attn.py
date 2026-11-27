@@ -22,11 +22,12 @@ from spyre_testing_plugin.attn_helpers import (
     _fused_qkv_kv_views,
     _padded_mask_metadata,
     assert_close_outliers,
+    drop_cpu_device_layouts,
     random_block_tables,
     ref_attn,
     split_by_chunk,
-    use_kv_buckets,
     use_python_for_each_tile,
+    use_static_pages,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
@@ -50,9 +51,6 @@ from spyre_inference.v1.attention.ops.batched_decode import (
     batched_decode_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
-from spyre_inference.v1.attention.ops.page_attn_decode import (
-    page_attn_decode_kernel,
-)
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
 )
@@ -66,15 +64,6 @@ pytestmark = pytest.mark.attention
 
 
 DTYPE = torch.float16
-
-
-@pytest.fixture()
-def enable_batched_decode(monkeypatch):
-    """Pin ``SPYRE_BATCHED_DECODE`` on, so the batched tests cannot silently fall
-    back to the per-seq loop if the default changes. The autouse cache-clearing
-    fixture in ``tests/conftest.py`` makes the value visible to ``envs``.
-    """
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
 
 @pytest.fixture()
@@ -174,6 +163,7 @@ def _run_spyre_attn_test(
     kv_scales: tuple[float, float] = (1.0, 1.0),
     expect_query_widths: set[int] | None = None,
     num_blocks: int = 256,
+    stale_cache: bool = False,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation.
 
@@ -301,6 +291,11 @@ def _run_spyre_attn_test(
     k_pages, v_pages = _fresh_pages(
         num_blocks, num_kv_heads, block_size, head_size, cache_device, dtype, fp8
     )
+    if stale_cache:
+        # Another request's KV in every slot the store below leaves alone: a slot the masks
+        # miss then moves the output far from the reference.
+        k_pages.fill_(2.0)
+        v_pages.fill_(5.0)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
     # The attention layer, not forward(), owns the KV write (see attn_layer.py).
@@ -424,26 +419,6 @@ def test_spyre_attn_core(default_vllm_config, seq_lens, configure_compilation, c
     )
 
 
-@pytest.mark.parametrize("head_size", [64, 128])
-@pytest.mark.parametrize(
-    ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
-)
-def test_spyre_attn_decode_head_size(
-    default_vllm_config, monkeypatch, head_size, configure_compilation, configure_device
-):
-    """Single-sequence decode across head sizes (regression for #284)."""
-    # The per-seq decode kernel is the subject; batched decode would take a lone decode.
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    _run_spyre_attn_test(
-        seq_lens=[(1, 256)],
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        head_size=head_size,
-    )
-
-
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -470,38 +445,10 @@ def test_spyre_attn_chunked_prefill(
 @pytest.mark.parametrize(
     ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
 )
-def test_mixed_batch_dispatches_decode_at_query_width_one(
+def test_prefill_walks_its_own_page_range(
     default_vllm_config, monkeypatch, configure_compilation, configure_device
 ):
-    """A decoding sequence in a mixed batch keeps the query_len=1 kernel."""
-    from vllm.config import get_current_vllm_config
-
-    # Batched decode would serve the decode prefix before the per-seq loop runs.
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    chunk_len = 64
-    chunk_bucket = SpyreAttnBucketer(get_current_vllm_config()).find_query_bucket(chunk_len)
-    assert chunk_bucket is not None and chunk_bucket > 1
-
-    _run_spyre_attn_test(
-        seq_lens=[(chunk_len, 256), (1, 256), (1, 512)],
-        block_size=128,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        expect_query_widths={1, chunk_bucket},
-    )
-
-
-@pytest.mark.parametrize(
-    ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
-)
-def test_prefill_and_decode_walk_their_own_page_ranges(
-    default_vllm_config, monkeypatch, configure_compilation, configure_device
-):
-    """In one batch, a prefill sequence walks the prefill page range 8 pages per loop step
-    and a decode sequence walks the decode range."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    envs.clear_env_cache()
+    """A prefill sequence walks the prefill page range, 8 pages per loop step."""
     walks = {}
     real_run = spyre_attn._run_with_capped_cores
 
@@ -514,7 +461,7 @@ def test_prefill_and_decode_walk_their_own_page_ranges(
     # The fixture's max_model_len 2048 at block 64 is 32 pages, enough for prefill to get
     # a range of its own. 18 pages of prefill KV round up to 24.
     _run_spyre_attn_test(
-        seq_lens=[(64, 1100), (1, 300)],
+        seq_lens=[(64, 1100)],
         block_size=64,
         sliding_window=None,
         configure_compilation=configure_compilation,
@@ -524,13 +471,9 @@ def test_prefill_and_decode_walk_their_own_page_ranges(
         num_kv_heads=2,
     )
 
-    (prefill_width,) = walks.keys() - {1}
-    prefill_range, prefill_group = walks[prefill_width]
-    decode_range, decode_group = walks[1]
+    ((prefill_range, prefill_group),) = walks.values()
     assert prefill_range is not None and prefill_range["granularity"] == 8
     assert prefill_group == 8
-    assert decode_range is not None and decode_range["granularity"] == 1
-    assert decode_group is None
 
 
 @pytest.mark.parametrize(
@@ -1008,6 +951,26 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
         assert stack_device.storage_offset() == 0
 
 
+def test_one_token_extend_joins_the_batched_decode_prefix(default_vllm_config, monkeypatch):
+    """A one-token extend, which MRV2 marks as prefilling, joins the batched decode prefix."""
+    torch.set_default_device("cpu")
+    query_start_loc = torch.tensor([0, 1, 2, 66], dtype=torch.int32)
+    metadata = _build_metadata(
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=64,
+        seq_lens=torch.tensor([300, 500, 256], dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        block_table=torch.arange(3 * 8, dtype=torch.int32).reshape(3, 8),
+        slot_mapping=torch.arange(66, dtype=torch.int64),
+        is_prefilling=torch.tensor([False, True, True]),
+    )
+    assert metadata.num_decode_seqs == 2
+    assert metadata.num_decode_tokens == 2
+    assert metadata.padded_num_seqs is not None
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "builds_tables"),
     [
@@ -1020,7 +983,7 @@ def test_page_index_tables_skipped_on_a_fully_batched_step(
 ):
     """A step the batched kernel fully serves uploads no per-sequence index table."""
     torch.set_default_device("cpu")
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    drop_cpu_device_layouts(monkeypatch)
     metadata = _padded_mask_metadata(seq_lens, block_size=64)
     assert metadata.padded_num_seqs is not None
     assert metadata.num_decode_seqs == sum(q == 1 for q, _ in seq_lens)
@@ -1050,6 +1013,86 @@ def test_page_index_tables_skipped_on_a_fully_batched_step(
         assert attn_impl._online_softmax_attention(*args) is output
         assert metadata.kernel_index_tables is None
     assert dispatched == [1]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "grouped"),
+    [
+        # One sequence decodes as one 32-page chunk: the gather a one-row query fails.
+        pytest.param([(1, 128)], False, id="single_decode"),
+        pytest.param([(1, 256)] * 4, False, id="decode_batch"),
+        pytest.param([(1, 256), (1, 256), (7, 256)], False, id="mixed"),
+        pytest.param([(1, 2000)] + [(1, 200)] * 4, True, id="jagged"),
+    ],
+)
+def test_an_unstaged_query_reaches_the_batched_kernel_through_the_staging_buffers(
+    default_vllm_config, monkeypatch, seq_lens, grouped
+):
+    """An unstaged query still reaches the batched kernel through the staging buffers."""
+    from vllm.config import get_current_vllm_config
+
+    torch.set_default_device("cpu")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    envs.clear_env_cache()
+    drop_cpu_device_layouts(monkeypatch)
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.model_config.max_model_len = 8192
+    metadata = _padded_mask_metadata(seq_lens, block_size=64)
+    assert (metadata.decode_groups is not None) == grouped
+    if len(seq_lens) == 1:
+        assert (metadata.padded_num_seqs, metadata.blocks_per_chunk) == (1, 32)
+
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
+    q_staging, out_staging = impl.staging_buffers(torch.device("cpu"))
+    # Rows no stub writes keep this, so the copy back to the caller is checked too.
+    out_staging.fill_(5.0)
+    batched_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    page_attn_queries: list[torch.Tensor] = []
+
+    def batched_kernel(
+        query_dev, rep_row_ids, k_pages, v_pages, chunks, mask, chunk_range, b_seqs, bpc, bs, out
+    ):
+        batched_calls.append((query_dev, out))
+        out[:b_seqs] = 7.0
+        return out
+
+    def page_attn(query, row_table, k_pages, v_pages, index_table, mask, n, rng, width, out):
+        page_attn_queries.append(query)
+        return out
+
+    def scatter_rows(dst, rows, src):
+        # CPU stand-in for the compiled store: eager index_copy_ needs an int64 index.
+        return dst.index_copy_(0, rows.long(), src[: rows.shape[0]])
+
+    monkeypatch.setattr(impl, "_run_batched_decode", batched_kernel)
+    monkeypatch.setattr(impl, "_run_page_attn", page_attn)
+    monkeypatch.setattr(spyre_attn, "_scatter_rows_compiled", scatter_rows)
+
+    num_tokens = sum(q for q, _ in seq_lens)
+    query = torch.randn(num_tokens, 32, 128, dtype=torch.float16)
+    output = torch.full_like(query, float("nan"))
+    pages = torch.zeros(200, 8, 64, 128, dtype=torch.float16)
+    impl.forward(
+        layer=None,
+        query=query,
+        key=None,
+        value=None,
+        kv_cache=SpyrePagedKVCache(k_pages=pages, v_pages=pages),
+        attn_metadata=metadata,
+        output=output,
+    )
+
+    expected_out = impl._group_staging if grouped else out_staging
+    assert len(batched_calls) == (len(metadata.decode_groups) if grouped else 1)
+    for query_dev, out in batched_calls:
+        assert query_dev is q_staging, "the batched kernel read the caller's query"
+        assert out is expected_out, "the batched kernel wrote outside the staging buffers"
+    assert all(q is q_staging for q in page_attn_queries)
+    torch.testing.assert_close(q_staging[:num_tokens], query)
+    num_decode = metadata.num_decode_seqs
+    assert torch.all(output[:num_decode] == 7.0), "decode rows did not reach the caller"
+    assert torch.all(output[num_decode:] == 5.0), "prefill rows did not reach the caller"
 
 
 def test_empty_mask_stack_cannot_be_mirrored(default_vllm_config):
@@ -1134,7 +1177,6 @@ def test_kv_sharing_layer_is_staged_but_never_writes_the_cache():
 @pytest.mark.parametrize("max_model_len", [512, 1536, 2048, 4096, 10000])
 def test_batched_decode_chunking_covers_every_block(
     default_vllm_config,
-    enable_batched_decode,
     max_num_seqs: int,
     max_model_len: int,
 ) -> None:
@@ -1211,7 +1253,6 @@ def test_batched_decode_chunking_covers_every_block(
 
 def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     default_vllm_config,
-    enable_batched_decode,
 ) -> None:
     """The decode mask's KV axis follows the layer's head count.
 
@@ -1317,7 +1358,7 @@ def _decode_reference_fp32(
     ],
 )
 def test_bucketed_block_ids_match_scalar_fill(
-    default_vllm_config, enable_batched_decode, kv_lens: list[int], sliding_window: int | None
+    default_vllm_config, kv_lens: list[int], sliding_window: int | None
 ) -> None:
     block_size = 64
     seq_lens = [(1, kv) for kv in kv_lens]
@@ -1342,30 +1383,6 @@ def test_bucketed_block_ids_match_scalar_fill(
             )
         for b in range(n_use, b_blocks):
             assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
-
-
-@pytest.mark.parametrize("batched_decode", ["0", "1"])
-def test_batched_decode_metadata_follows_env(
-    default_vllm_config, monkeypatch, batched_decode: str
-) -> None:
-    """build() computes the batched-decode metadata only when the path is enabled.
-
-    With the env off the fields stay None at any batch size, so anything reading them
-    must gate on the same flag — `_batched_decode_preconditions_met` does.
-    """
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", batched_decode)
-    metadata = _padded_mask_metadata([(1, 256)] * 4, block_size=64)
-
-    if batched_decode == "1":
-        assert metadata.padded_num_seqs is not None
-        assert metadata.padded_batch_blocks is not None
-        assert metadata.rep_row_ids_cpu is not None
-        assert metadata.chunk_page_ids_cpu is not None
-    else:
-        assert metadata.padded_num_seqs is None
-        assert metadata.padded_batch_blocks is None
-        assert metadata.rep_row_ids_cpu is None
-        assert metadata.chunk_page_ids_cpu is None
 
 
 def _seq_mask(metadata, seq_idx: int) -> torch.Tensor:
@@ -1583,23 +1600,14 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
     return SpyreAttnBucketer(vllm_config).num_blocks_buckets
 
 
-@pytest.mark.parametrize(
-    ("kv_len", "expected"),
-    [
-        pytest.param(65, 2, id="kv65_to_2"),
-        pytest.param(300, 8, id="kv300_to_8"),
-        pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
-    ],
-)
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len, expected):
+@pytest.mark.parametrize("kv_len", [65, 256, 300, 1025])
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len):
     # A page range keeps each sequence's own page count, so test the bucketed path.
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     torch.set_default_device("cpu")
-    buckets = _num_blocks_buckets()
-    assert expected in buckets
+    (expected,) = _num_blocks_buckets()
 
-    metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
+    metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=expected)
 
     assert metadata.padded_num_blocks == [expected]
     assert metadata.attention_mask_stacks[0].shape[0] == expected
@@ -1613,7 +1621,7 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config,
     build() actually pads to -- build() always pads to a bucket (no unpadded
     fallback), so both tables here must have at least that much headroom."""
     # A page range pads nothing, so test the bucketed path.
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     torch.set_default_device("cpu")
     block_size = 64
     kv_len, query_len = 300, 32
@@ -1646,14 +1654,14 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config,
 def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config, monkeypatch, declare_pages):
     """Zero real blocks must not be padded: a fully-masked tile would divide by zero."""
     if not declare_pages:
-        use_kv_buckets(monkeypatch)
+        use_static_pages(monkeypatch)
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
 
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_stacks[0].shape[0] == 0
     if not declare_pages:
-        assert metadata.padded_num_blocks[1] == 2
+        assert metadata.padded_num_blocks[1] == _num_blocks_buckets()[-1]
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):
@@ -2046,6 +2054,7 @@ def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
         num_queries_per_kv=qpk,
         block_size=block_size,
         head_size=head_size,
+        entry_local=page_ids.shape[0] > 1,
     )
 
     got = batched_decode_kernel(
@@ -2215,12 +2224,7 @@ def test_spyre_attn_fp8_kv_cache(
 def test_spyre_attn_dispatches_by_query_width(
     default_vllm_config, monkeypatch, configure_compilation, configure_device
 ):
-    """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
-    wide query to the decode kernel pays for residency the query width already amortises."""
-    # Batched decode now covers every batch size, and it serves a mixed batch's decode
-    # prefix before the per-seq loop runs, so the per-seq kernels are the subject here.
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    envs.clear_env_cache()
+    """A decode row takes the batched kernel and a wider query the per-sequence one."""
 
     called = []
 
@@ -2234,8 +2238,8 @@ def test_spyre_attn_dispatches_by_query_width(
     # Patched before the impl is built: __init__ reads these globals into the impl.
     monkeypatch.setattr(
         spyre_attn,
-        "_page_attn_decode_compiled",
-        spy("decode", spyre_attn._page_attn_decode_compiled),
+        "_batched_decode_compiled",
+        spy("batched", spyre_attn._batched_decode_compiled),
     )
     monkeypatch.setattr(
         spyre_attn,
@@ -2251,14 +2255,9 @@ def test_spyre_attn_dispatches_by_query_width(
         configure_device=configure_device,
     )
 
-    assert sorted(called) == ["decode", "prefill"], called
+    assert sorted(called) == ["batched", "prefill"], called
 
 
-@pytest.mark.parametrize(
-    ("query_len", "kernel_name"),
-    [(1, "page_attn_decode"), (64, "page_attn_prefill")],
-    ids=["decode", "prefill"],
-)
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2270,21 +2269,27 @@ def test_spyre_attn_dispatches_by_query_width(
 def test_spyre_attn_one_kernel_serves_every_page_count(
     default_vllm_config,
     monkeypatch,
-    query_len,
-    kernel_name,
     configure_compilation,
     configure_device,
 ):
-    """One compiled per-sequence kernel per query width serves every page count up to
-    max_model_len, a one-page sequence included, and matches the reference."""
+    """One compiled prefill kernel serves every page count up to max_model_len, one page
+    included, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._inductor import config as ts_config
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    envs.clear_env_cache()
-    # The fixture's max_model_len 2048 at block size 128 gives a range of 2 to 16 pages. The
-    # kernel compiles at 16, as in warmup, and is reused at 1 page (run as 2), 3 and 8.
-    kernel_code = getattr(spyre_attn, kernel_name).__code__
+    walked: set[int] = set()
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        walked.add(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    # The fixture's max_model_len 2048 at block size 128 gives a range of 1 to 16 pages. The
+    # kernel compiles at 16, as in warmup, and is reused at smaller counts, which prefill
+    # rounds up to 8.
+    query_len = 64
+    kernel_code = spyre_attn.page_attn_prefill.__code__
     # Restores the MIN_RESERVED_DIM_SIZE the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8):
@@ -2300,6 +2305,118 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
                 num_kv_heads=2,
             )
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
+    assert walked == {16, 8}
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "walked", "num_kv_heads"),
+    [((7, 7), [2], 2), ((1, 11), [], 2), ((1, 11), [], 1)],
+    ids=["prefill", "decode", "decode_one_kv_head"],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_page_masks_stale_slots(
+    default_vllm_config,
+    monkeypatch,
+    seq_len,
+    walked,
+    num_kv_heads,
+    configure_compilation,
+    configure_device,
+):
+    """At a max_model_len of two pages prefill takes the per-sequence page range. A one-page
+    sequence must still mask its page's stale slots: prefill covers two pages, and decode
+    runs batched, with one KV head too (tests/e2e/test_kv_cache_determinism.py)."""
+    from vllm.config import get_current_vllm_config
+
+    get_current_vllm_config().model_config.max_model_len = 2 * 128
+    pages: list[int] = []
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        pages.append(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    _run_spyre_attn_test(
+        seq_lens=[seq_len],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        stale_cache=True,
+    )
+    assert pages == walked, pages
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "num_kv_heads"), [(8, 2), (32, 2), (32, 1)], ids=["8", "32", "32_one_kv_head"]
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
+    default_vllm_config,
+    monkeypatch,
+    num_seqs,
+    num_kv_heads,
+    configure_compilation,
+    configure_device,
+):
+    """Batched decode at one chunk of its dynamic chunk count masks its pages' stale slots
+    too. At 32 sequences a chunk is a single page of each, with one KV head too."""
+    chunks: list[tuple[int, bool]] = []
+    run = SpyreAttentionImpl._run_batched_decode
+
+    def recording(
+        self,
+        query_dev,
+        rep_row_ids,
+        k_pages,
+        v_pages,
+        chunk_page_ids,
+        mask_by_chunk,
+        chunk_range,
+        *args,
+    ):
+        chunks.append((chunk_page_ids.shape[0], chunk_range is not None))
+        return run(
+            self,
+            query_dev,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_page_ids,
+            mask_by_chunk,
+            chunk_range,
+            *args,
+        )
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    _run_spyre_attn_test(
+        seq_lens=[(1, 100)] * num_seqs,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        stale_cache=True,
+    )
+    assert chunks == [(1, True)], chunks
 
 
 @pytest.mark.parametrize(
@@ -2317,8 +2434,8 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
     configure_compilation,
     configure_device,
 ):
-    """Batches longer than one chunk all run one compiled kernel, at every chunk count up
-    to max_model_len and for ragged batches too, and match the reference."""
+    """Every decode batch runs one compiled kernel, at every chunk count from one up to
+    max_model_len and for ragged batches too, and matches the reference."""
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
     from torch_spyre._C import get_reserved_dims
     from torch_spyre._inductor import config as ts_config
@@ -2333,14 +2450,16 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
 
     monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
     # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so the kernel runs 2 to 4 chunks: compiled at 4, then
-    # reused at 2 and 3.
+    # chunk holds 4 pages of each, so the kernel runs 1 to 4 chunks: compiled at 4, then
+    # reused at the others.
     kernel_code = spyre_attn.batched_decode.__code__
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         for seq_lens in (
             [(1, 2048)] * 8,
+            [(1, 100)] * 8,
+            [(1, 500 - 50 * i) for i in range(8)],
             [(1, 600)] * 8,
             [(1, 1100 - 60 * i) for i in range(8)],
             [(1, 1600), (1, 520)] * 4,
@@ -2357,88 +2476,7 @@ def test_spyre_attn_one_batched_kernel_serves_every_chunk_count(
             )
             assert batched_decode_calls, "the batch fell back to the per-seq loop"
             assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert set(chunk_counts) == {2, 3, 4}, chunk_counts
-
-
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_spyre_attn_short_decode_batches_share_one_full_width_chunk(
-    default_vllm_config,
-    monkeypatch,
-    batched_decode_calls,
-    configure_compilation,
-    configure_device,
-):
-    """Every decode batch that fits in one chunk runs the same compiled one-chunk kernel
-    and matches the reference."""
-    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
-    from torch_spyre._inductor import config as ts_config
-
-    chunk_shapes: set[tuple[int, int]] = set()
-    run = SpyreAttentionImpl._run_batched_decode
-
-    def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
-        chunk_shapes.add(tuple(chunk_page_ids.shape[:2]))
-        return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
-
-    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
-    # The fixture's max_model_len 2048 at block size 128 is 16 pages. At eight sequences a
-    # chunk holds 4 pages of each, so batches of 1 to 4 pages all run as one chunk.
-    kernel_code = spyre_attn.batched_decode.__code__
-    # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
-    # config-module entry, hiding it for later tests.
-    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
-        for seq_lens in ([(1, 100)] * 8, [(1, 500 - 50 * i) for i in range(8)]):
-            batched_decode_calls.clear()
-            _run_spyre_attn_test(
-                seq_lens=seq_lens,
-                block_size=128,
-                sliding_window=None,
-                configure_compilation=configure_compilation,
-                configure_device=configure_device,
-                num_query_heads=8,
-                num_kv_heads=2,
-            )
-            assert batched_decode_calls, "the batch fell back to the per-seq loop"
-            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {seq_lens}"
-    assert chunk_shapes == {(1, 32)}, chunk_shapes
-
-
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_spyre_attn_decode_compiles_at_a_prime_page_count(
-    default_vllm_config, monkeypatch, configure_compilation, configure_device
-):
-    """The decode kernel gathers page rows from a pool sized by the cache. In the default
-    layout torch-spyre relayouts that pool inside the page loop, and the copy fails to
-    compile at a prime page count above 65536 (114773: eager Qwen2.5-0.5B on a 96 GiB card).
-    """
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-    envs.clear_env_cache()
-
-    _run_spyre_attn_test(
-        seq_lens=[(1, 100)],
-        block_size=64,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        num_query_heads=14,
-        num_kv_heads=2,
-        head_size=64,
-        num_blocks=114773,
-    )
+    assert set(chunk_counts) == {1, 2, 3, 4}, chunk_counts
 
 
 @pytest.mark.parametrize(
@@ -2478,7 +2516,6 @@ def test_spyre_attn_grouped_decode_matches_reference(
 ):
     from vllm.config import get_current_vllm_config
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -2577,15 +2614,13 @@ def test_spyre_attn_soft_cap(
 
 
 @pytest.mark.parametrize(
-    ("seq_lens", "sliding_window", "multi_seq_decode"),
+    ("seq_lens", "sliding_window"),
     [
-        # The per-seq decode (LX-resident) and prefill kernels.
-        pytest.param([(1, 300), (64, 200)], None, False, id="per_seq_mixed"),
-        pytest.param([(1, 300), (64, 200)], 128, False, id="per_seq_sliding_window(128)"),
-        # The multi-sequence decode kernel, which serves decode by default: kv 512 at block
-        # 64 spans several chunks, so its per-slot merge runs and must count each sink
-        # once.
-        pytest.param([(1, 512), (1, 300), (1, 64)], None, True, id="multi_seq_decode"),
+        pytest.param([(1, 300), (64, 200)], None, id="mixed"),
+        pytest.param([(1, 300), (64, 200)], 128, id="mixed_sliding_window(128)"),
+        # kv 512 at block 64 spans several chunks, so the batched kernel's per-slot merge
+        # runs and must count each sink once.
+        pytest.param([(1, 512), (1, 300), (1, 64)], None, id="multi_seq_decode"),
     ],
 )
 # One KV head cannot tell the kv-major sink order from a transposed one; two can.
@@ -2605,14 +2640,11 @@ def test_spyre_attn_sinks(
     monkeypatch,
     seq_lens,
     sliding_window,
-    multi_seq_decode,
     num_kv_heads,
     configure_compilation,
     configure_device,
 ):
     """Attention sinks (gpt-oss: 64 q / 8 kv heads, head_dim 64; 8 / 1 per rank at TP8)."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1" if multi_seq_decode else "0")
-    envs.clear_env_cache()
     calls: list[str] = []
     real_decode_fn = spyre_attn._batched_decode_compiled
 
@@ -2636,7 +2668,7 @@ def test_spyre_attn_sinks(
         num_kv_heads=num_kv_heads,
         head_size=64,
     )
-    assert bool(calls) == multi_seq_decode, calls
+    assert calls, "the decode rows fell back to the per-seq loop"
 
 
 @pytest.mark.parametrize(
@@ -2665,64 +2697,45 @@ def test_spyre_attn_head_configs(
     )
 
 
-def test_page_attn_decode_matches_fp32_reference():
-    """The per-sequence decode kernel matches the suite's CPU reference."""
-    from spyre_testing_plugin.attn_helpers import ref_attn
+@pytest.mark.parametrize(
+    "sliding_window", [pytest.param(64, id="window"), pytest.param(None, id="one_page_context")]
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_kv_head_compiles_a_single_page_kernel(
+    default_vllm_config, monkeypatch, sliding_window, configure_compilation, configure_device
+):
+    """A lone KV head on a lone page compiles at a static page count: a sliding-window
+    layer, which keeps power-of-two page counts, and a max_model_len of one page, which has
+    no page range. The decode runs batched."""
+    from vllm.config import get_current_vllm_config
 
-    torch.set_default_device("cpu")
-    set_random_seed(0)
-    kv, qpk, d, block, blocks = 8, 4, 128, 64, 5
-    heads, query_len = kv * qpk, 1
-    # A ragged tail, so the last page is half masked rather than whole.
-    kv_len = (blocks - 1) * block + block // 2
-    k = torch.randn(blocks * kv, block, d)
-    v = torch.randn(blocks * kv, block, d)
-    # The kernel reads its row out of a wider staging buffer, and not the first one.
-    query = torch.randn(query_len + 2, heads, d)
-    rows = (torch.arange(query_len, dtype=torch.int32) + 2) % (query_len + 2)
-    # The base's page table: stick-wide rows, page id in column 0.
-    page_ids = torch.tensor([3, 1, 4, 0, 2], dtype=torch.int32)
-    page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-    page_table[:, 0] = page_ids
-    kv_row_pool = torch.arange(blocks * kv, dtype=torch.int32).reshape(blocks, kv, 1)
-    # Causal: query row q sits at absolute position kv_len - query_len + q.
-    q_abs = kv_len - query_len + torch.arange(query_len).unsqueeze(1)
-    pos = torch.arange(blocks * block).reshape(blocks, 1, block)
-    allow = (pos <= q_abs) & (pos < kv_len)
-    masks = torch.where(allow, 0.0, torch.finfo(torch.float32).min)
+    if sliding_window is None:
+        get_current_vllm_config().model_config.max_model_len = 128
+    pages: list[int] = []
+    run = SpyreAttentionImpl._run_page_attn
 
-    for soft_cap in (0.0, 30.0):
-        got = page_attn_decode_kernel(
-            query=query,
-            query_row_index=rows,
-            k_pages=k,
-            v_pages=v,
-            page_index_table=page_table,
-            kv_row_pool=kv_row_pool,
-            mask_stack=masks,
-            scale=d**-0.5,
-            num_blocks=blocks,
-            padded_query_len=query_len,
-            num_heads=heads,
-            num_kv_heads=kv,
-            head_size=d,
-            block_size=block,
-            logits_soft_cap=soft_cap,
-        )
-        expected = ref_attn(
-            query=query.index_select(0, rows.to(torch.int64)),
-            # ref_attn indexes a page's token axis first.
-            key_cache=k.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
-            value_cache=v.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
-            query_lens=[query_len],
-            kv_lens=[kv_len],
-            block_tables=page_ids.unsqueeze(0),
-            block_size=block,
-            scale=d**-0.5,
-            soft_cap=soft_cap,
-        )
-        assert got.shape == expected.shape
-        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        pages.append(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    _run_spyre_attn_test(
+        seq_lens=[(1, 100)],
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=1,
+    )
+    assert pages == [], pages
 
 
 @pytest.mark.parametrize(
@@ -2810,6 +2823,7 @@ def test_multi_seq_decode_matches_fp32_reference(
         num_queries_per_kv=qpk,
         block_size=block_size,
         head_size=head_size,
+        entry_local=chunk_page_ids.shape[0] > 1,
     )
     expected = _decode_reference_fp32(
         query_padded,
@@ -2870,7 +2884,6 @@ def test_spyre_attn_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     )
 
     pages = torch.empty(1 + num_seqs * blocks_per_seq)
-    assert impl._batched_decode_supported()
     assert impl._batched_decode_preconditions_met(attn_metadata, pages), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
     )
@@ -2929,12 +2942,11 @@ def test_dispatch_declines_a_gather_spanning_the_cache(default_vllm_config, conf
 
 @pytest.fixture()
 def batched_decode_calls(monkeypatch):
-    """Pin ``SPYRE_BATCHED_DECODE`` on and count the batched dispatches.
+    """Count the batched dispatches.
 
     A fall back to the per-seq loop still matches the reference, so without the count the
     tests below would pass while testing nothing.
     """
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     calls: list[bool] = []
     original = SpyreAttentionImpl._run_batched_decode
 
@@ -2989,9 +3001,9 @@ def test_spyre_attn_batched_decode_correctness(
     configure_compilation,
     configure_device,
 ):
-    """The batched decode kernel over folded pages, against the CPU reference.
+    """The batched decode kernel against the CPU reference.
 
-    Not bit-exact with the per-seq kernel and cannot be: the chunked reduction sums in a
+    Not bit-exact with the per-seq loop and cannot be: the chunked reduction sums in a
     different order under one shared max.
     """
     _run_spyre_attn_test(
@@ -3043,15 +3055,11 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     from spyre_inference.v1.attention.backends.spyre_attn import (
         SpyreAttentionMetadataBuilder,
     )
-    from spyre_inference.v1.attention.spyre_attn_bucketer import (
-        SpyreAttnBatchedDecodeBucket,
-        SpyreAttnBucketer,
-        batched_decode_chunking,
-    )
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
-    num_seqs, num_blocks, num_pages = 4, 4, 64
+    num_seqs, num_pages = 4, 64
 
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
@@ -3073,29 +3081,20 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
         num_kv_heads=num_kv_heads,
     )
     device = torch.device(configure_device)
-    assert impl._batched_decode_supported()
 
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
-    blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-    bucket = SpyreAttnBatchedDecodeBucket(
-        num_seqs=num_seqs,
-        num_blocks=num_blocks,
-        blocks_per_chunk=blocks_per_chunk,
-        num_chunks=num_chunks,
-    )
 
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=dynamic_chunks)
-        if dynamic_chunks:
-            # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
-            # pages each.
-            (bucket,) = [
-                v
-                for v in builder.attn_bucketer.batched_decode_variants()
-                if v.num_seqs == num_seqs and v.dynamic_chunks
-            ]
+        # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
+        # pages each.
+        (bucket,) = [
+            v
+            for v in builder.attn_bucketer.batched_decode_variants()
+            if v.num_seqs == num_seqs and v.dynamic_chunks == dynamic_chunks and v.num_chunks > 1
+        ]
         realized = impl._record_batched_one(
             bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize
         )

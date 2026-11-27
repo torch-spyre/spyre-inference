@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from spyre_testing_plugin.attn_helpers import use_kv_buckets, use_python_for_each_tile
+from spyre_testing_plugin.attn_helpers import use_python_for_each_tile, use_static_pages
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
 from vllm.config import get_current_vllm_config
@@ -43,6 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     _build_query_row_tables,
     _mirror_mask_stack,
+    batched_decode,
 )
 from spyre_inference.v1.attention.ops.page_attn_prefill import (
     page_attn_prefill_kernel,
@@ -50,7 +51,6 @@ from spyre_inference.v1.attention.ops.page_attn_prefill import (
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
-    batched_decode_chunking,
 )
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 
@@ -70,8 +70,8 @@ def compiles() -> int:
 
 @pytest.fixture()
 def impl(default_vllm_config, monkeypatch):
-    # These tests check the KV buckets, which a page range would replace.
-    use_kv_buckets(monkeypatch)
+    # These tests check the num_blocks bucket, which a page range would replace.
+    use_static_pages(monkeypatch)
     # Dynamo caches on the kernel's code object, shared by every impl in the
     # process, so an earlier test's graphs would hide a recorder that compiled none.
     torch._dynamo.reset()
@@ -114,6 +114,8 @@ def _make_builder(kv_cache_spec, backend=SpyreAttentionBackend) -> SpyreAttentio
     vllm_config.model_config.get_num_attention_heads = MagicMock(return_value=NUM_HEADS)
     vllm_config.model_config.get_num_kv_heads = MagicMock(return_value=NUM_KV_HEADS)
     vllm_config.cache_config.block_size = BLOCK_SIZE
+    # A sequence spans at most the cache, so every page count build() pads to records.
+    vllm_config.model_config.max_model_len = NUM_PAGES * BLOCK_SIZE
     return backend.get_builder_cls()(
         kv_cache_spec=kv_cache_spec,
         layer_names=["layers.0.self_attn"],
@@ -153,14 +155,18 @@ def sliding_window_builder(default_vllm_config):
 
 
 def make_bucketer(
-    max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8, declare_pages=False
+    max_model_len=256,
+    max_num_batched_tokens=64,
+    max_num_seqs=8,
+    declare_pages=False,
+    sliding_window=None,
 ):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
-    return SpyreAttnBucketer(config, declare_pages=declare_pages)
+    return SpyreAttnBucketer(config, declare_pages=declare_pages, sliding_window=sliding_window)
 
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
@@ -171,7 +177,7 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
 def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_bucket):
     from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16,64,128")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
@@ -188,7 +194,7 @@ def test_mixed_batch_mask_matches_recorded_strides(builder, monkeypatch, query_b
         max_num_blocks=4,
     )
     assert mixed.aligned_query_lens == [query_bucket, query_bucket]
-    assert mixed.padded_num_blocks == [1, 4]
+    assert mixed.padded_num_blocks == [NUM_PAGES, NUM_PAGES]
     torch.testing.assert_close(
         _mirror_mask_stack(mixed, 0, torch.device("cpu")),
         _mirror_mask_stack(recorded, 0, torch.device("cpu")),
@@ -319,7 +325,7 @@ def test_recorder_passes_explicit_causality_to_metadata(
     builder._attn_bucketer = make_bucketer()
     forward = MagicMock()
     monkeypatch.setattr(impl, "forward", forward)
-    monkeypatch.setattr(impl, "_batched_decode_supported", lambda: False)
+    monkeypatch.setattr(SpyreAttnBucketer, "batched_decode_variants", lambda self: [])
     impl.record_graphs(SimpleNamespace(), kv_cache, builder, causal=causal)
     assert forward.call_count > 0
     assert all(call.args[5].causal is causal for call in forward.call_args_list)
@@ -352,10 +358,7 @@ class TestRecordGraphs:
     def _per_seq_only(self, monkeypatch):
         """These counts are the per-seq recorder's; the batched ones are
         TestRecordBatchedDecode's."""
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-        envs.clear_env_cache()
-        yield
-        envs.clear_env_cache()
+        monkeypatch.setattr(SpyreAttnBucketer, "batched_decode_variants", lambda self: [])
 
     @pytest.mark.usefixtures("stub_forward")
     def test_records_every_enumerated_variant(self, impl, kv_cache, builder):
@@ -439,7 +442,7 @@ class TestRecordGraphs:
         self, impl, kv_cache, sliding_window_builder
     ):
         """Deduping on the realized bucket must not drop a graph dispatch needs."""
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        bucketer = sliding_window_builder._attn_bucketer = make_bucketer(sliding_window=BLOCK_SIZE)
 
         recorded = _record(impl, kv_cache, sliding_window_builder)
 
@@ -508,12 +511,12 @@ class TestRecordGraphs:
 
     @pytest.mark.usefixtures("stub_forward")
     def test_skips_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
-        """Buckets sized from max_model_len can outrun a small KV cache."""
+        """A page count sized from max_model_len can outrun a small KV cache."""
         bucketer = builder._attn_bucketer = make_bucketer(max_model_len=4096)
 
         recorded = _record(impl, kv_cache, builder)
 
-        assert 0 < recorded == len(_recordable(bucketer)) < len(bucketer.variants())
+        assert bucketer.variants() and recorded == len(_recordable(bucketer)) == 0
 
     def test_real_metadata_dispatch_compiles_nothing(self, impl, kv_cache, builder):
         """The acceptance criterion, driven from real builder metadata.
@@ -573,53 +576,6 @@ class TestRecordGraphs:
             _dispatch(impl, builder, kv_cache, num_blocks, aligned)
 
         assert compiles() == snapshot
-
-    def test_wide_chunk_beside_short_decode_stays_on_recorded_keys(
-        self, default_vllm_config, monkeypatch
-    ):
-        """The case that makes variants()' pruning load-bearing.
-
-        Pruning drops a (num_blocks, query bucket) pair on query_len <= kv_len,
-        which only holds within one sequence. It removes nothing until there are
-        three query buckets, and only bites when a chunk is wider than another
-        sequence's padded KV, so the other recorder tests never reach it.
-        """
-        from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
-
-        use_kv_buckets(monkeypatch)
-        cfg = get_current_vllm_config()
-        monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
-
-        chunk_len, chunk_kv, decode_kv = 600, 700, 200
-        metadata = _padded_mask_metadata(
-            [(chunk_len, chunk_kv), (1, decode_kv)],
-            block_size=128,
-            num_query_heads=NUM_HEADS,
-            num_kv_heads=NUM_KV_HEADS,
-            head_size=HEAD_SIZE,
-            max_num_blocks=16,
-        )
-
-        bucketer = SpyreAttnBucketer(cfg)
-        recorded = set(bucketer.variants())
-        assert len(recorded) < len(bucketer.query_buckets) * len(bucketer.num_blocks_buckets), (
-            "config prunes nothing, so this test would pass vacuously"
-        )
-
-        assert metadata.padded_num_blocks is not None
-        chunk_width = bucketer.find_query_bucket(chunk_len)
-        assert chunk_width is not None
-        assert metadata.aligned_query_lens == [chunk_width, 1]
-
-        # The variant a batch-wide width would have produced for the decode
-        # sequence. Pruned, so dispatching it means an Inductor compile in the
-        # serving path; asserted absent so this test fails loudly if the
-        # bucketer stops pruning it and the case goes uncovered.
-        assert SpyreAttnBucket(metadata.padded_num_blocks[1], chunk_width) not in recorded
-
-        for seq_idx, aligned in enumerate(metadata.aligned_query_lens):
-            variant = SpyreAttnBucket(metadata.padded_num_blocks[seq_idx], aligned)
-            assert variant in recorded, f"sequence {seq_idx} dispatches unrecorded {variant}"
 
     def test_mixed_batch_row_tables_keep_their_own_width(self, impl, kv_cache):
         """The recorded key is not enough: the row table's width is a guard too."""
@@ -710,8 +666,6 @@ class TestRecordGraphs:
 def test_one_token_variant_records_the_per_seq_kernel(builder, monkeypatch, num_blocks):
     """Per-seq variants are built with the batched path off, so recording the one-token
     variant runs the per-seq loop rather than the batched decode kernel."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    envs.clear_env_cache()
 
     metadata = builder.build_for_variant(SpyreAttnBucket(num_blocks, 1))
 
@@ -760,13 +714,6 @@ class TestRecordBatchedDecode:
     # per-seq recorder is still bounded by NUM_PAGES, hence the two page counts.
     PAGES = 64
 
-    @pytest.fixture(autouse=True)
-    def _enabled(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-        envs.clear_env_cache()
-        yield
-        envs.clear_env_cache()
-
     @pytest.fixture()
     def wide_cache(self, spyre_device):
         return SpyreAttentionImpl.allocate_pages(self.PAGES, SPEC, spyre_device)
@@ -794,16 +741,6 @@ class TestRecordBatchedDecode:
         assert recorded == self._expected(bucketer, len(batched))
 
     @pytest.mark.usefixtures("stub_forward")
-    def test_records_nothing_batched_when_the_flag_is_off(
-        self, impl, wide_cache, builder, monkeypatch
-    ):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-        envs.clear_env_cache()
-        bucketer = builder._attn_bucketer = make_bucketer()
-
-        assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
-
-    @pytest.mark.usefixtures("stub_forward")
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """The gather's entry axis, not the block count, is what a small cache bounds."""
         bucketer = builder._attn_bucketer = make_bucketer()
@@ -813,40 +750,6 @@ class TestRecordBatchedDecode:
         batched = self._recordable_batched(bucketer, pages=NUM_PAGES)
         assert len(batched) < len(bucketer.batched_decode_variants())
         assert recorded == len(_recordable(bucketer)) + len(batched)
-
-    def test_window_variants_over_the_requested_budget_still_record(
-        self, impl, sliding_window_builder, spyre_device
-    ):
-        """A window moves the realized entry axis, so the skip must key on that.
-
-        Keying on the bucket's window-agnostic ``blocks_per_chunk`` would drop
-        variants whose realized gather fits the cache, putting their compile back
-        in the serving path.
-        """
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
-        # Wide enough for what the window realizes, too narrow for what the buckets
-        # ask for. NUM_PAGES no longer straddles any variant once padding lifts the
-        # realized axis back to the bucket maximum.
-        pages = 12
-        cache = SpyreAttentionImpl.allocate_pages(pages, SPEC, spyre_device)
-        # Whether the realized gather fits is a question about build()'s output.
-        reachable = []
-        for v in bucketer.batched_decode_variants():
-            if v.num_seqs * v.blocks_per_chunk < pages:
-                continue
-            md = sliding_window_builder.build_for_batched_decode_variant(v)
-            assert md.padded_num_seqs is not None and md.blocks_per_chunk is not None
-            if md.padded_num_seqs * md.blocks_per_chunk < pages:
-                reachable.append(v)
-        assert reachable, "no over-budget variant realizes a gather that fits; nothing under test"
-
-        _record(impl, cache, sliding_window_builder)
-
-        # Each one must have been traced during recording, so dispatch compiles nothing.
-        snapshot = compiles()
-        for bucket in reachable:
-            _dispatch_batched(impl, sliding_window_builder, cache, bucket)
-        assert compiles() == snapshot
 
     def test_re_recording_compiles_nothing(self, impl, wide_cache, builder):
         builder._attn_bucketer = make_bucketer()
@@ -860,7 +763,7 @@ class TestRecordBatchedDecode:
         self, impl, wide_cache, sliding_window_builder
     ):
         """Deduping on the realized key must not drop a graph dispatch needs."""
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        bucketer = sliding_window_builder._attn_bucketer = make_bucketer(sliding_window=BLOCK_SIZE)
         requested = self._recordable_batched(bucketer)
 
         recorded = _record(impl, wide_cache, sliding_window_builder)
@@ -890,11 +793,30 @@ class TestRecordBatchedDecode:
             _dispatch_batched(impl, builder, wide_cache, bucket)
         assert compiles() == snapshot
 
+    def test_unstaged_decode_reaches_the_recorded_batched_kernels(self, impl, wide_cache, builder):
+        """An unstaged decode reaches the batched kernels warmup recorded."""
+        # Only the kernel's graphs are counted: the eager staging copies compile per row count.
+        from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+
+        bucketer = builder._attn_bucketer = make_bucketer()
+        _record(impl, wide_cache, builder)
+        device = wide_cache[0].device
+
+        traced = len(_debug_get_cache_entry_list(batched_decode.__code__))
+        assert traced > 0
+        for bucket in self._recordable_batched(bucketer):
+            metadata = builder.build_for_batched_decode_variant(bucket)
+            rows = torch.zeros(bucket.num_seqs, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+            query, output = rows.to(device), rows.clone().to(device)
+            impl.forward(MagicMock(), query, query, query, wide_cache, metadata, output)
+        assert len(_debug_get_cache_entry_list(batched_decode.__code__)) == traced
+
     def test_real_decode_batch_lands_on_a_recorded_key(self, builder):
         """A batch the scheduler could hand over must realize a key warmup enumerated."""
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-        bucketer = builder._attn_bucketer = make_bucketer()
+        # The builder's own, derived from the live config _padded_mask_metadata builds from.
+        bucketer = builder.attn_bucketer
         keys = {
             (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
             for v in bucketer.batched_decode_variants()
@@ -922,14 +844,12 @@ class TestRecordBatchedDecode:
 
 @pytest.mark.parametrize("num_seqs", [1, 2, 4, 8])
 def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch, num_seqs):
-    """With a chunk range, every decode batch runs a kernel that warmup recorded: the
-    one-chunk kernel if it fits in one chunk, else the dynamic kernel at a chunk count in
-    its range."""
+    """Every decode batch runs a kernel that warmup recorded: the dynamic kernel at a chunk
+    count in its range, a single chunk included, or the num_blocks bucket's kernel for a batch
+    size without a chunk range."""
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    envs.clear_env_cache()
     max_model_len = 2048
     max_blocks = max_model_len // BLOCK_SIZE
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
@@ -988,74 +908,3 @@ def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch,
             # Only the chunks the longest sequence needs, past the range minimum.
             needed = -(-int(seq_lens.max()) // (BLOCK_SIZE * md.blocks_per_chunk))
             assert num_chunks == max(needed, md.chunk_range["min"]), f"{kv_len=}"
-
-
-def test_large_batch_ladder_variants_build_onto_their_own_kernel(builder, monkeypatch):
-    """Warmup builds a large-batch bucket below the base bucket build() pads each sequence onto."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
-    monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "4")
-    envs.clear_env_cache()
-    bucketer = builder._attn_bucketer = make_bucketer(max_model_len=1024)
-    assert set(bucketer.batched_blocks_buckets(8)) > set(bucketer.num_blocks_buckets)
-    for v in bucketer.batched_decode_variants():
-        md = builder.build_for_batched_decode_variant(v)
-        realized = (
-            md.padded_num_seqs,
-            md.blocks_per_chunk,
-            md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
-        )
-        assert realized == (v.num_seqs, v.blocks_per_chunk, v.num_chunks), v
-
-
-@pytest.mark.parametrize("num_seqs", [4, 8])
-def test_large_batch_dispatch_lands_on_a_recorded_key(builder, monkeypatch, num_seqs):
-    """build() must dispatch onto the large-batch kernels warmup records, not the base ones."""
-    from vllm.v1.attention.backend import CommonAttentionMetadata
-
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
-    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
-    monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "4")
-    envs.clear_env_cache()
-    bucketer = builder._attn_bucketer = make_bucketer(max_model_len=1024)
-    keys = {
-        (v.num_seqs, v.blocks_per_chunk, v.num_chunks) for v in bucketer.batched_decode_variants()
-    }
-    max_blocks = 1024 // BLOCK_SIZE
-
-    realized = set()
-    for kv_len in range(65, 1025, 37):
-        seq_lens = torch.tensor([kv_len - 7 * i for i in range(num_seqs)], dtype=torch.int32)
-        md = builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=CommonAttentionMetadata(
-                query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
-                query_start_loc_cpu=torch.arange(num_seqs + 1, dtype=torch.int32),
-                seq_lens=seq_lens,
-                num_reqs=num_seqs,
-                num_actual_tokens=num_seqs,
-                max_query_len=1,
-                max_seq_len=int(seq_lens.max()),
-                block_table_tensor=torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
-                    num_seqs, max_blocks
-                ),
-                slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
-                causal=True,
-                is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
-            ),
-        )
-        assert md.padded_num_seqs is not None, "builder declined the batched path"
-        key = (
-            md.padded_num_seqs,
-            md.blocks_per_chunk,
-            md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
-        )
-        assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
-        realized.add(key)
-
-    base = {
-        (num_seqs, *batched_decode_chunking(num_seqs, nb)) for nb in bucketer.num_blocks_buckets
-    }
-    assert realized - base, "dispatch never used a large-batch bucket"

@@ -265,7 +265,8 @@ def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
     must not compile anything.
 
     The FP8 checkpoint, loaded through ``SpyreFp8Config``, must then track the BF16 TP=2
-    run on the text prompt. It runs text only: FP8 changes the decoder's linears alone.
+    run on the text prompt. It runs text only: FP8 changes the decoder alone, its linears
+    and, by default, its KV cache.
     """
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")

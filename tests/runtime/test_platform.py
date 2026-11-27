@@ -646,6 +646,72 @@ def test_quantization_is_rejected_with_bfloat16():
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def _compressed_tensors_config(weight_bits: int, weight_type: str, targets: list[str]) -> dict:
+    """The part of a compressed-tensors ``quantization_config`` the FP8 check reads."""
+    return {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {
+                "targets": targets,
+                "weights": {"num_bits": weight_bits, "type": weight_type},
+            }
+        },
+    }
+
+
+_FP8_LINEARS = _compressed_tensors_config(8, "float", ["Linear"])
+
+
+@pytest.mark.parametrize(
+    ("quantization", "quant_cfg", "requested", "expected"),
+    [
+        ("fp8", None, "auto", "fp8"),
+        ("compressed-tensors", _FP8_LINEARS, "auto", "fp8"),
+        ("fp8", None, "fp8_e4m3", "fp8_e4m3"),
+        ("fp8", None, "float16", "float16"),
+        ("fp8", None, "bfloat16", "float16"),
+        ("compressed-tensors", _compressed_tensors_config(4, "int", ["Linear"]), "auto", "auto"),
+        ("compressed-tensors", _compressed_tensors_config(8, "float", ["lm_head"]), "auto", "auto"),
+        ("gptq", None, "auto", "auto"),
+        (None, None, "auto", "auto"),
+        (None, None, "fp8", "fp8"),
+    ],
+)
+def test_fp8_model_defaults_to_an_fp8_kv_cache(
+    monkeypatch, quantization, quant_cfg, requested, expected
+):
+    """``auto`` gives a model with FP8 linears an FP8 cache; an explicit dtype wins, and
+    either 16-bit one keeps a float16 cache. vLLM runs the hook again after the EngineCore
+    handshake, so a second pass must leave the result alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.quantization = quantization
+    monkeypatch.setattr(
+        vllm_config.model_config.hf_config, "quantization_config", quant_cfg, raising=False
+    )
+    vllm_config.cache_config.cache_dtype = requested
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert vllm_config.cache_config.cache_dtype == expected
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert vllm_config.cache_config.cache_dtype == expected
+
+
+def test_fp8_model_keeps_a_model_dtype_cache_below_a_float8_stick(monkeypatch):
+    """A head size that does not fill a float8 stick cannot hold an FP8 cache."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.quantization = "fp8"
+    monkeypatch.setattr(vllm_config.model_config, "get_head_size", lambda: 64)
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.cache_dtype == "auto"
+
+
 def test_alibi_model_is_rejected(monkeypatch):
     """Neither attention layout implements ALiBi; fail in the front end, not in the worker."""
     from spyre_inference.platform import TorchSpyrePlatform
@@ -666,37 +732,6 @@ def test_bfloat16_is_accepted_at_tp1():
     vllm_config.model_config.dtype = torch.bfloat16
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-
-@pytest.mark.parametrize(
-    ("var", "value", "kv_buckets", "match"),
-    [
-        ("SPYRE_ATTN_KV_LADDER", "7_4", None, "SPYRE_ATTN_KV_LADDER='7_4'"),
-        ("SPYRE_ATTN_KV_LADDER", "7_4", "256,1024", None),
-        ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "7_4", None, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH='7_4'"),
-        ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8", "256,1024", "cannot be combined"),
-        ("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "0", None, "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
-        ("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "0", "256,1024", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
-    ],
-)
-def test_a_bad_kv_ladder_setting_fails_at_startup(monkeypatch, var, value, kv_buckets, match):
-    """SPYRE_ATTN_KV_BUCKETS replaces the base ladder, so its name is not read then, and the
-    large-batch ladder that extends it is rejected."""
-    from spyre_inference import envs
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    # Built first: VllmConfig runs this hook on construction too.
-    vllm_config = _defaults_config(enforce_eager=True, mode=None)
-    monkeypatch.setenv(var, value)
-    if kv_buckets:
-        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", kv_buckets)
-    envs.clear_env_cache()
-
-    if match:
-        with pytest.raises(ValueError, match=match):
-            TorchSpyrePlatform.check_and_update_config(vllm_config)
-    else:
-        TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
 def test_raise_dynamo_recompile_limits_survives_a_clobber():

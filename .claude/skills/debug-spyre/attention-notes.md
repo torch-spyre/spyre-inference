@@ -16,7 +16,7 @@ In addition to the generic table in `SKILL.md`:
 
 | Limitation | Workaround |
 |---|---|
-| KV alignment to bucketed length | `SpyreAttnBucketer` kv buckets: powers of two from `block_size` to `max_model_len`, consumed as a padded block count, so the same compiled kernel is reused as KV grows |
+| KV length without buckets | each sequence's page table and mask stack go to the device with a declared page range (`tensor.to(dynamic=...)`), at least two pages, so the same compiled kernel is reused as KV grows; sliding-window layers keep power-of-two block counts instead |
 | Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1] + multiples of min(512, max_num_batched_tokens)`; each sequence's query is padded up to its own bucket |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
 | The page gather is a 2-D subscript (`aten.index`), which fails eager on Spyre (torch-spyre#4334) | Attention always compiles, even under `--enforce-eager` |
@@ -108,7 +108,7 @@ When the failing surface is attention, in addition to the generic starter set, a
 - **Write source not materialized.** A single-token fused-QKV view reports contiguous at a nonzero storage offset; the store relies on an elementwise pass (`key * 1.0`) to copy it. Short-token tests pass while long prefill is wrong when this, or the per-head index split, regresses.
 - **Attention mask off-by-one / wrong padded shape / wrong causal boundary.** `_build_attention_mask` (no sliding window) and `_build_single_tile` (sliding window) build per-block tiles padded to `aligned_query_len × block_size`. Off-by-one in causal/padding masking produces near-100 % mismatches that look like "random output." Print the mask stack for a small case and verify masked positions are `finfo(fp16).min` (-65504), unmasked are `0`, and the causal boundary matches `context_lens + q_pos`.
 - **Page index table wrong.** `page_index_tables_cpu[s][i, 0]` must be the physical page of sequence `s`'s `i`-th *active* block (a position within `active_block_indices` under a window, not an absolute block index). A wrong order leaves the mask tiles misaligned with the pages they mask — silent disaster.
-- **Batched vs per-sequence path.** Even one decode sequence can take the batched kernel when it is supported (compiled and sufficient page capacity); set `SPYRE_BATCHED_DECODE=0` to force the per-sequence loop and see whether the failure follows the path.
+- **Batched vs per-sequence path.** Decode rows, one sequence included, take the batched kernel, except when the KV cache is too small for its gather, or under spec decode, where MRV2 sorts the verify rows first and a one-token row without drafts runs the per-sequence loop. To see whether a decode failure follows the path, monkeypatch both `SpyreAttentionImpl._grouped_decode_preconditions_met` and `SpyreAttentionImpl._batched_decode_preconditions_met` to return `False`, which sends the decode rows through the per-sequence loop at query width 1.
 - **Tiled vs Python walk.** CPU tests swap `for_each_tile` for a Python loop (`use_python_for_each_tile` in `spyre_testing_plugin.attn_helpers`) that runs the identical kernel bodies. A failure those CPU tests don't reproduce points at the `for_each_tile` lowering or the torch-spyre pin.
 - **A shape that escapes the `SpyreAttnBucketer` kv/query buckets** dispatches to an unrecorded kernel (correctness, not just recompilation cost).
 

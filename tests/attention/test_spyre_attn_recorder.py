@@ -61,6 +61,8 @@ NUM_KV_HEADS = 2
 HEAD_SIZE = 64
 BLOCK_SIZE = 64
 NUM_PAGES = 8
+# Touches 5 of NUM_PAGES pages for decode and 6 for a 64-token query.
+WINDOW = 4 * BLOCK_SIZE
 
 
 def compiles() -> int:
@@ -140,8 +142,7 @@ def builder(default_vllm_config):
 
 @pytest.fixture()
 def sliding_window_builder(default_vllm_config):
-    """A builder whose window leaves the active-block count unpadded, so several
-    requested buckets realize onto one kernel."""
+    """A builder whose layers attend through a ``WINDOW``-token sliding window."""
     return _make_builder(
         FullAttentionSpec(
             block_size=BLOCK_SIZE,
@@ -149,7 +150,7 @@ def sliding_window_builder(default_vllm_config):
             head_size=HEAD_SIZE,
             head_size_v=HEAD_SIZE,
             dtype=torch.float16,
-            sliding_window=BLOCK_SIZE,
+            sliding_window=WINDOW,
         )
     )
 
@@ -167,6 +168,13 @@ def make_bucketer(
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
     return SpyreAttnBucketer(config, declare_pages=declare_pages, sliding_window=sliding_window)
+
+
+def make_window_bucketer(declare_pages):
+    """The bucketer of ``sliding_window_builder``'s window, over the whole cache."""
+    return make_bucketer(
+        max_model_len=NUM_PAGES * BLOCK_SIZE, declare_pages=declare_pages, sliding_window=WINDOW
+    )
 
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
@@ -353,6 +361,40 @@ def _dispatch_batched(impl, builder, kv_cache, bucket):
     impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
 
+def _run_step(impl, builder, kv_cache, seq_lens, per_seq_only=False):
+    """Run one real step of ``(query_len, kv_len)`` sequences, laid on consecutive pages."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    query_lens = torch.tensor([q for q, _ in seq_lens], dtype=torch.int32)
+    kv_lens = torch.tensor([kv for _, kv in seq_lens], dtype=torch.int32)
+    num_seqs, num_tokens = len(seq_lens), int(query_lens.sum())
+    max_blocks = -(-int(kv_lens.max()) // BLOCK_SIZE)
+    query_start_loc = torch.cat([torch.zeros(1, dtype=torch.int32), query_lens.cumsum(0)]).to(
+        torch.int32
+    )
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc,
+            seq_lens=kv_lens,
+            num_reqs=num_seqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=int(query_lens.max()),
+            max_seq_len=int(kv_lens.max()),
+            block_table_tensor=torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
+                num_seqs, max_blocks
+            ),
+            slot_mapping=torch.zeros(num_tokens, dtype=torch.int64),
+            causal=True,
+        ),
+        per_seq_only=per_seq_only,
+    )
+    q_staging, out_staging = impl._staging_buffers(kv_cache[0].device)
+    impl.forward(MagicMock(), q_staging, q_staging, q_staging, kv_cache, metadata, out_staging)
+    return metadata
+
+
 class TestRecordGraphs:
     @pytest.fixture(autouse=True)
     def _per_seq_only(self, monkeypatch):
@@ -438,27 +480,36 @@ class TestRecordGraphs:
         )
         assert sink_impl.graph_key() != impl.graph_key()
 
-    def test_buckets_collapsing_onto_one_kernel_record_once(
-        self, impl, kv_cache, sliding_window_builder
+    @pytest.mark.parametrize("declare_pages", [False, True], ids=["bucketed", "declared"])
+    def test_sliding_window_steps_run_the_recorded_graphs(
+        self, impl, kv_cache, sliding_window_builder, declare_pages
     ):
-        """Deduping on the realized bucket must not drop a graph dispatch needs."""
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer(sliding_window=BLOCK_SIZE)
+        """Every page count a window walks, up to the end of its range, runs a graph warmup
+        recorded."""
+        from torch_spyre._inductor import config as ts_config
 
-        recorded = _record(impl, kv_cache, sliding_window_builder)
+        # Not monkeypatch: its undo deletes a config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=1, max_buckets=32):
+            bucketer = sliding_window_builder._attn_bucketer = make_window_bucketer(declare_pages)
+            assert _record(impl, kv_cache, sliding_window_builder) == len(_recordable(bucketer))
 
-        requested = _recordable(bucketer)
-        assert 0 < recorded < len(requested), "no buckets collapsed; nothing deduped"
+            snapshot = compiles()
+            walked: dict[bool, set[int]] = {False: set(), True: set()}
+            for query_len, kv_len in [
+                *[(1, kv_len) for kv_len in (1, 100, 192, 256, 300)],
+                *[(2, 2), (64, 150), (64, 200), (64, 300), (64, 400)],
+            ]:
+                # The per-sequence kernels, a decode included, as on a batched decode miss.
+                metadata = _run_step(
+                    impl, sliding_window_builder, kv_cache, [(query_len, kv_len)], per_seq_only=True
+                )
+                walked[query_len > 1].add(int(metadata.attention_mask_stacks[0].shape[0]))
+            assert compiles() == snapshot
 
-        snapshot = compiles()
-        for bucket in requested:
-            _dispatch(
-                impl,
-                sliding_window_builder,
-                kv_cache,
-                bucket.num_blocks,
-                bucket.padded_query_len,
-            )
-        assert compiles() == snapshot
+        if declare_pages:
+            assert walked == {False: {1, 2, 3, 4, 5}, True: {2, 3, 4, 5, 6}}
+        else:
+            assert walked == {False: {5}, True: {6}}
 
     @pytest.mark.usefixtures("stub_forward")
     def test_collapsing_without_a_sliding_window_warns(
@@ -476,13 +527,24 @@ class TestRecordGraphs:
         assert "bucketer and build() have diverged" in caplog.text
 
     @pytest.mark.usefixtures("stub_forward")
-    def test_collapsing_with_a_sliding_window_is_quiet(
+    def test_a_sliding_window_records_at_the_end_of_its_range(
         self, impl, kv_cache, sliding_window_builder, caplog
     ):
-        sliding_window_builder._attn_bucketer = make_bucketer()
+        """A window walks fewer pages than its variants are recorded at, so warmup pads it
+        up to them: torch-spyre traces its kernels at the end of the range, as full
+        attention's, whatever it makes of the size a graph is traced at."""
+        from torch_spyre._inductor import config as ts_config
 
-        with caplog.at_level(logging.WARNING):
-            _record(impl, kv_cache, sliding_window_builder)
+        with ts_config.patch(min_reserved_dim_size=1, max_buckets=32):
+            bucketer = sliding_window_builder._attn_bucketer = make_window_bucketer(True)
+            for v in bucketer.variants():
+                metadata = sliding_window_builder.build_for_variant(v)
+                assert metadata.active_block_indices is not None
+                assert len(set(metadata.active_block_indices[0])) < v.num_blocks
+                assert metadata.attention_mask_stacks[0].shape[0] == v.num_blocks
+
+            with caplog.at_level(logging.WARNING):
+                _record(impl, kv_cache, sliding_window_builder)
 
         assert "diverged" not in caplog.text
 
@@ -759,25 +821,41 @@ class TestRecordBatchedDecode:
         assert _record(impl, wide_cache, builder) == first
         assert compiles() == snapshot
 
-    def test_batched_buckets_collapsing_onto_one_kernel_record_once(
-        self, impl, wide_cache, sliding_window_builder
+    @pytest.mark.parametrize("declare_pages", [False, True], ids=["bucketed", "declared"])
+    def test_sliding_window_batches_run_the_recorded_graphs(
+        self, impl, wide_cache, sliding_window_builder, declare_pages, caplog
     ):
-        """Deduping on the realized key must not drop a graph dispatch needs."""
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer(sliding_window=BLOCK_SIZE)
-        requested = self._recordable_batched(bucketer)
+        """Decode batches under a window run graphs warmup recorded, at the end of their
+        chunk range, whichever chunk count their longest window needs."""
+        from torch_spyre._inductor import config as ts_config
 
-        recorded = _record(impl, wide_cache, sliding_window_builder)
-        # The window collapses both axes, so the total is below what either
-        # enumeration asks for on its own.
-        assert recorded < self._expected(bucketer, len(requested)), (
-            "nothing collapsed; the dedupe path is untested"
-        )
+        # Not monkeypatch: its undo deletes a config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=1, max_buckets=32):
+            bucketer = sliding_window_builder._attn_bucketer = make_window_bucketer(declare_pages)
+            batched = self._recordable_batched(bucketer)
+            assert len(batched) == len(bucketer.batched_decode_variants())
+            with caplog.at_level(logging.WARNING):
+                recorded = _record(impl, wide_cache, sliding_window_builder)
+            assert recorded == self._expected(bucketer, len(batched))
+            assert "diverged" not in caplog.text
 
-        # Every requested bucket must still reach a traced graph.
-        snapshot = compiles()
-        for bucket in requested:
-            _dispatch_batched(impl, sliding_window_builder, wide_cache, bucket)
-        assert compiles() == snapshot
+            snapshot = compiles()
+            plans = []
+            # Windows of 4 pages each, of 1 to 5, and a smaller batch size.
+            for kv_lens in ([512] * 8, [1, 100, 192, 256, 300, 320, 400, 512], [300, 100, 1]):
+                metadata = _run_step(
+                    impl, sliding_window_builder, wide_cache, [(1, kv) for kv in kv_lens]
+                )
+                assert metadata.chunk_page_ids_cpu is not None and metadata.blocks_per_chunk
+                num_chunks = metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk
+                plans.append((num_chunks, metadata.chunk_range is not None))
+            assert compiles() == snapshot
+
+        # Only eight sequences need two chunks of 4 pages for 5.
+        if declare_pages:
+            assert plans == [(1, True), (2, True), (1, False)]
+        else:
+            assert plans == [(2, False), (2, False), (1, False)]
 
     def test_batched_dispatch_after_recording_compiles_nothing(self, impl, wide_cache, builder):
         """The acceptance criterion: no batched decode batch compiles a new variant.

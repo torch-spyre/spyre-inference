@@ -229,9 +229,13 @@ The page tables and mask stacks are copied to the device with torch-spyre's
 
 A `--max-model-len` of one page has no page range: every sequence runs that one page.
 
-Sliding-window layers have no page range. Each sequence pads to the power of two at or above
-its page count, capped at the pages its window touches, with one kernel per (page count,
-query) bucket pair.
+A sliding-window layer reads only the pages its window touches, so its page range ends there
+instead of at `--max-model-len`: at `ceil(window / block_size) + 1` pages for decode, and at
+`ceil((window + max_num_batched_tokens - 1) / block_size) + 1` for prefill. The extra page is
+the one a window straddles when it does not start on a page boundary. For example, gemma-4's
+1024-token window at block size 128 and 512-token batches gives 9 pages for decode and 13 for
+prefill. Prefill keeps its own page count there, at least two pages, rather than a multiple
+of 8.
 
 The batched decode kernel takes its chunk count at run time in the same way, and under the
 same conditions. The kernel reads the KV cache one *chunk* per loop step: the next
@@ -241,8 +245,8 @@ and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter seq
 masked past their own length. The same kernel runs a batch that fits in one chunk, so warmup
 compiles one batched kernel per num-sequences bucket. A num-sequences bucket whose
 `--max-model-len` fits in one chunk, or any bucket under the conditions above, pads every
-batch to the page count of `--max-model-len` instead. A sliding-window layer pads its
-batches to their power-of-two page count, capped at the pages a one-token window touches.
+batch to the page count of `--max-model-len` instead. A sliding-window layer uses the decode
+end of its page range here in place of `--max-model-len`.
 
 ## KV cache size
 

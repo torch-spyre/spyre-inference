@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CompilationMode, VllmConfig
+from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -44,6 +45,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inline_active
 from spyre_inference.v1.attention.warmup import record_attention_graphs
+from spyre_inference.v1.core.vision_slices import SpyreVisionSliceConnector
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
 from spyre_inference.v1.worker.compile_granularity import compile_granularity
@@ -216,6 +218,8 @@ def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> Non
         runner.vllm_config, runner.spyre_device, dtype, model
     )
     encoder_runner.cudagraph_manager.capture(graph_pool=None)
+    if has_ec_transfer() and isinstance(connector := get_ec_transfer(), SpyreVisionSliceConnector):
+        connector.bind_encoder(encoder_runner.cudagraph_manager, runner.device)
     wrapper = cast(_SpyreModelWrapper, runner.model)
     image_rows = [torch.zeros(1, model.out_hidden_size, dtype=dtype)]
     # An image step stages at least two rows (see _SpyreModelWrapper.embed_input_ids).

@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_PREP_THREADS: int = 0
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_VISION_BLOCKS_PER_STEP: int = 0
 
 _cache: dict[str, Any] = {}
 
@@ -130,6 +131,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # Experimental. Vision encoder blocks run per engine step while other requests are
+    # running, so an image's encoder pass spreads over several steps instead of stalling
+    # every running decode for its whole length. The image's prefill waits until its pass
+    # completes. "0" (default) encodes each image in one step. Compiled vision towers
+    # (SpyreVisionEncoderMixin) only.
+    "SPYRE_VISION_BLOCKS_PER_STEP": lambda: int(os.getenv("SPYRE_VISION_BLOCKS_PER_STEP", "0")),
 }
 # --8<-- [end:env-vars-definition]
 

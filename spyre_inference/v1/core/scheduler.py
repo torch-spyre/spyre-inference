@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from spyre_inference import envs
+from spyre_inference.v1.core.vision_slices import SpyreVisionSliceConnector
 
 
 class TorchSpyreScheduler(Scheduler):
@@ -37,6 +38,15 @@ class TorchSpyreScheduler(Scheduler):
             if self.vllm_config.model_config.runner_type == "pooling"
             else envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
         )
+        # Upstream builds the connector before it has a scheduler to hand it.
+        if isinstance(self.ec_connector, SpyreVisionSliceConnector):
+            self.ec_connector.bind_scheduler(self)
+
+    def reset_encoder_cache(self) -> None:
+        super().reset_encoder_cache()
+        # Upstream doesn't tell the connector, whose passes ran on the old weights.
+        if isinstance(self.ec_connector, SpyreVisionSliceConnector):
+            self.ec_connector.reset()
 
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         if self.max_num_partial_prefills <= 0:

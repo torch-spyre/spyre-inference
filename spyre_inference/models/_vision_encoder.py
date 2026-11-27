@@ -70,6 +70,20 @@ class VisionBuffer:
     dtype: torch.dtype = torch.float16
 
 
+@dataclass
+class VisionEncodeState:
+    """One packed batch part-way through the encoder, its activations left on the card.
+
+    ``done`` blocks have run; ``hidden`` holds the ``vision_taps`` states reached so far.
+    """
+
+    x: torch.Tensor
+    block_kwargs: dict[str, Any]
+    wanted: frozenset[int]
+    hidden: dict[int, torch.Tensor]
+    done: int = 0
+
+
 class GatherTable(nn.Module):
     """A ``[rows, width]`` lookup table that a vision graph gathers rows from by index.
 
@@ -349,29 +363,44 @@ class SpyreVisionEncoderMixin:
     def encoder_cudagraph_forward(
         self, inputs: dict[str, torch.Tensor], path: str = "default"
     ) -> torch.Tensor:
-        """Run the three graphs on padded device buffers and return the output on the host.
+        """Run the three graphs on padded device buffers and return the output on the host."""
+        return self.vision_finish(self.vision_start(inputs))
 
-        One copy to the host here: device views at offsets off the stick read as offset 0
-        (torch-spyre#3770), and the embedding merge runs on the host anyway.
-        """
+    # --- 5. The encoder in resumable pieces, for spreading one item over engine steps ---
+
+    def vision_start(self, inputs: dict[str, torch.Tensor]) -> VisionEncodeState:
+        """Graph 1 on padded device buffers; the blocks have not run yet."""
         embed = getattr(self, "_spyre_vision_embed", self.vision_embed)
-        project = getattr(self, "_spyre_vision_project", self.vision_project)
-        blocks = self.vision_blocks()
-        depth = len(blocks) + 1
+        depth = len(self.vision_blocks()) + 1
         if any(not -depth <= t < depth for t in self.vision_taps):
             raise ValueError(
                 f"vision_taps {self.vision_taps} is out of range for {depth} hidden states"
             )
-        wanted = {t % depth for t in self.vision_taps}
-
+        wanted = frozenset(t % depth for t in self.vision_taps)
         x, block_kwargs = embed(inputs)
-        hidden = {0: x} if 0 in wanted else {}
-        for i, block in enumerate(blocks, start=1):
-            x = self.vision_call_block(block, x, block_kwargs)
-            if i in wanted:
-                hidden[i] = x
-        taps = [hidden[t % depth] for t in self.vision_taps]
-        return convert(project(x, taps), device="cpu")
+        return VisionEncodeState(x, block_kwargs, wanted, {0: x} if 0 in wanted else {})
+
+    def vision_advance(self, state: VisionEncodeState, num_blocks: int | None = None) -> None:
+        """Run up to ``num_blocks`` more blocks, all the remaining ones if ``None``."""
+        blocks = self.vision_blocks()
+        stop = len(blocks) if num_blocks is None else min(len(blocks), state.done + num_blocks)
+        for i in range(state.done, stop):
+            state.x = self.vision_call_block(blocks[i], state.x, state.block_kwargs)
+            if i + 1 in state.wanted:
+                state.hidden[i + 1] = state.x
+        state.done = stop
+
+    def vision_finish(self, state: VisionEncodeState) -> torch.Tensor:
+        """Run any remaining blocks, then graph 3, and return the output on the host.
+
+        One copy to the host here: device views at offsets off the stick read as offset 0
+        (torch-spyre#3770), and the embedding merge runs on the host anyway.
+        """
+        self.vision_advance(state)
+        project = getattr(self, "_spyre_vision_project", self.vision_project)
+        depth = len(self.vision_blocks()) + 1
+        taps = [state.hidden[t % depth] for t in self.vision_taps]
+        return convert(project(state.x, taps), device="cpu")
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"

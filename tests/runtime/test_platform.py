@@ -1204,6 +1204,66 @@ def test_validate_request_rejects_an_item_above_its_modality_limit(monkeypatch, 
     assert (err.value.parameter, err.value.value) == ("mm_processor_kwargs", 281)
 
 
+def test_vision_slicing_installs_its_connector_as_a_consumer(monkeypatch):
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+    from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
+
+    from spyre_inference.platform import TorchSpyrePlatform
+    from spyre_inference.v1.core import vision_slices
+
+    slicing = vision_slices.VisionSlicing(6, 4, ("image",))
+    monkeypatch.setattr(vision_slices, "vision_slicing", lambda vllm_config: slicing)
+    monkeypatch.setattr(TorchSpyrePlatform, "_sliced_modalities", ())
+    config = SimpleNamespace(ec_transfer_config=None)
+    TorchSpyrePlatform._install_vision_slicing(config)
+
+    ec_config = config.ec_transfer_config
+    # A producer would also make vLLM load the encoder alone.
+    assert ec_config.is_ec_consumer and not ec_config.is_ec_producer
+    connector = ECConnectorFactory.create_connector(config, ECConnectorRole.SCHEDULER)
+    assert isinstance(connector, vision_slices.SpyreVisionSliceConnector)
+    assert connector._slicing == slicing
+    assert TorchSpyrePlatform._sliced_modalities == ("image",)
+
+
+def _image_items(*items):
+    return {"type": "multimodal", "mm_kwargs": {"image": list(items)}, "mm_placeholders": {}}
+
+
+def _pixels(missing: bool = False, key: str = "pixel_values"):
+    return {key: SimpleNamespace(data=None if missing else torch.zeros(1))}
+
+
+def test_sliced_vision_accepts_pixels_and_processor_cache_hits(monkeypatch):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_sliced_modalities", ("image",))
+    # Pixtral's processor names the pixels ``images``.
+    TorchSpyrePlatform.validate_request(_image_items(_pixels(), _pixels(key="images"), None), None)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"image_embeds": SimpleNamespace(data=torch.zeros(1))},
+        _pixels(missing=True),
+        _pixels(missing=True, key="images"),
+    ],
+    ids=["embeddings", "missing", "missing-images"],
+)
+def test_sliced_vision_rejects_images_without_pixels(monkeypatch, item):
+    """As an encoder cache consumer, vLLM accepts both; a pass needs the pixels."""
+    from vllm.exceptions import VLLMValidationError
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_sliced_modalities", ("image",))
+    with pytest.raises(VLLMValidationError, match="pre-computed embeddings"):
+        TorchSpyrePlatform.validate_request(_image_items(item), None)
+    monkeypatch.setattr(TorchSpyrePlatform, "_sliced_modalities", ())
+    TorchSpyrePlatform.validate_request(_image_items(item), None)
+
+
 @pytest.mark.parametrize(
     ("max_model_len", "want"),
     [(128, 16), (256, 8), (512, 4), (514, 4), (2048, 4), (8192, 4)],

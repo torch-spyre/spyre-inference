@@ -17,7 +17,7 @@ fake model: what a model author can rely on without touching any other file."""
 
 import dataclasses
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -25,6 +25,12 @@ import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
+from spyre_inference.v1.core.vision_slices import (
+    SpyreVisionSliceConnector,
+    VisionSlices,
+    VisionSliceStart,
+)
+from spyre_inference.v1.worker import spyre_encoder_graph as encoder_graph_module
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
 MERGE_PATCHES = 4  # 2x2 merge
@@ -865,3 +871,144 @@ def test_eager_path_respects_the_items_per_call_cap():
     assert [o.shape[0] for o in outputs] == [5, 10, 15, 20, 25]
     for i, out in enumerate(outputs):
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def _ordered_blocks(model: _FakeVisionModel) -> None:
+    """Blocks that do not commute, so a block run twice, skipped or reordered shows."""
+    for i, block in enumerate(model.blocks):
+        block.forward = lambda x, offset, i=i: x * 2 + i
+
+
+@pytest.mark.parametrize("per_step", [1, 2, 3, 5, 100])
+def test_sliced_pass_matches_one_call(per_step):
+    """However the blocks are split over steps, the output and the taps are a single call's."""
+    model = _FakeVisionModel(num_blocks=5)
+    _ordered_blocks(model)
+    type(model).vision_taps = (-1, 0, 2)
+    try:
+        bufs = model._vision_empty(64)
+        bufs["patches"][:] = 1.0
+        whole = model.encoder_cudagraph_forward(bufs)
+
+        state = model.vision_start(bufs)
+        while state.done < 3:
+            model.vision_advance(state, per_step)
+        sliced = model.vision_finish(state)
+    finally:
+        del type(model).vision_taps
+    torch.testing.assert_close(sliced, whole)
+    assert len(model.seen_taps) == 2
+    for a, b in zip(*model.seen_taps, strict=True):
+        torch.testing.assert_close(a, b)
+
+
+def test_advance_never_runs_past_the_last_block():
+    model = _FakeVisionModel(num_blocks=3)
+    state = model.vision_start(model._vision_empty(64))
+    model.vision_advance(state, 2)
+    model.vision_advance(state, 2)
+    assert state.done == 3
+    model.vision_advance(state, 2)
+    assert state.done == 3
+
+
+def test_start_item_then_finish_item_matches_execute():
+    model = _FakeVisionModel(max_tokens=300, num_blocks=4)
+    _ordered_blocks(model)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    (expected,) = manager.execute({"tokens": [30]})
+    hits = manager.graph_hits
+
+    state = manager.start_item({"tokens": [30]})
+    model.vision_advance(state, 1)
+    model.vision_advance(state, 2)
+    out = manager.finish_item(state, {"tokens": [30]})
+
+    assert out.shape[0] == 30
+    torch.testing.assert_close(out, expected)
+    assert manager.graph_hits == hits + 1
+
+
+def test_run_slices_spreads_a_pass_and_drops_a_cancelled_one(monkeypatch):
+    """What the slicing connector runs on each worker: one pass over two steps, another
+    cancelled."""
+    monkeypatch.setattr(
+        encoder_graph_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **_: iter([(modality, 1, data) for modality, data in items]),
+    )
+    model = _FakeVisionModel(max_tokens=300, num_blocks=4)
+    _ordered_blocks(model)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    (expected,) = manager.execute({"tokens": [30]})
+    data = cast(Any, {"tokens": [30]})
+    cpu = torch.device("cpu")
+
+    starts = [VisionSliceStart("a", "image", data), VisionSliceStart("b", "image", data)]
+    assert manager.run_slices(VisionSlices(start=starts, run={"a": 2}), cpu) == {}
+    finished = manager.run_slices(VisionSlices(cancel=["b"], run={"a": None}), cpu)
+
+    assert list(finished) == ["a"]
+    torch.testing.assert_close(finished["a"], expected)
+    assert not manager._slice_passes
+
+
+def _active_connector(manager: SpyreEncoderGraphManager, monkeypatch) -> Any:
+    """MRV2's own EC connector hook, around the slicing connector on this manager."""
+    from vllm.config import ECTransferConfig
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+    from vllm.v1.worker.gpu import ec_connector as mrv2_ec_connector
+
+    config = SimpleNamespace(
+        ec_transfer_config=ECTransferConfig(
+            ec_connector=SpyreVisionSliceConnector.__name__,
+            ec_connector_module_path=SpyreVisionSliceConnector.__module__,
+            ec_role="ec_consumer",
+            ec_connector_extra_config={"blocks_per_step": 2, "steps": 2, "modalities": ["image"]},
+        )
+    )
+    connector = SpyreVisionSliceConnector(cast(Any, config), ECConnectorRole.WORKER)
+    connector.bind_encoder(manager, torch.device("cpu"))
+    monkeypatch.setattr(mrv2_ec_connector, "get_ec_transfer", lambda: connector)
+    return mrv2_ec_connector.ActiveECConnector(cast(Any, config), {})
+
+
+def test_mrv2_caches_a_finished_pass_before_it_gathers(monkeypatch):
+    """MRV2 loads around the step's gather, and on a step with no tokens through no_forward."""
+    monkeypatch.setattr(
+        encoder_graph_module,
+        "group_and_batch_mm_kwargs",
+        lambda items, **_: iter([(modality, 1, data) for modality, data in items]),
+    )
+    model = _FakeVisionModel(max_tokens=300, num_blocks=4)
+    _ordered_blocks(model)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+    (expected,) = manager.execute({"tokens": [30]})
+    active = _active_connector(manager, monkeypatch)
+
+    def output(slices: VisionSlices) -> Any:
+        return SimpleNamespace(ec_connector_metadata=slices, finished_req_ids=set())
+
+    def step(slices: VisionSlices) -> dict[str, torch.Tensor]:
+        with active.maybe_get_output(output(slices)):
+            # Where MRV2 gathers the step's encoder outputs.
+            return dict(active.encoder_cache)
+
+    data = cast(Any, {"tokens": [30]})
+    assert step(VisionSlices(start=[VisionSliceStart("a", "image", data)], run={"a": 2})) == {}
+    seen = step(VisionSlices(run={"a": None}))
+    assert list(seen) == ["a"]
+    torch.testing.assert_close(seen["a"], expected)
+
+    active.no_forward(output(VisionSlices(start=[VisionSliceStart("b", "image", data)])))
+    active.no_forward(output(VisionSlices(run={"b": None})))
+    torch.testing.assert_close(active.encoder_cache["b"], expected)
+
+
+def test_start_item_needs_a_compiled_budget():
+    manager = _manager(_FakeVisionModel(max_tokens=300))
+    with pytest.raises(RuntimeError, match="30-token item"):
+        manager.start_item({"tokens": [30]})

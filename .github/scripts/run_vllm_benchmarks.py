@@ -28,6 +28,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import string
 import subprocess
@@ -40,7 +41,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from resource_sampler import ContainerSampler, write_resource_metrics
+
+# The sibling scripts are not a package, and PYTHONSAFEPATH=1 (set by vllm-bench-serve's
+# run_leg.sh) keeps this script's directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from resource_sampler import ContainerSampler, write_resource_metrics  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -398,7 +403,7 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
 def format_command(cmd: list[str], env_vars: dict[str, str]) -> str:
     """Render a command as a copy-pasteable shell line, prefixed by its env vars.
 
-    Only the config's own variables are shown, not the inherited environment.
+    Only `env_vars` are shown, not the inherited environment.
     """
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(env_vars.items()))
     line = shlex.join(cmd)
@@ -513,6 +518,147 @@ def run_benchmark(
     return None
 
 
+# BENCH_SERVE_COMPILE_CACHE: "default" serves once on the compile caches the environment
+# points at; "cold-warm" gives each config a fresh private cache, starts the server once to
+# fill it (the cold start), stops it, and serves on a second start (the warm start).
+COMPILE_CACHE_MODES = ("default", "cold-warm")
+# The worker's line, one per TP worker (SpyreWorkerV2.compile_or_warm_up_model).
+CACHE_LINE = re.compile(
+    r"Compile cache: fxgraph (\d+) hit (\d+) miss, aotautograd (\d+) hit (\d+) miss,"
+    r" spyre kernel (\d+) hit (\d+) miss"
+)
+CACHE_LAYERS = ("fxgraph", "aotautograd", "spyre_kernel")
+# The subdirectory of TORCHINDUCTOR_CACHE_DIR each layer writes to. The rest of it is
+# output code; VLLM_CACHE_ROOT is counted apart.
+CENSUS_DIRS = {
+    "spyre_kernel": "inductor-spyre-cache",
+    "fxgraph": "fxgraph",
+    "aotautograd": "aotautograd",
+}
+
+
+def parse_cache_counts(log_text: str) -> dict[str, int] | None:
+    """`{layer}_hits` / `{layer}_misses` from the worker's line, max across TP workers."""
+    matches = CACHE_LINE.findall(log_text)
+    if not matches:
+        return None
+    counts = {}
+    for i, layer in enumerate(CACHE_LAYERS):
+        counts[f"{layer}_hits"] = max(int(m[2 * i]) for m in matches)
+        counts[f"{layer}_misses"] = max(int(m[2 * i + 1]) for m in matches)
+    return counts
+
+
+def cache_state(counts: dict[str, int] | None) -> str:
+    """warm (no miss), cold (no hit), partial (both), or unknown without the line or
+    with no cache lookup at all."""
+    if counts is None:
+        return "unknown"
+    hits = sum(counts[f"{layer}_hits"] for layer in CACHE_LAYERS)
+    misses = sum(counts[f"{layer}_misses"] for layer in CACHE_LAYERS)
+    if not hits and not misses:
+        return "unknown"
+    if not misses:
+        return "warm"
+    return "cold" if not hits else "partial"
+
+
+def cache_census(cache_root: Path) -> dict[str, int]:
+    """Files per layer of a private cache laid out by `_private_cache_env`."""
+
+    def files(path: Path) -> int:
+        return sum(1 for p in path.rglob("*") if p.is_file()) if path.is_dir() else 0
+
+    inductor = cache_root / "inductor"
+    census = {layer: files(inductor / sub) for layer, sub in CENSUS_DIRS.items()}
+    census["output_code"] = files(inductor) - sum(census.values())
+    census["vllm"] = files(cache_root / "vllm")
+    return census
+
+
+def _private_cache_env(cache_root: Path) -> dict[str, str]:
+    # The Spyre kernel cache lives in TORCHINDUCTOR_CACHE_DIR/inductor-spyre-cache.
+    return {
+        "TORCHINDUCTOR_CACHE_DIR": str(cache_root / "inductor"),
+        "VLLM_CACHE_ROOT": str(cache_root / "vllm"),
+        "SPYRE_KERNEL_CACHE": "1",
+    }
+
+
+def _kill_server(proc: subprocess.Popen) -> None:
+    """Kill the server and its entire process group, and wait for the group to exit."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    # The engine and worker processes can outlive the API server and still hold the cards
+    # and the port, so the next start would race them.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except OSError:
+            return
+        time.sleep(0.5)
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def _spawn_server(
+    cmd: list[str], env: dict[str, str], log_path: Path, cmd_line: str
+) -> tuple[subprocess.Popen, float]:
+    with open(log_path, "w") as lf:
+        lf.write(f"# {cmd_line}\n")
+        lf.flush()
+        start = time.monotonic()
+        proc = subprocess.Popen(cmd, env=env, stdout=lf, stderr=lf, start_new_session=True)
+    return proc, start
+
+
+def _wait_healthy(
+    proc: subprocess.Popen, health_url: str, start: float, timeout: int
+) -> tuple[float | None, str | None]:
+    """(seconds from the spawn to the first healthy /health, None), or (None, failure)."""
+    deadline = start + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return None, f"Server process died with exit code {proc.returncode}"
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            return round(time.monotonic() - start, 1), None
+        except Exception:
+            time.sleep(1)
+    return None, f"Server did not become healthy within {timeout}s"
+
+
+def _start_record(
+    seconds: float, log_path: Path, cache_root: Path | None, before: dict[str, int] | None
+) -> dict:
+    """One start: its seconds, cache state, hits and misses, and new files on a private cache."""
+    counts = parse_cache_counts(log_path.read_text(errors="replace"))
+    rec: dict = {"seconds": seconds, "state": cache_state(counts), **(counts or {})}
+    if cache_root is not None and before is not None:
+        for layer, n in cache_census(cache_root).items():
+            rec[f"{layer}_new_files"] = n - before.get(layer, 0)
+    return rec
+
+
+def _warn_unless_full_hit(test_name: str, warm: dict) -> None:
+    """A warm start on the cache its cold start filled should neither miss nor write."""
+    missed = {k: v for k, v in warm.items() if k.endswith(("_misses", "_new_files")) and v}
+    if missed or warm["state"] == "unknown":
+        log.warning(
+            "%s: the warm start was not a full cache hit (state %s): %s",
+            test_name,
+            warm["state"],
+            ", ".join(f"{k} {v}" for k, v in sorted(missed.items())) or "no cache line",
+        )
+
+
 def run_serve_benchmark(
     test_name: str,
     server_parameters: dict,
@@ -522,8 +668,13 @@ def run_serve_benchmark(
     spyre_devices: str,
     aiu_world_size: str,
     health_timeout: int = 180,
+    compile_cache: str = "default",
 ) -> str | None:
-    """Serve, wait for health, run bench serve, clean up; None on success, else the failure."""
+    """Serve, wait for health, run bench serve, clean up; None on success, else the failure.
+
+    compile_cache="cold-warm" first runs a start-only cold pass on a fresh private cache.
+    Every start goes in <test_name>_startup.json. health_timeout applies to each start.
+    """
     # As in run_benchmark: env_config is applied last and overrides the CLI
     # device values.
     env = os.environ.copy()
@@ -532,6 +683,13 @@ def run_serve_benchmark(
     config_env = build_env_vars(env_config)
     env.update(config_env)
 
+    cache_root = None
+    if compile_cache == "cold-warm":
+        cache_root = results_dir / f"{test_name}_compile_cache"
+        shutil.rmtree(cache_root, ignore_errors=True)
+        cache_root.mkdir(parents=True)
+        env.update(_private_cache_env(cache_root))
+
     # Build server command
     server_params = dict(server_parameters)
     model = server_params.pop("model")
@@ -539,81 +697,76 @@ def run_serve_benchmark(
     port = int(server_params.get("port", 8000))
     server_cmd = [*VLLM_CLI, "serve", model]
     server_cmd.extend(build_command_args(server_params))
+    health_url = f"http://{host}:{port}/health"
 
+    server_env = {**config_env, **(_private_cache_env(cache_root) if cache_root else {})}
     server_cmd_line = record_command(
-        server_cmd, config_env, results_dir / f"{test_name}_server.cmd"
+        server_cmd, server_env, results_dir / f"{test_name}_server.cmd"
     )
 
-    log.info("=== Starting vLLM server for serve test: %s ===", test_name)
-    log.info("Server command: %s", server_cmd_line)
+    startup_file = results_dir / f"{test_name}_startup.json"
+    startup: dict = {"mode": compile_cache, "starts": {}}
 
-    def _kill_server(proc: subprocess.Popen) -> None:
-        """Kill the server and its entire process group."""
-        with contextlib.suppress(OSError):
-            os.killpg(proc.pid, signal.SIGTERM)
+    def _write_startup() -> None:
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            tmp = startup_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(startup, indent=2) + "\n")
+            os.replace(tmp, startup_file)
+        except OSError as e:
+            log.warning("Could not write %s: %s", startup_file.name, e)
 
-    server_log = results_dir / f"{test_name}_server.log"
-    bench_result = None
-
-    def _server_failure(summary: str) -> str:
+    def _server_failure(summary: str, log_path: Path) -> str:
         log.error("%s", summary)
-        text = server_log.read_text() if server_log.exists() else ""
+        text = log_path.read_text() if log_path.exists() else ""
         if text:
             log.error("Server log:\n%s", text)
         return f"{summary}\n{_tail(text)}".strip()
 
-    with open(server_log, "w") as server_lf:
-        server_lf.write(f"# {server_cmd_line}\n")
-        server_lf.flush()
-        server_start_ts = time.monotonic()
-        server_proc = subprocess.Popen(
-            server_cmd,
-            env=env,
-            stdout=server_lf,
-            stderr=server_lf,
-            start_new_session=True,
-        )
+    bench_result = None
+    try:
+        census = cache_census(cache_root) if cache_root else None
+        if cache_root is not None:
+            log.info("=== Cold start of %s on %s ===", test_name, cache_root)
+            cold_log = results_dir / f"{test_name}_cold_server.log"
+            cold_proc, cold_start = _spawn_server(server_cmd, env, cold_log, server_cmd_line)
+            try:
+                cold_sec, error = _wait_healthy(cold_proc, health_url, cold_start, health_timeout)
+            finally:
+                _kill_server(cold_proc)
+            if error or cold_sec is None:
+                return _server_failure(f"Cold start: {error}", cold_log)
+            log.info("Cold start healthy after %.1fs", cold_sec)
+            startup["starts"]["cold"] = _start_record(cold_sec, cold_log, cache_root, census)
+            census = cache_census(cache_root)
+            _write_startup()
 
+        log.info("=== Starting vLLM server for serve test: %s ===", test_name)
+        log.info("Server command: %s", server_cmd_line)
+
+        server_log = results_dir / f"{test_name}_server.log"
+        server_proc, server_start_ts = _spawn_server(server_cmd, env, server_log, server_cmd_line)
         try:
             compile_sampler = _make_sampler()
             # Timed from before the spawn: for large models this is mostly the
             # one-time warmup compile, which is worth comparing run to run.
-            health_url = f"http://{host}:{port}/health"
-            server_startup_sec = None
-            deadline = server_start_ts + health_timeout
-            while time.monotonic() < deadline:
-                if server_proc.poll() is not None:
-                    compile_sampler.stop()
-                    write_resource_metrics(
-                        test_name,
-                        results_dir,
-                        compile_sampler.summary(phase="compile"),
-                        model=model,
-                    )
-                    return _server_failure(
-                        f"Server process died with exit code {server_proc.returncode}"
-                    )
-                try:
-                    urllib.request.urlopen(health_url, timeout=2)
-                    server_startup_sec = round(time.monotonic() - server_start_ts, 1)
-                    log.info("Server ready after %.1fs", server_startup_sec)
-                    break
-                except Exception:
-                    time.sleep(1)
-
+            server_startup_sec, error = _wait_healthy(
+                server_proc, health_url, server_start_ts, health_timeout
+            )
             compile_sampler.stop()
-
-            if server_startup_sec is None:
+            if error or server_startup_sec is None:
                 write_resource_metrics(
                     test_name, results_dir, compile_sampler.summary(phase="compile"), model=model
                 )
-                return _server_failure(f"Server did not become healthy within {health_timeout}s")
+                return _server_failure(str(error), server_log)
+            log.info("Server ready after %.1fs", server_startup_sec)
+
+            start_name = "warm" if cache_root else "default"
+            startup["starts"][start_name] = _start_record(
+                server_startup_sec, server_log, cache_root, census
+            )
+            _write_startup()
+            if cache_root:
+                _warn_unless_full_hit(test_name, startup["starts"]["warm"])
 
             # Run bench serve
             bench_cmd = [*VLLM_CLI, "bench", "serve"]
@@ -659,6 +812,9 @@ def run_serve_benchmark(
 
         finally:
             _kill_server(server_proc)
+    finally:
+        if cache_root is not None and os.environ.get("BENCH_SERVE_KEEP_CACHE") != "1":
+            shutil.rmtree(cache_root, ignore_errors=True)
 
     if bench_result.returncode != 0:
         return _bench_failure(test_name, bench_result)
@@ -698,6 +854,13 @@ def run_benchmarks_from_file(
         return [BenchResult(bench_type, config_file.name, "", 0.0, "malformed config file")]
 
     pins = _pinned_revisions()
+    compile_cache = os.environ.get("BENCH_SERVE_COMPILE_CACHE") or "default"
+    if bench_type == "serve" and compile_cache not in COMPILE_CACHE_MODES:
+        error = (
+            f"BENCH_SERVE_COMPILE_CACHE must be one of {COMPILE_CACHE_MODES}, got {compile_cache!r}"
+        )
+        log.error("%s", error)
+        return [BenchResult(bench_type, config_file.name, "", 0.0, error)]
     results = []
     for config in _select_configs(configs, models, tps):
         test_name = config.get("test_name", "unknown")
@@ -716,6 +879,7 @@ def run_benchmarks_from_file(
                 # Large models pay a one-time warmup compile before /health passes;
                 # let a config bump this past the 180s default.
                 health_timeout=int(config.get("server_health_timeout", 180)),
+                compile_cache=compile_cache,
             )
         else:
             error = run_benchmark(

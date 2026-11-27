@@ -110,7 +110,7 @@
   td.d-good { color:var(--pop-good); font-weight:800; }
   td.d-warn { color:var(--pop-warn); font-weight:800; }
   td.d-bad { color:var(--pop-bad); font-weight:800; }
-  tr.unreliable td, tr.unreliable td.k { color:var(--muted); }
+  td.unreliable { color:var(--muted); }
   .caveat { color:var(--pop-warn); font-family:var(--mono); font-size:11px; font-weight:700; margin-left:8px; }
   td.pend { color:var(--muted); }
 
@@ -154,7 +154,7 @@
   <header>
     <div class="eyebrow">spyre-inference &middot; PR #XXX</div>
     <h1>PR #XXX vs main: decode optimization</h1>
-    <p class="standfirst">PR #XXX optimizes decode by batching the per-sequence KV gathers into one kernel. On granite-3.3-8b at TP4 with the 8k cics trace, output throughput rises <strong>27%</strong> and mean ITL falls <strong>22%</strong>. Median and P99 TTFT are flat, but mean TTFT is slightly worse (+4%) and P100 TTFT regresses <strong>18%</strong>.</p>
+    <p class="standfirst">PR #XXX optimizes decode by batching the per-sequence KV gathers into one kernel. On granite-3.3-8b at TP4 with the 8k cics trace, output throughput rises <strong>27%</strong> and mean ITL falls <strong>22%</strong>. Median and P99 TTFT are flat, but mean TTFT is slightly worse (+4%) and P100 TTFT regresses <strong>18%</strong>. Compile cache mode <code>default</code>: both legs started warm.</p>
   </header>
 
   <dl class="meta">
@@ -190,9 +190,9 @@
         <span class="sub">xx &rarr; xx ms</span>
       </div>
       <div class="tile flat">
-        <span class="lab">Server startup</span>
+        <span class="lab">Server startup (warm vs warm)</span>
         <span class="big">+1.2%</span>
-        <span class="sub"><span class="caveat">unreliable: compile cache on</span></span>
+        <span class="sub">xx &rarr; xx s</span>
       </div>
     </div>
     <p>Throughput and ITL move by about the same amount, as expected when each decode step gets shorter at fixed concurrency. P100 ITL hardly changes (&minus;1.3%), and the TTFT regression is confined to the tail: the slowest prefill is 18% slower while the median and P99 are unchanged. Worth checking whether the PR's decode path delays a prefill that lands in a busy batch.</p>
@@ -226,15 +226,23 @@
           <tr><th class="k">Metric</th><th>main</th><th>PR #XXX</th><th>&Delta;</th></tr>
         </thead>
         <tbody>
-          <tr class="unreliable"><td class="k">Server startup (s)<span class="caveat">unreliable: compile cache on</span></td><td>xx</td><td>xx</td><td>+1.2%</td></tr>
+          <tr><td class="k">Server startup (s)</td><td>xx</td><td>xx</td><td>+1.2%</td></tr>
           <tr class="band"><td colspan="4">Startup and compilation</td></tr>
-          <tr class="unreliable"><td class="k">Init engine (s)<span class="caveat">unreliable: compile cache on</span></td><td>xx</td><td>xx</td><td>+1.1%</td></tr>
-          <tr class="unreliable"><td class="k">Total compilation (s)<span class="caveat">unreliable: compile cache on</span></td><td>xx</td><td>xx</td><td>+1.1%</td></tr>
-          <tr class="unreliable"><td class="k">Model graph warmup (s)<span class="caveat">unreliable: compile cache on</span></td><td>xx</td><td>xx</td><td>−0.4%</td></tr>
+          <tr><td class="k">Compile cache state</td><td>warm (1558 hit, 0 miss)</td><td>warm (1558 hit, 0 miss)</td><td></td></tr>
+          <tr><td class="k">Init engine (s)</td><td>xx</td><td>xx</td><td>+1.1%</td></tr>
+          <tr><td class="k">Total compilation (s)</td><td>xx</td><td>xx</td><td>+1.1%</td></tr>
+          <tr><td class="k">Model graph warmup (s)</td><td>xx</td><td>xx</td><td>−0.4%</td></tr>
           <tr><td class="k">Model graph buckets</td><td>5</td><td>5</td><td></td></tr>
-          <tr class="unreliable"><td class="k">Attention graph recording (s)<span class="caveat">unreliable: compile cache on</span></td><td>xx</td><td>xx</td><td>+1.5%</td></tr>
+          <tr><td class="k">Attention graph recording (s)</td><td>xx</td><td>xx</td><td>+1.5%</td></tr>
           <tr><td class="k">Attention graphs</td><td>1440</td><td>1440</td><td></td></tr>
           <tr><td class="k">Per layer: per-seq + batched-decode</td><td>12 + 24</td><td>12 + 24</td><td></td></tr>
+          <tr class="band"><td colspan="4">Compile cache</td></tr>
+          <tr><td class="k">FX graph hits</td><td>600</td><td>600</td><td></td></tr>
+          <tr><td class="k">FX graph misses</td><td>0</td><td>0</td><td></td></tr>
+          <tr><td class="k">AOTAutograd hits</td><td>544</td><td>544</td><td></td></tr>
+          <tr><td class="k">AOTAutograd misses</td><td>0</td><td>0</td><td></td></tr>
+          <tr><td class="k">Spyre kernel hits</td><td>414</td><td>414</td><td></td></tr>
+          <tr><td class="k">Spyre kernel misses</td><td>0</td><td>0</td><td></td></tr>
           <tr class="band"><td colspan="4">Request summary</td></tr>
           <tr><td class="k">Successful requests</td><td>100</td><td>100</td><td></td></tr>
           <tr><td class="k">Failed requests</td><td>0</td><td>0</td><td></td></tr>
@@ -270,7 +278,7 @@
         </tbody>
       </table>
     </div>
-    <p>Server startup is measured from the first timestamp in <code>_server.log</code> to the last timestamp before <code>Application startup complete</code>. With a compile cache on it depends on how much of the cache was already populated, which is unknown, so it is not comparable between legs. Rerun with <code>SPYRE_KERNEL_CACHE=0</code>, which also sets <code>TORCHINDUCTOR_FORCE_DISABLE_CACHES=1</code> and <code>VLLM_DISABLE_COMPILE_CACHE=1</code>, to measure it. The startup and compilation rows come from <code>_server.log</code>, as the max across TP workers. Total compilation is the wall time of the whole Spyre warmup, which covers model graph warmup and attention graph recording. &Delta; colours: green better, black within &plusmn;2%, orange 2&ndash;10% worse, red more than 10% worse.</p>
+    <p>Server startup is measured from the first timestamp in <code>_server.log</code> to the last timestamp before <code>Application startup complete</code>. It depends on what the compile cache already held, so each start is labelled with its cache state from the worker's <code>Compile cache:</code> line: warm (no miss), cold (no hit) or partial (both). A startup &Delta; is marked unreliable only when the two legs' states differ or either is partial; here both started warm. Pass <code>--startup</code> to measure cold and warm startup on a fresh private cache instead. The startup, compilation and compile cache rows come from <code>_server.log</code>, as the max across TP workers. Total compilation is the wall time of the whole Spyre warmup, which covers model graph warmup and attention graph recording. &Delta; colours: green better, black within &plusmn;2%, orange 2&ndash;10% worse, red more than 10% worse.</p>
   </section>
 
   <hr class="rule">
@@ -312,7 +320,8 @@
     </div>
     <p>RPM source: <code>~/spyre-libs</code>, installed from <code>spyre-rpms.lock</code> (<code>[packages]</code>, x86_64). Both legs used the same env:</p>
     <pre>SPYRE_KERNEL_CACHE=1
-SPYRE_DEVICES=0,1,2,3            # derived from tensor-parallel-size</pre>
+SPYRE_DEVICES=0,1,2,3            # derived from tensor-parallel-size
+compile cache mode: default      # one start on the default cache path</pre>
   </section>
 
   <section class="sec">

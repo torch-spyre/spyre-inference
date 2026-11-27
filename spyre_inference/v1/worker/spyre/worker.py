@@ -57,6 +57,39 @@ logger = init_logger(__name__)
 _SPYRE_REGION_BYTES = 16 << 30
 
 
+def compile_cache_counts() -> dict[str, tuple[int, int]]:
+    """In-process ``(hits, misses)`` of each compile cache layer so far."""
+    from torch._dynamo.utils import counters
+    from torch_spyre.execution.kernel_cache import get_kernel_registry
+
+    kernels = get_kernel_registry().all_entries().values()
+    return {
+        "fxgraph": (
+            counters["inductor"]["fxgraph_cache_hit"],
+            counters["inductor"]["fxgraph_cache_miss"],
+        ),
+        "aotautograd": (
+            counters["aot_autograd"]["autograd_cache_hit"],
+            counters["aot_autograd"]["autograd_cache_miss"],
+        ),
+        "spyre kernel": (
+            sum(e["hit_count"] for e in kernels),
+            sum(e["miss_count"] for e in kernels),
+        ),
+    }
+
+
+def format_compile_cache_line(
+    before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]
+) -> str:
+    """``Compile cache: fxgraph 600 hit 0 miss, ...``, the counts between two snapshots."""
+    parts = [
+        f"{layer} {hits - before[layer][0]} hit {misses - before[layer][1]} miss"
+        for layer, (hits, misses) in after.items()
+    ]
+    return "Compile cache: " + ", ".join(parts)
+
+
 def _kv_block_layout(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> tuple[int, list[int], int] | None:
@@ -316,9 +349,12 @@ class SpyreWorkerV2(Worker):
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
 
+        cache_counts = compile_cache_counts()
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
+        # Tells a warm, cold or partly warm start apart; benchmarks parse this line.
+        logger.info("%s", format_compile_cache_line(cache_counts, compile_cache_counts()))
         # Arm right after warm-up, at the level init_device already validated.
         compile_guard.arm(self._compile_guard_level)
         return CompilationTimes(

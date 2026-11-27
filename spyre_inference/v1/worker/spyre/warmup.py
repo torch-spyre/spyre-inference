@@ -147,9 +147,7 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
     if forced_plan is None or not encoder_inline_active():
         return
     tables = encoder_shape_tables(runner.vllm_config)
-    # A multimodal encoder's body arrives as inputs_embeds, so it always plans ragged.
-    rectangles = [] if runner.supports_mm_inputs else tables.rectangles
-    for extent, width in sorted(rectangles, reverse=True):
+    for extent, width in sorted(tables.rectangles, reverse=True):
         if extent * width in bodies:
             with forced_plan(rect=(extent, width)):
                 _dummy_run(runner, extent * width, skip_attn=False)
@@ -157,6 +155,18 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
         if groups and body in bodies:
             with forced_plan(ragged=True):
                 _dummy_run(runner, body, skip_attn=False)
+
+
+def _warm_encoder_embed_gather(runner: "SpyreModelRunnerV2", bodies: set[int]) -> None:
+    """prepare_inputs_embeds' grid gather, which no dummy run reaches."""
+    if not runner.supports_mm_inputs:
+        return
+    rects = {
+        extent * width for extent, width in encoder_shape_tables(runner.vllm_config).rectangles
+    }
+    buffer = runner.model_state.encoder_runner.inputs_embeds
+    for rows in sorted(rects & bodies):
+        buffer[:rows].copy_(select_rows(buffer[:rows], torch.zeros(rows, dtype=torch.int64)))
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
@@ -310,6 +320,7 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             runner.speculator.warm_draft_batches()
         if runner.pooling_runner is not None and not runner.model_config.enforce_eager:
             _warm_encoder_inline_paths(runner, {c.num_tokens for c in calls})
+            _warm_encoder_embed_gather(runner, {c.num_tokens for c in calls})
         if not runner.model_config.enforce_eager:
             _warm_multimodal(runner, [c.num_tokens for c in calls])
         if widest is not None:

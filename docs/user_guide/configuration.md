@@ -142,8 +142,9 @@ Compiled pooling warmup runs one dummy at the body shape. With the rectangular p
 opaque, the first attention call in it traces every declared rectangle and group pair,
 against that call's own tensors (a Spyre tensor's device layout is part of its cache
 key). With it traced in, warmup adds one dummy per rectangle, plus one forced onto the
-ragged path (when any group is reachable) that traces the group pairs. Eager pooling
-uses one short dummy and always takes the packed path.
+ragged path (when any group is reachable) that traces the group pairs. A multimodal
+pooling model (CLIP) also warms its embeddings-to-grid gather once per rectangle body.
+Eager pooling uses one short dummy and always takes the packed path.
 
 Example:
 

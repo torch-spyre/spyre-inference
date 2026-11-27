@@ -28,6 +28,7 @@ import pytest
 import torch
 import torch.nn as nn
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.model_states.encoder_only import EncoderOnlyModelState
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
@@ -92,9 +93,8 @@ def _state(causal: bool = False, **config_kwargs) -> SpyreEncoderOnlyModelState:
     return state
 
 
-def _step(state, batch):
-    """One MRV2 step's model-state calls, in execute_model's order."""
-    attn_metadata = state.prepare_attn(
+def _plan(state, batch):
+    return state.prepare_attn(
         batch,
         CUDAGraphMode.NONE,
         block_tables=(),
@@ -102,6 +102,11 @@ def _step(state, batch):
         attn_groups=[],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
     )
+
+
+def _step(state, batch):
+    """One MRV2 step's model-state calls, in execute_model's order."""
+    attn_metadata = _plan(state, batch)
     return attn_metadata, state.prepare_inputs(batch, req_states=None)
 
 
@@ -197,12 +202,70 @@ def test_ragged_steps_keep_the_body_packed(query_lens, padded, force_ragged):
     assert all(isinstance(md.encoder_plan, list) for md in attn_metadata.values())
 
 
-def test_multimodal_stays_packed_until_its_embeds_hook_lands():
+def _mm_state(monkeypatch, embeds: torch.Tensor) -> SpyreEncoderOnlyModelState:
+    monkeypatch.setattr(
+        EncoderOnlyModelState, "prepare_inputs_embeds", lambda self, *args: embeds, raising=False
+    )
     state = _state()
     state.supports_mm_inputs = True
     state.encoder_cache = None  # ty: ignore[invalid-assignment]
+    return state
+
+
+def _mm_step(state, batch):
+    """execute_model's order: prepare_attn, prepare_inputs_embeds, then prepare_inputs."""
+    _plan(state, batch)
+    embeds = state.prepare_inputs_embeds({}, batch, req_states=None)  # ty: ignore[invalid-argument-type]
+    state.prepare_inputs(batch, req_states=None)
+    return embeds
+
+
+def test_multimodal_plans_a_fitting_batch_rectangular(monkeypatch):
+    state = _mm_state(monkeypatch, torch.zeros(_BUDGET, 4))
     _step(state, make_input_batch([3, 2], num_tokens_after_padding=_BUDGET))
-    assert not state.encoder_plan.is_rectangular
+    assert state.encoder_plan.is_rectangular
+    assert state.encoder_plan.grid == (64, 8, [3, 2])
+
+
+def test_multimodal_embeds_land_on_the_grid_rows_of_the_staging_buffer(monkeypatch):
+    """Pad rows read row 0."""
+    query_lens = [7, 1, 63]
+    packed = torch.arange(_BUDGET, dtype=torch.float32).unsqueeze(1).repeat(1, 4)
+    buffer = packed.clone()
+    state = _mm_state(monkeypatch, buffer)
+    out = _mm_step(state, make_input_batch(query_lens, num_tokens_after_padding=_BUDGET))
+
+    assert out is buffer
+    rows = encoder_dense_row_indices(query_lens, 64)
+    assert torch.equal(buffer[rows], packed[: sum(query_lens)])
+    pad = torch.ones(_BUDGET, dtype=torch.bool)
+    pad[rows] = False
+    assert buffer[pad].unique().tolist() == [0.0]
+
+
+def test_multimodal_ragged_embeds_stay_packed(monkeypatch):
+    embeds = torch.randn(_BUDGET, 4)
+    packed = embeds.clone()
+    state = _mm_state(monkeypatch, embeds)
+    with state.forced_plan(ragged=True):
+        assert _mm_step(state, make_input_batch([3, 2], num_tokens_after_padding=_BUDGET)) is embeds
+    assert _mm_step(state, make_input_batch([3, 2])) is embeds  # unpadded: no plan fits
+    assert torch.equal(embeds, packed)
+
+
+def test_multimodal_embeds_of_another_batch_stay_packed(monkeypatch):
+    """A batch prepare_attn did not plan (profile_run) must not take the last grid."""
+    embeds = torch.randn(_BUDGET, 4)
+    state = _mm_state(monkeypatch, embeds)
+    _step(state, make_input_batch([3, 2], num_tokens_after_padding=_BUDGET))
+    other = make_input_batch([3, 2], num_tokens_after_padding=_BUDGET)
+    packed = embeds.clone()
+    assert state.prepare_inputs_embeds({}, other, req_states=None) is embeds  # ty: ignore[invalid-argument-type]
+
+    state = _mm_state(monkeypatch, embeds)
+    assert state.encoder_plan is None
+    assert state.prepare_inputs_embeds({}, other, req_states=None) is embeds  # ty: ignore[invalid-argument-type]
+    assert torch.equal(embeds, packed)
 
 
 def test_a_batch_without_prepare_attn_does_not_inherit_the_last_grid():
@@ -271,12 +334,14 @@ class TestForcedWarmupPlan:
         with state.forced_plan(rect=(64, 8)), pytest.raises(RuntimeError, match="512 rows"):
             _step(state, make_input_batch([64] * 4))
 
-    def test_multimodal_rejects_a_forced_rectangle(self):
-        """Serving runs multimodal packed, so a warmed rectangle would never be used."""
+    def test_multimodal_accepts_a_forced_rectangle(self):
+        """Serving puts multimodal steps on the rectangle too, so warmup traces it."""
         state = _state()
         state.supports_mm_inputs = True
-        with pytest.raises(ValueError, match="packed"), state.forced_plan(rect=(64, 8)):
-            pass
+        state.encoder_cache = None  # ty: ignore[invalid-assignment]
+        with state.forced_plan(rect=(64, 8)):
+            _step(state, make_input_batch([_BUDGET // 8] * 8))
+        assert state.encoder_plan.grid == (64, 8, [64] * 8)
 
     def test_forced_rectangle_wins_over_forced_ragged(self):
         state = _state()

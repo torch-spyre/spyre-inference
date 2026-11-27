@@ -246,8 +246,8 @@ def test_a_pooling_encoder_warms_every_modality_and_no_text_embedding(mm_budget)
     ]
 
 
-def test_a_multimodal_encoder_forces_no_rectangle(monkeypatch) -> None:
-    """Its body arrives as inputs_embeds, so it always plans ragged."""
+@pytest.mark.parametrize("mm", [False, True], ids=["text", "multimodal"])
+def test_a_pooling_encoder_traces_its_rectangles_multimodal_or_not(monkeypatch, mm) -> None:
     forced = []
 
     def forced_plan(rect=None, ragged=False):
@@ -258,16 +258,37 @@ def test_a_multimodal_encoder_forces_no_rectangle(monkeypatch) -> None:
     monkeypatch.setattr(warmup, "encoder_shape_tables", lambda config: tables)
     monkeypatch.setattr(warmup, "encoder_inline_active", lambda: True)
     monkeypatch.setattr(warmup, "_dummy_run", lambda runner, n, skip_attn: None)
-    runner = SimpleNamespace(model_state=SimpleNamespace(forced_plan=forced_plan), vllm_config=None)
-
-    runner.supports_mm_inputs = True
-    warmup._warm_encoder_inline_paths(runner, {128})
-    assert forced == [(None, True)]
-
-    forced.clear()
-    runner.supports_mm_inputs = False
+    runner = SimpleNamespace(
+        model_state=SimpleNamespace(forced_plan=forced_plan),
+        vllm_config=None,
+        supports_mm_inputs=mm,
+    )
     warmup._warm_encoder_inline_paths(runner, {128})
     assert forced == [((64, 2), False), (None, True)]
+
+
+@pytest.mark.parametrize("mm", [False, True], ids=["text", "multimodal"])
+def test_a_multimodal_encoder_warms_the_embeds_gather_once_per_rectangle_body(
+    monkeypatch, mm
+) -> None:
+    gathers = []
+
+    def select_rows(src, idx):
+        gathers.append((src.shape[0], idx.shape[0]))
+        return src.clone()
+
+    monkeypatch.setattr(warmup, "select_rows", select_rows)
+    tables = SimpleNamespace(rectangles=[(64, 2), (32, 4), (64, 8)])
+    monkeypatch.setattr(warmup, "encoder_shape_tables", lambda config: tables)
+    buffer = torch.zeros(512, 4)
+    runner = SimpleNamespace(
+        model_state=SimpleNamespace(encoder_runner=SimpleNamespace(inputs_embeds=buffer)),
+        vllm_config=None,
+        supports_mm_inputs=mm,
+    )
+    # 512 is not a warmed body, and 64 is no rectangle's.
+    warmup._warm_encoder_embed_gather(runner, {64, 128})
+    assert gathers == ([(128, 128)] if mm else [])
 
 
 def test_run_warms_every_logits_row_bucket_including_the_prompt_logprobs_chunk(

@@ -180,8 +180,7 @@ def _to_device_with_page_range(
         return convert(host, device=device)
     padded = host.new_zeros((page_range["max"], *host.shape[1:]))
     padded[: host.shape[0]] = host
-    dev = padded.to(device, dynamic={0: page_range})  # ty: ignore[no-matching-overload]
-    return dev.resize_(host.shape)
+    return convert(padded, device=device, dynamic={0: page_range}).resize_(host.shape)
 
 
 def _mirror_mask_stack(

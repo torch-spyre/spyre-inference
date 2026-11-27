@@ -169,29 +169,11 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
-def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
-    """The smallest KV head count any layer carries, after the TP split.
-
-    ``get_num_kv_heads`` reports one model-wide number that a heterogeneous config can
-    hide a smaller layer behind: gemma-4 reports 4 at TP2, its full-attention layers 1.
-    """
-    model_config = vllm_config.model_config
-    parallel_config = vllm_config.parallel_config
-    arch = model_config.model_arch_config
-    model_wide = model_config.get_num_kv_heads(parallel_config)
-    overrides = arch.per_layer_overrides or ()
-    return min(
-        (model_config.get_num_kv_heads(parallel_config, arch[i]) for i in range(len(overrides))),
-        default=model_wide,
-    )
-
-
-def _declared_page_range(max_pages: int, min_pages: int) -> DynamicRange | None:
+def _declared_page_range(max_pages: int) -> DynamicRange | None:
     """Return the range of page counts one per-sequence kernel is compiled for.
 
-    ``min_pages`` is the fewest pages a kernel can run. Returns None, and logs why, when
-    ``max_pages`` does not fit torch-spyre's limits; the kernels then pad every sequence to
-    ``max_pages`` instead.
+    Returns None, and logs why, when ``max_pages`` does not fit torch-spyre's limits; the
+    kernels then pad every sequence to ``max_pages`` instead.
     """
     from torch_spyre._inductor import config as ts_config
     from torch_spyre._inductor import pass_utils
@@ -208,13 +190,13 @@ def _declared_page_range(max_pages: int, min_pages: int) -> DynamicRange | None:
         ts_config.min_reserved_dim_size = 1
     if "MAX_BUCKETS" not in os.environ:
         ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
-    min_pages = max(min_pages, ts_config.min_reserved_dim_size)
+    min_pages = ts_config.min_reserved_dim_size
     # With min == max the size is a constant, which fails to trace.
     if not min_pages < max_pages <= ts_config.max_buckets:
         logger.warning_once(
-            "A dynamic page count needs the %d pages per sequence to be above the "
-            "minimum of %d and at most MAX_BUCKETS=%d, so the per-sequence attention "
-            "kernels pad every sequence to that many pages instead.",
+            "A dynamic page count needs the %d pages per sequence to be above "
+            "MIN_RESERVED_DIM_SIZE=%d and at most MAX_BUCKETS=%d, so the per-sequence "
+            "attention kernels pad every sequence to that many pages instead.",
             max_pages,
             min_pages,
             ts_config.max_buckets,
@@ -357,21 +339,14 @@ class SpyreAttnBucketer:
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
 
-        # One KV head on one page leaves torch-spyre's codegen no spare dim for the stick
-        # dim, so the decode kernel will not compile there. A second, fully masked page
-        # does, and it lifts the SWA bound _max_active_blocks derives from it.
-        min_pages = 2 if _min_num_kv_heads(vllm_config) == 1 else 1
-
         # num_blocks is what the kernel specializes on. Without a page range, every
         # sequence pads to the block count of max_model_len. A sliding window has no page
         # range, so it keeps power-of-two buckets and a short sequence pads to its own.
         max_blocks = (max_model_len + block_size - 1) // block_size
-        self._num_blocks_buckets: list[int] = [max(max_blocks, min_pages)]
+        self._num_blocks_buckets: list[int] = [max_blocks]
         self._batched_blocks_buckets = self._num_blocks_buckets
         if sliding_window is not None:
-            self._num_blocks_buckets = sorted(
-                {max(n, min_pages) for n in _powers_of_two_up_to(max_blocks)}
-            )
+            self._num_blocks_buckets = list(_powers_of_two_up_to(max_blocks))
             # Batched decode runs one-token queries, whose window spans at most this many
             # pages (_max_active_blocks), so it pads no further.
             window_blocks = (sliding_window + block_size - 1) // block_size + 1
@@ -384,7 +359,7 @@ class SpyreAttnBucketer:
         self._page_range: DynamicRange | None = None
         self._prefill_page_range: DynamicRange | None = None
         if declare_pages:
-            self._page_range = _declared_page_range(self._num_blocks_buckets[-1], min_pages)
+            self._page_range = _declared_page_range(self._num_blocks_buckets[-1])
         if self._page_range is not None:
             self._prefill_page_range = _prefill_page_range(self._page_range)
 

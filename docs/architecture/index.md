@@ -519,7 +519,14 @@ per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding a
 ### FP8 KV cache
 
 `--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the pages as `float8_e4m3fn`, halving KV
-memory and the bytes each page read moves.
+memory and the bytes each page read moves. An FP8 model gets it by default:
+`TorchSpyrePlatform._resolve_kv_cache_dtype` turns `auto` into `fp8` when the checkpoint's
+linears are FP8 (`_has_fp8_weights`) and the head size fills a float8 stick (128). An
+explicit `float16` is kept, and `bfloat16` becomes `float16`: upstream accepts the
+checkpoint's own 16-bit dtype before the platform forces float16, and the impl only takes
+the model dtype. vLLM runs `check_and_update_config` again after the EngineCore handshake,
+so each result is a fixed point; rewriting `float16` to `auto` would turn into `fp8` on
+that second pass.
 Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
 The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
@@ -544,8 +551,7 @@ Key constraints:
 - **KV length**: not bucketed. Each sequence keeps its own block count within a page range
   up to `max_model_len`, or pads to that count where there is no range (see the
   configuration guide). Sliding-window layers keep power-of-two block counts, capped at the
-  pages their window touches. A layer with one KV head floors it at two blocks: one
-  KV head on one page leaves the decode kernel no spare dim for the stick
+  pages their window touches.
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the

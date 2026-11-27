@@ -221,9 +221,7 @@ sequence length up to `--max-model-len`.
 Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
 per loop step at every sequence length. When `--max-model-len` is too short for that, prefill
 keeps its own page count, but covers at least two pages. Decode sequences keep their own page
-count. A model
-with a layer of one KV head (after the tensor-parallel split) runs at least two pages: a
-sequence that fits in one page also gets a masked copy of it as a second page.
+count.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
@@ -232,8 +230,8 @@ export them yourself: `MIN_RESERVED_DIM_SIZE` to 1, and `MAX_BUCKETS` to at leas
 below that rounded value, prefill reads one page per loop step instead.
 
 The per-sequence kernels pad every sequence to `--max-model-len / block_size` pages instead
-when `--max-model-len / block_size` is not above the minimum page count, or is above an
-exported `MAX_BUCKETS`; startup logs a warning.
+when `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`, or is above
+an exported `MAX_BUCKETS`; startup logs a warning.
 
 Sliding-window layers have no page range. Each sequence pads to the power of two at or above
 its page count, capped at the pages its window touches, with one kernel per (page count,
@@ -282,14 +280,19 @@ setting it to a size next to `--kv-cache-memory-bytes` is an error.
 
 ## FP8 KV cache
 
-Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
-each cached token takes:
+An FP8 model (FP8 linear weights: the `fp8` method, or a compressed-tensors checkpoint
+with 8-bit float weights) stores its KV cache in float8 (e4m3) by default, halving the
+bytes each cached token takes. Any other model opts in with `--kv-cache-dtype fp8`. An FP8
+model opts out with its checkpoint's 16-bit dtype, `float16` or `bfloat16`; either gives a
+float16 cache, the only 16-bit cache Spyre has:
 
 ```bash
-vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+vllm serve ibm-granite/granite-4.1-8b-fp8                             # FP8 KV cache
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype bfloat16   # float16 cache
 ```
 
-It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+It needs a head size that is a multiple of 128; with a smaller one an FP8 model keeps a
+model-dtype cache, and an explicit `--kv-cache-dtype fp8` is rejected. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
 ...) are rejected at startup. Since the KV cache is sized from free device memory (see
 [KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
 Attention still computes in the model dtype: pages are dequantized on read with the

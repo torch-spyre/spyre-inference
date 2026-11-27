@@ -240,6 +240,30 @@ def _spyre_loader_supported(vllm_config) -> bool:
     )
 
 
+def _has_fp8_weights(model_config) -> bool:
+    """True for a checkpoint whose linear layers are FP8: the ``fp8`` method, or a
+    compressed-tensors config group with 8-bit float weights that targets more than the
+    LM head."""
+    if model_config.quantization == "fp8":
+        return True
+    if model_config.quantization != "compressed-tensors":
+        return False
+    quant_cfg = getattr(model_config.hf_config, "quantization_config", None) or getattr(
+        model_config.hf_text_config, "quantization_config", None
+    )
+    if not isinstance(quant_cfg, dict):
+        return False
+    for group in (quant_cfg.get("config_groups") or {}).values():
+        weights = group.get("weights") or {}
+        if (
+            weights.get("type") == "float"
+            and weights.get("num_bits") == 8
+            and any(t != "lm_head" for t in group.get("targets") or [])
+        ):
+            return True
+    return False
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -631,6 +655,33 @@ class TorchSpyrePlatform(CpuPlatform):
         return True
 
     @classmethod
+    def _resolve_kv_cache_dtype(cls, vllm_config: VllmConfig) -> None:
+        """Give an FP8 model an FP8 KV cache unless ``--kv-cache-dtype`` says otherwise.
+
+        ``auto`` becomes ``fp8`` for a decoder with FP8 weights whose head size fills
+        float8 sticks (128 elements). Spyre's caches are fp8 or float16, so an explicit
+        ``float16`` is kept and ``bfloat16`` (the flag a bfloat16 checkpoint passes, which
+        upstream accepts before the model dtype is forced to float16) becomes ``float16``.
+        vLLM runs this hook more than once per engine, so every result is a fixed point.
+        """
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        if cache_config.cache_dtype == "bfloat16":
+            cache_config.cache_dtype = "float16"
+        if (
+            cache_config.cache_dtype != "auto"
+            or not _has_fp8_weights(model_config)
+            or model_config.runner_type == "pooling"
+            or model_config.get_head_size() % 128
+        ):
+            return
+        cache_config.cache_dtype = "fp8"
+        logger.info(
+            "FP8 model: using an FP8 KV cache. Pass --kv-cache-dtype float16 to keep a "
+            "float16 cache."
+        )
+
+    @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
         """Override hf_config.head_dim to a stick-aligned size when the native
         head_dim isn't one, stashing the original as ``_spyre_orig_head_dim``.
@@ -960,6 +1011,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
             # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
             cls._maybe_pad_intermediate_size(vllm_config)
+
+            # After the head_dim pad, which the float8 head-size check reads.
+            cls._resolve_kv_cache_dtype(vllm_config)
 
         parallel_config = vllm_config.parallel_config
 

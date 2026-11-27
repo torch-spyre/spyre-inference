@@ -2401,7 +2401,9 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
 
 
 @pytest.mark.parametrize(
-    ("seq_len", "walked"), [((7, 7), [2]), ((1, 11), [1])], ids=["prefill", "decode"]
+    ("seq_len", "walked", "num_kv_heads"),
+    [((7, 7), [2], 2), ((1, 11), [1], 2), ((1, 11), [1], 1)],
+    ids=["prefill", "decode", "decode_one_kv_head"],
 )
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -2412,11 +2414,17 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_spyre_attn_one_page_masks_stale_slots(
-    default_vllm_config, monkeypatch, seq_len, walked, configure_compilation, configure_device
+    default_vllm_config,
+    monkeypatch,
+    seq_len,
+    walked,
+    num_kv_heads,
+    configure_compilation,
+    configure_device,
 ):
     """At a max_model_len of two pages prefill takes the per-sequence page range. A one-page
-    sequence must still mask its page's stale slots: prefill covers two pages, decode one
-    (tests/e2e/test_kv_cache_determinism.py)."""
+    sequence must still mask its page's stale slots: prefill covers two pages, decode one,
+    with one KV head too (tests/e2e/test_kv_cache_determinism.py)."""
     from vllm.config import get_current_vllm_config
 
     get_current_vllm_config().model_config.max_model_len = 2 * 128
@@ -2437,13 +2445,15 @@ def test_spyre_attn_one_page_masks_stale_slots(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         num_query_heads=8,
-        num_kv_heads=2,
+        num_kv_heads=num_kv_heads,
         stale_cache=True,
     )
     assert pages == walked, pages
 
 
-@pytest.mark.parametrize("num_seqs", [8, 32])
+@pytest.mark.parametrize(
+    ("num_seqs", "num_kv_heads"), [(8, 2), (32, 2), (32, 1)], ids=["8", "32", "32_one_kv_head"]
+)
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2453,10 +2463,15 @@ def test_spyre_attn_one_page_masks_stale_slots(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
-    default_vllm_config, monkeypatch, num_seqs, configure_compilation, configure_device
+    default_vllm_config,
+    monkeypatch,
+    num_seqs,
+    num_kv_heads,
+    configure_compilation,
+    configure_device,
 ):
     """Batched decode at one chunk of its dynamic chunk count masks its pages' stale slots
-    too. At 32 sequences a chunk is a single page of each."""
+    too. At 32 sequences a chunk is a single page of each, with one KV head too."""
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     envs.clear_env_cache()
     chunks: list[tuple[int, bool]] = []
@@ -2494,7 +2509,7 @@ def test_spyre_attn_one_chunk_batched_decode_masks_stale_slots(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         num_query_heads=8,
-        num_kv_heads=2,
+        num_kv_heads=num_kv_heads,
         stale_cache=True,
     )
     assert chunks == [(1, True)], chunks
@@ -2813,6 +2828,49 @@ def test_spyre_attn_head_configs(
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
     )
+
+
+@pytest.mark.parametrize(
+    "sliding_window", [pytest.param(64, id="window"), pytest.param(None, id="one_page_context")]
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_kv_head_compiles_a_single_page_kernel(
+    default_vllm_config, monkeypatch, sliding_window, configure_compilation, configure_device
+):
+    """A lone KV head on a lone page compiles at a static page count: a sliding-window
+    layer, which keeps power-of-two page counts, and a max_model_len of one page, which has
+    no page range."""
+    from vllm.config import get_current_vllm_config
+
+    if sliding_window is None:
+        get_current_vllm_config().model_config.max_model_len = 128
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
+    pages: list[int] = []
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        pages.append(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    _run_spyre_attn_test(
+        seq_lens=[(1, 100)],
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=1,
+    )
+    assert pages == [1], pages
 
 
 def test_page_attn_decode_matches_fp32_reference():

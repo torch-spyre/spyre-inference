@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / ".github" / "scripts" / "run_vllm_benchmarks.py"
 sys.path.insert(0, str(_SCRIPT.parent))
@@ -41,6 +43,10 @@ def _rec(tmp_path, name="t", config=None):
 
 def _summary(total_s, passes, cache):
     return json.dumps({"v": 1, "total_s": total_s, "passes": passes, "cache": cache})
+
+
+def _knobs_of(results_dir, name="t"):
+    return json.loads((Path(results_dir) / name / "env.json").read_text())["knobs"]
 
 
 # ── where the records land ──
@@ -107,6 +113,44 @@ def test_child_env_does_not_overrule_an_operator(tmp_path):
     assert env[bench_support.TIMING_VAR] == "0"
 
 
+# ── which knobs the record names ──
+
+
+def test_knobs_are_the_benchmarks_own_env_not_this_process(tmp_path, monkeypatch):
+    """The per-test `environment_variables:` block is merged into the child env alone."""
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "the runners value")
+    rec = _rec(tmp_path)
+    rec.child_env({"SPYRE_ATTN_KV_LADDER": "this tests value", "AIU_WORLD_SIZE": "4"})
+    rec.write()
+    knobs = _knobs_of(tmp_path)
+    assert knobs["SPYRE_ATTN_KV_LADDER"] == "this tests value"
+    assert knobs["AIU_WORLD_SIZE"] == "4", "the card count a run asked for is a knob"
+    assert knobs[bench_support.TIMING_VAR] == "1", "including the ones child_env itself set"
+
+
+def test_two_tests_record_their_own_knobs(tmp_path):
+    """env_fingerprint is cached, so the knobs must not be frozen along with it."""
+    one, four = _rec(tmp_path, "one"), _rec(tmp_path, "four")
+    one.child_env({"SPYRE_DEVICES": "0"})
+    four.child_env({"SPYRE_DEVICES": "0,1,2,3"})
+    one.write()
+    four.write()
+    assert _knobs_of(tmp_path, "one")["SPYRE_DEVICES"] == "0"
+    assert _knobs_of(tmp_path, "four")["SPYRE_DEVICES"] == "0,1,2,3"
+
+
+def test_knobs_leave_out_what_does_not_steer_the_stack(tmp_path):
+    """The record is shared: it names stack knobs, not the whole environment."""
+    rec = _rec(tmp_path)
+    rec.child_env({"HF_TOKEN": "a secret", "PATH": "/usr/bin", "SPYRE_DEVICES": "0"})
+    rec.write()
+    assert _knobs_of(tmp_path) == {
+        "SPYRE_DEVICES": "0",
+        bench_support.COMPILE_SUMMARY_VAR: str(tmp_path / "t" / "compile"),
+        bench_support.TIMING_VAR: "1",
+    }
+
+
 # ── merging torch-spyre's per-process summaries ──
 
 
@@ -158,6 +202,67 @@ def test_a_summary_with_null_fields_does_not_break_the_merge(tmp_path):
     assert merged["total_s"] == 0.0 and merged["passes"] == {}
 
 
+# ── which cards the record names ──
+
+
+@pytest.fixture
+def fake_host(tmp_path, monkeypatch):
+    """A host whose /sys, and a container whose /dev/vfio, are under tmp_path."""
+    root = tmp_path / "host"
+    (root / "dev/vfio").mkdir(parents=True)
+    (root / "dev/vfio/vfio").touch()  # the VFIO container node; not a card
+    monkeypatch.setattr(bench_support, "VFIO_DIR", str(root / "dev/vfio"))
+    monkeypatch.setattr(bench_support, "IOMMU_GROUPS", str(root / "sys/kernel/iommu_groups"))
+    monkeypatch.setattr(bench_support, "PCI_DEVICES", str(root / "sys/bus/pci/devices"))
+    return root
+
+
+def _card(root: Path, pci: str, group: str | None = None) -> None:
+    """A Spyre card on the host; with `group`, one assigned to this container too."""
+    dev = root / "sys/bus/pci/devices" / pci
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1014\n")
+    (dev / "class").write_text("0x120000\n")
+    (dev / "device").write_text("0x06a7\n")
+    (dev / "current_link_width").write_text("16\n")
+    if group is None:
+        return
+    (root / "dev/vfio" / group).touch()
+    devices = root / "sys/kernel/iommu_groups" / group / "devices"
+    devices.mkdir(parents=True)
+    (devices / pci).symlink_to(dev)
+
+
+def test_cards_are_the_ones_assigned_here_not_every_card_on_the_machine(fake_host):
+    """/sys is not namespaced: a pod sees all twelve and can open only the one it was given."""
+    _card(fake_host, "0000:a1:00.0", group="47")
+    for slot in range(2, 13):
+        _card(fake_host, f"0000:a{slot}:00.0")
+    missing = {}
+    cards = bench_support._cards(missing)
+    assert [c["pci"] for c in cards] == ["0000:a1:00.0"]
+    assert cards[0]["iommu_group"] == "47"
+    assert cards[0]["current_link_width"] == "16", "the per-card sysfs detail still comes along"
+    assert missing == {}
+    assert bench_support._cards_on_host() == 12, "the machine's own count stays, as context"
+
+
+def test_no_assigned_card_is_reported_as_none(fake_host):
+    _card(fake_host, "0000:a1:00.0")
+    missing = {}
+    assert bench_support._cards(missing) == []
+    assert "cards" in missing
+
+
+def test_an_assigned_group_with_no_visible_device_still_counts(fake_host):
+    """A restricted /sys must not make an assigned card vanish from the count."""
+    (fake_host / "dev/vfio/47").touch()
+    missing = {}
+    cards = bench_support._cards(missing)
+    assert cards == [{"iommu_group": "47"}]
+    assert "card.47" in missing
+
+
 # ── the environment fingerprint ──
 
 
@@ -176,7 +281,8 @@ def test_env_json_carries_the_keys_the_ingest_reads(tmp_path):
     """torch-spyre's benchmeta reader keys off these names; renaming one drops a prop."""
     _rec(tmp_path).write()
     env = json.loads((tmp_path / "t" / "env.json").read_text())
-    for key in ("host", "cpu", "cgroup", "mem_total_b", "kernel", "os", "cards", "card_kind"):
+    keys = ("host", "cpu", "cgroup", "mem_total_b", "kernel", "os", "cards", "card_kind", "knobs")
+    for key in keys:
         assert key in env, key
     assert {"model", "threads"} <= set(env["cpu"])
     assert {"cpu_max", "memory_max"} <= set(env["cgroup"])
@@ -228,6 +334,29 @@ def test_run_benchmark_writes_the_records_and_no_extra_result_json(tmp_path, mon
     assert seen["env"][bench_support.COMPILE_SUMMARY_VAR] == str(tmp_path / "t" / "compile")
     phases = json.loads((tmp_path / "t" / "phases.json").read_text())["phases"]
     assert [p["name"] for p in phases] == ["run"]
+
+
+def test_the_record_names_the_knobs_the_run_was_actually_given(tmp_path, monkeypatch):
+    """Through the runner: the per-test block and the device vars reach env.json."""
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    monkeypatch.setattr(runner, "_make_sampler", lambda: runner._Noop())
+    monkeypatch.setattr(runner, "write_resource_metrics", lambda *a, **k: None)
+
+    runner.run_benchmark(
+        bench_type="latency",
+        test_name="t",
+        parameters={"model": "m"},
+        env_config={"SPYRE_ATTN_KV_LADDER": "1"},
+        results_dir=tmp_path,
+        spyre_devices="0,1",
+        aiu_world_size="2",
+    )
+    knobs = _knobs_of(tmp_path)
+    assert knobs["SPYRE_ATTN_KV_LADDER"] == "1"
+    assert knobs["SPYRE_DEVICES"] == "0,1"
+    assert knobs["AIU_WORLD_SIZE"] == "2"
 
 
 def test_records_are_written_when_the_benchmark_fails(tmp_path, monkeypatch):

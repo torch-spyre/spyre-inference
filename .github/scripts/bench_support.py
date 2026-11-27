@@ -46,6 +46,9 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 ARTIFACT_JSON = "/home/senuser/spyre_artifact.json"
+VFIO_DIR = "/dev/vfio"
+IOMMU_GROUPS = "/sys/kernel/iommu_groups"
+PCI_DEVICES = "/sys/bus/pci/devices"
 
 # torch-spyre writes compile_summary.<pid>.json into the directory named by this
 # variable (one file per process, so one per TP worker).
@@ -99,45 +102,72 @@ def _cpu(missing: dict) -> dict:
     }
 
 
+def _spyre_class(dev: str) -> str | None:
+    """The PCI class of `dev` if it is a Spyre card: IBM vendor 0x1014, class 0x12xx."""
+    try:
+        if Path(f"{dev}/vendor").read_text().strip() != "0x1014":
+            return None
+        cls = Path(f"{dev}/class").read_text().strip()
+    except OSError:
+        return None
+    return cls if cls.startswith("0x1200") else None
+
+
 def _cards(missing: dict) -> list[dict]:
-    """Spyre cards as the kernel sees them: IBM vendor 0x1014, PCI class 0x12xx."""
+    """The cards this process can actually open: one per numbered node under /dev/vfio.
+
+    Not a /sys/bus/pci scan. sysfs is not namespaced, so inside a pod that lists every
+    card on the machine rather than the one the device plugin assigned. What the pod
+    holds are the IOMMU groups passed in as /dev/vfio/<group>, which is also the set
+    SPYRE_DEVICES indexes.
+    """
+    try:
+        groups = sorted((p.name for p in Path(VFIO_DIR).iterdir() if p.name.isdigit()), key=int)
+    except OSError as e:
+        missing["cards"] = f"{VFIO_DIR}: {type(e).__name__}: {e}"
+        return []
+    if not groups:
+        missing["cards"] = f"no numbered node under {VFIO_DIR}: no card is assigned here"
     cards = []
-    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
-        try:
-            vendor = Path(f"{dev}/vendor").read_text().strip()
-            cls = Path(f"{dev}/class").read_text().strip()
-        except OSError:
-            continue
-        if vendor == "0x1014" and cls.startswith("0x1200"):
-            card = {"pci": os.path.basename(dev), "vendor_id": vendor, "class": cls}
+    for group in groups:
+        card: dict = {"iommu_group": group}
+        for link in sorted(Path(f"{IOMMU_GROUPS}/{group}/devices").glob("*")):
+            dev = f"{PCI_DEVICES}/{link.name}"
+            cls = _spyre_class(dev)
+            if cls is None:
+                continue
+            card |= {"pci": link.name, "vendor_id": "0x1014", "class": cls}
             for f in ("device", "subsystem_device", "current_link_speed", "current_link_width"):
                 if os.path.exists(f"{dev}/{f}"):
-                    card[f] = _read(f"{dev}/{f}", f"card.{card['pci']}.{f}", missing)
-            cards.append(card)
-    if not cards:
-        missing["cards"] = "no IBM (0x1014) class-0x12xx PCI device visible in /sys/bus/pci"
+                    card[f] = _read(f"{dev}/{f}", f"card.{link.name}.{f}", missing)
+        if "pci" not in card:
+            missing[f"card.{group}"] = f"no IBM accelerator under {IOMMU_GROUPS}/{group}/devices"
+        cards.append(card)
     return cards
 
 
-def _knobs() -> dict[str, str]:
-    """The environment variables that change what the stack does, and only those."""
+def _cards_on_host() -> int:
+    """Cards the machine has, assigned to this container or not: a run that held one of
+    twelve shared the machine with whatever used the other eleven."""
+    return sum(_spyre_class(d) is not None for d in glob.glob(f"{PCI_DEVICES}/*"))
+
+
+def _knobs(env) -> dict[str, str]:
+    """The variables that change what the stack does, out of the env a benchmark will run with."""
     prefixes = (
-        "SPYRE_", "TORCH_SPYRE", "VLLM_", "FLEX_", "DXP_", "LX_", "SENLIB", "OMP_", "DTLOG",
-        "TORCHINDUCTOR",
+        "AIU", "SPYRE_", "TORCH_SPYRE", "TORCH_SENDNN", "VLLM_", "FLEX_", "DXP_", "LX_",
+        "SENLIB", "OMP_", "DT", "TORCHINDUCTOR",
     )  # fmt: skip
-    return {
-        k: v
-        for k, v in sorted(os.environ.items())
-        if k in ("SENCORES", "DXP_LX_FRAC_AVAIL") or k.startswith(prefixes)
-    }
+    return {k: v for k, v in sorted(env.items()) if k == "SENCORES" or k.startswith(prefixes)}
 
 
 @functools.cache
 def env_fingerprint() -> dict:
-    """Host, CPU, cgroup limits, Spyre cards, knobs and artifact identity; never raises.
+    """Host, CPU, cgroup limits, Spyre cards and artifact identity; never raises.
 
-    An unreadable field is None with its reason under `_missing`. Cached: the host does not
-    change between tests, and the first call is made before any timed section starts.
+    An unreadable field is None with its reason under `_missing`. Cached, so nothing that
+    varies per test belongs here: the host does not change between tests, and the first
+    call is made before any timed section starts.
     """
     missing: dict[str, str] = {}
     try:
@@ -168,8 +198,8 @@ def env_fingerprint() -> dict:
             "os": osrel.get("PRETTY_NAME"),
             "cards": cards,
             "card_kind": "/".join(sorted({c["device"] for c in cards if c.get("device")})) or None,
+            "cards_on_host": _cards_on_host(),
             "image": os.environ.get("IMAGE_REF"),
-            "knobs": _knobs(),
             "artifact": artifact,
             "_missing": missing,
         }
@@ -191,6 +221,7 @@ class Recorder:
     def __init__(self, results_dir: Path, test_name: str, runtime_config: dict) -> None:
         self.dir = Path(results_dir) / test_name
         self._env = {**env_fingerprint(), "runtime_config": runtime_config}
+        self._child_env = os.environ
         self._phases: list[dict] = []
         self._server_startup_sec: float | None = None
         self.compile_dir = self.dir / "compile"
@@ -199,9 +230,14 @@ class Recorder:
         """Point the benchmarked process at this test's compile-summary directory, in place.
 
         setdefault, not assignment: an operator who exported either variable meant it.
+
+        `env` is kept by reference, not copied, and the knobs are read off it at write()
+        time: this process's own environment is not what a benchmark runs with -- the
+        per-test `environment_variables:` block is merged into `env` alone.
         """
         env.setdefault(COMPILE_SUMMARY_VAR, str(self.compile_dir))
         env.setdefault(TIMING_VAR, "1")
+        self._child_env = env
 
     def mark(self, name: str | None) -> None:
         """End the open phase and start `name` (None just ends it)."""
@@ -237,7 +273,7 @@ class Recorder:
         """Write env, phases and the merged compile summary; never raises."""
         self.mark(None)
         try:
-            _write_json(self.dir / "env.json", self._env)
+            _write_json(self.dir / "env.json", {**self._env, "knobs": _knobs(self._child_env)})
             _write_json(
                 self.dir / "phases.json",
                 {

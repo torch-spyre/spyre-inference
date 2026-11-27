@@ -225,12 +225,10 @@ count.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
 `tensor.to("spyre", dynamic=...)`. For this, the plugin sets torch-spyre's
-`MIN_RESERVED_DIM_SIZE` to 1 unless you export it yourself, and raises its `MAX_BUCKETS` cap
-to at least `--max-model-len / block_size` rounded up to a multiple of 8, exported or not.
+`MIN_RESERVED_DIM_SIZE` to 1 and raises its `MAX_BUCKETS` cap to at least
+`--max-model-len / block_size` rounded up to a multiple of 8, whether or not you export them.
 
-The per-sequence kernels pad every sequence to `--max-model-len / block_size` pages instead
-when `--max-model-len / block_size` is not above `MIN_RESERVED_DIM_SIZE`; startup logs a
-warning.
+A `--max-model-len` of one page has no page range: every sequence runs that one page.
 
 Sliding-window layers have no page range. Each sequence pads to the power of two at or above
 its page count, capped at the pages its window touches, with one kernel per (page count,

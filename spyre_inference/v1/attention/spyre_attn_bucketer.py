@@ -48,7 +48,6 @@ Vocabulary:
 from __future__ import annotations
 
 import bisect
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple, TypedDict
@@ -172,8 +171,7 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
 def _declared_page_range(max_pages: int) -> DynamicRange | None:
     """Return the range of page counts one per-sequence kernel is compiled for.
 
-    Returns None, and logs why, when ``max_pages`` is not above torch-spyre's
-    ``min_reserved_dim_size``; the kernels then pad every sequence to ``max_pages`` instead.
+    Returns None for a single page, which every sequence then runs.
     """
     from torch_spyre._inductor import config as ts_config
     from torch_spyre._inductor import pass_utils
@@ -184,23 +182,13 @@ def _declared_page_range(max_pages: int) -> DynamicRange | None:
             "(torch-spyre#6066), which the per-sequence attention kernels need. "
             "Upgrade torch-spyre."
         )
-    # The page count is the only dynamic size, so it lowers torch-spyre's floor unless the
-    # user exported one.
-    if "MIN_RESERVED_DIM_SIZE" not in os.environ:
-        ts_config.min_reserved_dim_size = 1
-    min_pages = ts_config.min_reserved_dim_size
     # With min == max the size is a constant, which fails to trace.
-    if not min_pages < max_pages:
-        logger.warning_once(
-            "A dynamic page count needs the %d pages per sequence to be above "
-            "MIN_RESERVED_DIM_SIZE=%d, so the per-sequence attention kernels pad every "
-            "sequence to that many pages instead.",
-            max_pages,
-            min_pages,
-        )
+    if max_pages <= 1:
         return None
+    # No kernel branches on the page count, so it may drop below torch-spyre's floor.
+    ts_config.min_reserved_dim_size = 1
     ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
-    return {"min": min_pages, "max": max_pages, "granularity": 1}
+    return {"min": 1, "max": max_pages, "granularity": 1}
 
 
 # Prefill reads this many pages per loop step, so its page counts are multiples of it.
@@ -237,12 +225,10 @@ def _declared_chunk_ranges(
     A bucket that never needs more than its minimum gets no entry and pads every call to
     the page count of ``max_model_len``.
     """
-    from torch_spyre._inductor import config as ts_config
-
     ranges: dict[int, DynamicRange] = {}
     for num_seqs in num_seqs_buckets:
         width = _chunk_width(num_seqs)
-        min_chunks = max(-(-page_range["min"] // width), ts_config.min_reserved_dim_size)
+        min_chunks = -(-page_range["min"] // width)
         max_chunks = -(-page_range["max"] // width)
         # A range needs at least two sizes; a range with min == max does not compile.
         if min_chunks < max_chunks:

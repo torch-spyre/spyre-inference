@@ -405,18 +405,10 @@ class TestDeclaredPages:
         assert b.find_declared_pages(1, prefill=True) == 2
         assert b.find_declared_pages(1) == 1
 
-    def test_an_exported_min_reserved_dim_size_raises_the_minimum_page_count(self, monkeypatch):
-        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
-        b = SpyreAttnBucketer(make_config(max_model_len=2048), declare_pages=True)
-        assert b.page_range is not None
-        assert b.page_range["min"] == 8
-        assert b.find_declared_pages(3) == 8
-
-    def test_a_context_at_an_exported_min_reserved_dim_size_keeps_the_buckets(self, monkeypatch):
-        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
-        b = SpyreAttnBucketer(make_config(max_model_len=8 * BLOCK_SIZE), declare_pages=True)
+    def test_a_one_page_context_keeps_the_bucket(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=BLOCK_SIZE), declare_pages=True)
         assert b.page_range is None
-        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+        assert {v.num_blocks for v in b.variants()} == {1}
 
     def test_max_buckets_grows_to_cover_max_model_len(self):
         from torch_spyre._inductor import config as ts_config
@@ -425,15 +417,17 @@ class TestDeclaredPages:
         assert b.page_range == {"min": 1, "max": 32768 // BLOCK_SIZE, "granularity": 1}
         assert ts_config.max_buckets == 32768 // BLOCK_SIZE
 
-    def test_an_exported_max_buckets_is_raised_too(self, monkeypatch):
-        """Neither range falls back below an exported cap."""
+    def test_exported_torch_spyre_limits_leave_the_ranges_unchanged(self, monkeypatch):
+        """The plugin sets the floor and the cap itself, exported or not."""
         from torch_spyre._inductor import config as ts_config
 
+        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
         monkeypatch.setenv("MAX_BUCKETS", "32")
         b = SpyreAttnBucketer(make_config(max_model_len=33 * BLOCK_SIZE), declare_pages=True)
         assert b.page_range == {"min": 1, "max": 33, "granularity": 1}
         assert b.prefill_page_range == {"min": 8, "max": 40, "granularity": 8}
-        assert ts_config.max_buckets == 40
+        assert b._chunk_ranges and all(r["min"] == 1 for r in b._chunk_ranges.values())
+        assert (ts_config.min_reserved_dim_size, ts_config.max_buckets) == (1, 40)
 
     def test_without_declare_pages_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048))
@@ -466,17 +460,6 @@ class TestDynamicChunks:
                 assert plan.chunk_range == {"min": 1, "max": max_pages // width, "granularity": 1}
                 assert plan.blocks_per_chunk == width
                 assert (plan.num_chunks - 1) * width < nb <= plan.num_chunks * width
-
-    def test_an_exported_min_reserved_dim_size_raises_the_minimum_chunk_count(self, monkeypatch):
-        from torch_spyre._inductor import config as ts_config
-
-        monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "3")
-        ts_config.min_reserved_dim_size = 3
-        b = SpyreAttnBucketer(make_config(max_model_len=8192), declare_pages=True)
-        assert all(r["min"] == 3 for r in b._chunk_ranges.values())
-        plan = b.batched_decode_plan(4, 1)
-        assert plan is not None
-        assert plan.num_chunks == 3
 
     def test_a_batch_size_whose_context_fits_one_chunk_keeps_the_buckets(self):
         # 32 pages: one full chunk at one sequence, two at two sequences.

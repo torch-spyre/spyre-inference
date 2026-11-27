@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from bench_support import Recorder
 from resource_sampler import ContainerSampler, write_resource_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -489,6 +490,9 @@ def run_benchmark(
     config_env = build_env_vars(env_config)
     env.update(config_env)
 
+    rec = Recorder(results_dir, test_name, {"bench_type": bench_type, "parameters": parameters})
+    rec.child_env(env)
+
     cmd_line = record_command(cmd, config_env, results_dir / f"{test_name}.cmd")
 
     log.info("=== Running %s test: %s ===", bench_type, test_name)
@@ -496,10 +500,16 @@ def run_benchmark(
 
     log_file = results_dir / f"{test_name}.log"
     sampler = _make_sampler()
-    with open(log_file, "w") as lf:
-        lf.write(f"# {cmd_line}\n")
-        lf.flush()
-        result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
+    rec.mark("run")
+    try:
+        with open(log_file, "w") as lf:
+            lf.write(f"# {cmd_line}\n")
+            lf.flush()
+            result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
+    finally:
+        # Off the clock, and written for a failed run too: the records say which
+        # machine and which knobs produced the failure.
+        rec.write()
     sampler.stop()
     # "total": covers compile + inference in one window, unlike the serve path
     # which splits compile_host_* from the bare bench-phase host_* metrics.
@@ -532,6 +542,17 @@ def run_serve_benchmark(
     config_env = build_env_vars(env_config)
     env.update(config_env)
 
+    rec = Recorder(
+        results_dir,
+        test_name,
+        {
+            "bench_type": "serve",
+            "server_parameters": server_parameters,
+            "parameters": bench_parameters,
+        },
+    )
+    rec.child_env(env)
+
     # Build server command
     server_params = dict(server_parameters)
     model = server_params.pop("model")
@@ -560,6 +581,9 @@ def run_serve_benchmark(
 
     server_log = results_dir / f"{test_name}_server.log"
     bench_result = None
+    # Bound before the try below, so the finally that records it cannot hit an
+    # unbound name on an early failure.
+    server_startup_sec = None
 
     def _server_failure(summary: str) -> str:
         log.error("%s", summary)
@@ -572,6 +596,7 @@ def run_serve_benchmark(
         server_lf.write(f"# {server_cmd_line}\n")
         server_lf.flush()
         server_start_ts = time.monotonic()
+        rec.mark("load")
         server_proc = subprocess.Popen(
             server_cmd,
             env=env,
@@ -585,7 +610,6 @@ def run_serve_benchmark(
             # Timed from before the spawn: for large models this is mostly the
             # one-time warmup compile, which is worth comparing run to run.
             health_url = f"http://{host}:{port}/health"
-            server_startup_sec = None
             deadline = server_start_ts + health_timeout
             while time.monotonic() < deadline:
                 if server_proc.poll() is not None:
@@ -641,6 +665,7 @@ def run_serve_benchmark(
 
             bench_log = results_dir / f"{test_name}_bench.log"
             bench_sampler = _make_sampler()
+            rec.mark("serve")
             try:
                 with open(bench_log, "w") as blf:
                     blf.write(f"# {bench_cmd_line}\n")
@@ -658,6 +683,10 @@ def run_serve_benchmark(
             write_resource_metrics(test_name, results_dir, combined, model=model)
 
         finally:
+            # Written for a failed or unhealthy server too, and after the phase
+            # marks, so the records always say what the run was and where it got to.
+            rec.set_server_startup(server_startup_sec)
+            rec.write()
             _kill_server(server_proc)
 
     if bench_result.returncode != 0:

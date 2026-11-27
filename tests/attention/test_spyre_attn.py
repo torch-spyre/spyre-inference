@@ -26,8 +26,8 @@ from spyre_testing_plugin.attn_helpers import (
     random_block_tables,
     ref_attn,
     split_by_chunk,
-    use_kv_buckets,
     use_python_for_each_tile,
+    use_static_pages,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
@@ -1600,23 +1600,14 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
     return SpyreAttnBucketer(vllm_config).num_blocks_buckets
 
 
-@pytest.mark.parametrize(
-    ("kv_len", "expected"),
-    [
-        pytest.param(65, 2, id="kv65_to_2"),
-        pytest.param(300, 8, id="kv300_to_8"),
-        pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
-    ],
-)
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len, expected):
+@pytest.mark.parametrize("kv_len", [65, 256, 300, 1025])
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, monkeypatch, kv_len):
     # A page range keeps each sequence's own page count, so test the bucketed path.
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     torch.set_default_device("cpu")
-    buckets = _num_blocks_buckets()
-    assert expected in buckets
+    (expected,) = _num_blocks_buckets()
 
-    metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
+    metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=expected)
 
     assert metadata.padded_num_blocks == [expected]
     assert metadata.attention_mask_stacks[0].shape[0] == expected
@@ -1630,7 +1621,7 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config,
     build() actually pads to -- build() always pads to a bucket (no unpadded
     fallback), so both tables here must have at least that much headroom."""
     # A page range pads nothing, so test the bucketed path.
-    use_kv_buckets(monkeypatch)
+    use_static_pages(monkeypatch)
     torch.set_default_device("cpu")
     block_size = 64
     kv_len, query_len = 300, 32
@@ -1663,14 +1654,14 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config,
 def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config, monkeypatch, declare_pages):
     """Zero real blocks must not be padded: a fully-masked tile would divide by zero."""
     if not declare_pages:
-        use_kv_buckets(monkeypatch)
+        use_static_pages(monkeypatch)
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
 
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_stacks[0].shape[0] == 0
     if not declare_pages:
-        assert metadata.padded_num_blocks[1] == 2
+        assert metadata.padded_num_blocks[1] == _num_blocks_buckets()[-1]
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):
@@ -2720,9 +2711,9 @@ def test_spyre_attn_head_configs(
 def test_spyre_attn_one_kv_head_compiles_a_single_page_kernel(
     default_vllm_config, monkeypatch, sliding_window, configure_compilation, configure_device
 ):
-    """A lone KV head on a lone page compiles on the KV buckets: a sliding-window layer,
-    which keeps them, and a max_model_len of one page, which has no page range. The decode
-    runs batched."""
+    """A lone KV head on a lone page compiles at a static page count: a sliding-window
+    layer, which keeps power-of-two page counts, and a max_model_len of one page, which has
+    no page range. The decode runs batched."""
     from vllm.config import get_current_vllm_config
 
     if sliding_window is None:
@@ -3064,15 +3055,11 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     from spyre_inference.v1.attention.backends.spyre_attn import (
         SpyreAttentionMetadataBuilder,
     )
-    from spyre_inference.v1.attention.spyre_attn_bucketer import (
-        SpyreAttnBatchedDecodeBucket,
-        SpyreAttnBucketer,
-        batched_decode_chunking,
-    )
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
-    num_seqs, num_blocks, num_pages = 4, 4, 64
+    num_seqs, num_pages = 4, 64
 
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
@@ -3096,26 +3083,18 @@ def test_spyre_attn_warmup_records_a_batched_decode_variant(
     device = torch.device(configure_device)
 
     kv_cache = SpyreAttentionImpl.allocate_pages(num_pages, spec, device)
-    blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
-    bucket = SpyreAttnBatchedDecodeBucket(
-        num_seqs=num_seqs,
-        num_blocks=num_blocks,
-        blocks_per_chunk=blocks_per_chunk,
-        num_chunks=num_chunks,
-    )
 
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
     # config-module entry, hiding it for later tests.
     with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
         builder._attn_bucketer = SpyreAttnBucketer(vllm_config, declare_pages=dynamic_chunks)
-        if dynamic_chunks:
-            # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
-            # pages each.
-            (bucket,) = [
-                v
-                for v in builder.attn_bucketer.batched_decode_variants()
-                if v.num_seqs == num_seqs and v.dynamic_chunks
-            ]
+        # max_model_len 2048 at block size 64 is 32 pages: at 4 sequences, 4 chunks of 8
+        # pages each.
+        (bucket,) = [
+            v
+            for v in builder.attn_bucketer.batched_decode_variants()
+            if v.num_seqs == num_seqs and v.dynamic_chunks == dynamic_chunks and v.num_chunks > 1
+        ]
         realized = impl._record_batched_one(
             bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize
         )

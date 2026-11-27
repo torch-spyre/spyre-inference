@@ -835,9 +835,7 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
-        # Every KV ladder keeps the powers of two starting at block_size; a
-        # non-power-of-two block size makes that ladder start off-grid, so block
-        # counts stop being a clean doubling sequence.
+        # Only power-of-two block sizes are tested on the Spyre paged attention backend.
         if aligned & (aligned - 1):
             raise ValueError(
                 f"Block size must be a power of two for the Spyre paged attention "
@@ -1074,11 +1072,6 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"{parallel_config.tensor_parallel_size}): torch-spyre's all_reduce is "
                 f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
-
-        # Validate the ladder settings now; the bucketer only reads them in the worker.
-        from spyre_inference.v1.attention.spyre_attn_bucketer import validate_kv_ladder_env
-
-        validate_kv_ladder_env()
 
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.

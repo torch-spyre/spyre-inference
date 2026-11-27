@@ -1205,7 +1205,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     attention_mask_stacks,
                 )
                 chunk_range = plan.chunk_range
-                # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
                 if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
                     decode_groups = self._batched_decode_groups(
@@ -2243,34 +2242,24 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> None:
         # Spyre-lowering shapes drive several structural choices here: K/V/q keep
         # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
-        # each chunk block-major to avoid an int32 index relayout; and the result
-        # scatter is a single contiguous copy_ at offset 0, valid because the decode
-        # prefix's query rows are range(num_decode_seqs) (asserted in the builder).
+        # each chunk block-major to avoid an int32 index relayout; and the kernel writes
+        # decode row i to staging row i, valid because the decode prefix's query rows are
+        # range(num_decode_seqs) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
-        num_decode_seqs = attn_metadata.num_decode_seqs
-        num_heads = self.num_heads
-        head_size = self.head_size
         block_size = attn_metadata.block_size
 
         assert b_seqs is not None and blocks_per_chunk is not None
         assert attn_metadata.rep_row_ids_dev is not None
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
-
         # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
-        # b_seqs, not the real count -- so the destination needs that many rows and a
-        # plain offset-0 layout; the scatter below covers every other case, including
-        # a query buffer narrower than the seq bucket. Re-checked per call: vLLM hands
-        # out a fresh buffer per layer.
-        store_out = (
-            query_dev.shape[0] >= b_seqs
-            and output.shape[0] >= b_seqs
-            and output.dtype == query_dev.dtype
-            and output.storage_offset() == 0
-            and output.is_contiguous()
-        )
-        result = self._run_batched_decode(
+        # b_seqs, not the real count -- into the staging buffers warmup recorded with.
+        q_staging, _ = self._staging_buffers(query_dev.device)
+        assert query_dev is q_staging, "batched decode runs on the staging buffers only"
+        assert output.shape == q_staging.shape and output.dtype == q_staging.dtype
+
+        self._run_batched_decode(
             query_dev,
             attn_metadata.rep_row_ids_dev,
             k_pages,
@@ -2281,19 +2270,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             b_seqs,
             blocks_per_chunk,
             block_size,
-            output if store_out else None,
+            output,
         )
-        if store_out:
-            return
-
-        # The decode prefix's query rows are range(num_decode_seqs), so the scatter
-        # is a contiguous prefix write at (0, 0). Neither per-row
-        # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
-        # via @compile_once and can return a stale binary) nor eager index_copy_
-        # (rejects the int32 row index) is safe here.
-        result_flat = result.reshape(b_seqs, num_heads, head_size)
-        src_block = result_flat[:num_decode_seqs].clone()
-        output[:num_decode_seqs].copy_(src_block)
 
     def _grouped_decode_preconditions_met(
         self, attn_metadata: "SpyreAttentionMetadata", kv_pages: torch.Tensor
@@ -2317,7 +2295,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _, out_staging = self._staging_buffers(device)
         group_out = self._group_staging
         assert group_out is not None
-        store = output if output is out_staging else out_staging
+        assert output is out_staging, "grouped decode runs on the staging buffers only"
         for group in attn_metadata.decode_groups:
             if group.metadata is None:
                 group.metadata = replace(
@@ -2344,10 +2322,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 query_dev, k_pages, v_pages, group.metadata, group_out
             )
             assert group.rows_dev is not None
-            _scatter_rows_compiled(store, group.rows_dev, group_out)
-        if store is not output:
-            num_decode_seqs = attn_metadata.num_decode_seqs
-            output[:num_decode_seqs].copy_(store[:num_decode_seqs].clone())
+            _scatter_rows_compiled(output, group.rows_dev, group_out)
 
     def _group_store_rows(self, rows: list[int], padded_num_seqs: int) -> torch.Tensor:
         # Padded to the seq bucket so the store compiles once per bucket. Padding writes the
@@ -2415,10 +2390,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         b_seqs: int,
         blocks_per_chunk: int,
         block_size: int,
-        out: torch.Tensor | None,
-    ) -> torch.Tensor:
+        out: torch.Tensor,
+    ) -> None:
         scale, v_scale = self._read_scales()
-        return _run_with_capped_cores(
+        _run_with_capped_cores(
             b_seqs * blocks_per_chunk * self.num_kv_heads,
             self._decode_fn,
             query=query_dev,
@@ -2575,32 +2550,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
 
-        num_decode_seqs = attn_metadata.num_decode_seqs
-        batched_done = False
-        if self._grouped_decode_preconditions_met(attn_metadata, k_pages):
-            self._run_grouped_decode(
-                query_dev, k_pages, v_pages, attn_metadata, output, _target_device
-            )
-            if num_decode_seqs == num_seqs:
-                return output
-            batched_done = True
-        elif self._batched_decode_preconditions_met(attn_metadata, k_pages):
-            self._run_batched_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
-            if num_decode_seqs == num_seqs:
-                return output
-            batched_done = True
-
-        # Past the early return: only the per-sequence loop reads these tables.
-        index_tables = self.index_tables(attn_metadata, _target_device)
-
-        # Past the early return, so a step the batched kernel fully served pays nothing.
-        # Entries are filled at their read site below: in a mixed batch, the decode
-        # prefix was already served by the batched kernel and needs no mask transfer.
-        # Mirrors the batch layout row for row, so the absolute query_start_loc
-        # offsets in the row tables still apply.
+        # Every kernel runs on the staging buffers warmup records with; a query attn_layer
+        # did not stage is copied in, in batch order so query_start_loc offsets apply.
         q_staging, out_staging = self._staging_buffers(_target_device)
-        # attn_layer stages inside the traced graph where it can be; then the
-        # buffers arrive here already staged and both copies are already done.
         pre_staged = query_dev is q_staging
         batch_rows = self.staging_rows
         if not pre_staged:
@@ -2610,6 +2562,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 f"{self.staging_rows}; the staging buffers cannot hold it"
             )
             q_staging[:batch_rows] = query_dev
+
+        num_decode_seqs = attn_metadata.num_decode_seqs
+        batched_done = False
+        if self._grouped_decode_preconditions_met(attn_metadata, k_pages):
+            self._run_grouped_decode(
+                q_staging, k_pages, v_pages, attn_metadata, out_staging, _target_device
+            )
+            batched_done = True
+        elif self._batched_decode_preconditions_met(attn_metadata, k_pages):
+            self._run_batched_decode_dispatch(
+                q_staging, k_pages, v_pages, attn_metadata, out_staging
+            )
+            batched_done = True
+        if batched_done and num_decode_seqs == num_seqs:
+            if not pre_staged:
+                output.copy_(out_staging[:batch_rows])
+            return output
+
+        # Past the early return: only the per-sequence loop reads these tables.
+        # Entries are filled at their read site below: in a mixed batch, the decode
+        # prefix was already served by the batched kernel and needs no mask transfer.
+        index_tables = self.index_tables(attn_metadata, _target_device)
 
         self._assert_query_fits_staging(max(aligned_query_lens, default=1))
 
@@ -2684,14 +2658,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # The kernels wrote `out_staging`; copy it back once.
         if not pre_staged:
-            if batched_done:
-                # Decode rows are already in output; copy only the prefill suffix.
-                prefill_token_start = attn_metadata.num_decode_tokens
-                output[prefill_token_start:batch_rows].copy_(
-                    out_staging[prefill_token_start:batch_rows]
-                )
-            else:
-                output.copy_(out_staging[:batch_rows])
+            output.copy_(out_staging[:batch_rows])
 
         return output
 

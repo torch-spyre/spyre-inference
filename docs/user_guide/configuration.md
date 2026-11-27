@@ -377,6 +377,31 @@ Differences from the removed V1 runner:
   batch-sharded sampling, `cudagraph_mm_encoder`, prefill context parallelism, and,
   untested on Spyre, HiSparse, watermarking and AuxOutput (e.g. returning routed experts).
 
+## Multithreaded weight loading
+
+The direct-to-device weight loader (`--load-format spyre`) is the default for the models
+it supports; `--load-format safetensors` goes back to vLLM's loader. It takes vLLM's two
+`--model-loader-extra-config` keys to read ahead on a thread pool. The pool is on by
+default; to go back to the serial loop:
+
+```bash
+vllm serve <model> --model-loader-extra-config '{"enable_multithread_load": false}'
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `enable_multithread_load` | `true` | Convert and transfer tensors on a thread pool. They are still loaded in checkpoint order. |
+| `num_threads` | `8` | Pool size, used only when the pool is enabled. It is capped at the process's torch thread count and at 32, the device's pool-stream count. Each pool thread's host conversion can itself use that many threads. |
+
+Other keys are ignored with a warning. A checkpoint without safetensors files goes to vLLM's
+loader instead, which rejects keys it does not know and reads serially unless
+`enable_multithread_load` is set.
+
+The pool shortens the load most at `--tensor-parallel-size 1`. With tensor parallelism the
+ranks already read side by side, so the gain is smaller, and each rank uses more host
+memory: the pool threads' conversion buffers stay with the process's allocator after the
+load.
+
 ## Offline engine in the calling process
 
 At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline

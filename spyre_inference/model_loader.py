@@ -18,8 +18,13 @@ from __future__ import annotations
 
 import copy
 import os
-from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from collections import deque
+from collections.abc import Callable, Generator, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import closing, nullcontext
+from dataclasses import dataclass
+from functools import partial
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
@@ -35,13 +40,46 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.config.load import LoadConfig
 
 logger = init_logger(__name__)
+
+_DEFAULT_LOAD_THREADS = DefaultModelLoader.DEFAULT_NUM_THREADS
+# torch-spyre's get_stream_from_pool rotates over this many streams; more pool threads
+# than that would put two injecting threads on one stream.
+_POOL_STREAMS = 32
+_KNOWN_EXTRA_CONFIG_KEYS = {"enable_multithread_load", "num_threads"}
 
 
 @register_model_loader("spyre")
 class SpyreModelLoader(BaseModelLoader):
     """Streams weights directly from safetensors to Spyre device memory."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        extra_config = load_config.model_loader_extra_config
+        if not isinstance(extra_config, dict):
+            extra_config = {}
+        unknown_keys = extra_config.keys() - _KNOWN_EXTRA_CONFIG_KEYS
+        if unknown_keys:
+            logger.warning(
+                "SpyreModelLoader: ignoring unknown model_loader_extra_config keys %s",
+                sorted(unknown_keys),
+            )
+        enable_multithread_load = extra_config.get("enable_multithread_load", True)
+        if not isinstance(enable_multithread_load, bool):
+            raise ValueError(
+                f"enable_multithread_load must be a bool, got "
+                f"{type(enable_multithread_load).__name__}"
+            )
+        num_threads = extra_config.get("num_threads")
+        if num_threads is not None and not (
+            isinstance(num_threads, int) and not isinstance(num_threads, bool) and num_threads > 0
+        ):
+            raise ValueError(f"num_threads must be a positive integer, got {num_threads!r}")
+        self._load_threads = 1
+        if enable_multithread_load:
+            self._load_threads = num_threads or _DEFAULT_LOAD_THREADS
 
     def download_model(self, model_config: ModelConfig) -> None:
         from vllm.model_executor.model_loader.weight_utils import (
@@ -57,7 +95,7 @@ class SpyreModelLoader(BaseModelLoader):
 
     def get_all_weights(
         self, model_config: ModelConfig, model: nn.Module
-    ) -> Iterable[tuple[str, torch.Tensor]]:
+    ) -> Generator[tuple[str, torch.Tensor]]:
         """Yield (name, tensor) pairs from checkpoint shards using physical disk order.
 
         Tensors destined for Spyre are loaded via safe_open(device="spyre"),
@@ -68,6 +106,10 @@ class SpyreModelLoader(BaseModelLoader):
         only this rank's slice is fetched via ``get_slice`` and DMA'd to the device,
         because vLLM's weight loaders cannot narrow a tensor that already lives on
         the device in Spyre's stick layout.
+
+        With ``enable_multithread_load`` the reads run ahead on a thread pool, capped
+        at the process's torch thread count; the tensors are still yielded in
+        checkpoint order.
         """
         from safetensors import safe_open
         from vllm.distributed import (
@@ -80,37 +122,56 @@ class SpyreModelLoader(BaseModelLoader):
         tp_rank = get_tensor_model_parallel_rank()
         cpu_fallback_names = _get_host_loaded_param_names(model)
         _, shard_files = _resolve_checkpoint_files(model_config, self.load_config)
-
-        for shard_path in shard_files:
-            with safe_open(
-                shard_path,
-                framework="pt",
-                device="spyre",
-                target_dtype=target_dtype,  # ty: ignore[unknown-argument]
-            ) as f_spyre:
-                ordered_keys = f_spyre.offset_keys()
-                cpu_keys = {
-                    k for k in ordered_keys if _param_name_for(model, k) in cpu_fallback_names
-                }
-                f_cpu = None
-                if cpu_keys or tp_size > 1:
-                    f_cpu = safe_open(shard_path, framework="pt", device="cpu")
-
-                try:
+        num_threads = min(self._load_threads, torch.get_num_threads(), _POOL_STREAMS)
+        pool = None
+        if num_threads > 1:
+            logger.info("SpyreModelLoader: reading weights on %d threads", num_threads)
+            on_card = hasattr(torch, "spyre") and torch.spyre.is_initialized()
+            pool = ThreadPoolExecutor(
+                num_threads,
+                thread_name_prefix="spyre-load",
+                initializer=_use_own_stream if on_card else None,
+                initargs=(torch.spyre.current_device(),) if on_card else (),
+            )
+        with pool or nullcontext():
+            for shard_path in shard_files:
+                with (
+                    safe_open(
+                        shard_path,
+                        framework="pt",
+                        device="spyre",
+                        target_dtype=target_dtype,  # ty: ignore[unknown-argument]
+                    ) as f_spyre,
+                    safe_open(shard_path, framework="pt", device="cpu") as f_cpu,
+                ):
+                    ordered_keys = f_spyre.offset_keys()
+                    cpu_keys = {
+                        k for k in ordered_keys if _param_name_for(model, k) in cpu_fallback_names
+                    }
                     if tp_size > 1:
                         yield from _iter_tp_sharded_weights(
-                            model, f_spyre, f_cpu, ordered_keys, cpu_keys, tp_size, tp_rank
+                            model,
+                            f_spyre,
+                            f_cpu,
+                            ordered_keys,
+                            cpu_keys,
+                            tp_size,
+                            tp_rank,
+                            target_dtype,
+                            pool,
+                            num_threads,
                         )
                     else:
-                        for name in ordered_keys:
-                            if name in cpu_keys and f_cpu is not None:
-                                tensor = f_cpu.get_tensor(name)
-                            else:
-                                tensor = f_spyre.get_tensor(name)
-                            yield name, tensor
-                finally:
-                    if f_cpu is not None:
-                        f_cpu.__exit__(None, None, None)
+                        reads = (
+                            (
+                                name,
+                                partial(f_cpu.get_tensor, name)
+                                if name in cpu_keys
+                                else _CardRead(f_spyre, f_cpu, name, target_dtype),
+                            )
+                            for name in ordered_keys
+                        )
+                        yield from _read_ahead(reads, pool, num_threads)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Stream checkpoint weights directly to Spyre device and CPU fallback modules."""
@@ -120,11 +181,10 @@ class SpyreModelLoader(BaseModelLoader):
                 "Ensure SpyreWorkerV2.init_device() runs first."
             )
 
-        # Delegate to model.load_weights() so fused parameters are scattered
-        # by each layer's weight_loader.
-        loaded_weights = model.load_weights(  # ty: ignore[call-non-callable,union-attr]
-            self.get_all_weights(model_config, model)
-        )
+        # Delegate to model.load_weights() so fused parameters are scattered by each layer's
+        # weight_loader; closing stops the pool and the files when one of them fails.
+        with closing(self.get_all_weights(model_config, model)) as weights:
+            loaded_weights = model.load_weights(weights)  # ty: ignore[call-non-callable,union-attr]
         logger.info("SpyreModelLoader: delegated weight loading to model.load_weights()")
         _check_all_weights_loaded(model, loaded_weights)
 
@@ -255,6 +315,105 @@ def _check_all_weights_loaded(model: nn.Module, loaded_weights: set[str] | None)
         )
 
 
+@dataclass
+class _CardRead:
+    """One checkpoint tensor bound for the card, optionally only ``index`` of it."""
+
+    f_spyre: Any
+    f_cpu: Any
+    name: str
+    target_dtype: torch.dtype
+    index: tuple[slice, ...] | None = None
+
+    def _read(self, handle) -> torch.Tensor:
+        if self.index is None:
+            return handle.get_tensor(self.name)
+        return handle.get_slice(self.name)[self.index]
+
+    def __call__(self) -> torch.Tensor:
+        return self._read(self.f_spyre)
+
+    def alloc(self) -> torch.Tensor | None:
+        """Allocate the card tensor the hook would, or None where only the hook knows how."""
+        from safetensors.torch import _TYPES
+        from torch_spyre._C import SpyreTensorLayout, spyre_empty_with_layout
+        from torch_spyre._monkey_patch import _classify_safetensors_key
+
+        source = self.f_cpu.get_slice(self.name)
+        shape = list(source.get_shape())
+        if self.index is not None:
+            shape = [len(range(*i.indices(n))) for i, n in zip(self.index, shape, strict=True)]
+        kind = _classify_safetensors_key(self.name, len(shape))
+        if kind == "embedding" or not shape or 0 in shape:
+            return None
+        dtype = cast(torch.dtype, _TYPES[source.get_dtype()])
+        if dtype.is_floating_point:
+            dtype = self.target_dtype
+        stride = list(torch.empty(shape, device="meta").stride())
+        if kind == "linear":
+            layout = SpyreTensorLayout(shape, stride, dtype, [1, 0])
+        else:
+            layout = SpyreTensorLayout(shape, dtype)
+        # A block the loading thread freed may still be read by a copy queued on the
+        # default stream; drain it before the allocator can hand that block to a pool stream.
+        torch.spyre.default_stream().synchronize()
+        return spyre_empty_with_layout(torch.Size(shape), tuple(stride), dtype, layout, device=None)
+
+    def fill(self, dst: torch.Tensor) -> torch.Tensor:
+        from torch_spyre._C import copy_tensor
+
+        copy_tensor(self._read(self.f_cpu).contiguous(), dst, non_blocking=False)
+        return dst
+
+
+def _use_own_stream(device_index: int) -> None:
+    """Pool-thread initializer: flex allows one injecting thread per stream."""
+    from torch_spyre._C import get_stream_from_pool, set_current_stream, set_device
+
+    set_device(device_index)
+    set_current_stream(get_stream_from_pool(torch.device("spyre", device_index), 0))
+
+
+def _read_ahead(
+    reads: Iterable[tuple[Any, Callable[[], torch.Tensor]]],
+    pool: ThreadPoolExecutor | None,
+    num_threads: int,
+) -> Generator[tuple[Any, torch.Tensor]]:
+    """Yield ``(tag, read())`` in order, with up to ``num_threads`` reads running ahead."""
+    if pool is None:
+        for tag, read in reads:
+            yield tag, read()
+        return
+
+    # Nothing orders two streams, so a pool thread (own stream) must never allocate card
+    # memory: this thread allocates each destination (_CardRead.alloc), or reads it itself.
+    on_card = hasattr(torch, "spyre") and torch.spyre.is_initialized()
+
+    def submit(read) -> Future:
+        if not (on_card and isinstance(read, _CardRead)):
+            return pool.submit(read)
+        dst = read.alloc()
+        if dst is not None:
+            return pool.submit(read.fill, dst)
+        done: Future = Future()
+        done.set_result(read())
+        return done
+
+    pending = deque()
+    try:
+        for tag, read in reads:
+            pending.append((tag, submit(read)))
+            if len(pending) >= num_threads:
+                tag, future = pending.popleft()
+                yield tag, future.result()
+        while pending:
+            tag, future = pending.popleft()
+            yield tag, future.result()
+    finally:
+        # The pool outlives the file, so the file must not close under a running read.
+        wait([future for _, future in pending if not future.cancel()])
+
+
 # ---------------------------------------------------------------------------
 # Tensor-parallel shard-on-read helpers (tp_size > 1)
 # ---------------------------------------------------------------------------
@@ -342,6 +501,9 @@ def _iter_tp_sharded_weights(
     cpu_keys: set[str],
     tp_size: int,
     tp_rank: int,
+    target_dtype: torch.dtype,
+    pool: ThreadPoolExecutor | None,
+    num_threads: int,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield checkpoint tensors for TP>1, reading only this rank's shard.
 
@@ -356,33 +518,40 @@ def _iter_tp_sharded_weights(
     """
     from vllm.model_executor.parameter import BasevLLMParameter
 
-    for name in ordered_keys:
-        if name in cpu_keys:
-            yield name, f_cpu.get_tensor(name)
-            continue
+    def reads():
+        for name in ordered_keys:
+            if name in cpu_keys:
+                yield (name, None), partial(f_cpu.get_tensor, name)
+                continue
 
-        shape = f_cpu.get_slice(name).get_shape()
-        plan = _shard_plan(model, _hf_to_vllm_name(model, name), shape, tp_size, tp_rank)
+            shape = f_cpu.get_slice(name).get_shape()
+            plan = _shard_plan(model, _hf_to_vllm_name(model, name), shape, tp_size, tp_rank)
 
-        if plan is _REPLICATED:
-            yield name, f_spyre.get_tensor(name)
-            continue
-        if plan is None or not isinstance(plan[0], BasevLLMParameter):
-            yield name, f_cpu.get_tensor(name)
-            continue
+            if plan is _REPLICATED:
+                yield (name, None), _CardRead(f_spyre, f_cpu, name, target_dtype)
+                continue
+            if plan is None or not isinstance(plan[0], BasevLLMParameter):
+                yield (name, None), partial(f_cpu.get_tensor, name)
+                continue
 
-        param, dim, start, size = plan
-        index = [slice(None)] * len(shape)
-        index[dim] = slice(start, start + size)
-        tensor = f_spyre.get_slice(name)[tuple(index)]
+            param, dim, start, size = plan
+            index = [slice(None)] * len(shape)
+            index[dim] = slice(start, start + size)
+            yield (name, param), _CardRead(f_spyre, f_cpu, name, target_dtype, tuple(index))
 
-        saved_rank = param.tp_rank
-        param.tp_rank = 0
-        try:
-            # The consumer applies weight_loader before asking for the next item.
-            yield name, tensor
-        finally:
-            param.tp_rank = saved_rank
+    with closing(_read_ahead(reads(), pool, num_threads)) as loaded:
+        for (name, param), tensor in loaded:
+            if param is None:
+                yield name, tensor
+                continue
+
+            saved_rank = param.tp_rank
+            param.tp_rank = 0
+            try:
+                # The consumer applies weight_loader before asking for the next item.
+                yield name, tensor
+            finally:
+                param.tp_rank = saved_rank
 
 
 def _has_safetensors_checkpoint(model_config: ModelConfig, load_config) -> bool:

@@ -63,7 +63,7 @@ CASES = {
             compilation_config={"compile_sizes": [1, 16, 64]},
             gemma4_text_backbone=True,
         ),
-        env={"SPYRE_ATTN_QUERY_BUCKETS": "1,16,64", "SPYRE_ATTN_KV_BUCKETS": "128,256,2304"},
+        env={"SPYRE_ATTN_QUERY_BUCKETS": "1,16,64"},
         batches={
             name: ([prompt], [32])
             for name, prompt in (

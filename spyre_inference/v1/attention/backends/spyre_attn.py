@@ -496,7 +496,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     attention_mask_stacks_device: list[torch.Tensor | None] | None = None
 
     # The range of page counts the page index tables and mask stacks are copied to the
-    # device with. None when page counts are rounded up to the KV buckets instead.
+    # device with. None when page counts are rounded up to the num_blocks buckets instead.
     page_range: DynamicRange | None = None
     # The same for a prefill sequence (aligned query length > 1), whose page counts are
     # multiples of the prefill page group.
@@ -614,11 +614,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.
-        # Sliding window layers pad each sequence to a bound taken from its KV bucket, so
-        # they keep the buckets.
+        # Sliding window layers pad each sequence to a bound taken from its num_blocks
+        # bucket, so they keep the buckets.
         self._attn_bucketer = SpyreAttnBucketer(
             vllm_config,
             declare_pages=self.sliding_window is None and not self._encoder_only,
+            sliding_window=self.sliding_window,
         )
 
         self._init_reorder_batch_threshold(reorder_batch_threshold=1)
@@ -938,7 +939,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # tiles, page-index tables, batched-decode precomputes -- and
             # SpyreEncoderAttentionImpl reads none of it, deriving its own packed
             # grid from seq_lens and query_start_loc. Besides the per-step waste,
-            # _pad_num_blocks would reject the batch: its ladder comes from
+            # _pad_num_blocks would reject the batch: its bucket comes from
             # max_model_len while a pooling model's body buckets come from
             # max_num_batched_tokens, and warmup profiles every sequence at the full
             # body size (a 256-token sentence-transformer asks for 512).
@@ -1058,7 +1059,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # zero mask tile; only boundary blocks get real per-query cutoffs.
             # The count is padded up to _max_active_blocks so it stops sliding with
             # the context, which would compile a new kernel inside the request. Not
-            # rounded onto the num_blocks ladder: that inflates the exact per-bucket
+            # rounded onto the num_blocks buckets: that inflates the exact per-bucket
             # bound several-fold. padded_num_blocks stays None so forward() keeps
             # gathering through active_block_indices.
             active_block_indices = []
@@ -1115,13 +1116,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         for s, n in enumerate(num_active):
             if active_block_indices is not None:
                 blocks_s = active_block_indices[s]
-            elif self._attn_bucketer.page_range is not None:
+            else:
                 # Pad with the last real page, as forward() does: rounding the count up to
-                # the range's minimum or granularity can take it past the block table's width.
+                # the range's minimum or granularity, or to the num_blocks bucket, can take
+                # it past the block table's width.
                 real = real_num_blocks[s]
                 blocks_s = list(range(real)) + [real - 1] * (n - real)
-            else:
-                blocks_s = slice(n)
             table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
             table[:, 0] = block_table[s, blocks_s]
             page_index_tables_cpu.append(table)
@@ -1158,7 +1158,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             if b_seqs is not None and plan is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
-                # bucket round-up (which padding the denser ladder addresses instead).
+                # bucket round-up.
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 prefix = list(range(num_decode_seqs))
                 (
@@ -1328,9 +1328,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             plan = group_plan(members)
             return None if plan is None else plan.num_chunks
 
+        # One seed group per power-of-two block count.
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
-            by_bucket.setdefault(bucketer.find_blocks_bucket(nb) or 0, []).append(s)
+            by_bucket.setdefault((max(nb, 1) - 1).bit_length(), []).append(s)
         groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
         merged = True
         while merged and len(groups) > 1:

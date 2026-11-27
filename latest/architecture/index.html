@@ -2895,11 +2895,9 @@ load-time constant such as a rope permutation becomes a non-persistent buffer on
 layer, lifted as a graph input, and a per-image one such as the attention mask is built
 once in the encoder forward and passed to each layer as an argument. A multimodal patch
 that has done that marks the layers with <code>mark_blocks_compilable</code> (<code>multimodal/utils.py</code>),
-and they are discovered like any other block stack; every other tower stays eager. CLIP's
-tower is marked (<code>multimodal/clip.py</code>): its attention is vLLM's <code>MMEncoderAttention</code>,
-which Spyre replaces out of tree (<code>custom_ops/vit_attn.py</code>) with a <code>padded_sdpa</code> call that
-traces into the block rather than running behind upstream's opaque SDPA wrapper, and its
-only mask is the key-padding row, which <code>padded_sdpa</code> keeps a graph input. Marked tower
+and they are discovered like any other block stack; every other tower stays eager. No
+registered model marks its tower any more: CLIP's (<code>models/clip.py</code>) runs on the vision
+encoder mixin below, and <code>multimodal/clip.py</code> is left until its removal. Marked tower
 blocks compile beside the decoder blocks but never stand in for them, so a model with no
 decoder blocks still falls back to the whole-model graph. Warmup runs a marked tower at
 every image-batch width up to <code>mm_max_items_per_batch</code>, for pooling and generative models
@@ -2969,6 +2967,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <th>Purpose</th>
 <th>Native Pixtral (<code>models/pixtral.py</code>)</th>
 <th>Gemma 4 (<code>models/gemma4_mm.py</code>)</th>
+<th>CLIP (<code>models/clip.py</code>)</th>
 </tr>
 </thead>
 <tbody>
@@ -2978,6 +2977,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>host inputs (fp16, or integer indices) and their padding values; patches per image token; output width</td>
 <td>patches, key-padding row, positions; <code>M²</code>; text hidden size</td>
 <td>patches, one-hot segments, x and y positions; <code>k²</code> (pooling kernel); text hidden size</td>
+<td>patches (zero class row), positions, one-hot segments (<code>full</code> only); the slot (<code>class</code>) or 1 (<code>full</code>); <code>projection_dim</code></td>
 </tr>
 <tr>
 <td><code>vision_item_tokens(mm_kwargs)</code></td>
@@ -2985,6 +2985,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>image tokens per item, for packing into budgets</td>
 <td>patches / <code>M²</code> per image</td>
 <td>valid patches / <code>k²</code> per image</td>
+<td>1 (<code>class</code>) or <code>grid² + 1</code> (<code>full</code>) per image</td>
 </tr>
 <tr>
 <td><code>vision_inputs(mm_kwargs)</code></td>
@@ -2992,6 +2993,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>host buffers, unpadded; validated against <code>vision_buffers</code></td>
 <td>one image's offset-major patches, a zero key-padding row, RoPE positions</td>
 <td>valid patches only, offset-major by position; segments; x and y</td>
+<td>per image: class row, raster patches, slot padding (<code>class</code> only); positions; segments (<code>full</code> only)</td>
 </tr>
 <tr>
 <td><code>vision_embed(values)</code></td>
@@ -2999,6 +3001,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>graph 1: patches -&gt; block input embeddings and shared block inputs</td>
 <td>patch linear, <code>ln_pre</code>, <code>[1, 1, 1, P]</code> key-padding mask</td>
 <td>patch linear plus position embeddings and RoPE, gathered per axis; image mask</td>
+<td>patch linear plus class and position embeddings, gathered; <code>pre_layrnorm</code> with fp32 statistics; <code>class</code>: slots batched <code>[images, slot, D]</code> under one key-padding row, <code>full</code>: packed under the image mask</td>
 </tr>
 <tr>
 <td><code>vision_blocks()</code></td>
@@ -3006,6 +3009,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>graph 2: blocks sharing one artifact</td>
 <td><code>TransformerBlock</code>s with <code>SpyrePixtralAttention</code></td>
 <td>stock encoder layers, their attention and norm instances switched to Spyre subclasses</td>
+<td><code>SpyreCLIPEncoderLayer</code>s with <code>SpyreCLIPAttention</code></td>
 </tr>
 <tr>
 <td><code>vision_project(x, taps)</code></td>
@@ -3013,11 +3017,13 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>graph 3: merge or pool, then project into the text space</td>
 <td>projector norm, patch merge, adapter</td>
 <td>the <code>k×k</code> pool only; the tail runs in <code>postprocess_encoder_output</code></td>
+<td>each slot's class row by a one-hot weight (<code>class</code> only); <code>post_layernorm</code> with fp32 statistics; <code>visual_projection</code></td>
 </tr>
 <tr>
 <td><code>vision_call_block</code></td>
 <td>no</td>
 <td>block call convention (default <code>block(x, **kw)</code>)</td>
+<td>default</td>
 <td>default</td>
 <td>default</td>
 </tr>
@@ -3027,6 +3033,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>intermediate hidden states passed to <code>vision_project</code></td>
 <td>none</td>
 <td>none</td>
+<td>none</td>
 </tr>
 <tr>
 <td><code>vision_pad_groups</code>, <code>vision_patch_multiple</code></td>
@@ -3034,6 +3041,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>padding layout and alignment (default: one group per merge offset, 64-wide sticks)</td>
 <td>default</td>
 <td>default (576 patches at <code>k = 3</code>)</td>
+<td>1; the slot (<code>class</code>) or 64 (<code>full</code>)</td>
 </tr>
 <tr>
 <td><code>vision_max_items_per_call</code></td>
@@ -3041,6 +3049,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>layout bound on items per encoder call</td>
 <td>1 (so the mask only hides padding)</td>
 <td>63 (one-hot width)</td>
+<td>63: one-hot width (<code>full</code>), bound on the largest budget (<code>class</code>)</td>
 </tr>
 <tr>
 <td><code>vision_items_limited_by_tokens</code></td>
@@ -3048,6 +3057,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>limit items per call by budget tokens and <code>vision_max_items_per_call</code> (then required) instead of upstream's smallest budget</td>
 <td><code>False</code></td>
 <td><code>False</code></td>
+<td><code>True</code></td>
 </tr>
 <tr>
 <td><code>vision_pack_tokens</code></td>
@@ -3055,6 +3065,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>packing stops at the budget covering this; larger items run alone (default <code>None</code>: up to the largest budget)</td>
 <td>default</td>
 <td>the engine's largest image</td>
+<td>default</td>
 </tr>
 <tr>
 <td><code>vision_modalities</code></td>
@@ -3062,6 +3073,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>modalities run through the graphs; others go to upstream's <code>embed_multimodal</code></td>
 <td><code>("image",)</code></td>
 <td><code>("image",)</code>; video is rejected</td>
+<td><code>("image",)</code></td>
 </tr>
 </tbody>
 </table>
@@ -3072,7 +3084,7 @@ host), and <code>get_encoder_cudagraph_budget_range</code> when the processor's 
 in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. <code>select_encoder_cudagraph_items</code> and <code>get_input_modality</code> come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
-upstream Pixtral does not, so <code>SpyrePixtralForConditionalGeneration</code> writes them. Gemma 4
+upstream Pixtral and CLIP do not, so their Spyre subclasses write them. Gemma 4
 overrides <code>postprocess_encoder_output</code> to run its tail on the host in fp32, as upstream does:
 the pooler's <code>sqrt(hidden_size)</code> scale can leave the fp16 range, so the scale, standardize and
 <code>embed_vision</code> never run on the card, and its graphs end at the pooled vision hidden size. The eager

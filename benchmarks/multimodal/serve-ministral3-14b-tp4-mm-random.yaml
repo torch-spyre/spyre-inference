@@ -8,6 +8,7 @@ spec:
   level: service
   tier: extended
   system: ministral-3-14b-instruct-bf16-tp4
+  profile: {supported: ["off"], default: "off"}
   workload:
     type: llm/serve
     endpoint: /v1/chat/completions

@@ -8,6 +8,7 @@ spec:
   level: model
   tier: sanity
   system: micro-g3.3-8b-instruct-1b-tp1
+  profile: {supported: ["off"], default: "off"}
   workload:
     type: llm/latency
     shape: {batch_size: 1, input_len: 64, output_len: 64}

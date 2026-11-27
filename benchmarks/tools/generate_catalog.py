@@ -301,6 +301,8 @@ def benchmark_file(config: dict, kind: str, system: str, dataset: str | None, in
         f"  level: {'service' if kind == 'serve' else 'model'}",
         f"  tier: {config['tier']}",
         f"  system: {system}",
+        # `off` only until a producer reads BENCH_PROFILE_LEVEL; bare `off` is a YAML 1.1 boolean.
+        '  profile: {supported: ["off"], default: "off"}',
         *workload_block(config, kind, dataset),
         "  run:",
         "    cache: warm",

@@ -8,6 +8,7 @@ spec:
   level: service
   tier: extended
   system: bge-reranker-v2-m3-tp1
+  profile: {supported: ["off"], default: "off"}
   workload:
     type: llm/serve
     endpoint: /rerank

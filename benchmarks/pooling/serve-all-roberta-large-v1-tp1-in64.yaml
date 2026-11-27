@@ -8,6 +8,7 @@ spec:
   level: service
   tier: extended
   system: all-roberta-large-v1-tp1
+  profile: {supported: ["off"], default: "off"}
   workload:
     type: llm/serve
     endpoint: /v1/embeddings

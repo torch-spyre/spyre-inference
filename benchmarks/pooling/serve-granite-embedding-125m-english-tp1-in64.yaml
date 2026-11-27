@@ -8,6 +8,7 @@ spec:
   level: service
   tier: extended
   system: granite-embedding-125m-english-tp1
+  profile: {supported: ["off"], default: "off"}
   workload:
     type: llm/serve
     endpoint: /v1/embeddings

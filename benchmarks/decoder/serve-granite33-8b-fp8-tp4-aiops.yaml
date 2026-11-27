@@ -8,6 +8,7 @@ spec:
   level: service
   tier: extended
   system: granite-3.3-8b-instruct-fp8-tp4
+  profile: {supported: ["off"], default: "off"}
   workload:
     type: llm/serve
     endpoint: /v1/completions

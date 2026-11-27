@@ -81,6 +81,10 @@ def _launch_sites() -> set[str]:
     }
 
 
+# Exempt from the tests/mrv2 budget: it neither compiles nor builds an engine, so
+# the budget guards nothing here, and the pinned vLLM tree's size plus host load
+# alone push the parse past 1s on a busy runner (#1704).
+@pytest.mark.ast_walk
 def test_every_launch_site_is_bound() -> None:
     bound = set(kernels.HOST_KERNELS) | set(kernels.UNSUPPORTED_KERNELS)
     sites = _launch_sites()

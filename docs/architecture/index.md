@@ -452,12 +452,12 @@ rather than lazily on first use: warmup records per-sequence variants from
 `max_model_len`; variants exceeding the allocated page count are skipped.
 When the per-sequence page count is dynamic (copied to the device with
 `tensor.to(dynamic=...)`), that kernel runs every page count up to it; otherwise every
-sequence pads to it. A sliding-window layer has no page range and records one variant per
-(power-of-two page count, query bucket) pair instead. When prefill gets its own range of
+sequence pads to it. A sliding-window layer records at the pages its window touches instead,
+fewer for decode than for the widest query bucket. When prefill gets its own range of
 multiples of 8 pages, a prefill variant is traced at that page count rounded up to a
 multiple of 8. Failed recordings are logged and compile on first use instead.
 For the batched-decode kernel, warmup enumerates its variants, one per num-sequences bucket at the page count of `max_model_len`, or
-at each power-of-two count up to its window for a sliding-window layer; variants that reach
+at the pages a one-token window touches for a sliding-window layer; variants that reach
 or exceed the allocated page count are skipped and declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
 one dynamic variant, at the chunk count of `max_model_len`, that runs every batch, a
 single chunk included. A single step can carry a mix of prefill and decode sequences;
@@ -539,8 +539,7 @@ Key constraints:
 
 - **KV length**: not bucketed. Each sequence keeps its own block count within a page range
   up to `max_model_len`, or pads to that count where there is no range (see the
-  configuration guide). Sliding-window layers keep power-of-two block counts, capped at the
-  pages their window touches.
+  configuration guide). A sliding-window layer's range ends at the pages its window touches.
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only): powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`);

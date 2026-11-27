@@ -337,15 +337,6 @@ class TestBatchedDecodeVariants:
         b = SpyreAttnBucketer(make_config(32768, 2048, max_num_seqs=64))
         assert len(b.batched_decode_variants()) < 100
 
-    def test_a_sliding_window_pads_batched_decode_to_its_window(self):
-        """A one-token query's window touches at most ceil(window / block_size) + 1 pages."""
-        b = SpyreAttnBucketer(make_config(), sliding_window=128)
-        assert b.num_blocks_buckets == [1, 2, 4, 8, 16, 32]
-        assert b.batched_blocks_buckets(8) == [1, 2, 3]
-        assert {v.num_blocks for v in b.batched_decode_variants()} == {1, 2, 3}
-        wide = SpyreAttnBucketer(make_config(), sliding_window=100_000)
-        assert max(v.num_blocks for v in wide.batched_decode_variants()) == 2048 // BLOCK_SIZE
-
 
 class TestDeclaredPages:
     """The per-sequence kernels take a page range instead of the num_blocks bucket when it fits."""
@@ -465,3 +456,76 @@ class TestDynamicChunks:
         assert not any(v.dynamic_chunks for v in b.batched_decode_variants())
         plan = b.batched_decode_plan(4, 100)
         assert plan is not None and plan.chunk_range is None
+
+
+class TestSlidingWindowPages:
+    """A sliding window ends the page ranges at the pages its queries' windows touch."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_ts_limits(self):
+        from torch_spyre._inductor import config as ts_config
+
+        # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+        # config-module entry, hiding it for later tests.
+        with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+            yield
+
+    def test_the_window_and_the_query_width_bound_the_pages(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, sliding_window=128
+        )
+        # A one-token window spans 128 positions over 64-token pages, plus one for a start
+        # off a page boundary; the widest query's windows 128 + 512 - 1.
+        assert b.page_range == {"min": 1, "max": 3, "granularity": 1}
+        assert b.prefill_page_range == {"min": 1, "max": 11, "granularity": 1}
+        assert [b.find_declared_pages(n, prefill=True) for n in (1, 3, 9, 11)] == [2, 3, 9, 11]
+
+    def test_a_window_wider_than_the_context_walks_the_context(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048), declare_pages=True, sliding_window=100_000
+        )
+        assert b.page_range is not None and b.prefill_page_range is not None
+        assert b.page_range["max"] == b.prefill_page_range["max"] == 2048 // BLOCK_SIZE
+
+    def test_each_query_bucket_records_at_the_end_of_its_range(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, max_num_batched_tokens=2048),
+            declare_pages=True,
+            sliding_window=128,
+        )
+        # 128 + 2048 - 1 positions span 35 pages.
+        assert [(v.padded_query_len, v.num_blocks) for v in b.variants()] == [
+            (2048, 35),
+            (1536, 35),
+            (1024, 35),
+            (512, 35),
+            (1, 3),
+        ]
+
+    def test_batched_decode_counts_chunks_up_to_a_one_token_window(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192), declare_pages=True, sliding_window=1024
+        )
+        # 1024 / 64 + 1 pages: one chunk at one sequence, five of four pages at eight.
+        assert [
+            (v.num_seqs, v.num_blocks, v.dynamic_chunks) for v in b.batched_decode_variants()
+        ] == [
+            (8, 17, True),
+            (4, 17, True),
+            (2, 17, True),
+            (1, 17, False),
+        ]
+        plan = b.batched_decode_plan(8, 3)
+        assert plan is not None
+        assert plan.chunk_range == {"min": 1, "max": 5, "granularity": 1}
+        assert plan.num_chunks == 1
+        assert b.batched_decode_plan(8, 18) is None
+
+    def test_without_a_page_range_a_window_pads_to_its_pages(self):
+        """Without a range a decode pads to a one-token window's pages, and a prefill to the
+        widest query's."""
+        b = SpyreAttnBucketer(make_config(), sliding_window=128)
+        assert b.page_range is None and b.prefill_page_range is None
+        assert (b.find_blocks_bucket(1), b.find_blocks_bucket(1, prefill=True)) == (3, 11)
+        assert b.find_blocks_bucket(4) is None
+        assert [(v.padded_query_len, v.num_blocks) for v in b.variants()] == [(512, 11), (1, 3)]

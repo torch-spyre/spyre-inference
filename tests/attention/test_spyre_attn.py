@@ -58,7 +58,7 @@ from spyre_inference.v1.attention.ops.reshape_and_cache import (
     quantize_kv,
     reshape_and_cache_kernel,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+from spyre_inference.v1.attention.spyre_attn_bucketer import MIN_PREFILL_PAGES, SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
 
@@ -1542,14 +1542,19 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     num_blocks = (kv_len + block_size - 1) // block_size
     real_active = list(range(first_active, num_blocks))
     assert metadata.active_block_indices is not None
-    active = metadata.active_block_indices[0]
-    # This case does pad, so assert the padded length first: the tail checks below
-    # are vacuous on an empty tail and would pass a regression to no padding.
-    assert len(active) == num_blocks > len(real_active)
-    # The real prefix is what the clamp could have disturbed; the tail is bucket
-    # padding, which repeats the last real block.
-    assert active[: len(real_active)] == real_active
-    assert set(active[len(real_active) :]) == {real_active[-1]}
+    # Three pages, within the page range, so nothing is padded.
+    assert metadata.active_block_indices[0] == real_active
+
+
+def test_a_one_page_sliding_window_prefill_walks_two_pages(default_vllm_config):
+    """A window's prefill takes the prefill floor too: one page would let its unused slots
+    into the output. The second page repeats the first under a fully masked tile."""
+    torch.set_default_device("cpu")
+    metadata = _padded_mask_metadata([(7, 7)], block_size=64, sliding_window=128)
+
+    assert metadata.active_block_indices == [[0] * MIN_PREFILL_PAGES]
+    padded = metadata.attention_mask_stacks[0][1:]
+    assert torch.equal(padded, torch.full_like(padded, torch.finfo(padded.dtype).min))
 
 
 def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm_config):
@@ -2309,6 +2314,107 @@ def test_spyre_attn_one_kernel_serves_every_page_count(
 
 
 @pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_sliding_window_kernel_serves_every_page_count(
+    default_vllm_config,
+    monkeypatch,
+    configure_compilation,
+    configure_device,
+):
+    """A window's prefill kernel, compiled at the end of its page range as warmup records
+    it, serves every page count the window walks below that, and matches the reference."""
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch_spyre._inductor import config as ts_config
+    from vllm.config import get_current_vllm_config
+
+    # A 256-token window and 64-token queries span up to 4 of the 128-token pages, which the
+    # first kv_len walks.
+    get_current_vllm_config().scheduler_config.max_num_batched_tokens = 64
+    walked: list[int] = []
+    run = SpyreAttentionImpl._run_page_attn
+
+    def recording(self, query, row_table, k_pages, v_pages, index_table, *args):
+        walked.append(index_table.shape[0])
+        return run(self, query, row_table, k_pages, v_pages, index_table, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_page_attn", recording)
+    kernel_code = spyre_attn.page_attn_prefill.__code__
+    # Restores the MIN_RESERVED_DIM_SIZE the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8):
+        for kv_len in (419, 2048, 100):
+            _run_spyre_attn_test(
+                seq_lens=[(64, kv_len)],
+                block_size=128,
+                sliding_window=256,
+                configure_compilation=configure_compilation,
+                configure_device=configure_device,
+                num_query_heads=8,
+                num_kv_heads=2,
+            )
+            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
+    assert walked == [4, 3, 2]
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_one_sliding_window_batched_kernel_serves_every_chunk_count(
+    default_vllm_config,
+    monkeypatch,
+    batched_decode_calls,
+    configure_compilation,
+    configure_device,
+):
+    """A window's batched decode kernel, compiled at the end of its chunk range as warmup
+    records it, serves every chunk count below that, and matches the reference."""
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch_spyre._C import get_reserved_dims
+    from torch_spyre._inductor import config as ts_config
+
+    chunk_counts: list[int] = []
+    run = SpyreAttentionImpl._run_batched_decode
+
+    def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
+        assert get_reserved_dims(chunk_page_ids), "the chunk count is not dynamic"
+        chunk_counts.append(chunk_page_ids.shape[0])
+        return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    # A 1024-token window touches up to 9 of the 128-token pages, 3 chunks of 4 at eight
+    # sequences, which the first batch walks.
+    kernel_code = spyre_attn.batched_decode.__code__
+    # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a
+    # config-module entry, hiding it for later tests.
+    with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+        for kv_len in (1100, 2048, 100):
+            batched_decode_calls.clear()
+            _run_spyre_attn_test(
+                seq_lens=[(1, kv_len)] * 8,
+                block_size=128,
+                sliding_window=1024,
+                configure_compilation=configure_compilation,
+                configure_device=configure_device,
+                num_query_heads=8,
+                num_kv_heads=2,
+            )
+            assert batched_decode_calls, "the batch fell back to the per-seq loop"
+            assert len(_debug_get_cache_entry_list(kernel_code)) == 1, f"recompiled at {kv_len=}"
+    assert chunk_counts == [3, 2, 1], chunk_counts
+
+
+@pytest.mark.parametrize(
     ("seq_len", "walked", "num_kv_heads"),
     [((7, 7), [2], 2), ((1, 11), [], 2), ((1, 11), [], 1)],
     ids=["prefill", "decode", "decode_one_kv_head"],
@@ -2592,6 +2698,10 @@ def test_spyre_attn_sliding_window(
 
 @pytest.mark.parametrize("seq_lens", [pytest.param([(1, 300), (64, 200)], id="mixed_batch")])
 @pytest.mark.parametrize("soft_cap", [30.0])
+# gemma-4's sliding layers combine the two.
+@pytest.mark.parametrize(
+    "sliding_window", [pytest.param(None, id="full"), pytest.param(128, id="sliding_window128")]
+)
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -2601,12 +2711,17 @@ def test_spyre_attn_sliding_window(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_spyre_attn_soft_cap(
-    default_vllm_config, seq_lens, soft_cap, configure_compilation, configure_device
+    default_vllm_config,
+    seq_lens,
+    soft_cap,
+    sliding_window,
+    configure_compilation,
+    configure_device,
 ):
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=64,
-        sliding_window=None,
+        sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         soft_cap=soft_cap,

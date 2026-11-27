@@ -72,6 +72,13 @@ local_scheme   = "_versioning:ci_local_scheme"
 [tool.uv]
 default-groups = ["dev"]
 
+# The uv version every environment runs. astral-sh/setup-uv reads this on every
+# call site and installs exactly this version, instead of resolving `latest`
+# through the astral-sh/versions manifest — a raw.githubusercontent fetch with a
+# 5 s timeout that has killed matrix legs at bootstrap (#1695). uv enforces the
+# same value at run time.
+required-version = "0.13.7"
+
 # Rebuild the csrc/ extension when its sources change, not just the metadata files.
 cache-keys = [
     { file = "pyproject.toml" },

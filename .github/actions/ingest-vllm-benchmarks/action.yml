@@ -127,7 +127,7 @@ runs:
 
     - name: Set up uv
       if: steps.gate.outputs.configured == 'true'
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
     - name: Set up ingest venv
       if: steps.gate.outputs.configured == 'true'

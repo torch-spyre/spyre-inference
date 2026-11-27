@@ -61,7 +61,8 @@ def _layer_norm_kernel(
     # torch-spyre layout limitation ("Multi-arg pointwise with mixed EA") when
     # multiplying by `weight`: the fp32 reduction's device layout doesn't
     # broadcast against a plain fp16 parameter. Keeping weight/bias in fp32 too
-    # and casting only the final result avoids it.
+    # and casting only the final result avoids it. Inside a larger graph that full-size
+    # cast trips the same limit downstream; models/clip.py:_vision_layer_norm is the variant.
     input_dtype = x.dtype
     x = x.float()
     mean = x.mean(dim=-1, keepdim=True)

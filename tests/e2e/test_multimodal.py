@@ -237,7 +237,12 @@ def test_gemma4_sliced_vision_pass_matches_one_shot(monkeypatch):
         def recording_finish(state, mm_kwargs):
             output = finish_item(state, mm_kwargs)
             (one_shot,) = manager.execute(mm_kwargs)
-            manager.finished.append((output.cpu(), one_shot.cpu()))
+            # Compared here: tensors come back from collective_rpc as strings.
+            try:
+                torch.testing.assert_close(output.cpu(), one_shot.cpu())
+                manager.finished.append(None)
+            except AssertionError as mismatch:
+                manager.finished.append(str(mismatch))
             return output
 
         manager.run_slices, manager.finish_item = recording_run, recording_finish
@@ -262,8 +267,8 @@ def test_gemma4_sliced_vision_pass_matches_one_shot(monkeypatch):
     assert all(o.outputs[0].text.strip() for o in outputs), "empty generation"
     ((advances, finished),) = llm.collective_rpc(recorded_slices)
     assert advances > 0, "the image was encoded in one step, not sliced"
-    ((sliced, one_shot),) = finished
-    torch.testing.assert_close(sliced, one_shot)
+    (mismatch,) = finished
+    assert mismatch is None, mismatch
 
 
 @pytest.mark.multimodal

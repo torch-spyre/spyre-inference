@@ -2794,9 +2794,7 @@ sequence length up to <code>--max-model-len</code>.</p>
 <p>Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
 per loop step at every sequence length. When <code>--max-model-len</code> is too short for that, prefill
 keeps its own page count, but covers at least two pages. Decode sequences keep their own page
-count. A model
-with a layer of one KV head (after the tensor-parallel split) runs at least two pages: a
-sequence that fits in one page also gets a masked copy of it as a second page.</p>
+count.</p>
 <p>The page tables and mask stacks are copied to the device with torch-spyre's
 <code>tensor.to("spyre", dynamic=...)</code>. For this, the plugin sets two torch-spyre limits unless you
 export them yourself: <code>MIN_RESERVED_DIM_SIZE</code> to 1, and <code>MAX_BUCKETS</code> to at least
@@ -2805,7 +2803,7 @@ below that rounded value, prefill reads one page per loop step instead.</p>
 <p>The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
 bucket pair, when any of these holds:</p>
 <ul>
-<li><code>--max-model-len / block_size</code> is not above the minimum page count, or is above an exported
+<li><code>--max-model-len / block_size</code> is not above <code>MIN_RESERVED_DIM_SIZE</code>, or is above an exported
   <code>MAX_BUCKETS</code>; startup logs a warning;</li>
 <li>the layer uses sliding-window attention.</li>
 </ul>

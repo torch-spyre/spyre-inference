@@ -28,14 +28,17 @@ defaults:
 
 tests:
   - test_name: serve_ministral3-14b_tp4_mm_random
+    tier: extended
     server_parameters:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
 
   - test_name: serve_gemma4-26b-a4b-it_tp4_mm_random
+    tier: extended
     server_parameters:
       model: google/gemma-4-26B-A4B-it
 
   - test_name: serve_ministral3-14b_tp2_mm_vision
+    tier: extended
     server_parameters:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
       tensor-parallel-size: 2

@@ -115,6 +115,15 @@ def parse_args():
         help="comma-separated subset of latency,throughput,serve to run (empty = all)",
     )
     parser.add_argument(
+        "--tests",
+        type=str,
+        default="",
+        help="comma-separated test_names to run (empty = all), matched "
+        "case-insensitively like --models; a name with no entry in the selected "
+        "configs is an error, so a caller that names one case per invocation "
+        "cannot silently measure nothing",
+    )
+    parser.add_argument(
         "--suite",
         type=str,
         default="",
@@ -192,8 +201,10 @@ def _missing_dataset(config: dict) -> str | None:
     return None
 
 
-def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
-    """Keep configs whose model and TP are selected (empty selects all).
+def _select_configs(
+    configs: list, models: set[str], tps: set[int], tests: set[str] | None = None
+) -> list:
+    """Keep configs whose test name, model and TP are selected (empty selects all).
 
     A selected config whose dataset is absent is fatal, not skipped: skipping
     would let a serve-only model job report success while measuring nothing.
@@ -201,6 +212,8 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
     selected = []
     missing_datasets = []
     for config in configs:
+        if tests and str(config.get("test_name", "")).lower() not in tests:
+            continue
         model = _config_model(config)
         if models and not (model and model.lower() in models):
             log.info("Skipping %s (model %s not selected)", config.get("test_name"), model)
@@ -687,6 +700,7 @@ def run_benchmarks_from_file(
     aiu_world_size: str,
     models: set[str],
     tps: set[int],
+    tests: set[str] | None = None,
 ) -> list[BenchResult]:
     """Run every selected benchmark in a config file."""
     if not config_file.exists():
@@ -699,7 +713,7 @@ def run_benchmarks_from_file(
 
     pins = _pinned_revisions()
     results = []
-    for config in _select_configs(configs, models, tps):
+    for config in _select_configs(configs, models, tps, tests):
         test_name = config.get("test_name", "unknown")
         _pin_revision(config, pins)
         env_config = config.get("environment_variables", {})
@@ -866,6 +880,26 @@ def main():
         print(json.dumps(list_legs(files, models, tps)))
         return
 
+    # Lowercased both sides: a stored benchmark name is hashed case-insensitively, so a caller
+    # naming a case may legitimately spell it differently from the config's `test_name`.
+    tests = {t.strip().lower() for t in args.tests.split(",") if t.strip()}
+    if tests:
+        known = {
+            str(c.get("test_name", "")): str(c.get("test_name", "")).lower()
+            for _, f in files
+            if f.exists()
+            for c in (_load_configs(f) or [])
+        }
+        unknown_tests = sorted(tests - set(known.values()))
+        if unknown_tests:
+            log.error(
+                "No config for test(s) %s in %s; known: %s",
+                unknown_tests,
+                [f.name for _, f in files],
+                sorted(n for n in known if n),
+            )
+            sys.exit(2)
+
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -878,6 +912,7 @@ def main():
             aiu_world_size=args.aiu_world_size,
             models=models,
             tps=tps,
+            tests=tests,
         )
     failed = sum(r.error is not None for r in results)
 

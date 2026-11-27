@@ -1,5 +1,6 @@
 # Latency benchmarks for Spyre devices
 - test_name: latency_granite8B_tp1_in64_out64
+  tier: sanity
   environment_variables:
     DTLOG_LEVEL: error
     SPYRE_DEVICES: '0'
@@ -15,6 +16,7 @@
     num-iters: 2
     max-model-len: 128
 - test_name: latency_granite33-8b_tp1_in64_out64
+  tier: core
   environment_variables:
     DTLOG_LEVEL: error
     SPYRE_DEVICES: '0'

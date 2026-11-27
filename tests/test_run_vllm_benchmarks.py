@@ -309,6 +309,43 @@ def test_missing_dataset_of_a_deselected_test_is_not_fatal(monkeypatch, tmp_path
     assert runner._select_configs([config], set(), {4}) == []
 
 
+# ── --tests: selecting one case by name, for a caller that runs them one at a time ──
+
+
+def _named(test_name: str) -> dict:
+    config = {
+        "test_name": test_name,
+        "parameters": {"model": "ibm-granite/x", "tensor_parallel_size": 1},
+    }
+    runner._derive_config(config)
+    return config
+
+
+def test_tests_filter_selects_only_the_named_case():
+    configs = [_named("latency_a_tp1_in64_out64"), _named("latency_b_tp1_in64_out64")]
+
+    selected = runner._select_configs(configs, set(), set(), {"latency_b_tp1_in64_out64"})
+
+    assert [c["test_name"] for c in selected] == ["latency_b_tp1_in64_out64"]
+
+
+def test_tests_filter_matches_case_insensitively():
+    """A stored benchmark name hashes case-insensitively, so a caller may spell a case in lower
+    case while the config spells the model `granite8B`."""
+    configs = [_named("latency_granite8B_tp1_in64_out64")]
+
+    selected = runner._select_configs(configs, set(), set(), {"latency_granite8b_tp1_in64_out64"})
+
+    assert [c["test_name"] for c in selected] == ["latency_granite8B_tp1_in64_out64"]
+
+
+@pytest.mark.parametrize("tests", [None, set()])
+def test_no_tests_filter_keeps_every_config(tests):
+    configs = [_named("latency_a_tp1_in64_out64"), _named("latency_b_tp1_in64_out64")]
+
+    assert len(runner._select_configs(configs, set(), set(), tests)) == 2
+
+
 # ── vision dataset: server_parameters expansion and archive defaults ──
 
 

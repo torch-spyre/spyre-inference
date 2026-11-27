@@ -1,0 +1,107 @@
+name: bench catalog
+
+# Hardware-free checks on benchmarks/. The point is that a benchmark's declaration cannot drift
+# from what runs or from the series it reports into: a renamed case silently starts a new trend
+# line, and nothing downstream would notice.
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/**'
+      - 'mk/bench.mk'
+      - 'vllm-benchmarks/**'
+      - '.github/cache_config/**'
+      - '.github/scripts/run_vllm_benchmarks.py'
+      - '.github/workflows/bench-catalog.yml'
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: >
+          torch-spyre ref to install the bench engine from. Use a branch to try this catalog
+          against an engine change that has not merged yet.
+        required: false
+        type: string
+        default: main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # The catalog resolves its Models, Datasets and Environments against the shared catalog the engine
+  # ships (spyre_bench/catalogs/), so this ref must have it: an engine without it makes every
+  # reference dangle. `make bench-validate` says so by name rather than listing each reference.
+  TORCH_SPYRE_REPO: https://github.com/torch-spyre/torch-spyre
+  ENGINE_REF: ${{ inputs.engine_ref || 'main' }}
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: '3.12'
+          enable-cache: false
+
+      # The engine and the ingest, nothing else: these checks never import vllm or torch, which is
+      # what keeps them on a plain ubuntu runner and off a Spyre card.
+      - name: Install the bench engine
+        run: |
+          set -eux
+          uv venv .bench-venv
+          uv pip install --python .bench-venv/bin/python pyyaml jsonschema \
+            "spyre-bench @ git+${TORCH_SPYRE_REPO}@${ENGINE_REF}#subdirectory=extensions/spyre-bench" \
+            "spyre-clickhouse-ingest @ git+${TORCH_SPYRE_REPO}@${ENGINE_REF}#subdirectory=extensions/clickhouse-ingest"
+          echo "$PWD/.bench-venv/bin" >> "$GITHUB_PATH"
+
+      # Fail here, with the engine ref named, rather than inside each check: an engine that ships no
+      # shared catalog is the one cause behind every "no Model of that name" a validate would print.
+      - name: Check the engine ships the shared catalog
+        run: |
+          set -eu
+          if ! spyre-bench catalogs --path llm; then
+            echo "::error::the bench engine at ${TORCH_SPYRE_REPO}@${ENGINE_REF} ships no shared" \
+                 "catalog (spyre_bench/catalogs/llm). This catalog cannot resolve its Models," \
+                 "Datasets or Environments without it. Merge the engine change first, or dispatch" \
+                 "this workflow with engine_ref set to the branch that has it."
+            exit 1
+          fi
+
+      - name: Validate the catalog
+        run: make bench-validate
+
+      - name: List the cases
+        run: make bench-list
+
+      # The gate that protects the stored trend lines: every case's identity block must reproduce
+      # the id the ingest derives from the config's own test name.
+      - name: Check the identity blocks against the ingest
+        run: make bench-check-ids
+
+      # benchmarks/ is generated from vllm-benchmarks/, so a config edit without a regenerate is
+      # the one way the two can disagree. This is what makes the single source of truth enforceable.
+      - name: Check the catalog is not stale against the configs
+        run: make bench-check-catalog
+
+      # A Selection that selects nothing would make a nightly report success while measuring
+      # nothing, so each one is planned here.
+      - name: Plan every Selection
+        run: |
+          set -eu
+          for sel in smoke nightly-f1 perf-core weekly-full; do
+            echo "::group::$sel"
+            make bench-plan BENCH_SELECTION="$sel" BENCH_PURPOSE=nightly \
+              BENCH_RESULTS_DIR="/tmp/plan-$sel" | tee "/tmp/plan-$sel.txt"
+            grep -qE 'plan: run [1-9]' "/tmp/plan-$sel.txt" \
+              || { echo "Selection $sel planned no cases" >&2; exit 1; }
+            echo "::endgroup::"
+          done

@@ -449,9 +449,9 @@ leaving the retained config's specs, and so its `page_size_bytes`, physical. YOC
 (`kv_sharing_fast_prefill`) swaps in an attention backend Spyre does not provide and is rejected.
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
-rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
-per-sequence variants from `SpyreAttnBucketer.variants()`: one per query bucket, at the
-page count of `max_model_len`; variants exceeding the allocated page count are skipped.
+rather than lazily on first use: warmup records per-sequence variants from
+`SpyreAttnBucketer.variants()`: one per query bucket, at the page count of
+`max_model_len`; variants exceeding the allocated page count are skipped.
 When the per-sequence page count is dynamic (copied to the device with
 `tensor.to(dynamic=...)`), that kernel runs every page count up to it; otherwise every
 sequence pads to it. A sliding-window layer has no page range and records one variant per
@@ -466,7 +466,8 @@ one dynamic variant, at the chunk count of `max_model_len`, that runs every batc
 single chunk included. A single step can carry a mix of prefill and decode sequences;
 each sequence is padded to its own query bucket (decodes use the length-1 bucket) before
 dispatch.
-`SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+Only `--enforce-eager` skips the recording; each attention variant then compiles on first
+use.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows

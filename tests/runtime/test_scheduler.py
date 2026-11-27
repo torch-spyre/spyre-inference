@@ -250,10 +250,14 @@ def _image(
 
 
 def _step(scheduler) -> tuple[SchedulerOutput, VisionSlices]:
-    """One schedule() plus the bookkeeping execute_model + update_from_output would do."""
+    """One schedule() plus the token update_from_output would append."""
     output = scheduler.schedule()
-    for rid, num_tokens in output.num_scheduled_tokens.items():
-        scheduler.requests[rid].num_computed_tokens += num_tokens
+    # schedule() has already advanced num_computed_tokens; a request that has caught up
+    # samples a token, which is what keeps it decoding.
+    for rid in output.num_scheduled_tokens:
+        request = scheduler.requests[rid]
+        if request.num_computed_tokens >= request.num_tokens:
+            request.append_output_token_ids(0)
     assert isinstance(output.ec_connector_metadata, VisionSlices)
     return output, output.ec_connector_metadata
 

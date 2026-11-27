@@ -1195,21 +1195,26 @@ def _image_items(*items):
     return {"type": "multimodal", "mm_kwargs": {"image": list(items)}, "mm_placeholders": {}}
 
 
-def _pixels(missing: bool = False):
-    return {"pixel_values": SimpleNamespace(data=None if missing else torch.zeros(1))}
+def _pixels(missing: bool = False, key: str = "pixel_values"):
+    return {key: SimpleNamespace(data=None if missing else torch.zeros(1))}
 
 
 def test_sliced_vision_accepts_pixels_and_processor_cache_hits(monkeypatch):
     from spyre_inference.platform import TorchSpyrePlatform
 
     monkeypatch.setattr(TorchSpyrePlatform, "_sliced_modalities", ("image",))
-    TorchSpyrePlatform.validate_request(_image_items(_pixels(), None), None)
+    # Pixtral's processor names the pixels ``images``.
+    TorchSpyrePlatform.validate_request(_image_items(_pixels(), _pixels(key="images"), None), None)
 
 
 @pytest.mark.parametrize(
     "item",
-    [{"image_embeds": SimpleNamespace(data=torch.zeros(1))}, _pixels(missing=True)],
-    ids=["embeddings", "missing"],
+    [
+        {"image_embeds": SimpleNamespace(data=torch.zeros(1))},
+        _pixels(missing=True),
+        _pixels(missing=True, key="images"),
+    ],
+    ids=["embeddings", "missing", "missing-images"],
 )
 def test_sliced_vision_rejects_images_without_pixels(monkeypatch, item):
     """As an encoder cache consumer, vLLM accepts both; a pass needs the pixels."""

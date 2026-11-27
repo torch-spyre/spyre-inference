@@ -908,8 +908,11 @@ class TorchSpyrePlatform(CpuPlatform):
         for modality in cls._sliced_modalities:
             # ``None`` is a processor-cache hit, checked when it was first sent.
             for item in processed_inputs["mm_kwargs"].get(modality, ()):
-                pixels = item.get("pixel_values") if item is not None else None
-                if item is not None and (pixels is None or pixels.data is None):
+                if item is None:
+                    continue
+                # Pixtral's processor names them ``images``.
+                pixels = item.get("pixel_values") or item.get("images")
+                if pixels is None or pixels.data is None:
                     raise VLLMValidationError(
                         f"With SPYRE_VISION_BLOCKS_PER_STEP set, an {modality} must come as "
                         "pixels, not as pre-computed embeddings.",

@@ -3071,6 +3071,42 @@ def test_multi_seq_decode_matches_fp32_reference(
     torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
 
 
+def test_batched_decode_chunk_range_uploads_to_a_cpu_target(default_vllm_config, monkeypatch):
+    """The upstream backend tests run batched decode on a CPU target. A batch with a dynamic
+    chunk count then uploads its indices without ``dynamic=``, which only a copy to Spyre
+    takes, as the per-sequence page ranges do."""
+    from spyre_testing_plugin.attn_helpers import _build_metadata, drop_cpu_device_layouts
+    from vllm.config import get_current_vllm_config
+
+    torch.set_default_device("cpu")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+    # What the upstream tests run under: the Spyre layouts are dropped for a CPU target.
+    drop_cpu_device_layouts(monkeypatch)
+    get_current_vllm_config().model_config.max_model_len = 8192
+    num_kv_heads, head_size, block_size = 2, 64, 64
+    md = _build_metadata(
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([5 * block_size], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=1 + torch.arange(8192 // block_size, dtype=torch.int32).reshape(1, -1),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+    )
+    assert md.chunk_range is not None, "the batch must run a dynamic chunk count"
+    impl = SpyreAttentionImpl(
+        num_heads=8, head_size=head_size, scale=head_size**-0.5, num_kv_heads=num_kv_heads
+    )
+    impl._mirror_batched_decode_indices(md, torch.device("cpu"))
+    assert md.blocks_per_chunk is not None and md.padded_num_seqs is not None
+    entries = md.blocks_per_chunk * md.padded_num_seqs
+    chunks = md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk
+    assert md.chunk_page_ids_dev.shape == (chunks, entries, 1)
+    assert md.mask_by_chunk_dev.shape[0] == chunks
+
+
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],

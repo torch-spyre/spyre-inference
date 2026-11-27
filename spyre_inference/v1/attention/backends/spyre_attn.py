@@ -2534,7 +2534,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             c, bpc, b, *attn_metadata.mask_by_chunk_cpu.shape[2:]
         )
         chunk_range = attn_metadata.chunk_range
-        if chunk_range is not None:
+        # CPU unit tests run this path too, and only a copy to Spyre takes `dynamic=`.
+        if chunk_range is not None and device.type == "spyre":
             # Both tensors get a layout with the chunk axis outermost on the device. The
             # buffer is reserved for chunk_range["max"] chunks, this batch's chunks are its
             # first rows, and only those rows are copied. In torch-spyre's default layout

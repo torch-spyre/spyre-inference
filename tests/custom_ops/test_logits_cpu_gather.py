@@ -27,7 +27,6 @@ import textwrap
 
 import pytest
 import torch
-
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
@@ -54,9 +53,7 @@ def test_gather_logits_dispatches_on_the_env_var(tp_group, monkeypatch):
 
     processor = _bare_processor()
     calls = []
-    monkeypatch.setattr(
-        SpyreLogitsProcessor, "_cpu_all_gather_logits", staticmethod(calls.append)
-    )
+    monkeypatch.setattr(SpyreLogitsProcessor, "_cpu_all_gather_logits", staticmethod(calls.append))
     logits = torch.zeros(2, 8, dtype=torch.float16)
 
     monkeypatch.setattr(envs, "SPYRE_LOGITS_CPU_GATHER", False)

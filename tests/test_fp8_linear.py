@@ -837,11 +837,9 @@ def test_modules_to_not_convert_skip_the_vision_tower():
         ignored_layers=["model.vision_tower", "model.multi_modal_projector", "lm_head"],
     )
     config.apply_vllm_mapper(Mistral3ForConditionalGeneration.hf_to_vllm_mapper)
-    assert config.ignored_layers == [
-        "vision_tower",
-        "multi_modal_projector",
-        "language_model.lm_head",
-    ]
+    assert {"vision_tower", "multi_modal_projector", "language_model.lm_head"} <= set(
+        config.ignored_layers
+    )
 
     def method(prefix: str):
         return config.get_quant_method(Mock(spec=LinearBase), prefix)

@@ -91,11 +91,14 @@ class SpyreFp8LinearMethod(Fp8LinearMethod):
 class SpyreFp8Config(Fp8Config):
     # HF ``modules_to_not_convert`` names modules (``model.vision_tower``), not layers. Mapped
     # bare they miss mappers whose prefixes end in a dot, and the exact match never hits the
-    # linears under them, so an unquantized tower got the FP8 method (#1697).
+    # linears under them, so an unquantized tower got the FP8 method (#1697). Upstream
+    # Fp8Config has both gaps too; drop these overrides once it handles module prefixes.
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         if self.ignored_layers is not None:
-            mapped = hf_to_vllm_mapper.apply_list([f"{name}." for name in self.ignored_layers])
-            self.ignored_layers = [name.removesuffix(".") for name in mapped]
+            # Both forms, for rules matching only one; a name mapping to no module skips nothing.
+            names = [*self.ignored_layers, *(f"{name}." for name in self.ignored_layers)]
+            mapped = hf_to_vllm_mapper.apply_list(names)
+            self.ignored_layers = list(dict.fromkeys(name.removesuffix(".") for name in mapped))
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase) and any(

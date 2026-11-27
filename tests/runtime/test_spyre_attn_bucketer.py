@@ -432,12 +432,17 @@ class TestDeclaredPages:
 
         monkeypatch.setenv("MIN_RESERVED_DIM_SIZE", "8")
         monkeypatch.setenv("MAX_BUCKETS", "32")
+        # 128 sequences: the bucket above shared_slot_seqs keeps a per-bucket chunk range.
         b = SpyreAttnBucketer(
-            make_config(max_model_len=33 * BLOCK_SIZE), declare_pages=True, kv_row=NARROW_KV_ROW
+            make_config(max_model_len=33 * BLOCK_SIZE, max_num_seqs=128),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
         )
         assert b.page_range == {"min": 1, "max": 33, "granularity": 1}
         assert b.prefill_page_range == {"min": 8, "max": 40, "granularity": 8}
-        assert b._chunk_ranges and all(r["min"] == 1 for r in b._chunk_ranges.values())
+        assert b.shared_slot_chunk_range["min"] == 1
+        assert set(b._chunk_ranges) == {128}
+        assert all(r["min"] == 1 for r in b._chunk_ranges.values())
         assert (ts_config.min_reserved_dim_size, ts_config.max_buckets) == (1, 40)
 
     def test_without_declare_pages_keeps_the_buckets(self):
@@ -631,6 +636,12 @@ def test_shared_block_slots_take_two_pages_per_core_while_the_kv_row_fits(
     assert shared_block_slots(num_kv_heads, head_size) == slots
 
 
+@pytest.mark.parametrize(("num_pages", "slots"), [(None, 64), (65, 64), (64, 32), (33, 32)])
+def test_shared_block_slots_stay_below_the_kv_cache_pages(num_pages, slots):
+    """A chunk gathers one page per slot, and a gather of the whole cache faults the device."""
+    assert shared_block_slots(*NARROW_KV_ROW, num_pages=num_pages) == slots
+
+
 class TestSharedSlotWidth:
     """The shared-slot chunk takes the layer group's slot count."""
 
@@ -659,6 +670,27 @@ class TestSharedSlotWidth:
         variant = two.shared_slot_variants()[0]
         assert (variant.blocks_per_chunk, variant.num_chunks) == (64, 256)
 
+    def test_a_kv_cache_of_64_pages_or_fewer_takes_32_slots(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048, max_num_seqs=32),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
+            kv_pages=64,
+        )
+        assert (b.shared_slots, b.shared_slot_seqs) == (32, 32)
+
+    def test_a_kv_cache_no_larger_than_32_slots_gets_no_shared_slot_kernel(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, max_num_seqs=32),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
+            kv_pages=32,
+        )
+        assert b.shared_slot_seqs is None
+        assert b.shared_slot_variants() == []
+        # Every batch size keeps its per-bucket kernel instead.
+        assert set(b._chunk_ranges) == set(b.num_seqs_buckets)
+
     def test_a_page_range_needs_the_kv_row(self):
         with pytest.raises(AssertionError, match="declare_pages needs the KV row"):
             SpyreAttnBucketer(make_config(), declare_pages=True)
@@ -672,3 +704,75 @@ class TestSharedSlotWidth:
         assert b.shared_slot_seqs == 64
         assert b.shared_slot_plan([1] * 64) is not None
         assert b.shared_slot_plan([1] * 65) is None
+
+
+class TestSharedSlotChunkCap:
+    """``SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS`` sets the shared-slot kernel's chunk range."""
+
+    @pytest.fixture(autouse=True)
+    def _declarable(self):
+        from torch_spyre._inductor import config as ts_config
+
+        with ts_config.patch(min_reserved_dim_size=8, max_buckets=32):
+            yield
+
+    @staticmethod
+    def _bucketer(monkeypatch, cap):
+        if cap is not None:
+            monkeypatch.setenv("SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS", str(cap))
+        envs.clear_env_cache()
+        # 512 pages; 32 sequences of 2 block slots each need 256 chunks at max_model_len.
+        return SpyreAttnBucketer(
+            make_config(max_model_len=32768, max_num_seqs=32),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
+        )
+
+    def test_unset_derives_the_range_from_max_model_len_and_max_num_seqs(self, monkeypatch):
+        b = self._bucketer(monkeypatch, None)
+        assert b.shared_slot_chunk_range == {"min": 1, "max": 256, "granularity": 1}
+        assert not b.splits_shared_slot_calls
+
+    @pytest.mark.parametrize("cap", [32, 64])
+    def test_a_cap_sets_the_range_and_splits_the_batches_past_it(self, monkeypatch, cap):
+        b = self._bucketer(monkeypatch, cap)
+        assert b.shared_slot_chunk_range == {"min": 1, "max": cap, "granularity": 1}
+        assert b.splits_shared_slot_calls
+        # Recorded at the most chunks one call runs: 32 sequences of 2 slots each.
+        (variant,) = b.shared_slot_variants()
+        assert (variant.num_blocks, variant.num_chunks) == (2 * cap, cap)
+        blocks = [512] * 32
+        assert b.shared_slot_plan(blocks) is None
+        groups = b.shared_slot_call_groups(blocks)
+        assert sorted(i for g in groups for i in g) == list(range(32))
+        # A call covers cap * 64 pages: cap // 8 sequences of 512.
+        assert {len(g) for g in groups} == {cap // 8}
+        assert all(b.shared_slot_plan([blocks[i] for i in g]).num_chunks <= cap for g in groups)
+
+    def test_a_cap_above_the_derived_range_is_kept(self, monkeypatch):
+        from torch_spyre._inductor import config as ts_config
+
+        b = self._bucketer(monkeypatch, 1000)
+        assert b.shared_slot_chunk_range["max"] == 1000
+        assert ts_config.max_buckets >= 1000
+        assert not b.splits_shared_slot_calls
+
+    def test_a_cap_below_one_sequence_is_raised_to_it(self, monkeypatch):
+        # One sequence of 512 pages needs 8 chunks of 64 slots, and no call splits it.
+        b = self._bucketer(monkeypatch, 4)
+        assert b.shared_slot_chunk_range["max"] == 8
+        assert b.shared_slot_plan([512]) is not None
+
+    def test_a_negative_cap_is_rejected(self, monkeypatch):
+        with pytest.raises(ValueError, match="SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS"):
+            self._bucketer(monkeypatch, -1)
+
+    def test_per_bucket_chunk_ranges_cover_only_the_batch_sizes_above_it(self, monkeypatch):
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=8192, max_num_seqs=128),
+            declare_pages=True,
+            kv_row=NARROW_KV_ROW,
+        )
+        assert b.shared_slot_seqs == 64
+        assert set(b._chunk_ranges) == {128}

@@ -639,6 +639,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             declare_pages=self.sliding_window is None and not self._encoder_only,
             sliding_window=self.sliding_window,
             kv_row=(self.num_kv_heads, self.head_size),
+            # Set from the KV cache config before the builders exist. A layer's pages are this
+            # many blocks times its kernel blocks per block, so never fewer.
+            kv_pages=vllm_config.cache_config.num_gpu_blocks,
         )
 
         self._init_reorder_batch_threshold(reorder_batch_threshold=1)
@@ -1171,20 +1174,25 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             plan = self._batched_decode_call_plan(decode_blocks)
-            if plan is not None:
-                # Mean/max block count: how uniform the contexts are, independent of
-                # bucket round-up.
-                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(
-                    1, max(decode_blocks)
-                )
+            rest = (
+                blocks_per_seq,
+                block_table,
+                query_start_loc,
+                active_block_indices,
+                attention_mask_stacks,
+            )
+            # Mean/max block count: how uniform the contexts are, independent of
+            # bucket round-up.
+            uniformity = (sum(decode_blocks) / num_decode_seqs) / max(1, max(decode_blocks))
+            if plan is None:
+                # Past SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS: the batch splits into calls that fit,
+                # whether or not jagged grouping is on.
+                decode_groups = self._batched_decode_groups(decode_blocks, *rest)
+                if decode_groups is not None:
+                    decode_uniformity = uniformity
+            else:
+                decode_uniformity = uniformity
                 prefix = list(range(num_decode_seqs))
-                rest = (
-                    blocks_per_seq,
-                    block_table,
-                    query_start_loc,
-                    active_block_indices,
-                    attention_mask_stacks,
-                )
                 if isinstance(plan, SharedSlotPlan):
                     shared_slot_seqs = self._attn_bucketer.shared_slot_seqs
                     fields, slot_onehot_cpu = self._shared_slot_tensors(prefix, plan, *rest)
@@ -1200,11 +1208,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 ) = fields
                 chunk_range = plan.chunk_range
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
-                if (
-                    envs.SPYRE_JAGGED_DECODE
-                    and decode_uniformity < 1.0
-                    and self._grouping_may_split(plan)
-                ):
+                # Grouping keeps two groups apart only to save more than a dispatch's chunks,
+                # and no part of a batch takes more chunks than the whole, so a shared-slot
+                # call of at most 2 + _GROUP_DISPATCH_CHUNKS chunks always stays one call.
+                may_split = not isinstance(plan, SharedSlotPlan) or (
+                    plan.num_chunks > 2 + _GROUP_DISPATCH_CHUNKS
+                )
+                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0 and may_split:
                     decode_groups = self._batched_decode_groups(decode_blocks, *rest)
 
         return SpyreAttentionMetadata(
@@ -1243,25 +1253,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             decode_groups=decode_groups,
         )
 
-    @staticmethod
-    def _grouping_may_split(plan: BatchedDecodePlan | SharedSlotPlan) -> bool:
-        """Whether the jagged grouping can split a call of ``plan``.
-
-        It keeps two groups apart only when together they take more than
-        ``_GROUP_DISPATCH_CHUNKS`` chunks over their own, and a shared-slot call over some of
-        a batch's sequences takes no more chunks than the whole. So a shared-slot call of at
-        most ``2 + _GROUP_DISPATCH_CHUNKS`` chunks stays one call, and the search is skipped.
-        """
-        return not isinstance(plan, SharedSlotPlan) or (
-            plan.num_chunks > 2 + _GROUP_DISPATCH_CHUNKS
-        )
-
     def _batched_decode_call_plan(
         self, blocks: list[int]
     ) -> BatchedDecodePlan | SharedSlotPlan | None:
         """How to run one batched call over sequences of ``blocks`` pages: on the shared-slot
         kernels when they take this many sequences, else on its num_seqs bucket's kernels.
-        None when its bucket has no kernel for it."""
+        None when one call cannot run it: past ``SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS`` or without
+        a kernel for its bucket."""
         bucketer = self._attn_bucketer
         slot_plan = bucketer.shared_slot_plan(blocks)
         if slot_plan is not None or len(blocks) <= (bucketer.shared_slot_seqs or 0):
@@ -1424,9 +1422,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         attention_mask_stacks: list[torch.Tensor],
     ) -> "list[BatchedDecodeGroup] | None":
         """The decode sequences in groups of one batched call each: by power-of-two block
-        count, then neighbours merged while one call runs them in at most
-        ``_GROUP_DISPATCH_CHUNKS`` more chunks than two. None for a single group, or when a
-        group has no kernel."""
+        count, a group past one shared-slot call split into calls that fit, then neighbours
+        merged while one call runs them in at most ``_GROUP_DISPATCH_CHUNKS`` more chunks than
+        two. None for a single group, or when a group has no kernel."""
         bucketer = self._attn_bucketer
 
         def group_plan(members: list[int]) -> BatchedDecodePlan | SharedSlotPlan | None:
@@ -1440,7 +1438,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         by_bucket: dict[int, list[int]] = {}
         for s, nb in enumerate(decode_blocks):
             by_bucket.setdefault((max(nb, 1) - 1).bit_length(), []).append(s)
-        groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
+        groups = []
+        for k in sorted(by_bucket, reverse=True):
+            members = by_bucket[k]
+            if group_plan(members) is not None:
+                groups.append(members)
+                continue
+            # Past one shared-slot call's chunks (SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS).
+            parts = bucketer.shared_slot_call_groups([decode_blocks[m] for m in members])
+            if parts is None:
+                return None
+            groups.extend([members[j] for j in part] for part in parts)
         merged = True
         while merged and len(groups) > 1:
             merged = False
@@ -1450,9 +1458,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     chunks(groups[i + 1]),
                     chunks(groups[i] + groups[i + 1]),
                 )
-                if ca is None or cb is None or cab is None:
+                if ca is None or cb is None:
                     return None
-                if cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
+                if cab is not None and cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
                     groups[i : i + 2] = [groups[i] + groups[i + 1]]
                     merged = True
                     break
@@ -1776,8 +1784,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 ),
             )
             # Each grouped dispatch writes its batch here before the scatter into
-            # out_staging; same shape and layout, so it matches the recorded variants.
-            if envs.SPYRE_JAGGED_DECODE:
+            # out_staging; same shape and layout, so it matches the recorded variants. A
+            # shared-slot chunk cap splits calls too.
+            if envs.SPYRE_JAGGED_DECODE or envs.SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS:
                 self._group_staging = convert(
                     torch.zeros(shape, dtype=self.model_dtype), device, device_layout=layout
                 )
@@ -2072,7 +2081,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 realized,
                 time.time() - t0,
             )
-        if envs.SPYRE_JAGGED_DECODE:
+        if envs.SPYRE_JAGGED_DECODE or builder.attn_bucketer.splits_shared_slot_calls:
             self._record_group_scatter(sorted({v.num_seqs for v in variants}), kv_cache)
         return len(recorded)
 

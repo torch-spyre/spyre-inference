@@ -2394,7 +2394,9 @@ def _use_batched_decode_kernels(monkeypatch, kernels: str) -> None:
     """The chunk counts below assume 32 block slots per chunk, so the shared-slot kernels take
     32 here; ``test_spyre_attn_narrow_kv_row_shares_64_slots_and_matches_reference`` covers 64."""
     monkeypatch.setattr(
-        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+        spyre_attn_bucketer,
+        "shared_block_slots",
+        lambda *args, **kwargs: 32,
     )
     if kernels == "per_bucket":
         use_per_bucket_decode(monkeypatch)
@@ -2622,7 +2624,9 @@ def test_spyre_attn_shared_slot_grouped_decode_matches_reference(
 
     # 64 slots would fit the batch in one chunk.
     monkeypatch.setattr(
-        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+        spyre_attn_bucketer,
+        "shared_block_slots",
+        lambda *args, **kwargs: 32,
     )
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     envs.clear_env_cache()
@@ -2640,6 +2644,83 @@ def test_spyre_attn_shared_slot_grouped_decode_matches_reference(
     )
 
     assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_shared_slot_batch_past_the_chunk_cap_splits_and_matches_reference(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """With SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS=4, 8 decode sequences that need 7 chunks together
+    run as two calls of 4 chunks or fewer, with jagged grouping off."""
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setenv("SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS", "4")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
+    envs.clear_env_cache()
+    monkeypatch.setattr(
+        spyre_attn_bucketer,
+        "shared_block_slots",
+        lambda *args, **kwargs: 32,
+    )
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 8
+    cfg.model_config.max_model_len = 4096
+    groups_run = _spy_grouped_decode(monkeypatch)
+
+    _run_spyre_attn_test(
+        seq_lens=[(1, 4000)] * 4 + [(1, 3000), (1, 2000), (1, 1000), (1, 100)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert groups_run == [2], f"expected one grouped step of two groups, got {groups_run}"
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_spyre_attn_a_48_page_kv_cache_runs_batched_decode_on_32_slots(
+    default_vllm_config, monkeypatch, batched_decode_calls, configure_compilation, configure_device
+):
+    """A KV cache of 48 pages cannot take a 64-page gather, so the builder shares 32 block
+    slots, and decode still runs batched instead of one sequence at a time."""
+    from vllm.config import get_current_vllm_config
+
+    widths: set[int] = set()
+    run = SpyreAttentionImpl._run_batched_decode
+
+    def recording(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args):
+        widths.add(chunk_page_ids.shape[1])
+        return run(self, query_dev, rep_row_ids, k_pages, v_pages, chunk_page_ids, *args)
+
+    monkeypatch.setattr(SpyreAttentionImpl, "_run_batched_decode", recording)
+    get_current_vllm_config().cache_config.num_gpu_blocks = 48
+    _run_spyre_attn_test(
+        seq_lens=[(1, 1000), (1, 700), (1, 300), (1, 130)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=2,
+        num_blocks=48,
+    )
+    assert batched_decode_calls, "the batch fell back to the per-seq loop"
+    assert widths == {32}, widths
 
 
 @pytest.mark.parametrize(

@@ -476,6 +476,9 @@ Output rows past the batch copy row 0, so they stay finite.
 
 One dynamic variant serves every batch of up to `S` sequences. Its chunk count runs from one
 chunk up to what `S` sequences at `max_model_len` need, so one call serves every such batch.
+`SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS` caps that range at a fixed count instead (at least what one
+`max_model_len` sequence needs); a batch past it splits into grouped calls, longest sequences
+first, each joining the first call it fits.
 
 A single step can carry a mix of prefill and decode sequences; each sequence is padded to its
 own query bucket (decodes use the length-1 bucket) before dispatch.

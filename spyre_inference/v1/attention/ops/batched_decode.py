@@ -26,9 +26,10 @@ slot 0 processes blocks 0, 2, 4, ... and slot 1 processes blocks 1, 3, 5, ... of
 sequence.
 Only the temporary softmax state grows; the permanent KV cache is unchanged.
 
-In shared-slot mode the chunk's 32 block slots are not tied to a sequence: the host
-assigns each one to a sequence per step, and a ``[slots, rows]`` one-hot then merges each
-sequence's block slots into its output row, so no shape depends on the batch size.
+In shared-slot mode the chunk's block slots, 64 (two pages per core) or 32 for a KV row too
+wide for that, are not tied to a sequence: the host assigns each one to a sequence per step,
+and a ``[slots, rows]`` one-hot then merges each sequence's block slots into its output row,
+so no shape depends on the batch size.
 """
 
 import torch

@@ -191,7 +191,9 @@ def shared_slot_config(default_vllm_config, monkeypatch):
 
     monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     monkeypatch.setattr(
-        spyre_attn_bucketer, "shared_block_slots", lambda num_kv_heads, head_size: 32
+        spyre_attn_bucketer,
+        "shared_block_slots",
+        lambda *args, **kwargs: 32,
     )
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 32
@@ -214,6 +216,20 @@ def test_a_narrow_kv_row_shares_64_slots(default_vllm_config, monkeypatch):
     assert md.decode_groups is None
 
 
+def test_a_small_kv_cache_clips_the_shared_slots_to_32(default_vllm_config):
+    """The builder passes the KV cache's block count on: 48 pages hold one 32-page gather, not
+    a 64-page one, so a narrow KV row shares 32 slots instead of 64."""
+    from vllm.config import get_current_vllm_config
+
+    cfg = get_current_vllm_config()
+    cfg.scheduler_config.max_num_seqs = 32
+    cfg.model_config.max_model_len = 32768
+    cfg.cache_config.num_gpu_blocks = 48
+    md = _build([5 * BLOCK] * 4)
+    assert md.shared_slot_seqs == 32
+    assert md.blocks_per_chunk == 32
+
+
 def test_shared_slot_call_keeps_a_jagged_batch_that_fits_its_slots(shared_slot_config):
     """1 x 235 + 4 x 5 blocks: 27 block slots and 1 each over 9 chunks together, 8 + 1 apart."""
     md = _build([235 * BLOCK] + [5 * BLOCK] * 4)
@@ -231,6 +247,26 @@ def test_shared_slot_grouping_splits_one_long_sequence_from_many_short(shared_sl
         (32, 8),
         (32, 8),
     ]
+
+
+@pytest.mark.parametrize("jagged", ["1", "0"])
+def test_a_shared_slot_batch_past_the_chunk_cap_splits_into_calls_that_fit(
+    shared_slot_config, monkeypatch, jagged
+):
+    """With SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS=32, 32 x 256 blocks need 256 chunks in one call;
+    8 calls of 4 sequences need 32 each. The split is not jagged grouping, so it happens with
+    that off too."""
+    from spyre_inference import envs
+
+    monkeypatch.setenv("SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS", "32")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", jagged)
+    envs.clear_env_cache()
+    md = _build([256 * BLOCK] * 32)
+    assert md.padded_num_seqs is None
+    assert _members(md) == [list(range(i, i + 4)) for i in range(0, 32, 4)]
+    assert {(g.shared_slot_seqs, g.padded_batch_blocks // 32) for g in md.decode_groups} == {
+        (32, 32)
+    }
 
 
 def test_jagged_grouping_off_keeps_one_shared_slot_call(shared_slot_config, monkeypatch):

@@ -252,7 +252,8 @@ compile kernels per num-sequences bucket.
 Each chunk of these kernels reads 64 pages, two per core. Each of these reads is a *block
 slot*. A layer group whose per-card KV heads times head size is too wide for two pages per
 core (for example 16 KV heads of 128 at TP1) reads 32, one per core, and serves up to 32
-sequences. The per-bucket kernels above give every sequence the same number of block slots, 32
+sequences. So does a KV cache of 64 pages or fewer, since a chunk must not gather the whole
+cache; a cache of 32 pages or fewer runs the per-bucket kernels below instead. The per-bucket kernels above give every sequence the same number of block slots, 32
 divided by the bucket. These kernels share their block slots by length instead, at every step:
 a long sequence gets many, a short one gets few. So a batch runs only as many chunks as all
 its pages need together, not as many as its longest sequence needs.
@@ -265,6 +266,14 @@ and each short one gets 1, and the batch runs 9 chunks; over 64, it runs 5.
 Warmup compiles a single such kernel for all batch sizes up to 64, instead of one per
 num-sequences bucket. It runs every chunk count, from a batch that fits in a single chunk up to
 every sequence at `--max-model-len`.
+
+Every launch of that kernel prepares data on the host for every chunk in its range, so a long
+range costs every call. `SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS` caps the range at a fixed chunk
+count, for example 32 or 64, instead of deriving it from `--max-model-len` and
+`--max-num-seqs`. A batch that needs more chunks then runs as several calls, whether or not
+`SPYRE_JAGGED_DECODE` is set. A value below what one sequence at `--max-model-len` needs is
+raised to that, since no call can split a sequence. Unset or `0`, the default, keeps the
+derived range.
 
 Batches of more than 64 sequences keep their per-bucket kernels, and sliding-window layers keep
 their KV buckets. These kernels need the same torch-spyre as the dynamic chunk count above.

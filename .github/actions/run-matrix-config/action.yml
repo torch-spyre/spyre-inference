@@ -386,8 +386,10 @@ runs:
         CFG: ${{ inputs.cfg }}
         NEW_XML: junit-${{ inputs.test_target }}.xml
         REPLACED_XML: ${{ runner.temp }}/replaced-junit/junit-${{ inputs.test_target }}.xml
-        # Stdlib-only, so fetched by path rather than installed; @main, like the ingest that reads its marks.
-        MARK_RETRIED_URL: https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
+        # Stdlib-only, so fetched by path rather than installed. Pinned to the rev
+        # that added the ch_mgmt schema, like the ingest installs (#1541); main as
+        # of 2026-11-26, where the file is identical to today's torch-spyre HEAD.
+        MARK_RETRIED_URL: https://raw.githubusercontent.com/torch-spyre/torch-spyre/f99177f10908b7afec681e8d16ade58faf3934f5/extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
       run: |
         warn() {
           echo "::warning::$1"

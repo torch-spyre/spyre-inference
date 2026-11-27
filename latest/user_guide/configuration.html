@@ -2783,13 +2783,13 @@ the ladder it extends, and ignored with a warning when the threshold is above th
 num-sequences bucket. <code>SPYRE_ATTN_KV_LADDER=8_5</code> with
 <code>SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8</code> gets close to plain <code>9_8</code> at large batches for noticeably
 less warmup.</p>
-<p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default), warmup
-records eligible KV-length × num-sequences combinations.
+<p>For the batched-decode kernel, warmup records eligible KV-length × num-sequences
+combinations.
 <code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code> (default: powers of two from 1 to <code>--max-num-seqs</code>) is the
 extra lever there, and the same keep-it-short advice applies.</p>
 <h4 id="one-per-sequence-kernel-for-every-page-count">One per-sequence kernel for every page count<a class="headerlink" href="#one-per-sequence-kernel-for-every-page-count" title="Permanent link">&para;</a></h4>
-<p>The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
-use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+<p>The per-sequence kernels (<code>page_attn_prefill</code>, which also runs any decode that batched decode
+does not take) do not use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
 sequence length up to <code>--max-model-len</code>.</p>
 <p>Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
 per loop step at every sequence length. When <code>--max-model-len</code> is too short for that, prefill

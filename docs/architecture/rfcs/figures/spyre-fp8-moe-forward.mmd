@@ -1,0 +1,32 @@
+flowchart LR
+    x["x [T, H] fp16<br/>router logits"]
+    quant["Per-token quant, once per layer<br/>quantscalepertokenfp8 + qfp8ch → x8, s_x"]
+    route["Recipe routing on device<br/>softmax, top-k, renormalize"]
+    subgraph gathered["Gathered form (decode)"]
+        g1["scaled_bmm(x8, gate/up[idx])<br/>T2: K-split chunk view"]
+        g2["× s_x · s_w13[e]; gelu_tanh(gate) · up<br/>per-token quant → a8, s_a"]
+        g3["scaled_bmm(a8, down[idx])<br/>× s_a · s_w2[e]; weighted top-k sum"]
+        g1 --> g2 --> g3
+    end
+    subgraph persistent["Persistent form (prefill): for_each_tile over E"]
+        p1["scaled_mm(x8, gate_e / up_e)<br/>T3: tile of stored QFP8WT pool"]
+        p2["× s_x · s_w13[e]; gelu_tanh(gate) · up<br/>per-token quant in body → a8"]
+        p3["scaled_mm(a8, down_e) × s_a · s_w2[e]<br/>acc += route_e · out"]
+        p1 --> p2 --> p3
+    end
+    y["y [T, H] fp16"]
+    x --> quant
+    x --> route
+    quant -->|T not a stick multiple| g1
+    quant -->|T a stick multiple| p1
+    route -->|expert index| g1
+    route -->|route column| p3
+    g3 --> y
+    p3 --> y
+
+    classDef plugin fill:#2e7d32,stroke:#1b5e20,color:#ffffff
+    classDef device fill:#1565c0,stroke:#0d47a1,color:#ffffff
+    classDef gap fill:#ef6c00,stroke:#e65100,color:#ffffff
+    class x,route,y plugin
+    class quant,g2,g3,p2,p3 device
+    class g1,p1 gap

@@ -1,13 +1,15 @@
 # RFC figures
 
-These diagrams accompany `../upstream-connector-port.md`. The committed SVGs are rendered from
+These diagrams accompany the RFCs in the parent directory. The committed SVGs are rendered from
 D2 with **v0.7.1**. Mermaid files express the same nodes and relationships for readers who prefer
 that format; they are not a second source for the committed SVG output.
 
 | D2 source | Committed output | Used by |
 |---|---|---|
-| `spyre-offloading-arch.d2` | `spyre-offloading-arch.svg` | §5, connector integration and transfer ownership |
-| `spyre-shared-pool-m2.d2` | `spyre-shared-pool-m2.svg` | §6.8, target shared pools and persistent lifecycle |
+| `spyre-offloading-arch.d2` | `spyre-offloading-arch.svg` | `upstream-connector-port.md` §5, connector integration and transfer ownership |
+| `spyre-shared-pool-m2.d2` | `spyre-shared-pool-m2.svg` | `upstream-connector-port.md` §6.8, target shared pools and persistent lifecycle |
+| `spyre-fp8-moe-arch.d2` | `spyre-fp8-moe-arch.svg` | `fp8-moe-experts.md` §5, FP8 MoE ownership across vLLM, spyre-inference and torch-spyre |
+| `spyre-fp8-moe-forward.d2` | `spyre-fp8-moe-forward.svg` | `fp8-moe-experts.md` §6.4, gathered and persistent FP8 expert forms |
 
 ## Regenerate
 
@@ -16,6 +18,8 @@ From this directory:
 ```bash
 d2 --pad 50 spyre-offloading-arch.d2 spyre-offloading-arch.svg
 d2 --pad 50 spyre-shared-pool-m2.d2 spyre-shared-pool-m2.svg
+d2 --pad 50 spyre-fp8-moe-arch.d2 spyre-fp8-moe-arch.svg
+d2 --pad 50 spyre-fp8-moe-forward.d2 spyre-fp8-moe-forward.svg
 ```
 
 Keep D2 and Mermaid labels/edges aligned, render after changes, and inspect the generated layout.

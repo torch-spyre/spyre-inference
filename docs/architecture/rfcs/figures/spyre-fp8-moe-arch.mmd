@@ -1,0 +1,51 @@
+flowchart TB
+    subgraph vllm["vLLM — FP8 MoE flow (upstream code)"]
+        method["Fp8MoEMethod / CompressedTensorsW8A8Fp8MoEMethod<br/>Load checkpoint; normalize scales as on GPU"]
+        oracle["select_fp8_moe_backend<br/>Fp8MoeBackend.OOT"]
+        registry["U1: Platform.get_moe_backends()<br/>Named OOT experts; also --moe-backend names"]
+        convert["convert_to_fp8_moe_kernel_format<br/>OOT → experts_cls.convert_fp8_weights"]
+        hook["fused_experts.process_weights_after_loading<br/>On vLLM main (#62603); not in v0.33.0"]
+        kernel["FusedMoEKernel<br/>No-DP/EP monolithic prepare/finalize"]
+        method --> oracle
+        oracle -->|auto: first supported| registry
+        method --> convert
+        method --> hook
+        method --> kernel
+    end
+    subgraph plugin["spyre-inference — SpyreModelRunnerV2 (MRV2)"]
+        runner["Model load, KV sizing, warmup<br/>Existing MoE prep threads; no runner change"]
+        moe["SpyreMoERunner + SpyreMoERecipe<br/>Existing OOT MoE runner; Gemma 4 recipe"]
+        experts["SpyreFp8Experts<br/>FusedMoEExpertsMonolithic; in-graph act quant"]
+        prep["Weight preparation<br/>QFP8WT expert pools + fp16 scale stacks"]
+        forms["Expert forward<br/>Gathered (decode) / persistent (prefill)"]
+        runner -->|forward| moe
+        experts --> prep
+        experts --> forms
+    end
+    subgraph ts["torch-spyre (pinned 0d212328)"]
+        ok["Supported<br/>scaled_bmm, qfp8ch, quantscalepertokenfp8,<br/>batched QFP8WT H2D copy, QFP8WT index_select"]
+        t2["T2: K-split chunk view of a QFP8WT pool"]
+        t3["T3: tile a stored QFP8WT pool in for_each_tile"]
+        t4["T4: half-filled FP8 sticks (N % 64)"]
+    end
+    runner -->|vLLM loader| method
+    moe -->|apply_monolithic| kernel
+    registry -->|selected experts class| experts
+    kernel -->|fp16 activations + router logits| experts
+    hook --> prep
+    prep -->|direct FP8 copy| ok
+    prep -.->|pad I| t4
+    forms --> ok
+    forms -.->|decode| t2
+    forms -.->|prefill| t3
+
+    classDef base fill:#37474f,stroke:#263238,color:#ffffff
+    classDef change fill:#6a1b9a,stroke:#4a148c,color:#ffffff
+    classDef plugin fill:#2e7d32,stroke:#1b5e20,color:#ffffff
+    classDef device fill:#1565c0,stroke:#0d47a1,color:#ffffff
+    classDef gap fill:#ef6c00,stroke:#e65100,color:#ffffff
+    class method,oracle,hook,kernel base
+    class registry,convert change
+    class runner,moe,experts,prep,forms plugin
+    class ok device
+    class t2,t3,t4 gap

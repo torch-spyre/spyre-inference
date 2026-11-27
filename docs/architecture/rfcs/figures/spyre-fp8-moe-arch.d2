@@ -1,0 +1,55 @@
+direction: down
+classes: {
+  upstream: {style: {fill: "#37474f"; stroke: "#263238"; font-color: "#ffffff"}}
+  change: {style: {fill: "#6a1b9a"; stroke: "#4a148c"; font-color: "#ffffff"; bold: true}}
+  plugin: {style: {fill: "#2e7d32"; stroke: "#1b5e20"; font-color: "#ffffff"; bold: true}}
+  device: {style: {fill: "#1565c0"; stroke: "#0d47a1"; font-color: "#ffffff"}}
+  gap: {style: {fill: "#ef6c00"; stroke: "#e65100"; font-color: "#ffffff"}}
+  container: {style: {fill: "#e0e0e0"; stroke: "#9e9e9e"; font-color: "#212121"}}
+}
+
+vllm: "vLLM — FP8 MoE flow (upstream code)" {
+  class: container
+  method: "Fp8MoEMethod / CompressedTensorsW8A8Fp8MoEMethod\nLoad checkpoint; normalize scales as on GPU" {class: upstream}
+  oracle: "select_fp8_moe_backend\nFp8MoeBackend.OOT" {class: upstream}
+  registry: "U1: Platform.get_moe_backends()\nNamed OOT experts; also --moe-backend names" {class: change}
+  convert: "convert_to_fp8_moe_kernel_format\nOOT → experts_cls.convert_fp8_weights" {class: change}
+  hook: "fused_experts.process_weights_after_loading\nOn vLLM main (#62603); not in v0.33.0" {class: upstream}
+  kernel: "FusedMoEKernel\nNo-DP/EP monolithic prepare/finalize" {class: upstream}
+  method -> oracle
+  oracle -> registry: "auto: first supported"
+  method -> convert
+  method -> hook
+  method -> kernel
+}
+
+plugin: "spyre-inference — SpyreModelRunnerV2 (MRV2)" {
+  class: container
+  runner: "Model load, KV sizing, warmup\nExisting MoE prep threads; no runner change" {class: plugin}
+  moe: "SpyreMoERunner + SpyreMoERecipe\nExisting OOT MoE runner; Gemma 4 recipe" {class: plugin}
+  experts: "SpyreFp8Experts\nFusedMoEExpertsMonolithic; in-graph act quant" {class: plugin}
+  prep: "Weight preparation\nQFP8WT expert pools + fp16 scale stacks" {class: plugin}
+  forms: "Expert forward\nGathered (decode) / persistent (prefill)" {class: plugin}
+  runner -> moe: "forward"
+  experts -> prep
+  experts -> forms
+}
+
+ts: "torch-spyre (pinned 0d212328)" {
+  class: container
+  ok: "Supported\nscaled_bmm, qfp8ch, quantscalepertokenfp8,\nbatched QFP8WT H2D copy, QFP8WT index_select" {class: device}
+  t2: "T2: K-split chunk view of a QFP8WT pool" {class: gap}
+  t3: "T3: tile a stored QFP8WT pool in for_each_tile" {class: gap}
+  t4: "T4: half-filled FP8 sticks (N % 64)" {class: gap}
+}
+
+plugin.runner -> vllm.method: "vLLM loader"
+plugin.moe -> vllm.kernel: "apply_monolithic"
+vllm.registry -> plugin.experts: "selected experts class"
+vllm.kernel -> plugin.experts: "fp16 activations + router logits"
+vllm.hook -> plugin.prep
+plugin.prep -> ts.ok: "direct FP8 copy"
+plugin.prep -> ts.t4: "pad I" {style.stroke-dash: 3}
+plugin.forms -> ts.ok
+plugin.forms -> ts.t2: "decode" {style.stroke-dash: 3}
+plugin.forms -> ts.t3: "prefill" {style.stroke-dash: 3}

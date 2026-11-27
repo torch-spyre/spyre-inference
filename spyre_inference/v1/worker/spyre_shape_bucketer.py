@@ -538,7 +538,7 @@ class SpyreShapeBucketer:
         sizes: list[int] = [int(s) for s in (compilation_config.compile_sizes or [])]
         self._bucket_sizes = sorted(sizes)
         self._max_bucket_size = self._bucket_sizes[-1] if self._bucket_sizes else 0
-        logger.info(
+        logger.info_once(
             "SpyreShapeBucketer initialized with %d body token buckets: min=%d, max=%d",
             len(self._bucket_sizes),
             self._bucket_sizes[0] if self._bucket_sizes else 0,
@@ -560,7 +560,7 @@ class SpyreShapeBucketer:
             return cls.for_pooling(vllm_config)
 
         if vllm_config.model_config.enforce_eager:
-            logger.info("Graph Recorder disabled (enforce_eager=True)")
+            logger.debug("Graph Recorder disabled (enforce_eager=True)")
             return None
 
         if not vllm_config.compilation_config.compile_sizes:

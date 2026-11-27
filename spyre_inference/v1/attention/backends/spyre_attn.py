@@ -1838,7 +1838,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             prev_limit, 4 * (len(variants) + len(decode_variants)) + 64
         )
 
-        logger.info(
+        logger.debug(
             "Recording %d per-seq + %d batched-decode attention variants for layer...",
             len(variants),
             len(decode_variants),
@@ -1859,7 +1859,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 "on first use. The per-variant warnings above carry the reason.",
                 len(variants),
             )
-        logger.info(
+        logger.debug(
             "Recorded %d/%d per-seq and %d/%d batched-decode attention variants in %.2fs.",
             recorded,
             len(variants),

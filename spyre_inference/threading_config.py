@@ -89,7 +89,7 @@ def configure_threading(worker_count: int) -> None:
     """
     assert worker_count > 0
     env_map = {env: os.environ.get(env) for env in THREADING_ENVS}
-    logger.info(
+    logger.debug(
         "Initial threading configuration: %s",
         " ".join(f"{env}={value}" for env, value in env_map.items()),
     )
@@ -119,7 +119,7 @@ def configure_threading(worker_count: int) -> None:
         # Spinning idle OpenMP threads use up the pod's CPU quota while the host waits on the
         # device. Takes effect in the spawned EngineCore and workers, not in this process.
         os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-        logger.info(
+        logger.info_once(
             "%s. Setting each threading configuration to %d for %d worker(s), "
             "OMP_WAIT_POLICY=%s (SPYRE_UPDATE_THREAD_CONFIG enabled).",
             detection_message,

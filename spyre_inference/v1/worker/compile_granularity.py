@@ -168,7 +168,7 @@ def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Mod
     tower = 0
 
     if vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
-        logger.info("Compilation disabled (enforce_eager=True)")
+        logger.debug("Compilation disabled (enforce_eager=True)")
         return model, 0
 
     model_name = type(model).__name__

@@ -60,7 +60,7 @@ def record_attention_graphs(
         if key in recorded:
             num_skipped += 1
             continue
-        logger.info("Recording attention graphs for layer %s...", layer_name)
+        logger.debug("Recording attention graphs for layer %s...", layer_name)
         total += impl.record_graphs(layer, kv_cache, builder, causal=causal)
         recorded.add(key)
     logger.info(

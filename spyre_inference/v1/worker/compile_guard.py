@@ -187,7 +187,7 @@ class _CompileGuard:
         if already_armed:
             logger.debug("Compile guard re-armed at level %s", level.value)
             return
-        logger.info(
+        logger.debug(
             "Compile guard armed at level '%s': %d watched compile sites. A further "
             "compile of one is %s.",
             level.value,

@@ -369,7 +369,7 @@ def bind_or_raise() -> None:
     missing = expected - bound
     if missing:
         raise RuntimeError(f"kernels.bind() left {sorted(missing)} unbound.")
-    logger.info(
+    logger.debug(
         "MRV2 kernels: %s",
         "Triton (triton-cpu)"
         if use_triton()

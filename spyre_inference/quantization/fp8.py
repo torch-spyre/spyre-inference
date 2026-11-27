@@ -101,4 +101,4 @@ class SpyreFp8Config(Fp8Config):
 
 def register_spyre_fp8_config() -> None:
     register_quantization_config("fp8")(SpyreFp8Config)
-    logger.info("Registered SpyreFp8Config for quantization='fp8' (no _C requant)")
+    logger.debug("Registered SpyreFp8Config for quantization='fp8' (no _C requant)")

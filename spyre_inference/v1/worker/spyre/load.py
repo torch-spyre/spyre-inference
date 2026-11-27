@@ -115,7 +115,7 @@ class _SpyreModelLoaderWrapper:
         runner.pooling_on_spyre = model_config.runner_type == "pooling" and (
             configure_pooling_for_spyre(model, runner.spyre_device, encoder_len_ladder(vllm_config))
         )
-        logger.info("Spyre-native layer weights moved to %s", runner.spyre_device)
+        logger.debug("Spyre-native layer weights moved to %s", runner.spyre_device)
 
         # Patches instances/classes, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.

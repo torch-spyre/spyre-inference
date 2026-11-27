@@ -823,6 +823,36 @@ def test_fp8_quantization_resolves_to_spyre_config():
     assert get_quantization_config("fp8") is SpyreFp8Config
 
 
+def test_modules_to_not_convert_skip_the_vision_tower():
+    """Ministral 3's HF config leaves the tower and projector BF16 by module name (#1697)."""
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.models.mistral3 import Mistral3ForConditionalGeneration
+
+    from spyre_inference.quantization.fp8 import SpyreFp8Config, SpyreFp8LinearMethod
+
+    config = SpyreFp8Config(
+        activation_scheme="static",
+        ignored_layers=["model.vision_tower", "model.multi_modal_projector", "lm_head"],
+    )
+    config.apply_vllm_mapper(Mistral3ForConditionalGeneration.hf_to_vllm_mapper)
+    assert {"vision_tower", "multi_modal_projector", "language_model.lm_head"} <= set(
+        config.ignored_layers
+    )
+
+    def method(prefix: str):
+        return config.get_quant_method(Mock(spec=LinearBase), prefix)
+
+    assert isinstance(
+        method("vision_tower.transformer.layers.0.attention.qkv_proj"), UnquantizedLinearMethod
+    )
+    assert isinstance(method("multi_modal_projector.linear_1"), UnquantizedLinearMethod)
+    assert isinstance(
+        method("language_model.model.layers.0.self_attn.qkv_proj"), SpyreFp8LinearMethod
+    )
+
+
 @pytest.mark.fp8
 @pytest.mark.parametrize(
     "scales, fused",

@@ -212,6 +212,18 @@ host and copied into its slice of the device tensor. The copy is host-bound (the
 conversion), so the chunking costs no time, and a chunk's transpose stays in cache where a
 whole stack's does not.
 
+On a first start, `SPYRE_PARALLEL_WARMUP_PRECOMPILE=N` traces the warm-up
+buckets once with each graph's Spyre inner compile in one of `N` forked processes (torch-spyre's `fork_inner_compiles`,
+with stand-in graphs that return zeros of the right shape so a bucket's forward runs to its end),
+then resets Dynamo and runs the normal warm-up as a second pass of cache hits. The buckets whose
+token count is off the stick run their experts behind the opaque MoE op, whose compiled regions a
+stand-in block never reaches, so the first pass ends by running those experts itself
+(`moe.warm_opaque_regions`). A restart with warm caches skips it. At tensor parallel size above
+1 it sets `ENABLE_LX_CONTEXT_SWITCHING=0` unless that is set already: with LX context switching
+on, a worker can cache a graph that calls an all-reduce on a buffer it never allocated
+(torch-spyre/torch-spyre#6563). The warm-up logs a warning when a worker's LX planning stops at
+its time limit, since that plan is kept in the cache.
+
 The relayout and copy of one layer's stacks are independent of every other layer's, so loading
 prepares the layers on `SPYRE_MOE_PREP_THREADS` threads (default `min(8, torch threads)`, this
 worker's share of the CPU budget, at most 16; `1` prepares them in order). The pool lives for

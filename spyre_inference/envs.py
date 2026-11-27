@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_MOE_PREP_THREADS: int = 0
     SPYRE_NUM_CPUS: int = 0
+    SPYRE_PARALLEL_WARMUP_PRECOMPILE: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
 _cache: dict[str, Any] = {}
@@ -123,6 +124,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device at the same time during load. "0" (default) uses min(8, torch threads), this
     # worker's share of the CPU budget, at most 16; "1" prepares one layer after another.
     "SPYRE_MOE_PREP_THREADS": lambda: int(os.getenv("SPYRE_MOE_PREP_THREADS", "0")),
+    # Forked processes compiling the warm-up buckets' graphs side by side; "0" (default)
+    # compiles them in order. Capped at this rank's torch thread count.
+    "SPYRE_PARALLEL_WARMUP_PRECOMPILE": lambda: int(
+        os.getenv("SPYRE_PARALLEL_WARMUP_PRECOMPILE", "0")
+    ),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

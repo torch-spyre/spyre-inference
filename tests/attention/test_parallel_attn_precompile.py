@@ -145,3 +145,14 @@ def test_the_recording_writes_the_marker(monkeypatch, tmp_path):
     )
     assert seen == [marker]
     assert os.path.exists(marker)
+
+
+def test_the_reset_finds_the_attention_kernels_behind_their_wrappers():
+    """spyre_attn wraps its torch.compile'd kernels in a plain function (the dynamic
+    page and chunk counts); a stand-in left in one of them breaks every recording."""
+    from spyre_inference.v1.attention.backends import spyre_attn
+
+    impl = object.__new__(SpyreAttentionImpl)
+    found = {fn.__name__ for fn in warmup._compiled_kernels([impl])}
+    assert {"page_attn_prefill", "page_attn_decode", "batched_decode"} <= found
+    assert spyre_attn._batched_decode_compiled.__name__ == "batched_decode"

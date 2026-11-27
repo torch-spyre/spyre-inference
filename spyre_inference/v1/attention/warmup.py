@@ -210,7 +210,8 @@ def _precompile_in_workers(static_ctx, kv_caches, builders, causal_by_layer, mar
 
 def _compiled_kernels(impls) -> list:
     """The torch.compile'd kernels reachable from ``impls``: their attributes and the
-    module globals of their classes."""
+    module globals of their classes, also when a plain function wraps the compiled
+    object (spyre_attn's ``_compile_with_dynamic_count`` keeps it in its closure)."""
     found = {}
     for impl in impls:
         owners = [impl] + [
@@ -218,7 +219,19 @@ def _compiled_kernels(impls) -> list:
         ]
         for owner in owners:
             for value in list(vars(owner).values()):
-                original = getattr(value, "_torchdynamo_orig_callable", None)
-                if callable(value) and original is not None:
-                    found[id(original)] = original
+                if not callable(value):
+                    continue
+                for candidate in (value, *_closure_values(value)):
+                    original = getattr(candidate, "_torchdynamo_orig_callable", None)
+                    if callable(candidate) and original is not None:
+                        found[id(original)] = original
     return list(found.values())
+
+
+def _closure_values(fn) -> list:
+    """What a function's closure holds, empty cells left out."""
+    values = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        with contextlib.suppress(ValueError):  # an empty cell
+            values.append(cell.cell_contents)
+    return values

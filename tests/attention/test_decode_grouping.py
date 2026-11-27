@@ -177,3 +177,41 @@ def test_group_padding_never_overwrites_a_live_row(decode_config, monkeypatch, k
         out[: len(rows), 0] = torch.tensor(rows, dtype=torch.float) + 1
         _scatter_rows_kernel(store, dst.long(), out)
     assert store[: len(kv_lens), 0].tolist() == [r + 1.0 for r in range(len(kv_lens))]
+
+
+def test_split_is_off_by_default(decode_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    monkeypatch.delenv("SPYRE_DECODE_SPLIT", raising=False)
+    assert _build([30000] * 8).decode_groups is None
+
+
+def test_split_runs_a_large_batch_as_groups_of_n(decode_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_DECODE_SPLIT", "4")
+    kv_lens = [30000, 29000, 30500, 28000, 30000, 31000, 29500, 30000]
+    width = 256
+    block_table = torch.randperm(len(kv_lens) * width, dtype=torch.int32).reshape(-1, width)
+    md = _build(kv_lens, block_table=block_table)
+    assert _members(md) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    for g in md.decode_groups:
+        rows = g.rows_cpu.tolist()
+        alone = _build([kv_lens[r] for r in rows], block_table=block_table[rows])
+        assert g.padded_num_seqs == alone.padded_num_seqs == 4
+        assert torch.equal(g.chunk_page_ids_cpu, alone.chunk_page_ids_cpu)
+        assert torch.equal(g.mask_by_chunk_cpu, alone.mask_by_chunk_cpu)
+
+
+def test_split_cuts_only_the_length_groups_above_n(decode_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_DECODE_SPLIT", "4")
+    md = _build([32000] + [2000] * 7)
+    assert _members(md) == [[0], [1, 2, 3, 4], [5, 6, 7]]
+
+
+@pytest.mark.parametrize(("jagged", "kv_lens"), [("0", [30000] * 8), ("1", [30000] * 4)])
+def test_split_keeps_one_batch_without_grouping_or_at_n(
+    decode_config, monkeypatch, jagged, kv_lens
+):
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", jagged)
+    monkeypatch.setenv("SPYRE_DECODE_SPLIT", "4")
+    assert _build(kv_lens).decode_groups is None

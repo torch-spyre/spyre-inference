@@ -211,6 +211,11 @@ export SPYRE_ATTN_NUM_SEQS_BUCKETS=1,4,8      # default: powers of two up to --m
 Warmup records one per-sequence kernel per query bucket and one batched-decode kernel per
 num-sequences bucket.
 
+Above 32 decode sequences the batched kernel puts two entries on each of the card's 32
+cores, and a decode step takes almost twice as long (Gemma-4 26B-A4B, 33 users against 32).
+`SPYRE_DECODE_SPLIT=32` runs such a batch as consecutive groups of 32 through the
+grouped dispatch (needs `SPYRE_JAGGED_DECODE=1`, the default). It is off by default.
+
 ### One per-sequence kernel for every page count
 
 The per-sequence kernels (`page_attn_prefill`, which also runs any decode that batched decode

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_JAGGED_DECODE: bool = True
+    SPYRE_DECODE_SPLIT: int = 0
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
@@ -91,6 +92,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.
     "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
+    # When N > 0 (with SPYRE_JAGGED_DECODE), a decode batch or group of more than N
+    # sequences runs as consecutive groups of at most N. Above 32 sequences the batched
+    # kernel puts two entries on each core, which is far slower than two grouped calls,
+    # so 32 suits the 32-core card. "0" (default): no split.
+    "SPYRE_DECODE_SPLIT": lambda: int(os.getenv("SPYRE_DECODE_SPLIT", "0")),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
     # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.

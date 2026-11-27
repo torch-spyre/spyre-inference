@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
+    SPYRE_FAST_DIST_INIT: str = "0"
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -122,6 +123,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" when torch runs far more threads than the CPUs it gets (e.g. with
     # SPYRE_UPDATE_THREAD_CONFIG=0 in a CPU-limited pod): there it is slower.
     "SPYRE_BLOCKED_TRANSPOSE": lambda: bool(int(os.getenv("SPYRE_BLOCKED_TRANSPOSE", "1"))),
+    # When "1", a one-card worker (world size 1, uni executor, DP 1) starts the card on a
+    # side thread while the weights are read, builds its process groups with gloo only, and
+    # takes the memory snapshot after the weight read. The card's generators are seeded
+    # after the weight read, host generators as usual. "gloo" only builds gloo groups.
+    # "0" (default) and every other setup: no change.
+    "SPYRE_FAST_DIST_INIT": lambda: os.getenv("SPYRE_FAST_DIST_INIT", "0"),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

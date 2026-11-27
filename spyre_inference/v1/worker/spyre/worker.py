@@ -45,7 +45,7 @@ from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
-from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker import compile_guard, fast_dist_init
 from spyre_inference.v1.worker.spyre import device_shims, kernels, triton_gate
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 
@@ -199,6 +199,10 @@ class SpyreWorkerV2(Worker):
             _get_spyre_pcie_address(self.local_rank),
         )
 
+        # Opt-in (SPYRE_FAST_DIST_INIT): at world size 1, start the card on a side
+        # thread so it comes up while the weights are read. None otherwise.
+        self._fast_card_start = fast_dist_init.start(self)
+
         # Parsed here rather than at the arm() call below: a typo raises, and after
         # warmup that costs the minutes the model just spent compiling. init_device
         # runs before the weights load, so an invalid value fails in seconds.
@@ -224,17 +228,23 @@ class SpyreWorkerV2(Worker):
             self.rank,
             self.distributed_init_method,
             self.local_rank,
-            current_platform.dist_backend,
+            fast_dist_init.dist_backend(self._fast_card_start, current_platform.dist_backend),
         )
 
-        # Set random seed.
-        set_random_seed(self.model_config.seed)
+        if fast_dist_init.defers_card_work(self._fast_card_start):
+            # The card is still starting: seed the host now. The card's seed and the
+            # memory snapshot follow the weight read (see load_model).
+            self._fast_card_start.seed_host_only(self.model_config.seed)
+        else:
+            # Set random seed.
+            set_random_seed(self.model_config.seed)
 
-        # As Worker.init_device does, after the distributed init. The platform reports
-        # device_type "cpu", so the snapshot is given the Spyre device explicitly.
-        self.init_snapshot = MemorySnapshot(device=self._spyre_memory_device())
-        self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
-        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+            # As Worker.init_device does, after the distributed init. The platform
+            # reports device_type "cpu", so the snapshot is given the Spyre device
+            # explicitly.
+            self.init_snapshot = MemorySnapshot(device=self._spyre_memory_device())
+            self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
+            logger.debug("worker init memory snapshot: %r", self.init_snapshot)
 
         device_shims.install()  # torch.cuda Stream/Event placeholders
         kernels.bind_or_raise()  # host ops in place of MRV2's Triton kernels
@@ -245,6 +255,12 @@ class SpyreWorkerV2(Worker):
             self.vllm_config,
             torch.device("spyre"),
         )
+
+    def load_model(self, *args, **kwargs) -> None:
+        # With SPYRE_FAST_DIST_INIT, init_device left the card starting: finish that
+        # between the weight read and the first upload. A plain call otherwise.
+        with fast_dist_init.join_after_weight_read(self):
+            super().load_model(*args, **kwargs)
 
     def _spyre_memory_device(self) -> torch.device:
         # getMemoryInfo checks the index against the card the runtime opened, which is

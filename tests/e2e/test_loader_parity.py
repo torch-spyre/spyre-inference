@@ -104,7 +104,7 @@ def _generate(load_format: str, tp_size: int):
 
 
 def _check_loader_parity(tp_size: int) -> None:
-    """``spyre`` (the opt-in direct loader) and ``safetensors`` give the same greedy output."""
+    """``spyre`` (the default direct loader) and ``safetensors`` give the same greedy output."""
     resolved, spyre = _generate("spyre", tp_size)
     assert resolved == "spyre"
     resolved, stock = _generate("safetensors", tp_size)

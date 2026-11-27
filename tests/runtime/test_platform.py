@@ -686,6 +686,7 @@ def test_fp8_model_defaults_to_an_fp8_kv_cache(
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.load_config.load_format = "auto"
     vllm_config.model_config.quantization = quantization
     monkeypatch.setattr(
         vllm_config.model_config.hf_config, "quantization_config", quant_cfg, raising=False
@@ -704,6 +705,7 @@ def test_fp8_model_keeps_a_model_dtype_cache_below_a_float8_stick(monkeypatch):
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.load_config.load_format = "auto"
     vllm_config.model_config.quantization = "fp8"
     monkeypatch.setattr(vllm_config.model_config, "get_head_size", lambda: 64)
 

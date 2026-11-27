@@ -14,11 +14,16 @@
 
 """Unit tests for SpyreModelLoader and direct-to-device weight loading."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import save_file
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.config import LoadConfig, ModelConfig, ParallelConfig, VllmConfig
@@ -26,14 +31,18 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVPar
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.model_executor.parameter import BasevLLMParameter
 
+import spyre_inference.model_loader as loader_mod
 import spyre_inference.platform as plat_mod
 from spyre_inference.model_loader import (
     SpyreModelLoader,
     _check_all_weights_loaded,
     _get_host_loaded_param_names,
     _hf_to_vllm_name,
+    _iter_tp_sharded_weights,
     _param_name_for,
+    _read_ahead,
     _resolve_module,
     _shard_plan,
 )
@@ -78,40 +87,20 @@ def _make_vllm_config(
     )
 
 
-@pytest.fixture
-def on_power(monkeypatch):
-    """Pretend the host is POWER, where `auto` resolves to the spyre loader.
-
-    Set before the VllmConfig is built: construction already runs the platform hook.
-    """
-    monkeypatch.setattr(plat_mod, "_host_machine", lambda: "ppc64le")
-
-
-@pytest.mark.parametrize("machine", ["ppc64le", "ppc64"])
-def test_platform_defaults_load_format_to_spyre_on_power(monkeypatch, machine):
-    """Positive control: a plain TP=1 text-generation config flips auto → spyre on POWER."""
-    monkeypatch.setattr(plat_mod, "_host_machine", lambda: machine)
+def test_platform_defaults_load_format_to_spyre():
+    """Positive control: a plain TP=1 text-generation config flips auto → spyre."""
     vllm_config = _make_vllm_config()
     assert vllm_config.load_config.load_format == "spyre"
 
 
-@pytest.mark.parametrize("machine", ["x86_64", "aarch64", "s390x"])
-def test_platform_keeps_auto_load_format_off_power(monkeypatch, machine):
-    """spyre is opt-in on every other architecture: a supported config stays on 'auto'."""
-    monkeypatch.setattr(plat_mod, "_host_machine", lambda: machine)
-    vllm_config = _make_vllm_config()
-    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    assert vllm_config.load_config.load_format == "auto"
-
-
-def test_platform_defaults_load_format_to_spyre_tp2(on_power):
+def test_platform_defaults_load_format_to_spyre_tp2():
     """TP>1 is supported: auto resolves to spyre (linear weights shard on read)."""
     vllm_config = _make_vllm_config(tp_size=2)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.load_config.load_format == "spyre"
 
 
-def test_platform_defaults_load_format_to_spyre_multimodal(on_power):
+def test_platform_defaults_load_format_to_spyre_multimodal():
     """Multimodal models are supported: auto resolves to spyre."""
     vllm_config = _make_vllm_config()
     vllm_config.model_config.multimodal_config = object()
@@ -128,8 +117,8 @@ def test_platform_defaults_load_format_to_spyre_multimodal(on_power):
     ],
     ids=["quantized", "pooling"],
 )
-def test_platform_load_format_stays_auto(kwargs, on_power):
-    """Even on POWER, load_format stays 'auto' for configs SpyreModelLoader doesn't support."""
+def test_platform_load_format_stays_auto(kwargs):
+    """load_format stays 'auto' for configs SpyreModelLoader doesn't support."""
     vllm_config = _make_vllm_config(**kwargs)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.load_config.load_format == "auto"
@@ -192,12 +181,12 @@ def test_spyre_loader_supported_rejects_unsupported(kwargs, description):
     assert not _spyre_loader_supported(_make_ns(**kwargs)), description
 
 
-def test_platform_load_format_stays_auto_transformers_backend(on_power):
+def test_platform_load_format_stays_auto_transformers_backend():
     """load_format stays 'auto' for the transformers backend."""
     assert _make_vllm_config(transformers_backend=True).load_config.load_format == "auto"
 
 
-def test_platform_load_format_stays_auto_moe(on_power):
+def test_platform_load_format_stays_auto_moe():
     """load_format stays 'auto' for MoE models."""
     assert _make_vllm_config(moe=True).load_config.load_format == "auto"
 
@@ -267,7 +256,7 @@ def test_spyre_loader_supported_accepts_unpadded_text_config():
     assert _spyre_loader_supported(ns)
 
 
-def test_gate_sees_padding_applied_by_the_hook(monkeypatch, on_power):
+def test_gate_sees_padding_applied_by_the_hook(monkeypatch):
     """The hook must pad before gating, since check_and_update_config runs later."""
     vllm_config = _make_vllm_config()
     vllm_config.load_config.load_format = "auto"
@@ -541,8 +530,328 @@ class _TwoLinearModel(nn.Module):
         return loaded
 
 
+def _reads(count, read=lambda i: i):
+    return ((i, partial(read, i)) for i in range(count))
+
+
+def _pool_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("spyre-load")]
+
+
+def _pool(num_threads=4):
+    return ThreadPoolExecutor(num_threads, thread_name_prefix="spyre-load")
+
+
+@pytest.fixture
+def host_only(monkeypatch):
+    """The fake handles return host tensors, whatever an earlier test initialized."""
+    if hasattr(torch, "spyre"):
+        monkeypatch.setattr(torch.spyre, "is_initialized", lambda: False)
+
+
+def test_read_ahead_keeps_order_when_reads_finish_out_of_order():
+    last_read = threading.Event()
+
+    def read(i):
+        if i == 0:
+            assert last_read.wait(30)
+        if i == 3:
+            last_read.set()
+        return i * 10
+
+    with _pool() as pool:
+        assert list(_read_ahead(_reads(4, read), pool, 4)) == [(i, i * 10) for i in range(4)]
+
+
+def test_read_ahead_bounds_the_reads_not_yet_consumed():
+    issued = consumed = 0
+    outstanding = []
+
+    def reads():
+        nonlocal issued
+        for item in _reads(20):
+            issued += 1
+            outstanding.append(issued - consumed)
+            yield item
+
+    with _pool() as pool:
+        for _ in _read_ahead(reads(), pool, 4):
+            consumed += 1
+    assert consumed == 20 and max(outstanding) == 4
+
+
+def test_read_ahead_without_a_pool_reads_on_the_calling_thread_one_at_a_time():
+    events = []
+
+    def read(i):
+        events.append(("read", i, threading.get_ident()))
+        return i
+
+    for tag, _ in _read_ahead(_reads(3, read), None, 1):
+        events.append(("got", tag, threading.get_ident()))
+    me = threading.get_ident()
+    assert events == [(kind, i, me) for i in range(3) for kind in ("read", "got")]
+
+
+def test_read_ahead_raises_a_failed_read_in_the_caller():
+    def read(i):
+        if i == 2:
+            raise RuntimeError("bad read")
+        return i
+
+    got = []
+    with _pool() as pool, pytest.raises(RuntimeError, match="bad read"):
+        for tag, _ in _read_ahead(_reads(8, read), pool, 4):
+            got.append(tag)
+    assert got == [0, 1]
+
+
+def _extra_config_loader(extra_config):
+    return SpyreModelLoader(LoadConfig(load_format="spyre", model_loader_extra_config=extra_config))
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "num_threads"),
+    [
+        ({}, 8),
+        ({"num_threads": 4}, 4),
+        ({"enable_multithread_load": False}, 1),
+        ({"enable_multithread_load": False, "num_threads": 4}, 1),
+        ({"enable_weights_track": True, "some_other_loaders_key": "x"}, 8),
+    ],
+    ids=["empty", "threads-only", "disabled", "disabled-4", "other-keys"],
+)
+def test_multithread_load_is_on_by_default_with_vllms_keys(extra_config, num_threads):
+    assert _extra_config_loader(extra_config)._load_threads == num_threads
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"enable_multithread_load": "yes"},
+        {"num_threads": 0},
+        {"num_threads": "8"},
+        {"num_threads": True},
+    ],
+    ids=["enable-str", "threads-zero", "threads-str", "threads-bool"],
+)
+def test_bad_multithread_load_values_are_rejected(extra_config):
+    with pytest.raises(ValueError, match="enable_multithread_load|num_threads"):
+        _extra_config_loader(extra_config)
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "warned"),
+    [
+        ({"num_thread": 2}, ["num_thread"]),
+        ({"enable_weights_track": True, "num_threads": 4}, ["enable_weights_track"]),
+        ({"enable_multithread_load": True, "num_threads": 4}, None),
+    ],
+    ids=["typo", "weights-track", "known-keys"],
+)
+def test_unknown_extra_config_keys_are_ignored_with_a_warning(caplog, extra_config, warned):
+    with caplog.at_level("WARNING", logger="spyre_inference.model_loader"):
+        loader = _extra_config_loader(extra_config)
+
+    messages = [r.getMessage() for r in caplog.records if "unknown" in r.getMessage()]
+    assert messages == (
+        [f"SpyreModelLoader: ignoring unknown model_loader_extra_config keys {warned}"]
+        if warned
+        else []
+    )
+    assert loader._load_threads == extra_config.get("num_threads", 8)
+
+
+class _RecordingHandle:
+    """A CPU safetensors handle that records which thread read each tensor."""
+
+    def __init__(self, path, readers):
+        self._handle = safe_open(path, framework="pt", device="cpu")
+        self._readers = readers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._handle.__exit__(*exc)
+
+    def offset_keys(self):
+        return self._handle.offset_keys()
+
+    def get_tensor(self, name):
+        self._readers[name] = threading.current_thread().name
+        return self._handle.get_tensor(name)
+
+    def get_slice(self, name):
+        self._readers[name] = threading.current_thread().name
+        return self._handle.get_slice(name)
+
+
+def _recorded_checkpoint(tmp_path, monkeypatch, weights):
+    ckpt = tmp_path / "model.safetensors"
+    save_file(weights, str(ckpt))
+    readers: dict[str, str] = {}
+    monkeypatch.setattr(
+        "safetensors.safe_open", lambda path, **kwargs: _RecordingHandle(path, readers)
+    )
+    monkeypatch.setattr(
+        "spyre_inference.model_loader._resolve_checkpoint_files",
+        lambda model_config, load_config: (str(tmp_path), [str(ckpt)]),
+    )
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
+    return readers
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "torch_threads", "pooled"),
+    [
+        ({}, 8, True),
+        ({"enable_multithread_load": False}, 8, False),
+        ({}, 1, False),
+    ],
+    ids=["default", "disabled", "default-one-cpu"],
+)
+def test_get_all_weights_reads_on_the_pool_only_when_enabled(
+    tmp_path, monkeypatch, tp_group, host_only, extra_config, torch_threads, pooled
+):
+    weights = {f"w{i}": torch.full((4,), float(i)) for i in range(6)}
+    readers = _recorded_checkpoint(tmp_path, monkeypatch, weights)
+    monkeypatch.setattr(torch, "get_num_threads", lambda: torch_threads)
+
+    loader = _extra_config_loader(extra_config)
+    loaded = dict(loader.get_all_weights(SimpleNamespace(dtype=torch.float16), nn.Module()))
+
+    assert list(loaded) == list(weights)
+    assert all(torch.equal(loaded[name], weights[name]) for name in weights)
+    assert all(reader.startswith("spyre-load") == pooled for reader in readers.values())
+    assert not _pool_threads()
+
+
+def test_pool_is_capped_at_the_device_stream_count(tmp_path, monkeypatch, tp_group, host_only):
+    _recorded_checkpoint(tmp_path, monkeypatch, {"w0": torch.zeros(4)})
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 64)
+    widths = []
+    monkeypatch.setattr(
+        loader_mod,
+        "ThreadPoolExecutor",
+        lambda num_threads, **kwargs: (
+            widths.append(num_threads) or ThreadPoolExecutor(num_threads, **kwargs)
+        ),
+    )
+
+    loader = _extra_config_loader({"num_threads": 64})
+    list(loader.get_all_weights(SimpleNamespace(dtype=torch.float16), nn.Module()))
+
+    assert widths == [32]
+
+
+def test_closing_get_all_weights_early_stops_the_pool(tmp_path, monkeypatch, tp_group, host_only):
+    _recorded_checkpoint(tmp_path, monkeypatch, {f"w{i}": torch.zeros(4) for i in range(8)})
+    loaded = _extra_config_loader({}).get_all_weights(
+        SimpleNamespace(dtype=torch.float16), nn.Module()
+    )
+    assert next(loaded)[0] == "w0"
+    assert _pool_threads()
+    loaded.close()
+    assert not _pool_threads()
+
+
+def test_a_failing_weight_loader_stops_the_pool(tmp_path, monkeypatch, tp_group):
+    _recorded_checkpoint(tmp_path, monkeypatch, {f"w{i}": torch.zeros(4) for i in range(8)})
+    monkeypatch.delattr(torch, "spyre", raising=False)  # the fake handles return host tensors
+
+    class Model(nn.Module):
+        def load_weights(self, weights):
+            next(iter(weights))
+            raise RuntimeError("bad weight")
+
+    with pytest.raises(RuntimeError, match="bad weight") as raised:
+        _extra_config_loader({}).load_weights(Model(), SimpleNamespace(dtype=torch.float16))
+    assert raised.traceback and not _pool_threads()
+
+
+def test_pool_threads_take_their_own_stream_and_never_allocate(tmp_path, monkeypatch, tp_group):
+    """On the card a pool thread only fills a tensor the loading thread allocated."""
+    weights = {f"w{i}": torch.full((4,), float(i)) for i in range(16)}
+    _recorded_checkpoint(tmp_path, monkeypatch, weights)
+    spyre = SimpleNamespace(is_initialized=lambda: True, current_device=lambda: 3)
+    monkeypatch.setattr(torch, "spyre", spyre, raising=False)
+    streams, allocated, filled = [], [], []
+    monkeypatch.setattr(
+        loader_mod,
+        "_use_own_stream",
+        lambda device: streams.append((device, threading.get_ident())),
+    )
+
+    def alloc(read):
+        allocated.append(threading.get_ident())
+        return None if read.name == "w5" else read.name
+
+    def fill(read, dst):
+        filled.append(threading.get_ident())
+        return read.f_cpu.get_tensor(dst)
+
+    monkeypatch.setattr(loader_mod._CardRead, "alloc", alloc)
+    monkeypatch.setattr(loader_mod._CardRead, "fill", fill)
+
+    loaded = dict(
+        _extra_config_loader({}).get_all_weights(SimpleNamespace(dtype=torch.float16), nn.Module())
+    )
+
+    me = threading.get_ident()
+    assert list(loaded) == sorted(weights)
+    assert all(torch.equal(loaded[name], weights[name]) for name in weights)
+    assert allocated == [me] * 16
+    assert len(filled) == 15 and me not in filled
+    assert {device for device, _ in streams} == {3}
+    idents = [ident for _, ident in streams]
+    assert len(idents) == len(set(idents)) and set(filled) <= set(idents)
+
+
+@pytest.mark.parametrize("num_threads", [1, 4])
+def test_tp_sharded_reads_take_this_ranks_slice(tmp_path, monkeypatch, host_only, num_threads):
+    weights = {f"w{i}": torch.arange(8.0).reshape(4, 2) + i for i in range(6)}
+    ckpt = tmp_path / "model.safetensors"
+    save_file(weights, str(ckpt))
+    handle = _RecordingHandle(str(ckpt), {})
+    params = {}
+    for name in weights:
+        params[name] = BasevLLMParameter(data=torch.empty(2, 2), weight_loader=lambda *args: None)
+        params[name].tp_rank = 1
+    monkeypatch.setattr(loader_mod, "_hf_to_vllm_name", lambda model, name: name)
+    monkeypatch.setattr(
+        loader_mod,
+        "_shard_plan",
+        lambda model, name, shape, tp_size, tp_rank: (params[name], 0, 2, 2),
+    )
+
+    seen = []
+    with _pool(num_threads) if num_threads > 1 else nullcontext() as pool:
+        sharded = _iter_tp_sharded_weights(
+            nn.Module(),
+            handle,
+            handle,
+            list(weights),
+            set(),
+            2,
+            1,
+            torch.float16,
+            pool,
+            num_threads,
+        )
+        for name, tensor in sharded:
+            assert torch.equal(tensor, weights[name][2:4])
+            assert params[name].tp_rank == 0
+            seen.append(name)
+    assert seen == list(weights)
+    assert all(param.tp_rank == 1 for param in params.values())
+
+
 @pytest.mark.spyre_device
-def test_loader_places_weights_on_the_right_device(tmp_path, monkeypatch, tp_group):
+@pytest.mark.parametrize(
+    "extra_config", [{}, {"enable_multithread_load": False}], ids=["default", "serial"]
+)
+def test_loader_places_weights_on_the_right_device(tmp_path, monkeypatch, tp_group, extra_config):
     """A normal weight is streamed to Spyre, a host-loaded one stays on the CPU, and both
     hold the checkpoint's values."""
     if not spyre_available():
@@ -569,7 +878,7 @@ def test_loader_places_weights_on_the_right_device(tmp_path, monkeypatch, tp_gro
         torch.empty(64, 64, dtype=torch.float16, device="spyre"), requires_grad=False
     )
 
-    loader = SpyreModelLoader(LoadConfig(load_format="spyre"))
+    loader = _extra_config_loader(extra_config)
     loader.load_weights(model, SimpleNamespace(dtype=torch.float16))
 
     assert model.dense.weight.device.type == "spyre"

@@ -154,5 +154,5 @@ def test_the_reset_finds_the_attention_kernels_behind_their_wrappers():
 
     impl = object.__new__(SpyreAttentionImpl)
     found = {fn.__name__ for fn in warmup._compiled_kernels([impl])}
-    assert {"page_attn_prefill", "page_attn_decode", "batched_decode"} <= found
+    assert {"page_attn_prefill", "batched_decode"} <= found
     assert spyre_attn._batched_decode_compiled.__name__ == "batched_decode"

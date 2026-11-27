@@ -476,7 +476,8 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     ],
 )
 def test_spyre_indirect_page_gather_2d_index(spyre_device, mode):
-    """`k_pages[kv_rows]` with a [KV, 1] int32 index, the page gather of page_attn_decode.
+    """`k_pages[kv_rows]` with a [KV, 1] int32 index, the 2-D form of batched decode's
+    [entries, 1] page gather.
 
     This is why SpyreAttentionImpl compiles attention on Spyre even under --enforce-eager.
     When the eager case XPASSes, attention can honor --enforce-eager on Spyre.
@@ -974,7 +975,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     ),
 )
 def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
-    """The same idea at the [KV, 1] entry shape ``page_attn_decode`` gathers with.
+    """The same idea at a [KV, 1] entry shape, the 2-D form batched decode gathers with.
 
     A 2-D entry cannot go through index_select, hence the subscript.
     """
@@ -1305,16 +1306,12 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#2971: eager GemmaRMSNorm cannot multiply its staggered-EA "
-        "FP32 activation by a STANDARD [hidden] FP32 weight. When this XPASS-es, "
-        "remove force=True from SpyreGemmaRMSNorm."
-    ),
-)
 def test_spyre_eager_gemma_rms_norm(spyre_device):
-    """Upstream FP32 GemmaRMSNorm should run without a surrounding compiled graph."""
+    """Upstream FP32 GemmaRMSNorm should run without a surrounding compiled graph.
+
+    Was strict-xfail on torch-spyre#2971: the staggered-EA FP32 activation could not
+    multiply the STANDARD [hidden] FP32 weight.
+    """
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
     torch.manual_seed(0)

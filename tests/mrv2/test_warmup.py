@@ -182,6 +182,7 @@ def _mm_runner(*, pooling=False, compiled_tower_blocks=0, encoder_only=False, mm
     )
     return SimpleNamespace(
         model=wrapper,
+        get_model=nn.Module,
         model_config=model_config,
         supports_mm_inputs=mm,
         is_pooling_model=pooling,
@@ -235,7 +236,7 @@ def test_an_eager_tower_on_a_generative_vlm_is_left_alone(mm_budget) -> None:
 
 
 def test_a_pooling_encoder_warms_every_modality_and_no_text_embedding(mm_budget) -> None:
-    """CLIP: an encoder-only model never embeds through embed_input_ids."""
+    """An encoder-only model with a marked tower never embeds through embed_input_ids."""
     runner = _mm_runner(pooling=True, encoder_only=True)
     warmup._warm_multimodal(runner, [128])
     assert runner.model.embedded == []

@@ -308,7 +308,6 @@ def test_flag_off_keeps_plain_kernels(monkeypatch):
     assert envs.SPYRE_ATTN_AOT_CACHE is False
     names = (
         "_page_attn_prefill_compiled",
-        "_page_attn_decode_compiled",
         "_batched_decode_compiled",
     )
     for name in names:

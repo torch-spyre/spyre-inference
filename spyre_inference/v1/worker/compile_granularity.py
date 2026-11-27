@@ -24,7 +24,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from spyre_inference import envs
-from spyre_inference.multimodal.utils import blocks_marked_compilable
 from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
@@ -88,21 +87,15 @@ def _is_vision_tower_path(qualname: str) -> bool:
     return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
 
 
-def repeated_block_lists(model: nn.Module) -> list[tuple[nn.ModuleList, bool]]:
-    """Each compilable block list with whether a multimodal patch marked it."""
-    block_lists: list[tuple[nn.ModuleList, bool]] = []
+def repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
+    block_lists: list[nn.ModuleList] = []
     for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
             continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
             continue
-        # A multimodal patch marks the blocks whose body it made traceable; reading the
-        # mark off the blocks keeps an outer list that merely nests a marked tower out.
-        if blocks_marked_compilable(blocks):
-            block_lists.append((module, True))
-            continue
-        # Every other tower stays eager: its block body builds constants on the host,
+        # A vision tower stays eager here: its block body builds constants on the host,
         # which have no device layout. Decoder lists are never named these.
         if _is_vision_tower_path(qualname):
             continue
@@ -113,19 +106,17 @@ def repeated_block_lists(model: nn.Module) -> list[tuple[nn.ModuleList, bool]]:
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
         if any(_is_decoder_attention_like(m) for b in blocks for m in b.modules()):
-            block_lists.append((module, False))
+            block_lists.append(module)
     return block_lists
 
 
-def compile_blocks(block_lists: list[tuple[nn.ModuleList, bool]]) -> tuple[int, int]:
-    """Compile every block in place; returns (decoder blocks, marked tower blocks)."""
-    # Only decoder blocks are counted first: the count decides the whole-model fallback,
-    # which an opted-in tower must not pre-empt (it compiles beside either form).
-    num_blocks = num_tower = 0
+def compile_blocks(block_lists: list[nn.ModuleList]) -> int:
+    """Compile every block in place; returns how many."""
+    num_blocks = 0
     # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
     # alias blocks across lists; recompiling one is harmless but would double the count.
     seen: set[int] = set()
-    for blocks, marked in block_lists:
+    for blocks in block_lists:
         for block in blocks:
             if isinstance(block, PPMissingLayer) or id(block) in seen:
                 continue
@@ -137,19 +128,14 @@ def compile_blocks(block_lists: list[tuple[nn.ModuleList, bool]]) -> tuple[int, 
             # Identical blocks share one `forward` code object -- that is why this
             # granularity shares a single artifact -- so this collapses to one
             # registration per block *class*, which is the right granularity for
-            # the message too. A marked tower is watched like the decoder:
-            # `_warmup_multimodal_encoder` compiles it at every image-batch width.
+            # the message too.
             compile_guard.watch(block, f"{type(block).__name__} (transformer block)")
-            if marked:
-                num_tower += 1
-            else:
-                num_blocks += 1
-    return num_blocks, num_tower
+            num_blocks += 1
+    return num_blocks
 
 
-def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Module, int]:
-    """Install torch.compile wrappers; tracing happens on the first forward. Returns the
-    model to run and the number of marked tower blocks compiled.
+def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+    """Install torch.compile wrappers; tracing happens on the first forward.
 
     `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
     """
@@ -165,11 +151,10 @@ def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Mod
     # Per-block is the default: identical blocks share a ``forward`` code object,
     # so the backend compiles one block rather than a program that grows with depth.
     granularity = compile_granularity()
-    tower = 0
 
     if vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
         logger.info("Compilation disabled (enforce_eager=True)")
-        return model, 0
+        return model
 
     model_name = type(model).__name__
 
@@ -182,15 +167,14 @@ def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Mod
                 "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
                 defeated_by,
             )
-        num_blocks, tower = compile_blocks(repeated_block_lists(model))
+        num_blocks = compile_blocks(repeated_block_lists(model))
         if num_blocks:
             logger.info(
-                "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre.",
+                "Wrapped %d transformer blocks of %s for per-block compile on Spyre.",
                 num_blocks,
-                f" and {tower} tower blocks" if tower else "",
                 model_name,
             )
-            return model, tower
+            return model
         logger.warning(
             "Found no attention-bearing block ModuleList in %s; falling back to a "
             "whole-model graph. Models whose attention is not a vLLM Attention "
@@ -209,4 +193,4 @@ def compile_for_spyre(model: nn.Module, vllm_config: VllmConfig) -> tuple[nn.Mod
     )
     compile_guard.watch(compiled, f"{model_name} (whole-model graph)")
     logger.info("Wrapped %s as a single graph for Spyre.", model_name)
-    return compiled, tower
+    return compiled

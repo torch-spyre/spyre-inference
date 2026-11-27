@@ -65,7 +65,6 @@ from spyre_inference.models._vision_encoder import (
     unbind_items,
 )
 from spyre_inference.multimodal.utils import align_up, padded_sdpa
-from spyre_inference.v1.pool.spyre_pooler import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
 
 if TYPE_CHECKING:
@@ -145,17 +144,6 @@ def merge_text_and_vision(
     # Unsqueezed on the host: a device-side [N, 1] view gives the result a layout that
     # index_select faults the card on past row 63 (torch-spyre#5230).
     return torch.where(convert(mask.unsqueeze(-1), device=text.device), vision, text)
-
-
-def select_class_rows(feats: torch.Tensor) -> torch.Tensor:
-    """Each image's class token, ``feats[:, :1, :]``, gathered rather than sliced.
-
-    Past one image the slice is a strided view, and the on-card post-norm reads it as
-    contiguous: every image after the first got rows of the first image instead.
-    """
-    b, s, h = feats.shape
-    rows = torch.arange(b, dtype=torch.int64) * s
-    return select_rows(feats.reshape(b * s, h), rows).reshape(b, 1, h)
 
 
 class SpyreCLIPAttention(CLIPAttention):
@@ -297,8 +285,8 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
         }
         if not self._class_layout:
             self.vision_buffers["segments"] = segment_buffer()
-        # Weighs a slot's rows down to its class row: a strided slice there is misread on the
-        # card (see select_class_rows).
+        # Weighs a slot's rows down to its class row. A `[:, :1]` slice is a strided view past
+        # one image, which the card reads as contiguous: later images got the first one's rows.
         pick = torch.zeros(1, self._slot, 1)
         pick[0, 0] = 1.0
         self.register_buffer("_class_pick", pick, persistent=False)
@@ -471,11 +459,3 @@ class SpyreCLIPEmbeddingModel(SpyreVisionEncoderMixin, CLIPEmbeddingModel):
             grid_mask[encoder_dense_row_indices(query_lens, extent)] = mask
             mask = grid_mask
         self._spyre_mm_token_mask = mask
-
-    def get_image_features(self, pixel_values, feature_select_strategy=None):
-        if feature_select_strategy is None and pixel_values.shape[0] > 1:
-            pooling_type = self.pooler_config.seq_pooling_type
-            assert pooling_type is not None
-            if _get_vision_feature_select_strategy(pooling_type) == "class":
-                feature_select_strategy = select_class_rows
-        return super().get_image_features(pixel_values, feature_select_strategy)

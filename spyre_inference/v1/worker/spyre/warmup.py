@@ -34,7 +34,6 @@ from vllm.config import CompilationMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
@@ -159,14 +158,11 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
-    """The input embedding at every body size, and the encoder at every batch width.
+    """The input embedding at every body size.
 
     A dummy run hands the model the staging buffer instead of producing it through
-    embed_input_ids, and no dummy run reaches the encoder. A generative model's tower is
-    enumerated only when its blocks are compiled, and only for images: an eager tower
-    compiles per op on first use, which the guard expects, and a video or audio item
-    expands to a count the request sets. A SpyreVisionEncoderMixin tower is skipped:
-    it compiles per token budget instead (_record_vision_graphs).
+    embed_input_ids. No tower runs here: an eager one compiles per op on first use, a
+    SpyreVisionEncoderMixin one per budget in _record_vision_graphs.
     """
     if not runner.supports_mm_inputs:
         return
@@ -178,19 +174,6 @@ def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
         for n in sizes:
             # int32 to match upstream's input_ids buffer; 0 is an id every vocab holds.
             wrapper.embed_input_ids(torch.zeros(n, dtype=torch.int32))
-    if not runner.is_pooling_model and not runner.compiled_tower_blocks:
-        return
-    if isinstance(runner.get_model(), SpyreVisionEncoderMixin):
-        return
-    budget = MultiModalBudget(runner.vllm_config, runner.mm_registry, enable_cache=False)
-    for modality, n_max in budget.mm_max_items_per_batch.items():
-        if not runner.is_pooling_model and modality != "image":
-            continue
-        logger.info("Warming the %s encoder at batch widths 1..%d.", modality, n_max)
-        for n in range(1, int(n_max) + 1):
-            items = budget.get_dummy_encoder_profile_inputs(modality, n)
-            for _, _, batch in group_and_batch_mm_kwargs(items, device=runner.device):
-                wrapper.embed_multimodal(**batch)
 
 
 def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:

@@ -606,6 +606,21 @@ def test_only_the_spyre_model_may_carry_the_tower():
         multimodal.apply_multimodal_patches(other, torch.device("cpu"))
 
 
+def test_a_stage_missing_stock_tower_is_not_rejected():
+    """With image and video at 0 (EmbeddingGemma2, DiffusionGemma), vLLM builds the tower on
+    meta behind a `StageMissingLayer`; a text-only run must not hit the rejection."""
+    from vllm.model_executor.models.utils import StageMissingLayer
+
+    from spyre_inference import multimodal
+
+    class Gemma4VisionModel(nn.Module):
+        pass
+
+    model = nn.Module()
+    model.vision_tower = StageMissingLayer("vision_tower", Gemma4VisionModel())
+    multimodal.apply_multimodal_patches(model, torch.device("cpu"))
+
+
 @pytest.mark.parametrize("padded_to", [None, PADDED_HEAD_DIM + 128])
 def test_spyre_attention_refuses_an_unpadded_instance(padded_to):
     """An instance ``process_weights_after_loading`` never touched, or padded for another

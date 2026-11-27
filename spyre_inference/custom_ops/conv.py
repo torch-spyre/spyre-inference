@@ -34,10 +34,9 @@ logger = init_logger(__name__)
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
     """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card.
 
-    Spyre needs static shapes, so the kernel recompiles per distinct (B, H, W). Warmup
-    covers the batch widths up to the image limit at the dummy resolution; every other
-    resolution costs a full compile mid-request — bucket or resize images if a workload
-    uses many resolutions.
+    Spyre needs static shapes, so the kernel recompiles per distinct (B, H, W). Warmup does
+    not run an eager tower, so each new shape costs a full compile mid-request — bucket or
+    resize images if a workload uses many resolutions.
     """
 
     # Per-(B, H, W) recompiles are this layer's contract, so the compile guard must not

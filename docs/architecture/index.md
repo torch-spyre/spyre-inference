@@ -267,29 +267,16 @@ Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entr
 hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
 (`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager unless
-marked (below) or compiled per encoder budget (see [Vision encoders](#vision-encoders)). Models whose
+compiled per encoder budget (see [Vision encoders](#vision-encoders)). Models whose
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
 
-A vision tower opts in. A block cannot assemble a constant
-on the host: a CPU-resident buffer has no device layout, and layout propagation rejects
-the graph. So a tower qualifies only once its block body builds nothing there: a
-load-time constant such as a rope permutation becomes a non-persistent buffer on the
-layer, lifted as a graph input, and a per-image one such as the attention mask is built
-once in the encoder forward and passed to each layer as an argument. A multimodal patch
-that has done that marks the layers with `mark_blocks_compilable` (`multimodal/utils.py`),
-and they are discovered like any other block stack; every other tower stays eager. No
-registered model marks its tower any more: CLIP's (`models/clip.py`) runs on the vision
-encoder mixin below, and `multimodal/clip.py` is left until its removal. Marked tower
-blocks compile beside the decoder blocks but never stand in for them, so a model with no
-decoder blocks still falls back to the whole-model graph. Warmup runs a marked tower at
-every image-batch width up to `mm_max_items_per_batch`, for pooling and generative models
-alike, and the compile guard watches its blocks like the decoder's: a tower compile after
-warmup is a shape warmup missed. A tower whose per-image shape varies beyond the batch
-width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
-marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
-(`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
-budget, and rejects video. Upstream's doubling covers the engine's `max_soft_tokens`. Larger
+A vision tower is never compiled as a block stack. A block cannot assemble a constant on
+the host: a CPU-resident buffer has no device layout, and layout propagation rejects the
+graph. A tower compiles only on the vision encoder mixin below, per token budget, which
+builds its per-image constants once per encoder call and hands them to the blocks as
+graph inputs. CLIP's tower (`models/clip.py`) runs there, and so does Gemma 4's:
+`SpyreGemma4ForConditionalGeneration` (`models/gemma4_mm.py`) rejects video. Upstream's doubling covers the engine's `max_soft_tokens`. Larger
 per-request sizes get budgets only when listed in `encoder_cudagraph_token_budgets` (see
 [per-request image sizes](../user_guide/configuration.md#gemma-4-per-request-image-sizes));
 `TorchSpyrePlatform.validate_request` rejects an image above the largest budget at the

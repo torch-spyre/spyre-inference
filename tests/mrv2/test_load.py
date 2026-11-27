@@ -110,7 +110,7 @@ def steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(load, "configure_pooling_for_spyre", record("configure_pooling", True))
     monkeypatch.setattr(load, "encoder_len_ladder", lambda config: [])
     monkeypatch.setattr(
-        load, "compile_for_spyre", lambda model, config: calls.append("compile") or (model, 3)
+        load, "compile_for_spyre", lambda model, config: calls.append("compile") or model
     )
     monkeypatch.setattr(load.SpyreShapeBucketer, "for_config", staticmethod(lambda config: None))
     return calls
@@ -135,7 +135,7 @@ def test_the_loader_runs_the_shared_steps_and_returns_the_wrapper(steps) -> None
         "compile",
     ]
     assert isinstance(wrapper, _SpyreModelWrapper) and wrapper._model is model
-    assert runner.pooling_on_spyre is False and runner.compiled_tower_blocks == 3
+    assert runner.pooling_on_spyre is False
     assert wrapper._keep_outputs_on_device is False
 
 
@@ -431,7 +431,7 @@ def test_load_model_through_upstreams_body() -> None:
         upstream.compile_model_with_stock_torch = lambda model, config: stock.append(model)
         # Not enforce_eager: that resets the mode to NONE and upstream's stock branch
         # would never run. The block compile itself is stubbed to keep the model on CPU.
-        load.compile_for_spyre = lambda model, config: (model, 0)
+        load.compile_for_spyre = lambda model, config: model
         device_shims.install()
         config = VllmConfig(
             model_config=ModelConfig(

@@ -111,9 +111,7 @@ def register_variant(name, impl_label, compiled=True, batched=False, available_f
 
 register_variant("online_softmax_compiled", "Implementation.SPYRE_ONLINE_SOFTMAX", True)
 register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EAGER", False)
-register_variant(
-    "batched_decode_compiled", "Implementation.SPYRE_BATCHED_DECODE", True, batched=True
-)
+register_variant("batched_decode_compiled", "Implementation.BATCHED_DECODE", True, batched=True)
 
 
 @contextlib.contextmanager
@@ -741,16 +739,12 @@ def expected_kernels(row, span):
 
     The loop runs one kernel per sequence; the batched path collapses the decode
     prefix's into one. Staging copies count as memory ops, so they are excluded.
-    The decode kernel emits its store as a second kernel per call, where the
-    batched-GQA prefill kernel fuses it into the attention one.
     """
     num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
     if row["attn_path"].startswith("batched"):
         attn = 1 + (num_seqs - num_decode)
     else:
         attn = num_seqs
-    if row["padded_query_len"] == 1:
-        attn *= 2
     write = 1 if row["kv_write"] else 0
     if span == SPANS["reshape_and_cache"]:
         return write

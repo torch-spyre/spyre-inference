@@ -2928,7 +2928,7 @@ def test_spyre_attn_batched_decode_correctness(
     configure_compilation,
     configure_device,
 ):
-    """The batched decode kernel over folded pages, against the CPU reference.
+    """The batched decode kernel against the CPU reference.
 
     Not bit-exact with the per-seq loop and cannot be: the chunked reduction sums in a
     different order under one shared max.

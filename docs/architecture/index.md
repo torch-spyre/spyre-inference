@@ -480,13 +480,14 @@ Decode rows run the batched decode kernel, even for one sequence. It gathers who
 which stay in the LX scratchpad from the gather to their last use instead of round-tripping
 through HBM. The per-sequence loop runs `page_attn_prefill`: batched GQA over the cache, one
 whole page per gather, the page transfer amortised over every query row. It also serves the
-decode rows batched decode declines (a cache too small for the gather), at query width 1.
+decode rows batched decode does not take, at query width 1: a cache too small for the
+gather, or a one-token row behind spec-decode verify rows, which MRV2 sorts first.
 
-Batched decode's page gather is a subscript, which lowers to `aten.index` and fails eager
-on Spyre by upcasting its int32 index (torch-spyre#4334, tracked by
-`test_spyre_indirect_page_gather_subscript_needs_compile`), so attention is always compiled
-on Spyre, even under `--enforce-eager` — attention compiles in its own domain, so the rest
-of the model still runs eager. Because a narrow query's bmm output axes
+Batched decode's page gather is an `[entries, 1]` subscript, which lowers to `aten.index`;
+eager `aten.index` takes only a 1-D index on Spyre (torch-spyre#4334, tracked by
+`test_spyre_indirect_page_gather_2d_index`), so attention is always compiled on Spyre,
+even under `--enforce-eager` — attention compiles in its own domain, so the rest of the
+model still runs eager. Because a narrow query's bmm output axes
 (`num_kv_heads * padded_query_len`) cannot fill 32 cores, and filling them would mean
 K-splitting a reduction a gather cannot mirror, such an attention compile alone is capped
 at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The batched decode kernel's page index is

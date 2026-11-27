@@ -347,3 +347,27 @@ def test_compiles_as_plain_torch_compile_under_inference_mode(monkeypatch):
     assert list(second._loaded) == list(first._loaded)
     ((_, path, _),) = second._loaded.values()
     assert path is not None
+
+
+def test_aot_compile_traces_a_ranged_count_size_obliviously(monkeypatch):
+    """With its range argument set, the kernel traces like spyre_attn's plain path
+    (backed_size_oblivious), so its graphs match the precompile pool's."""
+    from torch.fx.experimental import _config as fx_config
+
+    def ranged(a, page_range=None):
+        return a + 1
+
+    seen = []
+
+    def fake_aot_compile(_inputs):
+        seen.append(fx_config.backed_size_oblivious)
+        raise RuntimeError("not compiled in this test")
+
+    plain = _Plain(ranged)
+    k = akc.AotKernel(ranged, plain, "page_range")
+    monkeypatch.setattr(k._aot, "aot_compile", fake_aot_compile)
+    a = torch.randn(4)
+    assert torch.equal(k(a=a, page_range=(1, 8)), a + 1)
+    assert torch.equal(k(a=a, page_range=None), a + 1)
+    assert seen == [True, False]
+    assert plain.calls == 2

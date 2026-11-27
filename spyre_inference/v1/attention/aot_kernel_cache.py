@@ -54,6 +54,7 @@ from typing import Any
 
 import torch
 import torch._functorch.config
+from torch.fx.experimental import _config as fx_config
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -160,9 +161,15 @@ def _compile_mode() -> Iterator[None]:
 class AotKernel:
     """A ``torch.compile``'d kernel whose compiled code is kept on disk per input key."""
 
-    def __init__(self, fn: FunctionType, compiled: Callable[..., Any]) -> None:
+    def __init__(
+        self, fn: FunctionType, compiled: Callable[..., Any], range_arg: str | None = None
+    ) -> None:
         self._fn = fn
         self._compiled = compiled
+        # The argument whose trip count spyre_attn's plain path traces size-obliviously
+        # (``_compile_with_dynamic_count``): aot_compile traces the same way, so its
+        # graphs match the ones a precompile pool compiled.
+        self._range_arg = range_arg
         # A second compile object for aot_compile only, which keeps just the shape
         # guards. The plain object keeps all its guards for the fallback.
         self._aot: Any = torch.compile(
@@ -222,7 +229,12 @@ class AotKernel:
 
     def _compile_and_run(self, key: tuple, args: tuple, kwargs: dict) -> Any:
         try:
-            with _compile_mode():
+            oblivious = (
+                fx_config.patch(backed_size_oblivious=True)
+                if self._range_arg is not None and kwargs.get(self._range_arg) is not None
+                else contextlib.nullcontext()
+            )
+            with _compile_mode(), oblivious:
                 fn = self._aot.aot_compile((args, kwargs))
             # _run checks the guards itself, so a failed check takes the plain path.
             fn.disable_guard_check()

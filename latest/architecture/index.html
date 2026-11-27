@@ -3175,16 +3175,17 @@ leaving the retained config's specs, and so its <code>page_size_bytes</code>, ph
 (<code>kv_sharing_fast_prefill</code>) swaps in an attention backend Spyre does not provide and is rejected.</p>
 <p>Because attention kernels are <code>dynamic=False</code> too, they are pre-compiled during warmup
 rather than lazily on first use: warmup records per-sequence variants from
-<code>SpyreAttnBucketer.variants()</code>. A query bucket pairs only with block counts that fit its
-smallest real query length; variants exceeding the allocated page count are skipped. When the per-sequence page count is dynamic (copied to the device
-with <code>tensor.to(dynamic=...)</code>), warmup instead records one per-sequence variant per query
-bucket, at the page count of <code>max_model_len</code>, and that kernel runs every page count up to
-it. When prefill gets its own range of multiples of 8 pages, a prefill variant is traced
-at that page count rounded up to a multiple of 8. Failed recordings are logged and compile
-on first use instead.
-For the batched-decode kernel, warmup enumerates its variants, the product of the KV-length (<code>num_blocks</code>) and num-sequences
-buckets; combinations that reach or exceed the allocated page count are skipped and
-declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
+<code>SpyreAttnBucketer.variants()</code>: one per query bucket, at the page count of
+<code>max_model_len</code>; variants exceeding the allocated page count are skipped.
+When the per-sequence page count is dynamic (copied to the device with
+<code>tensor.to(dynamic=...)</code>), that kernel runs every page count up to it; otherwise every
+sequence pads to it. A sliding-window layer has no page range and records one variant per
+(power-of-two page count, query bucket) pair instead. When prefill gets its own range of
+multiples of 8 pages, a prefill variant is traced at that page count rounded up to a
+multiple of 8. Failed recordings are logged and compile on first use instead.
+For the batched-decode kernel, warmup enumerates its variants, one per num-sequences bucket at the page count of <code>max_model_len</code>, or
+at each power-of-two count up to its window for a sliding-window layer; variants that reach
+or exceed the allocated page count are skipped and declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
 one dynamic variant, at the chunk count of <code>max_model_len</code>, that runs every batch, a
 single chunk included. A single step can carry a mix of prefill and decode sequences;
 each sequence is padded to its own query bucket (decodes use the length-1 bucket) before
@@ -3253,9 +3254,10 @@ checkpoint without KV scales, where every layer is 1.0, and up to one per layer 
 calibrated one.</p>
 <p>Key constraints:</p>
 <ul>
-<li><strong>KV length bucketing</strong>: padded block count on power-of-two buckets from <code>block_size</code>
-  to <code>max_model_len</code> (avoids per-step recompilation on Spyre); <code>SPYRE_ATTN_KV_LADDER</code>
-  selects a denser preset.</li>
+<li><strong>KV length</strong>: not bucketed. Each sequence keeps its own block count within a page range
+  up to <code>max_model_len</code>, or pads to that count where there is no range (see the
+  configuration guide). Sliding-window layers keep power-of-two block counts, capped at the
+  pages their window touches.</li>
 <li><strong>Query length bucketing</strong>: <code>[1] + multiples of min(512, max_num_batched_tokens)</code>
   (consistent tensor shapes for compilation)</li>
 <li><strong>Num-sequences bucketing</strong> (batched-decode kernel only): powers of two from 1 to <code>max_num_seqs</code> (<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>);

@@ -1102,29 +1102,6 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#choosing-a-kv-ladder" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Choosing a KV ladder
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Choosing a KV ladder">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#a-denser-ladder-for-large-batches-only" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        A denser ladder for large batches only
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
   <a href="#one-per-sequence-kernel-for-every-page-count" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1132,11 +1109,6 @@
       
     </span>
   </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
         
@@ -1894,29 +1866,6 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#choosing-a-kv-ladder" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Choosing a KV ladder
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Choosing a KV ladder">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#a-denser-ladder-for-large-batches-only" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        A denser ladder for large batches only
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
   <a href="#one-per-sequence-kernel-for-every-page-count" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1924,11 +1873,6 @@
       
     </span>
   </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
         
@@ -2379,29 +2323,6 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#choosing-a-kv-ladder" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Choosing a KV ladder
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Choosing a KV ladder">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#a-denser-ladder-for-large-batches-only" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        A denser ladder for large batches only
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
   <a href="#one-per-sequence-kernel-for-every-page-count" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2409,11 +2330,6 @@
       
     </span>
   </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
         
@@ -2660,10 +2576,8 @@ uses one short dummy and always takes the packed path.</p>
 <p>Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
-that fit its smallest real query length. Batched decode uses KV-length/num-sequences
-pairs; both recording paths also enforce the allocated page-capacity limit. Extra
-buckets can still multiply the recorded variants, so keep those lists short.</p>
+compile at warmup. Full-attention layers have no KV-length buckets (see below); their query and
+num-sequences buckets each add recorded variants, so keep those lists short.</p>
 <p><strong>Decoder body (packed token count).</strong> Override the defaults with <code>compile_sizes</code>; the
 platform clamps <code>--max-num-batched-tokens</code> to the largest entry. A decode-heavy run at
 <code>--max-num-seqs 8</code> rarely needs the full power-of-two ladder:</p>
@@ -2694,119 +2608,31 @@ the number of image-batch widths the vision tower is warmed at, which can run ou
 device memory (#1302). At a long <code>--max-model-len</code>, a 2048-token bucket can push the
 largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
 they are left to compile on first use (torch-spyre#5250 makes that limit configurable).</p>
-<p><strong>Attention (KV length × query length).</strong> Set the buckets directly as comma-separated
-lists. Each is clamped to its limit: entries above <code>--max-model-len</code> (KV) or
-<code>--max-num-batched-tokens</code> (query) are dropped, and the limit is appended if missing, so
-every schedulable length keeps a bucket.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_KV_BUCKETS</span><span class="o">=</span><span class="m">256</span>,1024,2048<span class="w">    </span><span class="c1"># default: the SPYRE_ATTN_KV_LADDER preset (pow2)</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,512<span class="w">         </span><span class="c1"># 1 = decode; 512 = prefill chunk</span>
+<p><strong>Attention (query length and batch size).</strong> Set the buckets as comma-separated lists.
+Each is clamped to its limit: entries above <code>--max-num-batched-tokens</code> (query) or
+<code>--max-num-seqs</code> (num-sequences) are dropped, and the limit is appended if missing, so every
+schedulable length keeps a bucket.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,512<span class="w">         </span><span class="c1"># 1 = decode; 512 = prefill chunk</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_NUM_SEQS_BUCKETS</span><span class="o">=</span><span class="m">1</span>,4,8<span class="w">      </span><span class="c1"># default: powers of two up to --max-num-seqs</span>
 </span></code></pre></div>
-<p>The default KV buckets are the powers of two from <code>block_size</code>; the denser presets below
-union them with a further series. The ladder stays geometric rather than uniform because the
-recorded set grows with both the KV and num-sequences axes, even after filtering, so each
-extra entry costs warmup time. If your context never exceeds 2048,
-dropping the higher entries removes variants from warmup at no serving cost.</p>
-<h3 id="choosing-a-kv-ladder">Choosing a KV ladder<a class="headerlink" href="#choosing-a-kv-ladder" title="Permanent link">&para;</a></h3>
-<p><code>SPYRE_ATTN_KV_LADDER</code> picks how finely the KV ladder subdivides, without having to write the
-buckets out. The default is <code>pow2</code>. Every preset keeps the powers of two, so a KV length's bucket
-can only move down relative to <code>pow2</code>, never up. The denser presets do not contain each other,
-though: at block_size 128, 2600 rounds to 2688 under <code>8_5</code> but to 2944 under <code>4_3</code>. Counts and
-overpay below are for block_size 128, at the <code>--max-model-len</code> each column names:</p>
-<table>
-<thead>
-<tr>
-<th>preset</th>
-<th>spacing</th>
-<th>buckets at 4096 / 16384 / 32768</th>
-<th>mean overpay at 4096 / 32768</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>pow2</code> (default)</td>
-<td>powers of two only</td>
-<td>6 / 8 / 9</td>
-<td>39% / 39%</td>
-</tr>
-<tr>
-<td><code>8_5</code></td>
-<td>8/5 ratio</td>
-<td>10 / 15 / 18</td>
-<td>21% / 19%</td>
-</tr>
-<tr>
-<td><code>4_3</code></td>
-<td>4/3 ratio</td>
-<td>14 / 20 / 24</td>
-<td>15% / 13%</td>
-</tr>
-<tr>
-<td><code>9_8</code></td>
-<td>9/8 ratio</td>
-<td>20 / 34 / 41</td>
-<td>8% / 6%</td>
-</tr>
-<tr>
-<td><code>uniform</code></td>
-<td>odd sixteenths of <code>--max-model-len</code></td>
-<td>13 / 15 / 16</td>
-<td>14% / 14%</td>
-</tr>
-</tbody>
-</table>
-<p>Overpay is the bucket over the real KV length, averaged over every KV length above <code>block_size</code>,
-so it describes a workload whose lengths are spread out. Warmup cost tracks the number of distinct
-recorded kernels, which rises with the bucket count. The ratio presets put their buckets at fixed
-token counts; <code>uniform</code> places them as fractions of <code>--max-model-len</code>, so its buckets move up with
-the context while its count stays roughly flat. Short contexts that are not a power of two are the
-exception: there the step rounds down to a whole block and adds a few buckets (16 at 2047 against
-12 at 2048). Match <code>--max-model-len</code> to your real lengths before choosing it.</p>
-<p>As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
-saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
-it buys little for its warmup. Once the block count exceeds one chunk of <code>32 // num_seqs</code> blocks,
-the batched-decode kernel also pads it up to whole chunks, which takes back part of a denser
-preset's saving below 32 sequences. <code>8_5</code> is the recommended compromise, <code>9_8</code> the fastest when
-warmup time does not matter, and <code>pow2</code> the default because it has the shortest warmup.</p>
-<p>If the KV lengths are known and clustered, <code>SPYRE_ATTN_KV_BUCKETS</code> beats every preset: put the
-buckets where the lengths actually are. A workload that sits on one power of two gains nothing
-from any preset.</p>
-<h4 id="a-denser-ladder-for-large-batches-only">A denser ladder for large batches only<a class="headerlink" href="#a-denser-ladder-for-large-batches-only" title="Permanent link">&para;</a></h4>
-<p>A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
-concentrates at large batches. <code>SPYRE_ATTN_KV_LADDER_LARGE_BATCH</code> names a second preset that
-batched decode uses once the batch's num-sequences bucket reaches <code>SPYRE_ATTN_LARGE_BATCH_MIN_SEQS</code>
-(default 16, which with the default buckets means 9 or more sequences), while the per-sequence
-path and smaller batches keep <code>SPYRE_ATTN_KV_LADDER</code>. Below the threshold the dense buckets
-cost warmup without a measured gain. The second ladder is unioned with the first, so no length
-rounds up further.
-It is off by default, rejected at startup together with <code>SPYRE_ATTN_KV_BUCKETS</code>, which replaces
-the ladder it extends, and ignored with a warning when the threshold is above the largest
-num-sequences bucket. <code>SPYRE_ATTN_KV_LADDER=8_5</code> with
-<code>SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8</code> gets close to plain <code>9_8</code> at large batches for noticeably
-less warmup.</p>
-<p>For the batched-decode kernel, warmup records eligible KV-length × num-sequences
-combinations.
-<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code> (default: powers of two from 1 to <code>--max-num-seqs</code>) is the
-extra lever there, and the same keep-it-short advice applies.</p>
-<h4 id="one-per-sequence-kernel-for-every-page-count">One per-sequence kernel for every page count<a class="headerlink" href="#one-per-sequence-kernel-for-every-page-count" title="Permanent link">&para;</a></h4>
+<p>Warmup records one per-sequence kernel per query bucket and one batched-decode kernel per
+num-sequences bucket.</p>
+<h3 id="one-per-sequence-kernel-for-every-page-count">One per-sequence kernel for every page count<a class="headerlink" href="#one-per-sequence-kernel-for-every-page-count" title="Permanent link">&para;</a></h3>
 <p>The per-sequence kernels (<code>page_attn_prefill</code>, which also runs any decode that batched decode
-does not take) do not use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+does not take) do not bucket the KV length. Warmup compiles one kernel per query bucket, and that kernel runs any
 sequence length up to <code>--max-model-len</code>.</p>
 <p>Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
 per loop step at every sequence length. When <code>--max-model-len</code> is too short for that, prefill
 keeps its own page count, but covers at least two pages. Decode sequences keep their own page
 count.</p>
 <p>The page tables and mask stacks are copied to the device with torch-spyre's
-<code>tensor.to("spyre", dynamic=...)</code>. For this, the plugin sets two torch-spyre limits unless you
-export them yourself: <code>MIN_RESERVED_DIM_SIZE</code> to 1, and <code>MAX_BUCKETS</code> to at least
-<code>--max-model-len / block_size</code> rounded up to a multiple of 8. If an exported <code>MAX_BUCKETS</code> is
-below that rounded value, prefill reads one page per loop step instead.</p>
-<p>The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
-bucket pair, when any of these holds:</p>
-<ul>
-<li><code>--max-model-len / block_size</code> is not above <code>MIN_RESERVED_DIM_SIZE</code>, or is above an exported
-  <code>MAX_BUCKETS</code>; startup logs a warning;</li>
-<li>the layer uses sliding-window attention.</li>
-</ul>
+<code>tensor.to("spyre", dynamic=...)</code>. For this, the plugin sets torch-spyre's
+<code>MIN_RESERVED_DIM_SIZE</code> to 1 and raises its <code>MAX_BUCKETS</code> cap to at least
+<code>--max-model-len / block_size</code> rounded up to a multiple of 8, whether or not you export them.</p>
+<p>A <code>--max-model-len</code> of one page has no page range: every sequence runs that one page.</p>
+<p>Sliding-window layers have no page range. Each sequence pads to the power of two at or above
+its page count, capped at the pages its window touches, with one kernel per (page count,
+query) bucket pair.</p>
 <p>The batched decode kernel takes its chunk count at run time in the same way, and under the
 same conditions. The kernel reads the KV cache one <em>chunk</em> per loop step: the next
 <code>32 / num_seqs</code> pages (at least one) of every sequence in the batch, so that each of the 32
@@ -2814,7 +2640,9 @@ cores reads one page. For example, a batch of 8 sequences reads 4 pages of each 
 and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
 masked past their own length. The same kernel runs a batch that fits in one chunk, so warmup
 compiles one batched kernel per num-sequences bucket. A num-sequences bucket whose
-<code>--max-model-len</code> fits in one chunk keeps its KV buckets.</p>
+<code>--max-model-len</code> fits in one chunk, or any bucket under the conditions above, pads every
+batch to the page count of <code>--max-model-len</code> instead. A sliding-window layer pads its
+batches to their power-of-two page count, capped at the pages a one-token window touches.</p>
 <h2 id="kv-cache-size">KV cache size<a class="headerlink" href="#kv-cache-size" title="Permanent link">&para;</a></h2>
 <p>The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
 card's free memory (<code>torch.accelerator.get_memory_info</code>) and gives the KV cache what is

@@ -29,7 +29,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from spyre_testing_plugin.attn_helpers import use_python_for_each_tile, use_static_pages
+from spyre_testing_plugin.attn_helpers import (
+    use_per_bucket_decode,
+    use_python_for_each_tile,
+    use_static_pages,
+)
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from torch._dynamo.utils import counters
 from vllm.config import get_current_vllm_config
@@ -160,13 +164,17 @@ def make_bucketer(
     max_num_seqs=8,
     declare_pages=False,
     sliding_window=None,
+    # Too wide for two pages per core: 32 shared slots.
+    kv_row=(16, 128),
 ):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
-    return SpyreAttnBucketer(config, declare_pages=declare_pages, sliding_window=sliding_window)
+    return SpyreAttnBucketer(
+        config, declare_pages=declare_pages, sliding_window=sliding_window, kv_row=kv_row
+    )
 
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
@@ -811,12 +819,15 @@ class TestRecordBatchedDecode:
             impl.forward(MagicMock(), query, query, query, wide_cache, metadata, output)
         assert len(_debug_get_cache_entry_list(batched_decode.__code__)) == traced
 
-    def test_real_decode_batch_lands_on_a_recorded_key(self, builder):
+    def test_real_decode_batch_lands_on_a_recorded_key(self, builder, monkeypatch):
         """A batch the scheduler could hand over must realize a key warmup enumerated."""
         from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
-        # The builder's own, derived from the live config _padded_mask_metadata builds from.
-        bucketer = builder.attn_bucketer
+        # The per-bucket keys; test_shared_slot_dispatch_lands_on_a_recorded_shared_slot_kernel
+        # covers the shared-slot kernel. Rebuilt after the switch, from the live config
+        # _padded_mask_metadata builds from.
+        use_per_bucket_decode(monkeypatch)
+        bucketer = _make_builder(builder.kv_cache_spec).attn_bucketer
         keys = {
             (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
             for v in bucketer.batched_decode_variants()
@@ -850,6 +861,9 @@ def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch,
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
+    # The per-bucket kernels; test_shared_slot_dispatch_lands_on_a_recorded_shared_slot_kernel
+    # covers the shared-slot kernels.
+    use_per_bucket_decode(monkeypatch)
     max_model_len = 2048
     max_blocks = max_model_len // BLOCK_SIZE
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a

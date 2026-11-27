@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_JAGGED_DECODE: bool = True
+    SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS: int = 0
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
@@ -91,6 +92,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When "1" (default), a decode batch spanning several KV buckets runs one batched
     # dispatch per bucket group instead of padding every sequence to the longest.
     "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
+    # The most chunks, the for_each_tile loop count, one shared-slot batched decode call runs.
+    # Unset or "0" (default): what max_num_seqs sequences at max_model_len need, so a batch
+    # never splits. A positive value caps the range there instead, so every launch prepares
+    # host data for fewer chunks; a batch needing more runs as several calls. Raised to what
+    # one max_model_len sequence needs if it is below.
+    "SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS": lambda: int(
+        os.getenv("SPYRE_ATTN_SHARED_SLOT_MAX_CHUNKS", "0")
+    ),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
     # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.

@@ -83,39 +83,15 @@ def _convert_op_func(
     if tensor.device.type == "spyre" and tensor.dtype != target_dtype:
         tensor = tensor.to(device="cpu")
 
-    owned = tensor.dtype != target_dtype
-    if owned:
+    if tensor.dtype != target_dtype:
         tensor = tensor.to(dtype=target_dtype)
 
     if tensor.device.type != target_device.type:
-        if tensor.device.type == "cpu":
-            tensor = _async_source(tensor, owned).to(device=target_device, non_blocking=True)
-        else:
-            tensor = tensor.to(device=target_device)
+        # torch-spyre finishes reading a pageable source before a non-blocking upload
+        # returns, so the caller may reuse it at once.
+        tensor = tensor.to(device=target_device, non_blocking=tensor.device.type == "cpu")
 
     return tensor
-
-
-# torch-spyre stages converting uploads (int64 narrowing, the fp16 format change) before a
-# non-blocking copy returns; any other dtype is read by the DMA later, so it gets a private copy.
-_STAGED_UPLOAD_DTYPES = (torch.int64, torch.float16)
-
-
-def _async_source(tensor: torch.Tensor, owned: bool) -> torch.Tensor:
-    if owned or tensor.dtype in _STAGED_UPLOAD_DTYPES:
-        return tensor
-    return tensor.clone()
-
-
-def _to_layout_async(tensor: torch.Tensor, device, device_layout) -> torch.Tensor:
-    # torch-spyre's layout-aware `Tensor.to` always uploads blocking.
-    from torch_spyre._C import copy_tensor, spyre_empty_with_layout
-
-    dst = spyre_empty_with_layout(
-        tensor.size(), tensor.stride(), tensor.dtype, device_layout, device=device
-    )
-    copy_tensor(_async_source(tensor, owned=False), dst, non_blocking=True)
-    return dst
 
 
 def _convert_op_fake(
@@ -128,21 +104,23 @@ def _convert_op_fake(
     return torch.empty(tensor.shape, dtype=target_dtype, device=target_device)
 
 
-def convert(tensor, device=None, dtype=None, device_layout=None):
+def convert(tensor, device=None, dtype=None, device_layout=None, dynamic=None):
     """Convert tensor device and/or dtype. No-op when both are None.
 
     Normal transfers route through the opaque custom op
     `torch.ops.vllm.spyre_convert` so the transfer is invisible to torch.compile
-    / Dynamo. A device layout bypasses that op because ``SpyreTensorLayout`` is
-    not representable in the custom-op schema. None tensors are short-circuited
+    / Dynamo. A device layout or a dynamic dim bypasses that op because neither
+    is representable in the custom-op schema. None tensors are short-circuited
     at the Python boundary because `infer_schema` does not accept
-    Optional[Tensor] returns.
+    Optional[Tensor] returns. Uploads to Spyre do not wait for the copy to finish.
 
     Args:
         tensor: Input tensor, or None (passed through as None).
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
         device_layout: Optional physical Spyre tensor layout to place the result in.
+        dynamic: Optional torch-spyre reservation (``{0: {"min", "max", "granularity"}}``)
+            for a host-to-Spyre upload whose dim 0 varies between calls.
 
     Returns:
         Converted tensor, or None if input is None.
@@ -151,25 +129,19 @@ def convert(tensor, device=None, dtype=None, device_layout=None):
         return None
     if isinstance(device, str):
         device = torch.device(device)
-    if device_layout is not None:
+    if device_layout is not None or dynamic is not None:
         # `Tensor.to` is the only entry point that takes a layout, and it covers
         # both a host->device placement and a same-device relayout (copy_from_d2d),
         # so a layout-aware conversion must not insist on a device transfer: a
         # cache already moved to Spyre still needs its rows placed outermost.
-        # Only a dense same-dtype upload is async: `Tensor.to` converts dtype on the device
-        # and honours the source strides, which the async copy does not.
-        if (
-            tensor.device.type == "cpu"
-            and device is not None
-            and device.type == "spyre"
-            and dtype in (None, tensor.dtype)
-            and tensor.is_contiguous()
-        ):
-            return _to_layout_async(tensor, device, device_layout)
+        spyre_kwargs = {"device_layout": device_layout} if device_layout is not None else {}
+        if dynamic is not None:
+            spyre_kwargs["dynamic"] = dynamic
         return tensor.to(
             tensor.device if device is None else device,
             dtype=tensor.dtype if dtype is None else dtype,
-            device_layout=device_layout,
+            non_blocking=True,
+            **spyre_kwargs,
         )
     # Short-circuit a true no-op at the call site so Inductor never emits a
     # same-device/dtype spyre_convert FallbackKernel into the graph.

@@ -35,13 +35,14 @@ the measured interval; the applied value is recorded in the `threads` column.
 
 `granite33_8b_e2e_ref.json` reproduces the shapes of one specific end-to-end run,
 as a reference point for checking the harness against it. It declares the shapes
-that run's kernels actually got, not the request lengths it was given: the
-`SPYRE_ATTN_KV_BUCKETS=2048` pin made every step a 16-page kernel, so its four
-prefill chunks — kv 512/1024/1536/1984, query 512/512/512/448 — were all the one
-`q=512, kv=2048` shape, and appear here as a single capture. The run it mirrors:
+that run's kernels actually got, not the request lengths it was given: its KV buckets,
+pinned to 2048 (a setting since removed with the KV ladder), made every step a 16-page
+kernel, so its four prefill chunks — kv 512/1024/1536/1984, query 512/512/512/448 —
+were all the one `q=512, kv=2048` shape, and appear here as a single capture. Rerun
+today, each chunk walks its own page count. The run it mirrors:
 
 ```bash
-LAYOUT_SOLVER=greedy SPYRE_NUM_CPUS=8 SPYRE_ATTN_KV_BUCKETS=2048 \
+LAYOUT_SOLVER=greedy SPYRE_NUM_CPUS=8 \
 uv run --no-sync vllm bench latency \
     --model ibm-granite/granite-3.3-8b-instruct \
     --input-len 1984 --output-len 64 --batch-size 4 \
@@ -53,8 +54,8 @@ uv run --no-sync vllm bench latency \
 ```
 
 Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace;
-`SPYRE_BATCHED_DECODE=1` is the default; the batched decode path also depends on
-compilation, bucket coverage and allocated KV-cache pages.
+the batched decode path depends on compilation, bucket coverage and allocated KV-cache
+pages.
 
 ### Which scope to measure
 
@@ -104,8 +105,10 @@ kernel. Treat it as a bound, not as production's KV-write cost.
 
 A config declares `(query_lens, seq_lens)` and the kernel runs those lengths. The
 bucket lattice is not a second knob: `derive_lattice` builds it from the shape list
-so that every declared length is its own bucket and the real
-`SpyreAttentionMetadataBuilder`'s round-up is the identity. `max_model_len` and
+so that every declared query length and batch size is its own bucket and the real
+`SpyreAttentionMetadataBuilder`'s round-up is the identity. Page counts have no
+buckets: each sequence walks its own, rounded only onto the page range (up to two
+pages, and for a prefill to a multiple of 8). `max_model_len` and
 `max_num_seqs` are the tops of those ladders, so they are derived too.
 `max_num_batched_tokens` comes from `--max-num-batched-tokens` instead (default 512,
 the platform's default prefill bucket): `staging_rows` is it plus one, and those
@@ -113,12 +116,11 @@ buffers are the kernel's query and output arguments, so deriving it from a
 decode-only shape list would narrow the gather the kernel runs.
 A config that sets any of the three, or the old `attn_*_buckets` keys, is rejected.
 
-Padding has not gone away — it is now something you ask for. The kernel specialises
-on `(num_blocks, padded_query_len)`, so **to measure what a deployment's coarser
-ladder does to a length, declare the padded length**: a `q=512, kv=512` chunk under
-`SPYRE_ATTN_KV_BUCKETS=2048` is a 16-page kernel, so declare `kv=2048`. The mask
-differs (fewer valid positions) but the shape, and so the cost, is the one
-production runs.
+Query padding has not gone away — it is now something you ask for. The kernel
+specialises on `padded_query_len`, so **to measure what a deployment's coarser query
+buckets do to a length, declare the padded length**: a `q=300` chunk under the default
+512 step is a `q=512` kernel, so declare `q=512`. The mask differs (fewer valid
+positions) but the shape, and so the cost, is the one production runs.
 
 Either way the realized shape is recorded per row, read back from the built metadata
 rather than assumed: `num_kv_blocks_iterated` and `padded_query_len` are what the
@@ -144,11 +146,11 @@ is reported as a row with `error` set rather than an assertion mid-sweep.
 
 ### Batched decode
 
-The batched decode kernel needs the `batched_decode_compiled` variant, which sets
-`SPYRE_BATCHED_DECODE` for the process (so it cannot be mixed with a per-seq
-variant in one run). Even one decode sequence can use it, provided the build is
-compiled, the sequence/blocks bucket pair resolves, and the padded sequence count
-times blocks per chunk is strictly less than the allocated KV-cache page count.
+Every decode row runs the batched decode kernel, whichever variant is measured; the
+`batched_decode_compiled` variant additionally flags a run where it did not. Even one
+decode sequence uses it, provided the build is compiled, the sequence/blocks bucket
+pair resolves, and the padded sequence count times blocks per chunk is strictly less
+than the allocated KV-cache page count.
 
 The batch axis is bucketed like the other two — one bucket per captured batch size,
 so each of `granite33_8b_batched_decode.json`'s 4/8/16/32 captures dispatches to its
@@ -302,8 +304,8 @@ windows, i.e. whether an Inductor compile landed inside a measurement.
 - `block_size` 128 is what you get in practice: `platform.py` sets it whenever the user
   does not pass one; a user-supplied value is rounded up to a multiple of 64, then the
   result must be a power of two.
-- Compiled and eager variants need separate runs, as do batched and per-seq decode
-  variants — both are fixed per process.
+- Compiled and eager variants need separate runs: the compilation mode is fixed per
+  process.
 - The kernel specializes per `(num_blocks, aligned_max_query_len)`, so a sweep
   legitimately triggers many recompiles; the dynamo recompile limit is raised to
   4096. Warmup runs before the profiled windows so no compile lands inside a

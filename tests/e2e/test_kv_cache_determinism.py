@@ -241,8 +241,6 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     _assert_fits_prefill([*_BATCH_PROBE_PROMPTS, _DIRTY_PROMPT])
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
-    # Pinned on, so a default flip cannot silently move this test onto the per-seq loop.
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
     with _engine(
         model=_MODEL,

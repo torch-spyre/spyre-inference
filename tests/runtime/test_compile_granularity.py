@@ -30,7 +30,6 @@ from vllm.config import CompilationMode
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from spyre_inference.multimodal.utils import mark_blocks_compilable
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import (
     _is_decoder_attention_like,
@@ -175,7 +174,7 @@ class _Model(nn.Module):
         return self.model(input_ids)
 
 
-def _compile(model: nn.Module, enforce_eager: bool = False) -> tuple[nn.Module, int]:
+def _compile(model: nn.Module, enforce_eager: bool = False) -> nn.Module:
     vllm_config = types.SimpleNamespace(
         compilation_config=types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
         model_config=types.SimpleNamespace(enforce_eager=enforce_eager),
@@ -183,14 +182,14 @@ def _compile(model: nn.Module, enforce_eager: bool = False) -> tuple[nn.Module, 
     return compile_for_spyre(model, vllm_config)  # ty: ignore[invalid-argument-type]
 
 
-def _compile_blocks(model: nn.Module) -> tuple[int, int]:
+def _compile_blocks(model: nn.Module) -> int:
     return compile_blocks(repeated_block_lists(model))
 
 
 def test_finds_the_transformer_block_list() -> None:
     model = _Model(num_layers=4)
     found = repeated_block_lists(model)
-    assert found == [(model.model.layers, False)]
+    assert found == [model.model.layers]
 
 
 def test_ignores_module_lists_without_attention() -> None:
@@ -204,7 +203,7 @@ def test_ignores_module_lists_without_attention() -> None:
 
 def test_pp_missing_layers_do_not_break_discovery() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert repeated_block_lists(model) == [(model.model.layers, False)]
+    assert repeated_block_lists(model) == [model.model.layers]
 
 
 def test_ignores_a_module_list_of_bare_attention_layers() -> None:
@@ -222,7 +221,7 @@ def test_finds_heterogeneous_hybrid_stacks() -> None:
     """Hybrid Mamba+attention stacks (Granite 4.0, Jamba, Nemotron-H) mix classes."""
     model = _Model(num_layers=4, hybrid=True)
     assert len({type(b) for b in model.model.layers}) == 2
-    assert repeated_block_lists(model) == [(model.model.layers, False)]
+    assert repeated_block_lists(model) == [model.model.layers]
 
 
 def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
@@ -254,7 +253,7 @@ def test_finds_blocks_with_hf_decoder_kv_cache_attention(implementation: str) ->
     """
     model = _hf_decoder_stack(implementation)
     assert not isinstance(model.layers[0].self_attn, Attention)
-    assert repeated_block_lists(model) == [(model.layers, False)]
+    assert repeated_block_lists(model) == [model.layers]
 
 
 def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
@@ -336,49 +335,6 @@ def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
     assert repeated_block_lists(PixtralHF()) == []
 
 
-def _marked_tower(marked: bool = True) -> nn.Module:
-    class VisionBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc = nn.Linear(4, 4)
-
-        def forward(self, x):
-            return self.fc(x)
-
-    tower = nn.Module()
-    tower.encoder = nn.Module()
-    tower.encoder.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
-    if marked:
-        mark_blocks_compilable(tower.encoder.layers)
-    return tower
-
-
-class _VLM(nn.Module):
-    def __init__(self, marked: bool = True, decoder: bool = False):
-        super().__init__()
-        self.vision_tower = _marked_tower(marked)
-        if decoder:
-            self.language_model = _hf_decoder_stack()
-
-
-def test_a_marked_vision_tower_opts_into_block_compile() -> None:
-    """The mark sits on the blocks, so it is independent of where discovery starts and
-    of whether the tower sits under a recognised ``vision_*`` path."""
-    assert repeated_block_lists(_VLM(marked=False)) == []
-
-    marked = _VLM()
-    assert repeated_block_lists(marked) == [(marked.vision_tower.encoder.layers, True)]
-    assert repeated_block_lists(marked.vision_tower) == [(marked.vision_tower.encoder.layers, True)]
-
-
-def test_marking_one_tower_does_not_compile_the_list_that_nests_it() -> None:
-    """The mark is read off the blocks, not off anything they contain, so an outer
-    ``ModuleList`` that merely holds a marked tower is not itself a compile unit."""
-    model = nn.Module()
-    model.towers = nn.ModuleList([_marked_tower().encoder for _ in range(2)])
-    assert repeated_block_lists(model) == [(t.layers, True) for t in model.towers]
-
-
 def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     """Ministral-style VLM: decoder KV-cache attention compiles; vision stays eager."""
 
@@ -417,48 +373,31 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     model = VLM()
     vision_layers = model.vision_encoder.transformer.layers
     decoder_layers = model.language_model.layers
-    assert repeated_block_lists(model) == [(decoder_layers, False)]
+    assert repeated_block_lists(model) == [decoder_layers]
 
     originals = list(vision_layers)
-    assert _compile_blocks(model)[0] == 3
+    assert _compile_blocks(model) == 3
     assert all(block._compiled_call_impl is None for block in originals)
     assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
-
-
-def test_a_marked_tower_alone_falls_back_to_the_whole_model_graph() -> None:
-    """Only decoder blocks are counted, so a tower alone still sends the decoder to the
-    whole-model graph; the tower compiles beside it."""
-    model = _VLM()
-    assert _compile_blocks(model) == (0, 2)
-    assert all(b._compiled_call_impl is not None for b in model.vision_tower.encoder.layers)
-    fresh = _VLM()
-    compiled, tower = _compile(fresh)
-    assert compiled is not fresh and compiled._orig_mod is fresh and tower == 2
-
-
-def test_a_marked_tower_compiles_beside_the_decoder_and_is_watched() -> None:
-    """Tower blocks compile with the decoder's and the compile guard watches both: warmup
-    runs the tower at every image-batch width, so a later compile is a missed shape."""
-    model = _VLM(decoder=True)
-    compile_guard.reset()
-    assert _compile_blocks(model) == (3, 2)
-    tower_blocks = model.vision_tower.encoder.layers
-    assert all(b._compiled_call_impl is not None for b in tower_blocks)
-    watched = compile_guard._guard.watched_labels().values()
-    assert "GraniteDecoderLayer (transformer block)" in watched
-    assert "VisionBlock (transformer block)" in watched
 
 
 def test_compile_blocks_wraps_every_block_in_place() -> None:
     model = _Model(num_layers=4)
     originals = list(model.model.layers)
 
-    assert _compile_blocks(model)[0] == 4
+    assert _compile_blocks(model) == 4
 
     for i, original in enumerate(originals):
         assert model.model.layers[i] is original
         assert isinstance(original, _Block)
         assert original._compiled_call_impl is not None
+
+
+def test_compile_blocks_registers_each_block_with_the_compile_guard() -> None:
+    """A block compile after warmup is a shape warmup missed."""
+    compile_guard.reset()
+    _compile_blocks(_Model(num_layers=2))
+    assert "_Block (transformer block)" in compile_guard._guard.watched_labels().values()
 
 
 def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
@@ -470,7 +409,7 @@ def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
     model.model.cross_decoder.decoder_layers = model.model.layers[2:]
     assert len(repeated_block_lists(model)) == 3
 
-    assert _compile_blocks(model)[0] == 4
+    assert _compile_blocks(model) == 4
     assert all(block._compiled_call_impl is not None for block in model.model.layers)
 
 
@@ -488,7 +427,7 @@ def test_compile_blocks_preserves_parameter_names() -> None:
 
 def test_pp_missing_layers_are_not_compiled() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert _compile_blocks(model)[0] == 2
+    assert _compile_blocks(model) == 2
     assert all(isinstance(layer, PPMissingLayer) for layer in model.model.layers[2:])
 
 
@@ -513,7 +452,7 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
 
     model = _Model(num_layers=2)
-    assert _compile(model) == (model, 0)
+    assert _compile(model) is model
 
     assert compiled == [model]
     assert all(block._compiled_call_impl is None for block in model.model.layers)
@@ -539,7 +478,7 @@ def test_eager_compiles_nothing(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
 
     model = _Model(num_layers=2)
-    assert _compile(model, enforce_eager=True) == (model, 0)
+    assert _compile(model, enforce_eager=True) is model
 
     assert compiled == []
     assert all(block._compiled_call_impl is None for block in model.model.layers)

@@ -194,9 +194,7 @@ vllm serve google/gemma-4-26B-A4B -tp 4 --max-model-len 32768 \
 ```
 
 Warmup takes longer, and for prompts under a few thousand tokens it gains little; decode
-can get slightly slower. The example serves text only: a larger token budget also raises
-the number of image-batch widths the vision tower is warmed at, which can run out of
-device memory (#1302). At a long `--max-model-len`, a 2048-token bucket can push the
+can get slightly slower. At a long `--max-model-len`, a 2048-token bucket can push the
 largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
 they are left to compile on first use (torch-spyre#5250 makes that limit configurable).
 

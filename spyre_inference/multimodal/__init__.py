@@ -12,19 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-architecture workarounds for multimodal models on Spyre.
+"""Load-time checks for multimodal models on Spyre.
 
-One module per architecture, each exposing `apply(model, device)`. These monkeypatch
-upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
-implementations by layer class. Architectures migrated to a registered subclass on
-`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4, Granite 4 Vision)
-are not patched here.
+Towers on `models._vision_encoder.SpyreVisionEncoderMixin` are adapted by their model subclass.
 """
 
 import torch
 from vllm.model_executor.models.utils import StageMissingLayer
-
-from . import clip
 
 
 def _tower(model: torch.nn.Module, *names: str) -> torch.nn.Module | None:
@@ -62,14 +56,3 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
                 f"{type(model).__name__}: the Gemma 4 vision tower runs on Spyre only under "
                 "Gemma4ForConditionalGeneration."
             )
-
-    # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
-    # Gated on model_type, not just attribute presence: other architectures (e.g.
-    # BLIP-2) also set `vision_model`, and clip.apply() assumes CLIP's specific
-    # LayerNorm-based boundary norms.
-    hf_config = getattr(model, "config", None)
-    if (
-        getattr(hf_config, "model_type", None) == "clip"
-        and _tower(model, "vision_model") is not None
-    ):
-        clip.apply(model, device)

@@ -35,7 +35,6 @@ from spyre_inference.models.clip import (
     force_disable_chunked_prefill,
     has_text_tokens,
     merge_text_and_vision,
-    select_class_rows,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import build_encoder_plan
 
@@ -203,12 +202,6 @@ def test_merge_output_keeps_the_standard_device_layout():
     mask[[0, 100]] = True
     out = merge_text_and_vision(text, vision, mask)
     assert out.device_tensor_layout().stride_map == text.device_tensor_layout().stride_map
-
-
-@pytest.mark.parametrize("batch", [1, 3])
-def test_select_class_rows_matches_the_class_token_slice(batch):
-    feats = torch.randn(batch, 50, 8)
-    assert torch.equal(select_class_rows(feats), feats[:, :1, :])
 
 
 def _align(mask: torch.Tensor, num_tokens: int, grid=None) -> types.SimpleNamespace:

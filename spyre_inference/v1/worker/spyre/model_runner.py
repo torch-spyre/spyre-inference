@@ -56,7 +56,6 @@ class SpyreModelRunnerV2(GPUModelRunner):
         self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
         # Set by load_model.
         self.pooling_on_spyre = False
-        self.compiled_tower_blocks = 0
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)

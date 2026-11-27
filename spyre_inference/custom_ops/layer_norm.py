@@ -22,7 +22,7 @@ see ``torch_spyre._inductor.decompositions.spyre_layer_norm``). That
 decomposition is wrapped in an ``_OPWrapper`` that unconditionally
 ``torch.compile``s it in isolation the first time it's dispatched eagerly --
 regardless of ``--enforce-eager``. For call sites outside any per-block
-compiled region (e.g. CLIP's ``pre_layrnorm``/``post_layernorm``), the
+compiled region (e.g. CLIP's ``text_model.final_layer_norm``), the
 resulting fused kernel fails at the native ``dxp_standalone`` compiler stage
 ("Not enough dimensions" matching ``layernormnorm.ddl``'s fixed 5-dim
 signature).
@@ -37,11 +37,11 @@ exactly where activation outliers of that magnitude show up.
 
 This is a drop-in subclass, not a global monkeypatch of
 ``torch.nn.LayerNorm`` -- only the specific boundary LayerNorms that actually
-hit the crash (currently: CLIP's, patched in ``spyre_inference.multimodal.clip``)
-should be swapped to it. Most ``LayerNorm`` call sites live inside a per-block
-``torch.compile`` region and never take the crashing eager path in the first
-place, so patching them too would be unnecessary blast radius onto unrelated
-models.
+hit the crash (currently: CLIP's ``text_model.final_layer_norm``, built by
+``spyre_inference.models.clip``) should be swapped to it. Most ``LayerNorm``
+call sites live inside a per-block ``torch.compile`` region and never take the
+crashing eager path in the first place, so patching them too would be
+unnecessary blast radius onto unrelated models.
 """
 
 from __future__ import annotations

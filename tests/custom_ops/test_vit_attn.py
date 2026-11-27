@@ -95,8 +95,8 @@ class TestForwardOotMatchesReference:
 
 
 def test_traces_into_one_graph():
-    """A marked tower's block is compiled `fullgraph=True`; the attention must not
-    break it, and SDPA must be in the graph rather than behind an opaque op."""
+    """Traced `fullgraph=True`, the attention must not break the graph, and SDPA must be
+    in it rather than behind an opaque op."""
     graphs: list[torch.fx.GraphModule] = []
 
     def backend(gm, example_inputs):

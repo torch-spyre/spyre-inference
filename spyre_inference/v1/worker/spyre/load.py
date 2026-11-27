@@ -120,7 +120,7 @@ class _SpyreModelLoaderWrapper:
         # Patches instances/classes, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.
         apply_multimodal_patches(model, runner.spyre_device)
-        compiled, runner.compiled_tower_blocks = compile_for_spyre(model, vllm_config)
+        compiled = compile_for_spyre(model, vllm_config)
 
         bucketer = SpyreShapeBucketer.for_config(vllm_config)
         row_buckets = []

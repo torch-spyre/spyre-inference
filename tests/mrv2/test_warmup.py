@@ -172,7 +172,7 @@ def test_a_pooling_warmup_warms_the_row_widths_on_the_recompacted_output(monkeyp
     assert len(warmed) == 2 and warmed[0] is hidden and warmed[1] is packed
 
 
-def _mm_runner(*, pooling=False, compiled_tower_blocks=0, encoder_only=False, mm=True):
+def _mm_runner(*, pooling=False, encoder_only=False, mm=True):
     wrapper = SimpleNamespace(embedded=[], encoded=[])
     wrapper.embed_input_ids = lambda ids, *a, **kw: wrapper.embedded.append(ids.shape[0])
     wrapper.embed_multimodal = lambda **kw: wrapper.encoded.append(kw)
@@ -182,69 +182,30 @@ def _mm_runner(*, pooling=False, compiled_tower_blocks=0, encoder_only=False, mm
     )
     return SimpleNamespace(
         model=wrapper,
-        get_model=nn.Module,
         model_config=model_config,
         supports_mm_inputs=mm,
         is_pooling_model=pooling,
-        compiled_tower_blocks=compiled_tower_blocks,
-        vllm_config=None,
-        mm_registry=None,
-        device="cpu",
     )
 
 
-@pytest.fixture
-def mm_budget(monkeypatch):
-    """MultiModalBudget with image and video widths, one item per batch."""
-
-    class Budget:
-        mm_max_items_per_batch = {"image": 2, "video": 1}
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get_dummy_encoder_profile_inputs(self, modality, n):
-            return [(modality, n)]
-
-    monkeypatch.setattr(warmup, "MultiModalBudget", Budget)
-    monkeypatch.setattr(
-        warmup,
-        "group_and_batch_mm_kwargs",
-        lambda items, device: [(m, n, {"modality": m, "n": n}) for m, n in items],
-    )
-
-
-def test_a_text_only_model_warms_no_multimodal_path(mm_budget) -> None:
+def test_a_text_only_model_warms_no_multimodal_path() -> None:
     runner = _mm_runner(mm=False)
     warmup._warm_multimodal(runner, [8, 1])
     assert runner.model.embedded == [] and runner.model.encoded == []
 
 
-def test_a_generative_vlm_warms_the_embedding_and_its_compiled_image_tower(mm_budget) -> None:
-    """Only images: a video expands to a frame count the request sets."""
-    runner = _mm_runner(compiled_tower_blocks=4)
+def test_a_vlm_warms_the_embedding_and_leaves_its_tower_alone() -> None:
+    """An eager tower's ops compile per op on first use, which the guard expects."""
+    runner = _mm_runner()
     warmup._warm_multimodal(runner, [8, 1])
-    assert runner.model.embedded == [8, 1]
-    assert [(b["modality"], b["n"]) for b in runner.model.encoded] == [("image", 1), ("image", 2)]
+    assert runner.model.embedded == [8, 1] and runner.model.encoded == []
 
 
-def test_an_eager_tower_on_a_generative_vlm_is_left_alone(mm_budget) -> None:
-    """Its ops compile per op on first use, which the guard expects."""
-    runner = _mm_runner(compiled_tower_blocks=0)
-    warmup._warm_multimodal(runner, [8])
-    assert runner.model.embedded == [8] and runner.model.encoded == []
-
-
-def test_a_pooling_encoder_warms_every_modality_and_no_text_embedding(mm_budget) -> None:
-    """An encoder-only model with a marked tower never embeds through embed_input_ids."""
+def test_a_pooling_encoder_warms_no_text_embedding() -> None:
+    """An encoder-only model never embeds through embed_input_ids."""
     runner = _mm_runner(pooling=True, encoder_only=True)
     warmup._warm_multimodal(runner, [128])
-    assert runner.model.embedded == []
-    assert [(b["modality"], b["n"]) for b in runner.model.encoded] == [
-        ("image", 1),
-        ("image", 2),
-        ("video", 1),
-    ]
+    assert runner.model.embedded == [] and runner.model.encoded == []
 
 
 def test_a_multimodal_encoder_forces_no_rectangle(monkeypatch) -> None:

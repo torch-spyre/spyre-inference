@@ -396,15 +396,6 @@ class TestDeclaredPages:
             32,
         ]
 
-    def test_prefill_keeps_single_pages_above_the_exported_max_buckets(self, monkeypatch):
-        from torch_spyre._inductor import config as ts_config
-
-        monkeypatch.setenv("MAX_BUCKETS", "31")
-        ts_config.max_buckets = 31
-        b = SpyreAttnBucketer(make_config(max_model_len=31 * BLOCK_SIZE), declare_pages=True)
-        assert b.page_range is not None
-        assert b.prefill_page_range == b.page_range
-
     def test_a_prefill_on_the_per_sequence_range_covers_two_pages(self):
         """Too short for multiples of eight, prefill takes the per-sequence range, but a
         one-page prefill still runs over two: one page lets its unused slots through."""
@@ -434,11 +425,15 @@ class TestDeclaredPages:
         assert b.page_range == {"min": 1, "max": 32768 // BLOCK_SIZE, "granularity": 1}
         assert ts_config.max_buckets == 32768 // BLOCK_SIZE
 
-    def test_a_context_above_the_exported_max_buckets_keeps_the_buckets(self, monkeypatch):
+    def test_an_exported_max_buckets_is_raised_too(self, monkeypatch):
+        """Neither range falls back below an exported cap."""
+        from torch_spyre._inductor import config as ts_config
+
         monkeypatch.setenv("MAX_BUCKETS", "32")
-        b = SpyreAttnBucketer(make_config(max_model_len=4096 + BLOCK_SIZE), declare_pages=True)
-        assert b.page_range is None
-        assert {v.num_blocks for v in b.variants()} == set(b.num_blocks_buckets)
+        b = SpyreAttnBucketer(make_config(max_model_len=33 * BLOCK_SIZE), declare_pages=True)
+        assert b.page_range == {"min": 1, "max": 33, "granularity": 1}
+        assert b.prefill_page_range == {"min": 8, "max": 40, "granularity": 8}
+        assert ts_config.max_buckets == 40
 
     def test_without_declare_pages_keeps_the_buckets(self):
         b = SpyreAttnBucketer(make_config(max_model_len=2048))

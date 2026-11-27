@@ -172,8 +172,8 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
 def _declared_page_range(max_pages: int) -> DynamicRange | None:
     """Return the range of page counts one per-sequence kernel is compiled for.
 
-    Returns None, and logs why, when ``max_pages`` does not fit torch-spyre's limits; the
-    kernels then pad every sequence to ``max_pages`` instead.
+    Returns None, and logs why, when ``max_pages`` is not above torch-spyre's
+    ``min_reserved_dim_size``; the kernels then pad every sequence to ``max_pages`` instead.
     """
     from torch_spyre._inductor import config as ts_config
     from torch_spyre._inductor import pass_utils
@@ -184,24 +184,22 @@ def _declared_page_range(max_pages: int) -> DynamicRange | None:
             "(torch-spyre#6066), which the per-sequence attention kernels need. "
             "Upgrade torch-spyre."
         )
-    # The page count is the only dynamic size, so it sets these torch-spyre limits unless
-    # the user exported them.
+    # The page count is the only dynamic size, so it lowers torch-spyre's floor unless the
+    # user exported one.
     if "MIN_RESERVED_DIM_SIZE" not in os.environ:
         ts_config.min_reserved_dim_size = 1
-    if "MAX_BUCKETS" not in os.environ:
-        ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
     min_pages = ts_config.min_reserved_dim_size
     # With min == max the size is a constant, which fails to trace.
-    if not min_pages < max_pages <= ts_config.max_buckets:
+    if not min_pages < max_pages:
         logger.warning_once(
             "A dynamic page count needs the %d pages per sequence to be above "
-            "MIN_RESERVED_DIM_SIZE=%d and at most MAX_BUCKETS=%d, so the per-sequence "
-            "attention kernels pad every sequence to that many pages instead.",
+            "MIN_RESERVED_DIM_SIZE=%d, so the per-sequence attention kernels pad every "
+            "sequence to that many pages instead.",
             max_pages,
             min_pages,
-            ts_config.max_buckets,
         )
         return None
+    ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
     return {"min": min_pages, "max": max_pages, "granularity": 1}
 
 
@@ -216,18 +214,16 @@ def _prefill_page_range(page_range: DynamicRange) -> DynamicRange:
     """Return ``page_range`` with its bounds rounded up to multiples of
     ``PREFILL_PAGE_GRANULARITY``.
 
-    Returns ``page_range`` unchanged when the rounded range holds a single page count or is
-    above an exported ``MAX_BUCKETS``.
+    Returns ``page_range`` unchanged when the rounded range holds a single page count.
     """
     from torch_spyre._inductor import config as ts_config
 
     g = PREFILL_PAGE_GRANULARITY
     min_pages = -(-page_range["min"] // g) * g
     max_pages = -(-page_range["max"] // g) * g
-    if "MAX_BUCKETS" not in os.environ:
-        ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
-    if not min_pages < max_pages <= ts_config.max_buckets:
+    if not min_pages < max_pages:
         return page_range
+    ts_config.max_buckets = max(ts_config.max_buckets, max_pages)
     return {"min": min_pages, "max": max_pages, "granularity": g}
 
 

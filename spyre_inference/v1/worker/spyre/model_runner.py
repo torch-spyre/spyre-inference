@@ -52,8 +52,9 @@ class SpyreModelRunnerV2(GPUModelRunner):
         self.spyre_device = device
         if self.speculator is not None:
             self.speculator = SpyreDFlashSpeculator(vllm_config, self.device, device)
-        # Filled by initialize_kv_cache; warmup records the attention kernels against them.
-        self.spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+        # Filled by initialize_kv_cache: attention pages, or a Mamba layer's state tensors.
+        # Warmup records the attention kernels and warms the Mamba ones against them.
+        self.spyre_kv_caches: dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]] = {}
         # Set by load_model.
         self.pooling_on_spyre = False
         self.compiled_tower_blocks = 0

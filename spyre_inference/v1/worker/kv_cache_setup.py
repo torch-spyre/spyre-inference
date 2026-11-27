@@ -24,10 +24,12 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
@@ -95,18 +97,39 @@ def split_attn_groups_by_window(
         attn_groups[kv_cache_group_id] = split_groups
 
 
+def _allocate_mamba_states(
+    num_blocks: int, spec: MambaSpec, device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """One device tensor per state, ``num_blocks`` slots each, as upstream views its page.
+
+    Slot-outermost: the mixer kernels gather and scatter whole slots in-graph, which on
+    the default tiled layout relayout the whole cache, so their cost would grow with
+    the slot count rather than the batch.
+    """
+    states = []
+    for shape, dtype in zip(spec.shapes, spec.dtypes):
+        full = (num_blocks, *shape)
+        layout = row_outermost_layout(full, dtype) if device.type == "spyre" else None
+        states.append(convert(torch.zeros(full, dtype=dtype), device=device, device_layout=layout))
+    return tuple(states)
+
+
 def allocate_spyre_kv_caches(
     kv_cache_config: KVCacheConfig,
     static_ctx: dict[str, Any],
     shared_layers: dict[str, str],
     device: torch.device,
     kernel_block_sizes: list[int] | None = None,
-) -> dict[str, SpyrePagedKVCache]:
-    """SpyrePagedKVCache pages per layer, at upstream's KVCacheTensor placement.
+) -> dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]]:
+    """SpyrePagedKVCache pages per attention layer and a tuple of state tensors per Mamba
+    layer, at upstream's KVCacheTensor placement.
 
-    Layers placed on the same bytes (layer ``l`` of every cache group) share one K/V pair,
-    each viewing it in its own page shape. A Spyre tensor never spans the allocator's
-    regions, so each byte range is its own allocation rather than one backing buffer.
+    Layers placed on the same bytes (layer ``l`` of every cache group) share one allocation
+    per kind: attention layers one K/V pair, each viewing it in its own page shape, and
+    Mamba layers one state tuple. Upstream also lays the Mamba states over the attention
+    pages, which Spyre's separate K and V tensors cannot hold. A Spyre tensor never spans
+    the allocator's regions, so each byte range is its own allocation rather than one
+    backing buffer.
     """
     group_by_layer = {
         layer_name: (group_id, group.kv_cache_spec)
@@ -115,13 +138,34 @@ def allocate_spyre_kv_caches(
     }
     num_blocks = kv_cache_config.num_blocks
     pages_by_offset: dict[int, SpyrePagedKVCache] = {}
+    states_by_offset: dict[int, tuple[MambaSpec, tuple[torch.Tensor, ...]]] = {}
     claimed: set[tuple[int, int]] = set()
-    kv_caches: dict[str, SpyrePagedKVCache] = {}
+    kv_caches: dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         for index, layer_name in enumerate(kv_cache_tensor.layers):
             group_id, spec = group_by_layer[layer_name]
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[layer_name]
+            offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
+            if (offset, group_id) in claimed:
+                raise RuntimeError(
+                    f"{layer_name}: another layer of KV cache group {group_id} already "
+                    f"holds the pages at byte offset {offset}."
+                )
+            claimed.add((offset, group_id))
+            if isinstance(spec, MambaSpec):
+                # Block IDs are unique across groups, so the groups' slots never collide.
+                if offset not in states_by_offset:
+                    states = _allocate_mamba_states(num_blocks, spec, device)
+                    states_by_offset[offset] = (spec, states)
+                first_spec, states = states_by_offset[offset]
+                if (spec.shapes, spec.dtypes) != (first_spec.shapes, first_spec.dtypes):
+                    raise NotImplementedError(
+                        f"{layer_name}: its Mamba states {spec.shapes} {spec.dtypes} differ "
+                        f"from those already at byte offset {offset}."
+                    )
+                kv_caches[layer_name] = states
+                continue
             # The group's kernel block size from upstream, which can split a manager block
             # into several kernel blocks. Without an entry the kernels read whole manager blocks.
             kernel_block_size = spec.block_size
@@ -132,13 +176,6 @@ def allocate_spyre_kv_caches(
             # A layer without an impl (fixture stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            offset = kv_cache_tensor.offset + index * kv_cache_tensor.layer_stride
-            if (offset, group_id) in claimed:
-                raise RuntimeError(
-                    f"{layer_name}: another layer of KV cache group {group_id} already "
-                    f"holds the pages at byte offset {offset}."
-                )
-            claimed.add((offset, group_id))
             num_pages = num_blocks * pages_per_block
             # The first layer at an offset allocates its pages; layers of other groups at the
             # same offset view them in their own page shape.

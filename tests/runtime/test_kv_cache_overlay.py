@@ -18,6 +18,7 @@ cache group shares one K/V pair, which each layer views in its own page shape.
 Card-free: upstream's real grouping and placement run on CPU, and the impl's
 allocate_pages / view_pages are stubbed to record what they were asked for."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +26,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
 from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.worker import kv_cache_setup
@@ -54,13 +55,34 @@ def _gemma4_26b() -> dict:
     return specs
 
 
-def _config(hybrid: bool = True) -> VllmConfig:
+def _nemotron_h_4b() -> dict:
+    """Nemotron-H-4B-Instruct at TP=1 with an fp16 state: 24 Mamba2 and 4 attention layers.
+    Upstream grows the attention block to 512 tokens to hold a Mamba page."""
+    attn = FullAttentionSpec(block_size=512, num_kv_heads=8, head_size=128, dtype=torch.float16)
+    mamba = MambaSpec(
+        shapes=((3, 112 * 64 + 2 * 8 * 128), (112, 64, 128)),
+        dtypes=(torch.float16, torch.float16),
+        block_size=8192,
+        page_size_padded=attn.page_size_bytes,
+        mamba_cache_mode="none",
+    )
+    pattern = "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
+    specs: dict = {}
+    for i, kind in enumerate(pattern):
+        if kind == "M":
+            specs[f"layers.{i}.mixer"] = mamba
+        elif kind == "*":
+            specs[f"layers.{i}.attn"] = attn
+    return specs
+
+
+def _config(hybrid: bool = True, block_size: int = 128) -> VllmConfig:
     vllm_config = VllmConfig()
     vllm_config.model_config = SimpleNamespace(
         max_model_len=4096, multimodal_config=None, supports_kv_cache_grouping=False
     )
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
-    vllm_config.cache_config.block_size = 128
+    vllm_config.cache_config.block_size = block_size
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = not hybrid
     return vllm_config
 
@@ -85,8 +107,14 @@ def recorded(monkeypatch):
         calls.append(("view", num_pages, spec, base))
         return pages
 
+    def allocate_mamba_states(num_blocks, spec, device):
+        states = (object(), object())
+        calls.append(("mamba", num_blocks, spec, states))
+        return states
+
     monkeypatch.setattr(SpyreAttentionImpl, "allocate_pages", classmethod(allocate_pages))
     monkeypatch.setattr(SpyreAttentionImpl, "view_pages", classmethod(view_pages))
+    monkeypatch.setattr(kv_cache_setup, "_allocate_mamba_states", allocate_mamba_states)
     return calls
 
 
@@ -149,6 +177,62 @@ def test_two_layers_of_one_group_at_one_offset_are_rejected(recorded):
 
     with pytest.raises(RuntimeError, match="KV cache group 0 already holds"):
         kv_cache_setup.allocate_spyre_kv_caches(config, {}, {}, torch.device("cpu"))
+
+
+def test_a_mamba_hybrid_shares_states_per_slot_beside_the_attention_pages(recorded):
+    """Upstream places six Mamba groups and one attention group of four layers each over
+    four slots, a Mamba page over attention bytes. Spyre keeps one state tuple and one K/V
+    pair per slot: the Mamba layers of a slot share the states, never an attention page."""
+    num_blocks = 10
+    specs = _nemotron_h_4b()
+    config = _kv_cache_config(_config(block_size=512), specs, num_blocks)
+    assert type(config.kv_cache_groups[0].kv_cache_spec) is MambaSpec
+
+    kv_caches = kv_cache_setup.allocate_spyre_kv_caches(
+        config, {}, {}, torch.device("cpu"), [512] * len(config.kv_cache_groups)
+    )
+
+    assert kv_caches.keys() == specs.keys()
+    states = [call[3] for call in recorded if call[0] == "mamba"]
+    pages = [call[3] for call in recorded if call[0] == "allocate"]
+    assert len(states) == len(pages) == 4
+    assert [call[0] for call in recorded].count("view") == 0
+    assert {call[1] for call in recorded if call[0] == "mamba"} == {num_blocks}
+    for slot_states in states:
+        sharing = [name for name, cache in kv_caches.items() if cache is slot_states]
+        assert len(sharing) == 6 and all(name.endswith(".mixer") for name in sharing)
+    for slot_pages in pages:
+        sharing = [name for name, cache in kv_caches.items() if cache is slot_pages]
+        assert len(sharing) == 1 and sharing[0].endswith(".attn")
+
+
+def test_mamba_layers_with_other_states_at_one_offset_are_rejected(recorded):
+    """Sharing a state tuple is only sound when every layer at the offset has its shapes."""
+    specs = _nemotron_h_4b()
+    config = _kv_cache_config(_config(block_size=512), specs, num_blocks=10)
+    mamba_group = config.kv_cache_groups[1]
+    narrow = replace(mamba_group.kv_cache_spec, shapes=((3, 64), (112, 64, 128)))
+    config.kv_cache_groups[1] = replace(mamba_group, kv_cache_spec=narrow)
+
+    with pytest.raises(NotImplementedError, match="Mamba states .* differ"):
+        kv_cache_setup.allocate_spyre_kv_caches(config, {}, {}, torch.device("cpu"))
+
+
+def test_a_mamba_hybrid_is_sized_per_slot_and_kind():
+    """Nemotron-H-4B: four K/V pairs and four unpadded (conv, ssm) tuples per block, 15.2
+    MiB; not upstream's 8 MiB pool, which overlays them, nor 51.3 MiB at one allocation
+    per layer."""
+    specs = _nemotron_h_4b()
+    layout = _kv_block_layout(_config(block_size=512), specs)
+
+    assert layout is not None
+    pool_bytes, tensor_bytes, _ = layout
+    attn = specs["layers.7.attn"].page_size_bytes
+    mamba = specs["layers.0.mixer"]
+    assert pool_bytes == 4 * attn
+    conv_bytes, ssm_bytes = 3 * 9216 * 2, 112 * 64 * 128 * 2
+    assert sorted(tensor_bytes) == sorted([attn // 2] * 8 + [conv_bytes, ssm_bytes] * 4)
+    assert sum(tensor_bytes) == 4 * (attn + mamba.real_page_size_bytes)
 
 
 def test_sizing_counts_one_k_v_pair_per_slot():

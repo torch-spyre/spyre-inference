@@ -37,10 +37,12 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.mamba_mixer2 import SpyreMambaMixer2
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
+    SpyrePagedKVCache,
     allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inline_active
@@ -245,11 +247,42 @@ def _record_attention(runner: "SpyreModelRunnerV2") -> None:
         causal_by_layer.update(
             zip(draft.get_draft_kv_cache_layer_names(), draft.get_draft_attn_causal(), strict=True)
         )
+    # Mamba layers hold a tuple of state tensors; only paged attention records graphs.
+    pages = {
+        name: cache
+        for name, cache in runner.spyre_kv_caches.items()
+        if isinstance(cache, SpyrePagedKVCache)
+    }
     record_attention_graphs(
         runner.compilation_config.static_forward_context,
-        runner.spyre_kv_caches,
+        pages,
         builders,
         causal_by_layer=causal_by_layer,
+    )
+
+
+def _warm_mamba(runner: "SpyreModelRunnerV2", body_buckets: list[int]) -> None:
+    """Compile every Mamba layer's decode and prefill kernels on the null state slot.
+
+    MRV2's dummy runs carry no Mamba metadata, so the mixer body never runs there.
+    """
+    if runner.compilation_config.mode is CompilationMode.NONE:
+        return
+    static_ctx = runner.compilation_config.static_forward_context
+    mixers = [layer for layer in static_ctx.values() if isinstance(layer, SpyreMambaMixer2)]
+    if not mixers:
+        return
+    t0 = time.time()
+    for mixer in mixers:
+        mixer.warm_kernels(body_buckets)
+    logger.info(
+        "Mamba kernels warmed for %d layers (body buckets %s, decode buckets %s, "
+        "prefill chunk %d) in %.3fs.",
+        len(mixers),
+        body_buckets,
+        mixers[0].decode_buckets,
+        mixers[0].chunk_size,
+        time.time() - t0,
     )
 
 
@@ -326,6 +359,7 @@ def run(runner: "SpyreModelRunnerV2") -> None:
         # The bench tooling (vllm-bench-serve's collect.py) parses this line.
         logger.info("Warmup complete in %.3fs for %d buckets.", time.time() - t0, len(calls))
         if runner.spyre_kv_caches:
+            _warm_mamba(runner, [] if bucketer is None else bucketer.bucket_sizes)
             _record_attention(runner)
         if not runner.model_config.enforce_eager:
             _record_vision_graphs(runner, [c.num_tokens for c in calls])

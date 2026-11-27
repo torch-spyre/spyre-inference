@@ -157,10 +157,8 @@ vllm serve ibm-granite/granite-embedding-125m-english \
 Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
-that fit its smallest real query length. Batched decode uses KV-length/num-sequences
-pairs; both recording paths also enforce the allocated page-capacity limit. Extra
-buckets can still multiply the recorded variants, so keep those lists short.
+compile at warmup. Full-attention layers have no KV-length buckets (see below); their query and
+num-sequences buckets each add recorded variants, so keep those lists short.
 
 **Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
 platform clamps `--max-num-batched-tokens` to the largest entry. A decode-heavy run at
@@ -200,102 +198,40 @@ device memory (#1302). At a long `--max-model-len`, a 2048-token bucket can push
 largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
 they are left to compile on first use (torch-spyre#5250 makes that limit configurable).
 
-**Attention (KV length × query length).** Set the buckets directly as comma-separated
-lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
-`--max-num-batched-tokens` (query) are dropped, and the limit is appended if missing, so
-every schedulable length keeps a bucket.
+**Attention (query length and batch size).** Set the buckets as comma-separated lists.
+Each is clamped to its limit: entries above `--max-num-batched-tokens` (query) or
+`--max-num-seqs` (num-sequences) are dropped, and the limit is appended if missing, so every
+schedulable length keeps a bucket.
 
 ```bash
-export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: the SPYRE_ATTN_KV_LADDER preset (pow2)
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
+export SPYRE_ATTN_NUM_SEQS_BUCKETS=1,4,8      # default: powers of two up to --max-num-seqs
 ```
 
-The default KV buckets are the powers of two from `block_size`; the denser presets below
-union them with a further series. The ladder stays geometric rather than uniform because the
-recorded set grows with both the KV and num-sequences axes, even after filtering, so each
-extra entry costs warmup time. If your context never exceeds 2048,
-dropping the higher entries removes variants from warmup at no serving cost.
+Warmup records one per-sequence kernel per query bucket and one batched-decode kernel per
+num-sequences bucket.
 
-### Choosing a KV ladder
+### One per-sequence kernel for every page count
 
-`SPYRE_ATTN_KV_LADDER` picks how finely the KV ladder subdivides, without having to write the
-buckets out. The default is `pow2`. Every preset keeps the powers of two, so a KV length's bucket
-can only move down relative to `pow2`, never up. The denser presets do not contain each other,
-though: at block_size 128, 2600 rounds to 2688 under `8_5` but to 2944 under `4_3`. Counts and
-overpay below are for block_size 128, at the `--max-model-len` each column names:
-
-| preset | spacing | buckets at 4096 / 16384 / 32768 | mean overpay at 4096 / 32768 |
-|---|---|---|---|
-| `pow2` (default) | powers of two only | 6 / 8 / 9 | 39% / 39% |
-| `8_5` | 8/5 ratio | 10 / 15 / 18 | 21% / 19% |
-| `4_3` | 4/3 ratio | 14 / 20 / 24 | 15% / 13% |
-| `9_8` | 9/8 ratio | 20 / 34 / 41 | 8% / 6% |
-| `uniform` | odd sixteenths of `--max-model-len` | 13 / 15 / 16 | 14% / 14% |
-
-Overpay is the bucket over the real KV length, averaged over every KV length above `block_size`,
-so it describes a workload whose lengths are spread out. Warmup cost tracks the number of distinct
-recorded kernels, which rises with the bucket count. The ratio presets put their buckets at fixed
-token counts; `uniform` places them as fractions of `--max-model-len`, so its buckets move up with
-the context while its count stays roughly flat. Short contexts that are not a power of two are the
-exception: there the step rounds down to a whole block and adds a few buckets (16 at 2047 against
-12 at 2048). Match `--max-model-len` to your real lengths before choosing it.
-
-As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
-saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
-it buys little for its warmup. Once the block count exceeds one chunk of `32 // num_seqs` blocks,
-the batched-decode kernel also pads it up to whole chunks, which takes back part of a denser
-preset's saving below 32 sequences. `8_5` is the recommended compromise, `9_8` the fastest when
-warmup time does not matter, and `pow2` the default because it has the shortest warmup.
-
-If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every preset: put the
-buckets where the lengths actually are. A workload that sits on one power of two gains nothing
-from any preset.
-
-#### A denser ladder for large batches only
-
-A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
-concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
-batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`
-(default 16, which with the default buckets means 9 or more sequences), while the per-sequence
-path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the dense buckets
-cost warmup without a measured gain. The second ladder is unioned with the first, so no length
-rounds up further.
-It is off by default, rejected at startup together with `SPYRE_ATTN_KV_BUCKETS`, which replaces
-the ladder it extends, and ignored with a warning when the threshold is above the largest
-num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
-`SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
-less warmup.
-
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default), warmup
-records eligible KV-length × num-sequences combinations.
-`SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
-extra lever there, and the same keep-it-short advice applies.
-
-#### One per-sequence kernel for every page count
-
-The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
-use the KV buckets. Warmup compiles one kernel per query bucket, and that kernel runs any
+The per-sequence kernels (`page_attn_prefill`, which also runs any decode that batched decode
+does not take) do not bucket the KV length. Warmup compiles one kernel per query bucket, and that kernel runs any
 sequence length up to `--max-model-len`.
 
 Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages
 per loop step at every sequence length. When `--max-model-len` is too short for that, prefill
 keeps its own page count, but covers at least two pages. Decode sequences keep their own page
-count. A model
-with a layer of one KV head (after the tensor-parallel split) runs at least two pages: a
-sequence that fits in one page also gets a masked copy of it as a second page.
+count.
 
 The page tables and mask stacks are copied to the device with torch-spyre's
-`tensor.to("spyre", dynamic=...)`. For this, the plugin sets two torch-spyre limits unless you
-export them yourself: `MIN_RESERVED_DIM_SIZE` to 1, and `MAX_BUCKETS` to at least
-`--max-model-len / block_size` rounded up to a multiple of 8. If an exported `MAX_BUCKETS` is
-below that rounded value, prefill reads one page per loop step instead.
+`tensor.to("spyre", dynamic=...)`. For this, the plugin sets torch-spyre's
+`MIN_RESERVED_DIM_SIZE` to 1 and raises its `MAX_BUCKETS` cap to at least
+`--max-model-len / block_size` rounded up to a multiple of 8, whether or not you export them.
 
-The per-sequence kernels use the KV buckets above after all, with one kernel per (KV, query)
-bucket pair, when any of these holds:
+A `--max-model-len` of one page has no page range: every sequence runs that one page.
 
-- `--max-model-len / block_size` is not above the minimum page count, or is above an exported
-  `MAX_BUCKETS`; startup logs a warning;
-- the layer uses sliding-window attention.
+Sliding-window layers have no page range. Each sequence pads to the power of two at or above
+its page count, capped at the pages its window touches, with one kernel per (page count,
+query) bucket pair.
 
 The batched decode kernel takes its chunk count at run time in the same way, and under the
 same conditions. The kernel reads the KV cache one *chunk* per loop step: the next
@@ -304,7 +240,9 @@ cores reads one page. For example, a batch of 8 sequences reads 4 pages of each 
 and if its longest sequence has 256 pages, the batch runs 64 chunks. Shorter sequences are
 masked past their own length. The same kernel runs a batch that fits in one chunk, so warmup
 compiles one batched kernel per num-sequences bucket. A num-sequences bucket whose
-`--max-model-len` fits in one chunk keeps its KV buckets.
+`--max-model-len` fits in one chunk, or any bucket under the conditions above, pads every
+batch to the page count of `--max-model-len` instead. A sliding-window layer pads its
+batches to their power-of-two page count, capped at the pages a one-token window touches.
 
 ## KV cache size
 
@@ -338,14 +276,19 @@ setting it to a size next to `--kv-cache-memory-bytes` is an error.
 
 ## FP8 KV cache
 
-Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
-each cached token takes:
+An FP8 model (FP8 linear weights: the `fp8` method, or a compressed-tensors checkpoint
+with 8-bit float weights) stores its KV cache in float8 (e4m3) by default, halving the
+bytes each cached token takes. Any other model opts in with `--kv-cache-dtype fp8`. An FP8
+model opts out with its checkpoint's 16-bit dtype, `float16` or `bfloat16`; either gives a
+float16 cache, the only 16-bit cache Spyre has:
 
 ```bash
-vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+vllm serve ibm-granite/granite-4.1-8b-fp8                             # FP8 KV cache
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype bfloat16   # float16 cache
 ```
 
-It needs a head size that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+It needs a head size that is a multiple of 128; with a smaller one an FP8 model keeps a
+model-dtype cache, and an explicit `--kv-cache-dtype fp8` is rejected. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
 ...) are rejected at startup. Since the KV cache is sized from free device memory (see
 [KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one.
 Attention still computes in the model dtype: pages are dequantized on read with the

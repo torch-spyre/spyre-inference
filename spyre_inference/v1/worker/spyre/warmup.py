@@ -36,7 +36,6 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
-from spyre_inference import envs
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -166,7 +165,8 @@ def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
     embed_input_ids, and no dummy run reaches the encoder. A generative model's tower is
     enumerated only when its blocks are compiled, and only for images: an eager tower
     compiles per op on first use, which the guard expects, and a video or audio item
-    expands to a count the request sets.
+    expands to a count the request sets. A SpyreVisionEncoderMixin tower is skipped:
+    it compiles per token budget instead (_record_vision_graphs).
     """
     if not runner.supports_mm_inputs:
         return
@@ -179,6 +179,8 @@ def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
             # int32 to match upstream's input_ids buffer; 0 is an id every vocab holds.
             wrapper.embed_input_ids(torch.zeros(n, dtype=torch.int32))
     if not runner.is_pooling_model and not runner.compiled_tower_blocks:
+        return
+    if isinstance(runner.get_model(), SpyreVisionEncoderMixin):
         return
     budget = MultiModalBudget(runner.vllm_config, runner.mm_registry, enable_cache=False)
     for modality, n_max in budget.mm_max_items_per_batch.items():
@@ -203,6 +205,9 @@ def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> Non
     budget = MultiModalBudget(runner.vllm_config, runner.mm_registry, enable_cache=False)
     # The processor's largest item, as upstream computes it for the scheduler's budget.
     model.max_tokens_per_item = max(budget.mm_max_toks_per_item[m] for m in model.vision_modalities)
+    model.max_items_per_step = max(
+        budget.mm_max_items_per_batch[m] for m in model.vision_modalities
+    )
     # The platform sets float16 for every engine run; the field is typed wider.
     dtype = cast(torch.dtype, runner.model_config.dtype)
     model.compile_vision_graphs()
@@ -225,9 +230,6 @@ def _record_vision_graphs(runner: "SpyreModelRunnerV2", sizes: list[int]) -> Non
 
 
 def _record_attention(runner: "SpyreModelRunnerV2") -> None:
-    if not envs.SPYRE_ATTN_RECORD:
-        logger.info("Attention graph recording disabled (SPYRE_ATTN_RECORD=0)")
-        return
     if runner.compilation_config.mode is CompilationMode.NONE:
         logger.info("Attention graph recording disabled (CompilationMode.NONE)")
         return

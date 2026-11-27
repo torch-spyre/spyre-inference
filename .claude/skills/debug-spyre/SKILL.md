@@ -332,7 +332,7 @@ When you see odd code in this repo, it usually exists because of one of these. B
 | Indexed reads/writes lower only in specific forms | Gathers go through `index_select` with a stick-aligned int32 index, writes through `index_copy_` in a compiled graph (eager `index_copy_` falls back to CPU), and an indexed tensor is placed with the indexed dim outermost (`place_row_gathered`, `head_major_kv_layout`); boolean-mask `index_put` is replaced by host scatter + `torch.where` |
 | No in-device transpose + contiguous | Compute permutations on CPU where possible, or interleave `transpose + contiguous` against ops that tolerate non-contiguous inputs |
 | No simultaneous dtype + device conversion | `custom_ops/utils.py::convert` does the dtype change on CPU first, then moves to Spyre |
-| `torch.compile` recompiles on shape change | Modules pre-align inputs to fixed bucket sizes (e.g. KV-length alignment, query-chunk size) so the same compiled kernel is reused |
+| `torch.compile` recompiles on shape change | Modules pre-align inputs to fixed bucket sizes (e.g. query-chunk size), or declare a dynamic range (the KV page count), so the same compiled kernel is reused |
 | Collectives are fp16-only and pad-sensitive | `SpyreCommunicator` flattens multidimensional Spyre `all_reduce` inputs. Eager `all_gather` pads the gathered dimension to a multiple of 64; compiled `all_gather` requires shard `numel()` divisible by 64. The platform rejects DP>1, PP>1 and bf16+TP>1 |
 | Only `float16` is validated | `TorchSpyrePlatform` sets `float16` for every model (overriding an explicit `--dtype`); the attention backend also lists `bfloat16` in `supported_dtypes`, but no engine run reaches it |
 

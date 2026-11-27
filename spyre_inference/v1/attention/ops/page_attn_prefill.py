@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged attention over a head-major KV cache for a query wider than one token.
+"""Per-sequence paged attention over a head-major KV cache.
 
-``page_attn_decode`` buys LX page residency by shaping the gather and the query
-around the folded cache. Past one query token the page transfer that buys is amortised over
-every query row, so this kernel spends it instead: batched GQA over
-``[kv_head, group, query, D]``, one accumulator, store fuses.
+Batched GQA over ``[kv_head, group, query, D]``, one accumulator, store fuses.
 """
 
 import torch
@@ -47,11 +44,15 @@ def page_attn_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    The page walk is a `for_each_tile`. Shapes are ``page_attn_decode``'s, except:
+    The page walk is a `for_each_tile`. Expected shapes:
+        query: [num_tokens, num_heads, head_size], the whole batch's query
+        query_row_index: [padded_query_len] int32 device tensor of this sequence's
+            absolute query rows.
+        k_pages / v_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor, row i
-            holding the i-th active block's page index at column 0, indexing
-            ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
+            holding the i-th active block's page index at column 0.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
+        out: buffer to store into, or None to return the result instead.
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.

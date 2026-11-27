@@ -19,10 +19,13 @@ Pixtral path, whose tower gets no quant config. So this links the cached snapsho
 them, as a copy holding only the HF-format files looks.
 """
 
+import gc
+import os
 from pathlib import Path
 
 import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_available
+from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
 MODEL = "mistralai/Ministral-3-14B-Instruct-2512"
 MISTRAL_FORMAT_FILES = {"consolidated.safetensors", "params.json", "tekken.json"}
@@ -75,6 +78,10 @@ def test_hf_format_tower_stays_unquantized(monkeypatch: pytest.MonkeyPatch, tmp_
         (methods,) = llm.apply_model(linears)
     finally:
         llm.llm_engine.engine_core.shutdown(timeout=60)
+        del llm
+        gc.collect()
+        freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
+    assert freed, "Spyre devices were not released after LLM shutdown"
 
     assert methods == {
         "tower": ("UnquantizedLinearMethod", "torch.float16"),

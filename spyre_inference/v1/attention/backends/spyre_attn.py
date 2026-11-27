@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
+from torch.fx.experimental import _config as fx_config
 from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -179,8 +180,7 @@ def _to_device_with_page_range(
         return convert(host, device=device)
     padded = host.new_zeros((page_range["max"], *host.shape[1:]))
     padded[: host.shape[0]] = host
-    dev = padded.to(device, dynamic={0: page_range})  # ty: ignore[no-matching-overload]
-    return dev.resize_(host.shape)
+    return convert(padded, device=device, dynamic={0: page_range}).resize_(host.shape)
 
 
 def _mirror_mask_stack(
@@ -310,16 +310,42 @@ def batched_decode(
     # the same checks bound a dynamic chunk count.
     _walked_pages(chunk_page_ids, mask_by_chunk, chunk_range)
     return batched_decode_kernel(
-        chunk_page_ids=chunk_page_ids, mask_by_chunk=mask_by_chunk, **kwargs
+        chunk_page_ids=chunk_page_ids,
+        mask_by_chunk=mask_by_chunk,
+        entry_local=chunk_range is not None or chunk_page_ids.shape[0] > 1,
+        **kwargs,
     )
+
+
+def _compile_with_dynamic_count(
+    fn: Callable[..., torch.Tensor], range_arg: str
+) -> Callable[..., torch.Tensor]:
+    """``torch.compile`` ``fn``, whose trip count may vary over its ``range_arg`` range.
+
+    Dynamo traces a size of 1 as a constant, so a graph traced at another size guards the
+    count at 2 or more and recompiles for one page or chunk. With a range, ``fn`` therefore
+    traces size-obliviously: the count starts at 0 and only the range's own checks bound
+    it. The count is the only size these kernels leave dynamic. The inductor caches do not
+    key on this setting, so an artifact traced without it keeps the floor.
+    """
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+
+    @functools.wraps(fn)
+    def run(**kwargs: Any) -> torch.Tensor:
+        if kwargs[range_arg] is None:
+            return compiled(**kwargs)
+        with fx_config.patch(backed_size_oblivious=True):
+            return compiled(**kwargs)
+
+    return run
 
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
 # Compiled even under --enforce-eager: the eager page gather fails (torch-spyre#4334).
-_page_attn_prefill_compiled = torch.compile(page_attn_prefill, dynamic=False, fullgraph=True)
-_page_attn_decode_compiled = torch.compile(page_attn_decode, dynamic=False, fullgraph=True)
-_batched_decode_compiled = torch.compile(batched_decode, dynamic=False, fullgraph=True)
+_page_attn_prefill_compiled = _compile_with_dynamic_count(page_attn_prefill, "page_range")
+_page_attn_decode_compiled = _compile_with_dynamic_count(page_attn_decode, "page_range")
+_batched_decode_compiled = _compile_with_dynamic_count(batched_decode, "chunk_range")
 
 
 # Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
@@ -643,7 +669,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return tile
 
     def _pad_num_blocks(self, num_blocks: int, prefill: bool = False) -> int:
-        """Round an active-block count up onto the recorder's num_blocks buckets.
+        """Round an active-block count up onto the recorder's num_blocks buckets, or onto
+        the declared page count with a page range.
 
         block_table is allocated at width ceil(max_model_len / block_size) for
         the engine's lifetime, so the padded bucket always fits.
@@ -652,16 +679,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # A fully-masked padded tile would divide by a zero softmax
             # denominator, so zero real blocks must stay zero.
             return 0
-        if self._attn_bucketer.page_range is not None:
-            return self._attn_bucketer.find_declared_pages(num_blocks, prefill)
-        padded = self._attn_bucketer.find_blocks_bucket(num_blocks)
-        # The buckets cover ceil(max_model_len / block_size), and the scheduler
-        # bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
+        bucketer = self._attn_bucketer
+        if bucketer.page_range is not None:
+            page_range = bucketer.prefill_page_range if prefill else bucketer.page_range
+            assert page_range is not None
+            padded: int | None = bucketer.find_declared_pages(num_blocks, prefill)
+            largest = page_range["max"]
+        else:
+            padded = bucketer.find_blocks_bucket(num_blocks)
+            largest = bucketer.num_blocks_buckets[-1]
+        # The buckets and the page range cover ceil(max_model_len / block_size), and the
+        # scheduler bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
         # seq_lens come from the token budget instead, never reach here.
-        assert padded is not None, (
-            f"num_blocks={num_blocks} exceeds the largest recorded bucket "
-            f"{self._attn_bucketer.num_blocks_buckets[-1]}, which should cover "
-            f"ceil(max_model_len / block_size)."
+        assert padded is not None and padded <= largest, (
+            f"num_blocks={num_blocks} exceeds the largest recorded bucket {largest}, which "
+            f"should cover ceil(max_model_len / block_size)."
         )
         assert padded >= num_blocks
         return padded
@@ -1110,8 +1142,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             if active_block_indices is not None:
                 blocks_s = active_block_indices[s]
             elif self._attn_bucketer.page_range is not None:
-                # Pad with the last real page, as forward() does: raising the count to the
-                # range minimum can take it past the block table's width.
+                # Pad with the last real page, as forward() does: rounding the count up to
+                # the range's minimum or granularity can take it past the block table's width.
                 real = real_num_blocks[s]
                 blocks_s = list(range(real)) + [real - 1] * (n - real)
             else:

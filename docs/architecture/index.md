@@ -455,17 +455,18 @@ block counts that fit its smallest real query length; variants exceeding the all
 page count are skipped. When the per-sequence page count is dynamic (copied to the device
 with `tensor.to(dynamic=...)`), warmup instead records one per-sequence variant per query
 bucket, at the page count of `max_model_len`, and that kernel runs every page count up to
-it. When prefill gets its own range of multiples of 8 pages from 16, a prefill variant is
-traced at that page count rounded up to a multiple of 8. Failed recordings are logged and
-compile on first use instead.
+it. When prefill gets its own range of multiples of 8 pages, a prefill variant is traced
+at that page count rounded up to a multiple of 8. Failed recordings are logged and compile
+on first use instead.
 When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup
 enumerates its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets; combinations that reach or exceed the allocated page count are skipped and
 declined at dispatch. When the chunk count is dynamic too, a num-sequences bucket records
-just two variants: one for a batch that fits in a single chunk, and one dynamic variant,
-recorded at the chunk count of `max_model_len`, that runs every longer batch. A single step can carry a mix of prefill
-and decode sequences; each sequence is padded to its own query bucket (decodes use the
-length-1 bucket) before dispatch. `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
+one dynamic variant, at the chunk count of `max_model_len`, that runs every batch, a
+single chunk included. A single step can carry a mix of prefill and decode sequences;
+each sequence is padded to its own query bucket (decodes use the length-1 bucket) before
+dispatch.
+`SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
 time, so a graph holds one copy of the attention body per page and compile time grows
@@ -518,7 +519,14 @@ per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: folding a
 ### FP8 KV cache
 
 `--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the pages as `float8_e4m3fn`, halving KV
-memory and the bytes each page read moves.
+memory and the bytes each page read moves. An FP8 model gets it by default:
+`TorchSpyrePlatform._resolve_kv_cache_dtype` turns `auto` into `fp8` when the checkpoint's
+linears are FP8 (`_has_fp8_weights`) and the head size fills a float8 stick (128). An
+explicit `float16` is kept, and `bfloat16` becomes `float16`: upstream accepts the
+checkpoint's own 16-bit dtype before the platform forces float16, and the impl only takes
+the model dtype. vLLM runs `check_and_update_config` again after the EngineCore handshake,
+so each result is a fixed point; rewriting `float16` to `auto` would turn into `fp8` on
+that second pass.
 Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
 The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
 the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
@@ -542,8 +550,7 @@ Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
   to `max_model_len` (avoids per-step recompilation on Spyre); `SPYRE_ATTN_KV_LADDER`
-  selects a denser preset. A layer with one KV head floors the ladder at two blocks: one
-  KV head on one page leaves the decode kernel no spare dim for the stick
+  selects a denser preset.
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the

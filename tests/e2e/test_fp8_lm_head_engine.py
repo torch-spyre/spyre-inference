@@ -74,6 +74,10 @@ def test_fp8_lm_head_serves(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     def head_method(model):
         return type(model.lm_head.quant_method).__name__
 
+    def kv_cache_fp8(model):
+        impls = (getattr(m, "impl", None) for m in model.modules())
+        return {impl.kv_cache_fp8 for impl in impls if hasattr(impl, "kv_cache_fp8")}
+
     prompt = "1, 2, 3, 4, 5, 6,"
     engine = LLM(
         model=str(model),
@@ -88,6 +92,8 @@ def test_fp8_lm_head_serves(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     assert engine.apply_model(head_method) == ["SpyreFp8LMHeadMethod"], (
         "the checkpoint's FP8 head was not loaded as FP8"
     )
+    # No --kv-cache-dtype: an FP8 model gets an FP8 KV cache by default.
+    assert engine.apply_model(kv_cache_fp8) == [{True}]
     # The FP16-head reference: FP8 logits keep the same greedy tokens on this prompt.
     expected = " 7, 8, 9, 10, 11"
     assert output[0].outputs[0].text == expected

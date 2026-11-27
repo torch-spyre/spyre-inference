@@ -87,6 +87,7 @@ def _build_metadata(
     sliding_window: int | None = None,
     model_num_kv_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
+    is_prefilling: torch.Tensor | None = None,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata.
 
@@ -147,7 +148,7 @@ def _build_metadata(
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
         causal=True,
-        is_prefilling=(query_lens_per_seq > 1),
+        is_prefilling=(query_lens_per_seq > 1) if is_prefilling is None else is_prefilling,
     )
 
     return builder.build(

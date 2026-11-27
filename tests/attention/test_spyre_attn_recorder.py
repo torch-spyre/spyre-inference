@@ -325,7 +325,7 @@ def test_recorder_passes_explicit_causality_to_metadata(
     builder._attn_bucketer = make_bucketer()
     forward = MagicMock()
     monkeypatch.setattr(impl, "forward", forward)
-    monkeypatch.setattr(impl, "_batched_decode_supported", lambda: False)
+    monkeypatch.setattr(SpyreAttnBucketer, "batched_decode_variants", lambda self: [])
     impl.record_graphs(SimpleNamespace(), kv_cache, builder, causal=causal)
     assert forward.call_count > 0
     assert all(call.args[5].causal is causal for call in forward.call_args_list)
@@ -358,10 +358,7 @@ class TestRecordGraphs:
     def _per_seq_only(self, monkeypatch):
         """These counts are the per-seq recorder's; the batched ones are
         TestRecordBatchedDecode's."""
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-        envs.clear_env_cache()
-        yield
-        envs.clear_env_cache()
+        monkeypatch.setattr(SpyreAttnBucketer, "batched_decode_variants", lambda self: [])
 
     @pytest.mark.usefixtures("stub_forward")
     def test_records_every_enumerated_variant(self, impl, kv_cache, builder):
@@ -669,8 +666,6 @@ class TestRecordGraphs:
 def test_one_token_variant_records_the_per_seq_kernel(builder, monkeypatch, num_blocks):
     """Per-seq variants are built with the batched path off, so recording the one-token
     variant runs the per-seq loop rather than the batched decode kernel."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    envs.clear_env_cache()
 
     metadata = builder.build_for_variant(SpyreAttnBucket(num_blocks, 1))
 
@@ -719,13 +714,6 @@ class TestRecordBatchedDecode:
     # per-seq recorder is still bounded by NUM_PAGES, hence the two page counts.
     PAGES = 64
 
-    @pytest.fixture(autouse=True)
-    def _enabled(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-        envs.clear_env_cache()
-        yield
-        envs.clear_env_cache()
-
     @pytest.fixture()
     def wide_cache(self, spyre_device):
         return SpyreAttentionImpl.allocate_pages(self.PAGES, SPEC, spyre_device)
@@ -751,16 +739,6 @@ class TestRecordBatchedDecode:
             "the cache is too small to record the whole enumeration, so this would not cover it"
         )
         assert recorded == self._expected(bucketer, len(batched))
-
-    @pytest.mark.usefixtures("stub_forward")
-    def test_records_nothing_batched_when_the_flag_is_off(
-        self, impl, wide_cache, builder, monkeypatch
-    ):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-        envs.clear_env_cache()
-        bucketer = builder._attn_bucketer = make_bucketer()
-
-        assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
 
     @pytest.mark.usefixtures("stub_forward")
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
@@ -872,8 +850,6 @@ def test_dynamic_chunk_dispatch_lands_on_a_recorded_kernel(builder, monkeypatch,
     from torch_spyre._inductor import config as ts_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    envs.clear_env_cache()
     max_model_len = 2048
     max_blocks = max_model_len // BLOCK_SIZE
     # Restores the limits the bucketer sets. Not monkeypatch: its undo deletes a

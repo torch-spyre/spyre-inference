@@ -208,14 +208,13 @@ export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 export SPYRE_ATTN_NUM_SEQS_BUCKETS=1,4,8      # default: powers of two up to --max-num-seqs
 ```
 
-Warmup records one per-sequence kernel per query bucket and, with the batched-decode kernel
-enabled (`SPYRE_BATCHED_DECODE=1`, the default), one batched kernel per num-sequences
-bucket.
+Warmup records one per-sequence kernel per query bucket and one batched-decode kernel per
+num-sequences bucket.
 
 ### One per-sequence kernel for every page count
 
-The per-sequence kernels (prefill, and any decode that batched decode does not take) do not
-bucket the KV length. Warmup compiles one kernel per query bucket, and that kernel runs any
+The per-sequence kernels (`page_attn_prefill`, which also runs any decode that batched decode
+does not take) do not bucket the KV length. Warmup compiles one kernel per query bucket, and that kernel runs any
 sequence length up to `--max-model-len`.
 
 Prefill sequences are padded to a multiple of 8 pages, so the prefill kernel can read 8 pages

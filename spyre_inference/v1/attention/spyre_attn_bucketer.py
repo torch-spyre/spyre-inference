@@ -478,8 +478,6 @@ class SpyreAttnBucketer:
         batch of any size can sit at any context length. A num_seqs bucket with a chunk
         range records only its dynamic kernel, at the chunk count of max_model_len.
         """
-        if not envs.SPYRE_BATCHED_DECODE:
-            return []
         pairs = []
         for num_seqs in self._num_seqs_buckets:
             blocks_buckets = self.batched_blocks_buckets(num_seqs)

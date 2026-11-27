@@ -295,15 +295,8 @@ class TestBatchedDecodeVariants:
     """The batched decode enumeration, keyed on (num_seqs, blocks_per_chunk, num_chunks)."""
 
     @pytest.fixture()
-    def enabled(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-        envs.clear_env_cache()
+    def enabled(self):
         return SpyreAttnBucketer(make_config())
-
-    def test_empty_when_the_path_is_disabled(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
-        envs.clear_env_cache()
-        assert SpyreAttnBucketer(make_config()).batched_decode_variants() == []
 
     def test_covers_the_full_num_seqs_by_num_blocks_grid(self, enabled):
         assert {(v.num_seqs, v.num_blocks) for v in enabled.batched_decode_variants()} == {
@@ -341,12 +334,9 @@ class TestBatchedDecodeVariants:
         assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
 
     def test_count_stays_tractable_at_long_context(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-        envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config(32768, 2048, max_num_seqs=64))
         assert len(b.batched_decode_variants()) < 100
 
-    @pytest.mark.usefixtures("enabled")
     def test_a_sliding_window_pads_batched_decode_to_its_window(self):
         """A one-token query's window touches at most ceil(window / block_size) + 1 pages."""
         b = SpyreAttnBucketer(make_config(), sliding_window=128)

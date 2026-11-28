@@ -128,6 +128,10 @@ runs:
     - name: Set up uv
       if: steps.gate.outputs.configured == 'true'
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        # Pinned: without a version, setup-uv fetches the release manifest from
+        # raw.githubusercontent.com on every run, and a timeout there fails the ingest.
+        version: "0.13.10"
 
     - name: Set up ingest venv
       if: steps.gate.outputs.configured == 'true'

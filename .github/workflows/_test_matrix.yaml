@@ -875,6 +875,15 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-distributed-tp4
+          # TEMPORARY (PR validation only, dropped before merge): PARALLEL vs serial A/B.
+          - cfg: PARALLEL vs serial AB (temporary)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x4
+              - linux
+            image_label: image_torch_spyre
+            test_target: parallel-ab
           # torch-spyre backend probes (strict-xfail signals for backend readiness),
           # sharded across parallel 2-card jobs. Deliberately NOT in `integration`: a
           # strict-xfail flipping to xpass means the backend team shipped support and must

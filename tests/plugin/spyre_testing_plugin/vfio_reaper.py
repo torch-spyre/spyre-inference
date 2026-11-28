@@ -54,19 +54,42 @@ def _read_cmdline(pid: int) -> str:
         return "<unknown>"
 
 
+# Set per shard by `make tests PARALLEL=...`: shards on other cards also hold /dev/vfio.
+CARD_SCOPE_ENV = "SPYRE_TEST_CARD_SCOPE"
+
+
+def _in_card_scope(pid: int, scope: str | None) -> bool:
+    # A holder with no scope (an orphan of an earlier run) stays ours to reap.
+    if not scope:
+        return True
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = f.read().split(b"\0")
+    except OSError:
+        return False  # another user's process, or gone: not ours
+    prefix = f"{CARD_SCOPE_ENV}=".encode()
+    theirs = [e for e in env if e.startswith(prefix)]
+    return not theirs or theirs[0] == prefix + scope.encode()
+
+
 def _pids_holding_vfio(exclude_pids: set[int]) -> list[tuple[int, str, str]]:
     """(pid, device, cmdline) for every process holding the Spyre card open,
     found by scanning `/proc/*/fd` for `/dev/vfio/*` or `anon_inode:[vfio-device]`."""
+    scope = os.environ.get(CARD_SCOPE_ENV)
     holders: dict[int, tuple[int, str, str]] = {}
+    other_scope: set[int] = set()
     for fd_path in glob.glob("/proc/[0-9]*/fd/*"):
         pid = int(fd_path.split("/")[2])
-        if pid in exclude_pids or pid in holders:
+        if pid in exclude_pids or pid in holders or pid in other_scope:
             continue
         try:
             target = os.readlink(fd_path)
         except OSError:
             continue  # fd or process vanished mid-scan — expected race
         if target.startswith("/dev/vfio/") or target == "anon_inode:[vfio-device]":
+            if not _in_card_scope(pid, scope):
+                other_scope.add(pid)
+                continue
             holders[pid] = (pid, target, _read_cmdline(pid))
     return list(holders.values())
 
